@@ -1,6 +1,6 @@
 //! Drawing: sky, world texture with a glow shader, blocks, cars, markers.
 
-use crate::blocks::{Block, BlockKind, STUD};
+use crate::blocks::{Block, BlockKind, Member, MemberMat, STUD};
 use crate::car::{Car, ModelKind};
 use crate::world::{Mat, World, H, W};
 use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation, PipelineParams};
@@ -73,10 +73,48 @@ void main() {
     gl_FragColor = vec4(rgb, a);
 }";
 
+// Clouds and steam are drawn from a density layer: blurred, then thresholded so
+// the cells merge into soft, billowy blobs, lit from above.
+const GAS_FRAG: &str = "#version 100
+precision highp float;
+varying vec2 uv;
+uniform sampler2D Texture;
+uniform vec2 texel;
+float dens(vec2 p) {
+    float d = 0.0;
+    float ws = 0.0;
+    for (int i = -3; i <= 3; i++) {
+        for (int j = -3; j <= 3; j++) {
+            vec4 s = texture2D(Texture, p + vec2(float(i), float(j)) * texel * 2.0);
+            float w = exp(-float(i * i + j * j) / 7.0);
+            d += s.a * w;
+            ws += w;
+        }
+    }
+    return d / ws;
+}
+void main() {
+    float d = dens(uv);
+    float a = smoothstep(0.16, 0.52, d);
+    if (a <= 0.003) {
+        gl_FragColor = vec4(0.0);
+        return;
+    }
+    float up = dens(uv - vec2(0.0, texel.y * 6.0));
+    float dn = dens(uv + vec2(0.0, texel.y * 6.0));
+    float lightness = clamp(0.88 + (up - dn) * 0.9, 0.7, 1.08);
+    vec3 col = vec3(0.97, 0.98, 1.0) * lightness;
+    float alpha = a * 0.86;
+    gl_FragColor = vec4(col * alpha, alpha);
+}";
+
 pub struct Renderer {
     pub image: Image,
     pub texture: Texture2D,
     material: Material,
+    gas_image: Image,
+    gas_texture: Texture2D,
+    gas_material: Material,
 }
 
 impl Renderer {
@@ -94,23 +132,63 @@ impl Renderer {
             },
         )
         .expect("shader");
-        Renderer { image, texture, material }
+        let gas_image = Image::gen_image_color(W as u16, H as u16, Color::new(0.0, 0.0, 0.0, 0.0));
+        let gas_texture = Texture2D::from_image(&gas_image);
+        gas_texture.set_filter(FilterMode::Linear);
+        let gas_material = load_material(
+            ShaderSource::Glsl { vertex: VERT, fragment: GAS_FRAG },
+            MaterialParams {
+                pipeline_params: PipelineParams { color_blend: Some(blend), alpha_blend: Some(blend), ..Default::default() },
+                uniforms: vec![UniformDesc::new("texel", UniformType::Float2)],
+                ..Default::default()
+            },
+        )
+        .expect("gas shader");
+        Renderer { image, texture, material, gas_image, gas_texture, gas_material }
     }
 
-    pub fn draw_world(&mut self, world: &World, v: View) {
-        {
-            let px = self.image.get_image_data_mut();
-            for y in 0..H {
-                for x in 0..W {
-                    px[y * W + x] = world.color(x, y);
-                }
+    /// Fills the texture in parallel from a per-cell colour function.
+    fn fill(image: &mut Image, color: impl Fn(usize, usize) -> [u8; 4] + Sync) {
+        let px = image.get_image_data_mut();
+        let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).min(8);
+        let rows = H.div_ceil(threads);
+        let color = &color;
+        std::thread::scope(|scope| {
+            for (i, chunk) in px.chunks_mut(rows * W).enumerate() {
+                scope.spawn(move || {
+                    for (j, out) in chunk.iter_mut().enumerate() {
+                        let idx = i * rows * W + j;
+                        *out = color(idx % W, idx / W);
+                    }
+                });
             }
+        });
+    }
+
+    pub fn draw_world(&mut self, world: &World, v: View, thermal: bool) {
+        let size = DrawTextureParams { dest_size: Some(vec2(W as f32 * v.s, H as f32 * v.s)), ..Default::default() };
+        if thermal {
+            Self::fill(&mut self.image, |x, y| world.thermal_color(x, y));
+            self.texture.update(&self.image);
+            draw_texture_ex(&self.texture, v.ox, v.oy, WHITE, size);
+            return;
         }
+        Self::fill(&mut self.image, |x, y| world.color(x, y));
         self.texture.update(&self.image);
         self.material.set_uniform("texel", vec2(1.0 / W as f32, 1.0 / H as f32));
         gl_use_material(&self.material);
+        draw_texture_ex(&self.texture, v.ox, v.oy, WHITE, size);
+        gl_use_default_material();
+    }
+
+    /// Clouds and steam as soft blobs, drawn over the landscape.
+    pub fn draw_gas(&mut self, world: &World, v: View) {
+        Self::fill(&mut self.gas_image, |x, y| world.gas_color(x, y));
+        self.gas_texture.update(&self.gas_image);
+        self.gas_material.set_uniform("texel", vec2(1.0 / W as f32, 1.0 / H as f32));
+        gl_use_material(&self.gas_material);
         draw_texture_ex(
-            &self.texture,
+            &self.gas_texture,
             v.ox,
             v.oy,
             WHITE,
@@ -118,49 +196,7 @@ impl Renderer {
         );
         gl_use_default_material();
     }
-}
 
-fn lerp_color(a: Color, b: Color, t: f32) -> Color {
-    Color::new(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, 1.0)
-}
-
-pub fn draw_sky(v: View, time: f32) {
-    let r = v.rect();
-    let top = Color::from_rgba(70, 120, 214, 255);
-    let mid = Color::from_rgba(150, 200, 238, 255);
-    let low = Color::from_rgba(255, 224, 182, 255);
-    let bands = 48;
-    for i in 0..bands {
-        let t = i as f32 / bands as f32;
-        let c = if t < 0.6 { lerp_color(top, mid, t / 0.6) } else { lerp_color(mid, low, (t - 0.6) / 0.4) };
-        draw_rectangle(r.x, r.y + r.h * t, r.w, r.h / bands as f32 + 1.0, c);
-    }
-    // Sun and drifting clouds.
-    draw_circle(r.x + r.w * 0.82, r.y + r.h * 0.17, r.h * 0.07, Color::new(1.0, 0.96, 0.78, 0.35));
-    draw_circle(r.x + r.w * 0.82, r.y + r.h * 0.17, r.h * 0.045, Color::new(1.0, 0.98, 0.85, 0.95));
-    for k in 0..4 {
-        let x = (r.x + ((k as f32 * 0.29 + time * 0.004) % 1.2 - 0.1) * r.w) as f32;
-        let y = r.y + r.h * (0.12 + 0.09 * k as f32);
-        for (dx, dy, rad) in [(0.0, 0.0, 0.03), (0.035, -0.012, 0.038), (0.075, 0.0, 0.03), (0.035, 0.01, 0.034)] {
-            if x + dx * r.w - rad * r.h < r.x || x + dx * r.w + rad * r.h > r.x + r.w {
-                continue;
-            }
-            draw_circle(x + dx * r.w, y + dy * r.h, rad * r.h, Color::new(1.0, 1.0, 1.0, 0.7));
-        }
-    }
-    // Far hills.
-    for (base, amp, freq, col) in [
-        (0.66, 0.05, 6.0, Color::from_rgba(150, 178, 214, 255)),
-        (0.74, 0.04, 9.0, Color::from_rgba(118, 152, 190, 255)),
-    ] {
-        let step = 6.0;
-        let mut x = 0.0;
-        while x < r.w {
-            let h = (base + amp * ((x / r.w) * freq).sin() + amp * 0.5 * ((x / r.w) * freq * 2.3 + 1.0).sin()) * r.h;
-            draw_rectangle(r.x + x, r.y + h, step + 1.0, r.h - h, col);
-            x += step;
-        }
-    }
 }
 
 fn quad(a: Vec2, b: Vec2, c: Vec2, d: Vec2, col: Color) {
@@ -178,7 +214,7 @@ fn shade(c: (u8, u8, u8), k: f32) -> Color {
 }
 
 /// Draws a block shape centred at `c` (screen px); `s` is screen px per cell.
-pub fn draw_block_shape(kind: BlockKind, c: Vec2, s: f32, angle: f32, tint: Option<Color>, heat: f32) {
+pub fn draw_block_shape(kind: BlockKind, c: Vec2, s: f32, angle: f32, tint: Option<Color>, heat: f32, rust: f32, stress: Option<f32>) {
     let spec = kind.spec();
     let p = |lx: f32, ly: f32| c + rot(angle, vec2(lx, ly) * s);
     let rect = |cx: f32, cy: f32, w: f32, h: f32, col: Color| {
@@ -204,24 +240,39 @@ pub fn draw_block_shape(kind: BlockKind, c: Vec2, s: f32, angle: f32, tint: Opti
         draw_circle(c.x, c.y, r * 0.16, tintify(shade((220, 224, 236), 1.0)));
         return;
     }
+    if kind.is_glass() {
+        let a = |k: f32| Color::new(0.72 * k, 0.9 * k, 0.98 * k, 0.9);
+        rect(0.0, 0.0, w, h, Color::new(0.7, 0.88, 0.97, 0.33));
+        rect(0.0, -h / 2.0 + 0.6, w, 1.2, a(1.0));
+        rect(0.0, h / 2.0 - 0.6, w, 1.2, a(0.75));
+        rect(-w / 2.0 + 0.6, 0.0, 1.2, h, a(0.9));
+        rect(w / 2.0 - 0.6, 0.0, 1.2, h, a(0.75));
+        for k in 0..(w / STUD).round() as i32 {
+            let x = -w / 2.0 + STUD / 2.0 + k as f32 * STUD;
+            rect(x, -h / 2.0 - 1.1, 5.6, 2.2, Color::new(0.7, 0.88, 0.97, 0.55));
+        }
+        let (s1, s2) = (p(-w / 2.0 + 3.0, h / 2.0 - 2.0), p(-w / 2.0 + 3.0 + h * 0.6, -h / 2.0 + 2.0));
+        draw_line(s1.x, s1.y, s2.x, s2.y, (s * 1.2).max(1.2), Color::new(1.0, 1.0, 1.0, 0.7));
+        return;
+    }
     // Shadow, outline, body, bevels.
     rect(0.8, 1.2, w, h, Color::new(0.0, 0.0, 0.0, 0.25));
     rect(0.0, 0.0, w, h, tintify(shade(spec.color, 0.62)));
-    let inset = 1.2;
+    let inset = 0.9;
     rect(0.0, 0.0, w - inset * 2.0, h - inset * 2.0, tintify(shade(spec.color, 1.0)));
-    rect(0.0, -h / 2.0 + inset + 1.2, w - inset * 2.0, 2.4, tintify(shade(spec.color, 1.28)));
-    rect(0.0, h / 2.0 - inset - 1.0, w - inset * 2.0, 2.0, tintify(shade(spec.color, 0.8)));
+    rect(0.0, -h / 2.0 + inset + 1.0, w - inset * 2.0, 2.0, tintify(shade(spec.color, 1.28)));
+    rect(0.0, h / 2.0 - inset - 0.8, w - inset * 2.0, 1.6, tintify(shade(spec.color, 0.8)));
     match kind {
         BlockKind::Brick | BlockKind::Long | BlockKind::Cube => {
             let studs = (w / STUD).round() as i32;
             for i in 0..studs {
                 let x = -w / 2.0 + STUD / 2.0 + i as f32 * STUD;
-                rect(x, -h / 2.0 - 1.4, 7.0, 2.8, tintify(shade(spec.color, 0.8)));
-                rect(x, -h / 2.0 - 1.6, 7.0, 1.6, tintify(shade(spec.color, 1.2)));
+                rect(x, -h / 2.0 - 1.1, 5.6, 2.2, tintify(shade(spec.color, 0.8)));
+                rect(x, -h / 2.0 - 1.3, 5.6, 1.3, tintify(shade(spec.color, 1.2)));
                 if kind == BlockKind::Cube {
                     for j in 1..(h / STUD).round() as i32 {
                         let y = -h / 2.0 + j as f32 * STUD;
-                        rect(x, y, 5.0, 5.0, tintify(shade(spec.color, 0.9)));
+                        rect(x, y, 4.0, 4.0, tintify(shade(spec.color, 0.9)));
                     }
                 }
             }
@@ -229,23 +280,30 @@ pub fn draw_block_shape(kind: BlockKind, c: Vec2, s: f32, angle: f32, tint: Opti
         BlockKind::Plank => {
             for k in 1..6 {
                 let x = -w / 2.0 + w * k as f32 / 6.0;
-                let (a, b) = (p(x, -h / 2.0 + 1.0), p(x + 4.0, h / 2.0 - 1.0));
+                let (a, b) = (p(x, -h / 2.0 + 0.8), p(x + 3.0, h / 2.0 - 0.8));
                 draw_line(a.x, a.y, b.x, b.y, 1.0, tintify(shade(spec.color, 0.75)));
             }
         }
-        BlockKind::Beam => {
-            let teeth = (w / 12.0) as i32;
+        BlockKind::Beam | BlockKind::SteelBeam => {
+            let teeth = (w / STUD) as i32;
             for k in 0..teeth {
-                let x0 = -w / 2.0 + 12.0 * k as f32;
-                let (a, b) = if k % 2 == 0 { (p(x0, h / 2.0 - 2.0), p(x0 + 12.0, -h / 2.0 + 2.0)) } else { (p(x0, -h / 2.0 + 2.0), p(x0 + 12.0, h / 2.0 - 2.0)) };
-                draw_line(a.x, a.y, b.x, b.y, (s * 1.6).max(1.5), tintify(shade((88, 96, 112), 1.0)));
+                let x0 = -w / 2.0 + STUD * k as f32;
+                let (a, b) = if k % 2 == 0 { (p(x0, h / 2.0 - 1.5), p(x0 + STUD, -h / 2.0 + 1.5)) } else { (p(x0, -h / 2.0 + 1.5), p(x0 + STUD, h / 2.0 - 1.5)) };
+                draw_line(a.x, a.y, b.x, b.y, (s * 1.2).max(1.2), tintify(shade((88, 96, 112), 1.0)));
             }
             for k in 0..=teeth {
-                let q = p(-w / 2.0 + 12.0 * k as f32, 0.0);
-                draw_circle(q.x, q.y, s * 1.4, tintify(shade((200, 206, 220), 1.0)));
+                let q = p(-w / 2.0 + STUD * k as f32, 0.0);
+                draw_circle(q.x, q.y, s * 1.0, tintify(shade((200, 206, 220), 1.0)));
             }
         }
-        BlockKind::Wheel => {}
+        BlockKind::Wheel | BlockKind::Glass | BlockKind::GlassHalf | BlockKind::GlassChip => {}
+    }
+    if rust > 0.0 {
+        rect(0.0, 0.0, w, h, Color::new(0.62, 0.30, 0.10, 0.62 * rust.min(1.0)));
+    }
+    if let Some(st) = stress {
+        let (r, g, b) = stress_rgb(st);
+        rect(0.0, 0.0, w, h, Color::new(r, g, b, 0.72));
     }
     if heat > 0.0 {
         let t = (heat / 150.0).min(1.0);
@@ -253,17 +311,29 @@ pub fn draw_block_shape(kind: BlockKind, c: Vec2, s: f32, angle: f32, tint: Opti
     }
 }
 
-pub fn draw_block(b: &Block, v: View) {
+/// Green (relaxed) through yellow to red (about to break).
+pub fn stress_rgb(t: f32) -> (f32, f32, f32) {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.5 {
+        (0.2 + 1.6 * t * 0.9, 0.85, 0.25)
+    } else {
+        (0.95, 0.85 - (t - 0.5) * 1.6, 0.2)
+    }
+}
+
+pub fn draw_block(b: &Block, v: View, stress: Option<f32>) {
     let heat = if b.kind.spec().mat == Mat::Wood { b.heat as f32 } else { 0.0 };
-    draw_block_shape(b.kind, v.to_screen(b.pos), v.s, b.angle, None, heat);
+    draw_block_shape(b.kind, v.to_screen(b.pos), v.s, b.angle, None, heat, b.rust, stress);
 }
 
 pub fn draw_car(car: &Car, v: View) {
     let m = car.kind.model();
     let d = car.dir;
     let s = v.s;
-    let p = |lx: f32, ly: f32| v.to_screen(car.p + rot(car.angle, vec2(lx * d, ly)));
-    let col = Color::from_rgba(m.color.0, m.color.1, m.color.2, 255);
+    let sc = crate::car::S;
+    let p = |lx: f32, ly: f32| v.to_screen(car.p + rot(car.angle, vec2(lx * d, ly) * sc));
+    let rgb = car.color_rgb();
+    let col = Color::from_rgba(rgb.0, rgb.1, rgb.2, 255);
     let dark = Color::new(col.r * 0.6, col.g * 0.6, col.b * 0.6, 1.0);
     let glass = Color::from_rgba(170, 225, 250, 255);
     let (hl, top, bot) = (m.hull_half, m.hull_top, m.hull_bottom);
@@ -272,14 +342,14 @@ pub fn draw_car(car: &Car, v: View) {
     for (i, w) in car.wheels.iter().enumerate() {
         let a = v.to_screen(car.anchor(i));
         let c = v.to_screen(w.pos);
-        draw_line(a.x, a.y, c.x, c.y, s * 2.6, Color::from_rgba(70, 74, 86, 255));
-        let r = m.wheels[i].r * s;
+        draw_line(a.x, a.y, c.x, c.y, s * 1.9, Color::from_rgba(70, 74, 86, 255));
+        let r = car.wheel_r(i) * s;
         draw_circle(c.x, c.y, r, Color::from_rgba(26, 26, 32, 255));
         draw_circle(c.x, c.y, r * 0.62, Color::from_rgba(160, 164, 178, 255));
         for k in 0..5 {
             let ang = w.roll + k as f32 * std::f32::consts::TAU / 5.0;
             let q = c + vec2(ang.cos(), ang.sin()) * r * 0.6;
-            draw_line(c.x, c.y, q.x, q.y, s * 1.2, Color::from_rgba(90, 94, 108, 255));
+            draw_line(c.x, c.y, q.x, q.y, s * 0.9, Color::from_rgba(90, 94, 108, 255));
         }
         draw_circle(c.x, c.y, r * 0.2, Color::from_rgba(230, 232, 240, 255));
     }
@@ -313,14 +383,14 @@ pub fn draw_car(car: &Car, v: View) {
     }
     // Headlight.
     let head = p(hl, slab_top + (bot - slab_top) * 0.35);
-    draw_circle(head.x, head.y, s * 1.8, Color::from_rgba(255, 250, 200, 255));
+    draw_circle(head.x, head.y, s * 1.2, Color::from_rgba(255, 250, 200, 255));
 }
 
 pub fn draw_flag(v: View, at: (i32, i32), col: Color, checkered: bool) {
-    let base = v.to_screen(vec2(at.0 as f32, at.1 as f32 + 20.0));
-    let top = v.to_screen(vec2(at.0 as f32, at.1 as f32 - 14.0));
-    draw_line(base.x, base.y, top.x, top.y, (v.s * 1.5).max(2.0), Color::from_rgba(235, 235, 240, 255));
-    let (w, h) = (v.s * 18.0, v.s * 12.0);
+    let base = v.to_screen(vec2(at.0 as f32, at.1 as f32 + 26.0));
+    let top = v.to_screen(vec2(at.0 as f32, at.1 as f32 - 8.0));
+    draw_line(base.x, base.y, top.x, top.y, (v.s * 1.2).max(1.5), Color::from_rgba(235, 235, 240, 255));
+    let (w, h) = (v.s * 14.0, v.s * 9.0);
     draw_rectangle(top.x, top.y, w, h, col);
     if checkered {
         let n = 3;
@@ -332,7 +402,7 @@ pub fn draw_flag(v: View, at: (i32, i32), col: Color, checkered: bool) {
             }
         }
     }
-    draw_circle(top.x, top.y, v.s * 1.6, Color::from_rgba(255, 220, 90, 255));
+    draw_circle(top.x, top.y, v.s * 1.2, Color::from_rgba(255, 220, 90, 255));
 }
 
 pub struct Boom {
@@ -346,8 +416,81 @@ pub fn draw_booms(booms: &[Boom], v: View) {
         let c = v.to_screen(b.pos);
         let k = b.t;
         let a = (1.0 - k).max(0.0);
-        draw_circle(c.x, c.y, (6.0 + 34.0 * k) * v.s, Color::new(b.color.r, b.color.g, b.color.b, 0.45 * a));
-        draw_circle(c.x, c.y, (4.0 + 20.0 * k) * v.s, Color::new(1.0, 0.95, 0.7, 0.7 * a));
-        draw_circle_lines(c.x, c.y, (8.0 + 46.0 * k) * v.s, 2.5, Color::new(1.0, 1.0, 1.0, 0.8 * a));
+        draw_circle(c.x, c.y, (4.0 + 24.0 * k) * v.s, Color::new(b.color.r, b.color.g, b.color.b, 0.45 * a));
+        draw_circle(c.x, c.y, (3.0 + 14.0 * k) * v.s, Color::new(1.0, 0.95, 0.7, 0.7 * a));
+        draw_circle_lines(c.x, c.y, (6.0 + 32.0 * k) * v.s, 2.0, Color::new(1.0, 1.0, 1.0, 0.8 * a));
+    }
+}
+
+/// A cable as a polyline with a highlight and round fixings.
+pub fn draw_cable(pts: &[Vec2], v: View, snapped: bool, valid: bool) {
+    if pts.len() < 2 {
+        return;
+    }
+    let col = if !valid { Color::new(0.95, 0.3, 0.3, 0.9) } else if snapped { Color::from_rgba(150, 60, 50, 255) } else { Color::from_rgba(52, 56, 66, 255) };
+    let s = v.s;
+    for w in pts.windows(2) {
+        let (a, b) = (v.to_screen(w[0]), v.to_screen(w[1]));
+        draw_line(a.x, a.y, b.x, b.y, (s * 2.4).max(2.0), col);
+        draw_line(a.x, a.y - s * 0.5, b.x, b.y - s * 0.5, (s * 0.8).max(1.0), Color::new(1.0, 1.0, 1.0, 0.25));
+    }
+    for p in [pts[0], pts[pts.len() - 1]] {
+        let c = v.to_screen(p);
+        draw_circle(c.x, c.y, s * 2.4, Color::from_rgba(200, 204, 214, 255));
+        draw_circle(c.x, c.y, s * 1.1, col);
+    }
+}
+
+/// The sagging line shown for a cable that has no physics yet.
+pub fn cable_preview(a: Vec2, b: Vec2, len: f32) -> Vec<Vec2> {
+    let n = 24;
+    let sag = ((len * len - (b - a).length_squared()).max(0.0)).sqrt() * 0.55;
+    (0..=n)
+        .map(|i| {
+            let u = i as f32 / n as f32;
+            a + (b - a) * u + vec2(0.0, sag * 4.0 * u * (1.0 - u))
+        })
+        .collect()
+}
+
+/// A free beam: a bar with a pin at each end; coloured by load in the effort view.
+pub fn draw_member(m: &Member, v: View, stress: bool) {
+    let (a, b) = (v.to_screen(m.p0), v.to_screen(m.p1));
+    let th = m.mat.thickness() * v.s;
+    let (cr, cg, cb) = m.mat.color();
+    let base = Color::from_rgba(cr, cg, cb, 255);
+    let (r, g, bl) = stress_rgb(m.stress);
+    let col = if stress { Color::new(r, g, bl, 1.0) } else { base };
+    let dark = Color::new(col.r * 0.55, col.g * 0.55, col.b * 0.55, 1.0);
+    let d = (b - a).normalize_or_zero();
+    let n = vec2(-d.y, d.x);
+    draw_line(a.x + 1.0, a.y + 2.0, b.x + 1.0, b.y + 2.0, th, Color::new(0.0, 0.0, 0.0, 0.25));
+    draw_line(a.x, a.y, b.x, b.y, th, dark);
+    draw_line(a.x, a.y, b.x, b.y, th * 0.68, col);
+    let hi = n * (-th * 0.18);
+    draw_line(a.x + hi.x, a.y + hi.y, b.x + hi.x, b.y + hi.y, (th * 0.18).max(1.0), Color::new(1.0, 1.0, 1.0, 0.28));
+    match m.mat {
+        MemberMat::Wood => {
+            let len = (b - a).length();
+            let mut t = 12.0;
+            while t < len - 6.0 {
+                let p = a + d * t;
+                draw_line(p.x, p.y, p.x + d.x * 5.0, p.y + d.y * 5.0, 1.0, Color::new(0.35, 0.22, 0.1, 0.6));
+                t += 14.0;
+            }
+        }
+        MemberMat::Iron | MemberMat::Steel => {
+            let len = (b - a).length();
+            let mut t = 8.0;
+            while t < len - 4.0 {
+                let p = a + d * t;
+                draw_circle(p.x, p.y, th * 0.12 + 0.6, Color::new(1.0, 1.0, 1.0, 0.35));
+                t += 18.0;
+            }
+        }
+    }
+    for p in [a, b] {
+        draw_circle(p.x, p.y, th * 0.78, Color::from_rgba(226, 228, 236, 255));
+        draw_circle(p.x, p.y, th * 0.34, Color::from_rgba(60, 64, 78, 255));
     }
 }

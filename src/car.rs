@@ -2,13 +2,17 @@
 //! spin driven by an engine torque curve, and traction limited by grip.
 //! Units are grid cells and simulation steps.
 
-use crate::world::{Mat, World, H};
+use crate::world::{Mat, World, H, W};
 use macroquad::prelude::{vec2, Vec2};
 
-const GRAVITY: f32 = 0.12;
-const WHEEL_INERTIA: f32 = 8.0;
+/// Everything below is tuned in "design units"; this shrinks the car to fit the finer grid.
+pub const S: f32 = 0.67;
+const GRAVITY: f32 = 0.12 * S;
+const WHEEL_INERTIA: f32 = 8.0 * S * S;
 const SLIP_GAIN: f32 = 2.0;
 const SAMPLES: usize = 24;
+/// Speed (design units) above which the hull breaks through glass.
+const GLASS_BREAK_SPEED: f32 = 0.5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ModelKind {
@@ -50,6 +54,8 @@ pub struct Model {
     pub hull_top: f32,
     pub hull_bottom: f32,
     pub color: (u8, u8, u8),
+    /// Weight pressed onto whatever it drives over (physics units, kg).
+    pub mass: f32,
 }
 
 const BUGGY: Model = Model {
@@ -70,6 +76,7 @@ const BUGGY: Model = Model {
     hull_top: -9.0,
     hull_bottom: 3.0,
     color: (240, 190, 40),
+    mass: 1.5,
 };
 
 const RACE: Model = Model {
@@ -90,6 +97,7 @@ const RACE: Model = Model {
     hull_top: -6.0,
     hull_bottom: 2.0,
     color: (220, 50, 60),
+    mass: 1.0,
 };
 
 const OFFROAD: Model = Model {
@@ -110,6 +118,7 @@ const OFFROAD: Model = Model {
     hull_top: -12.0,
     hull_bottom: 4.0,
     color: (70, 150, 80),
+    mass: 2.2,
 };
 
 const TRUCK: Model = Model {
@@ -130,6 +139,7 @@ const TRUCK: Model = Model {
     hull_top: -14.0,
     hull_bottom: 4.0,
     color: (70, 120, 220),
+    mass: 3.5,
 };
 
 impl ModelKind {
@@ -144,6 +154,49 @@ impl ModelKind {
         }
     }
 }
+
+/// Player adjustments applied on top of a model (1.0 = stock).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Tuning {
+    /// Engine torque.
+    pub power: f32,
+    /// Top speed.
+    pub speed: f32,
+    /// Suspension spring stiffness.
+    pub stiffness: f32,
+    /// Suspension damping.
+    pub damping: f32,
+    /// Tyre grip.
+    pub grip: f32,
+    /// Wheel size.
+    pub wheel: f32,
+    /// How hard a crash it survives.
+    pub tough: f32,
+    /// Weight pressed on bridges.
+    pub weight: f32,
+    pub color: Option<(u8, u8, u8)>,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning { power: 1.0, speed: 1.0, stiffness: 1.0, damping: 1.0, grip: 1.0, wheel: 1.0, tough: 1.0, weight: 1.0, color: None }
+    }
+}
+
+impl Tuning {
+    pub const COLORS: [(u8, u8, u8); 8] = [
+        (240, 190, 40),
+        (220, 50, 60),
+        (70, 150, 80),
+        (70, 120, 220),
+        (170, 90, 210),
+        (240, 130, 40),
+        (235, 235, 240),
+        (40, 44, 54),
+    ];
+}
+
+static NEXT_CAR_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Fate {
@@ -163,7 +216,10 @@ pub struct WheelState {
     pub contact: bool,
 }
 
+#[derive(Clone)]
 pub struct Car {
+    pub id: u32,
+    pub tuning: Tuning,
     pub kind: ModelKind,
     pub p: Vec2,
     pub v: Vec2,
@@ -172,6 +228,11 @@ pub struct Car {
     pub wheels: Vec<WheelState>,
     pub dir: f32,
     pub fate: Fate,
+    /// Where the wheels press on the ground this step: (point, share of the weight).
+    pub loads: Vec<(Vec2, f32)>,
+    /// Glass cells the hull smashed through this step.
+    pub smashed: Vec<(i32, i32)>,
+    smash_grace: u32,
     damage: u32,
     ticks: u32,
     last_x: f32,
@@ -190,47 +251,62 @@ fn cross(a: Vec2, b: Vec2) -> f32 {
 }
 
 /// Outward normal of the hard cells touching a circle, if any.
-fn probe(world: &World, c: Vec2, radius: f32) -> Option<Vec2> {
+/// Hard for the car, except glass it is going fast enough to smash.
+fn solid(world: &World, fast: bool, x: i32, y: i32) -> bool {
+    if fast && world.at(x, y) == Mat::Glass {
+        return false;
+    }
+    world.hard_for_car(x, y)
+}
+
+fn probe(world: &World, fast: bool, c: Vec2, radius: f32) -> Option<Vec2> {
     let mut sum = Vec2::ZERO;
     for k in 0..SAMPLES {
         let a = k as f32 / SAMPLES as f32 * std::f32::consts::TAU;
         let d = vec2(a.cos(), a.sin());
         let p = c + d * radius;
-        if world.hard_for_car(p.x.floor() as i32, p.y.floor() as i32) {
+        if solid(world, fast, p.x.floor() as i32, p.y.floor() as i32) {
             sum -= d;
         }
     }
     (sum.length() > 1e-3).then(|| sum.normalize())
 }
 
-fn overlaps(world: &World, c: Vec2, radius: f32) -> bool {
+fn overlaps(world: &World, fast: bool, c: Vec2, radius: f32) -> bool {
     for k in 0..SAMPLES {
         let a = k as f32 / SAMPLES as f32 * std::f32::consts::TAU;
         let p = c + vec2(a.cos(), a.sin()) * radius;
-        if world.hard_for_car(p.x.floor() as i32, p.y.floor() as i32) {
+        if solid(world, fast, p.x.floor() as i32, p.y.floor() as i32) {
             return true;
         }
     }
-    world.hard_for_car(c.x.floor() as i32, c.y.floor() as i32)
+    solid(world, fast, c.x.floor() as i32, c.y.floor() as i32)
 }
 
 impl Car {
+    #[allow(dead_code)]
     pub fn new(kind: ModelKind, at: (i32, i32)) -> Self {
+        Self::with_tuning(kind, at, Tuning::default())
+    }
+
+    pub fn with_tuning(kind: ModelKind, at: (i32, i32), tuning: Tuning) -> Self {
         let m = kind.model();
-        let tallest = m.wheels.iter().fold(0.0f32, |a, w| a.max(w.r));
-        let p = vec2(at.0 as f32, at.1 as f32 + 14.0 - m.anchor_y - m.travel - tallest);
+        let tallest = m.wheels.iter().fold(0.0f32, |a, w| a.max(w.r)) * tuning.wheel;
+        let p = vec2(at.0 as f32, at.1 as f32 + 22.0 - (m.anchor_y + m.travel + tallest) * S);
         let wheels = m
             .wheels
             .iter()
             .map(|w| WheelState {
-                pos: p + vec2(w.x, m.anchor_y + m.travel * 0.5),
-                ext: m.travel * 0.5,
+                pos: p + vec2(w.x * S, (m.anchor_y + m.travel * 0.5) * S),
+                ext: m.travel * S * 0.5,
                 spin: 0.0,
                 roll: 0.0,
                 contact: false,
             })
             .collect();
         Car {
+            id: NEXT_CAR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            tuning,
             kind,
             p,
             v: Vec2::ZERO,
@@ -239,6 +315,9 @@ impl Car {
             wheels,
             dir: 1.0,
             fate: Fate::Driving,
+            loads: Vec::new(),
+            smashed: Vec::new(),
+            smash_grace: 0,
             damage: 0,
             ticks: 0,
             last_x: p.x,
@@ -248,16 +327,26 @@ impl Car {
         }
     }
 
-    pub fn center(&self) -> Vec2 {
-        self.p
+    pub fn wheel_r(&self, i: usize) -> f32 {
+        self.kind.model().wheels[i].r * S * self.tuning.wheel
+    }
+
+    /// Weight pressed on whatever it drives over, in kg.
+    pub fn weight_kg(&self) -> f32 {
+        self.kind.model().mass * self.tuning.weight
+    }
+
+    pub fn color_rgb(&self) -> (u8, u8, u8) {
+        self.tuning.color.unwrap_or(self.kind.model().color)
     }
 
     pub fn anchor(&self, i: usize) -> Vec2 {
         let m = self.kind.model();
-        self.p + rot(self.angle, vec2(m.wheels[i].x, m.anchor_y))
+        self.p + rot(self.angle, vec2(m.wheels[i].x, m.anchor_y) * S)
     }
 
     /// Forward speed along the direction of travel, cells per step.
+    #[cfg(test)]
     pub fn speed(&self) -> f32 {
         self.v.x * self.dir
     }
@@ -275,7 +364,29 @@ impl Car {
             return;
         }
         self.ticks += 1;
+        self.loads.clear();
+        self.smashed.clear();
+        let mut load_total = 0.0f32;
         let m = self.kind.model();
+        // A car that is already ploughing through glass keeps going.
+        let fast = self.v.length() > GLASS_BREAK_SPEED * S || self.smash_grace > 0;
+        self.smash_grace = self.smash_grace.saturating_sub(1);
+        if fast {
+            // Glass in the path of a wheel shatters.
+            for w in &self.wheels {
+                let r = m.wheels[0].r * S * self.tuning.wheel + 2.0;
+                for dy in (-(r as i32))..=(r as i32) {
+                    for dx in (-(r as i32))..=(r as i32) {
+                        let cell = (w.pos.x.floor() as i32 + dx, w.pos.y.floor() as i32 + dy);
+                        if (dx * dx + dy * dy) as f32 <= r * r && world.at(cell.0, cell.1) == Mat::Glass && self.smashed.len() < 24 {
+                            self.smashed.push(cell);
+                        }
+                    }
+                }
+            }
+        }
+        let travel_len = m.travel * S;
+        let crash = m.crash_speed * S * self.tuning.tough;
         let down = rot(self.angle, vec2(0.0, 1.0));
         let mut acc = vec2(0.0, GRAVITY);
         let mut torque = 0.0f32;
@@ -285,24 +396,24 @@ impl Car {
         let ground_speed = self.v.x * self.dir;
 
         for i in 0..self.wheels.len() {
-            let r = m.wheels[i].r;
+            let r = self.wheel_r(i);
             let anchor = self.anchor(i);
             let at = |e: f32| anchor + down * e;
 
             // Find how far the wheel can extend before touching the ground.
-            let mut ext = m.travel;
+            let mut ext = travel_len;
             let mut depth = 0.0;
             let mut contact = false;
-            if overlaps(world, at(m.travel), r) {
+            if overlaps(world, fast, at(travel_len), r) {
                 contact = true;
-                let mut e = m.travel;
-                while e >= 0.0 && overlaps(world, at(e), r) {
-                    e -= 0.5;
+                let mut e = travel_len;
+                while e >= 0.0 && overlaps(world, fast, at(e), r) {
+                    e -= 0.3;
                 }
                 if e < 0.0 {
                     let mut d = 0.0;
-                    while d < r * 2.0 && overlaps(world, at(-d), r) {
-                        d += 0.5;
+                    while d < r * 2.0 && overlaps(world, fast, at(-d), r) {
+                        d += 0.3;
                     }
                     depth = d;
                     ext = 0.0;
@@ -323,16 +434,18 @@ impl Car {
             let mut ft = 0.0;
             if contact {
                 touching += 1;
-                let n = probe(world, pos, r + 1.0).unwrap_or(-down);
+                let n = probe(world, fast, pos, r + 1.0).unwrap_or(-down);
                 let ra = anchor - self.p;
                 let va = self.v + vec2(-ra.y, ra.x) * self.omega;
                 let vn = va.dot(n);
-                if depth > 0.0 && vn < -m.crash_speed {
+                if depth > 0.0 && vn < -crash {
                     crashed = true;
                 }
-                let comp = m.travel - ext + depth * 2.0;
-                let normal_force = (m.stiffness * comp - m.damping * vn).max(0.0);
+                let comp = travel_len - ext + depth * 2.0;
+                let normal_force = (m.stiffness * self.tuning.stiffness * comp - m.damping * self.tuning.damping * vn).max(0.0);
                 let f = n * normal_force;
+                self.loads.push((pos - n * (r + 0.8), normal_force));
+                load_total += normal_force;
                 acc += f;
                 torque += cross(ra, f);
 
@@ -341,7 +454,7 @@ impl Car {
                 let rc = pos - self.p;
                 let vhub = self.v + vec2(-(pos - self.p).y, (pos - self.p).x) * self.omega;
                 let slip = self.wheels[i].spin * r - vhub.dot(t);
-                ft = (SLIP_GAIN * slip).clamp(-m.grip * normal_force, m.grip * normal_force);
+                ft = (SLIP_GAIN * slip).clamp(-m.grip * self.tuning.grip * normal_force, m.grip * self.tuning.grip * normal_force);
                 let tf = t * ft;
                 acc += tf;
                 torque += cross(rc, tf);
@@ -350,9 +463,9 @@ impl Car {
             // Engine torque curve, then reaction from the ground.
             let mut te = 0.0;
             if self.is_driven(i) {
-                let w_max = m.top_speed / r;
+                let w_max = m.top_speed * self.tuning.speed * S / r;
                 let forward = (self.dir * self.wheels[i].spin).max(ground_speed / r);
-                te = self.dir * m.torque * (1.0 - forward / w_max).clamp(-0.2, 1.5);
+                te = self.dir * m.torque * self.tuning.power * S * S * (1.0 - forward / w_max).clamp(-0.2, 1.5);
             }
             let w = &mut self.wheels[i];
             w.spin += (te - ft * r) / WHEEL_INERTIA;
@@ -360,6 +473,11 @@ impl Car {
             w.roll += w.spin;
         }
 
+        if load_total > 0.0 {
+            for l in &mut self.loads {
+                l.1 /= load_total;
+            }
+        }
         if wet {
             self.v *= 0.985;
             for w in &mut self.wheels {
@@ -368,28 +486,33 @@ impl Car {
         }
 
         self.v += acc;
-        self.omega += torque / m.inertia;
+        self.omega += torque / (m.inertia * S * S);
         self.omega *= 0.995;
         self.v *= 0.9998;
         self.p += self.v;
         self.angle += self.omega;
 
         // Chassis hull against the terrain.
+        let (hh, ht, hb) = (m.hull_half * S, m.hull_top * S, m.hull_bottom * S);
         let hull = [
-            vec2(-m.hull_half, m.hull_top),
-            vec2(0.0, m.hull_top),
-            vec2(m.hull_half, m.hull_top),
-            vec2(-m.hull_half, (m.hull_top + m.hull_bottom) * 0.5),
-            vec2(m.hull_half, (m.hull_top + m.hull_bottom) * 0.5),
-            vec2(-m.hull_half * 0.55, m.hull_bottom),
-            vec2(m.hull_half * 0.55, m.hull_bottom),
-            vec2(0.0, m.hull_bottom),
+            vec2(-hh, ht),
+            vec2(0.0, ht),
+            vec2(hh, ht),
+            vec2(-hh, (ht + hb) * 0.5),
+            vec2(hh, (ht + hb) * 0.5),
+            vec2(-hh * 0.55, hb),
+            vec2(hh * 0.55, hb),
+            vec2(0.0, hb),
         ];
         for _ in 0..8 {
             let mut sum = Vec2::ZERO;
             for h in hull {
                 let q = self.p + rot(self.angle, h);
-                if world.hard_for_car(q.x.floor() as i32, q.y.floor() as i32) {
+                let cell = (q.x.floor() as i32, q.y.floor() as i32);
+                if world.at(cell.0, cell.1) == Mat::Glass && fast {
+                    // Fast enough: the car goes through and the glass shatters.
+                    self.smashed.push(cell);
+                } else if world.hard_for_car(cell.0, cell.1) {
                     sum += (q - self.p).normalize_or_zero();
                 }
             }
@@ -399,7 +522,7 @@ impl Car {
             let n = -sum.normalize();
             self.p += n * 0.6;
             let vn = self.v.dot(n);
-            if vn < -m.crash_speed {
+            if vn < -crash {
                 crashed = true;
             }
             if vn < 0.0 {
@@ -407,6 +530,10 @@ impl Car {
                 self.v *= 0.99;
                 self.omega *= 0.9;
             }
+        }
+        if !self.smashed.is_empty() {
+            self.smash_grace = 12;
+            self.v *= 0.995;
         }
         if crashed {
             self.fate = Fate::Exploded;
@@ -416,7 +543,7 @@ impl Car {
         // Upside down for too long counts as a wreck.
         if self.angle.cos() < -0.2 {
             self.upside_down += 1;
-            if self.upside_down > 180 {
+            if self.upside_down > 45 {
                 self.fate = Fate::Exploded;
                 return;
             }
@@ -431,7 +558,7 @@ impl Car {
             self.grounded += 1;
         }
         if self.ticks % 60 == 0 {
-            if self.grounded >= 30 && self.progress < 3.0 {
+            if self.grounded >= 30 && self.progress < 3.0 * S {
                 self.dir = -self.dir;
             }
             self.progress = 0.0;
@@ -445,7 +572,7 @@ impl Car {
         for p in pts {
             for k in 0..8 {
                 let a = k as f32 / 8.0 * std::f32::consts::TAU;
-                let q = p + vec2(a.cos(), a.sin()) * 10.0;
+                let q = p + vec2(a.cos(), a.sin()) * (10.0 * S);
                 if matches!(world.at(q.x.floor() as i32, q.y.floor() as i32), Mat::Fire | Mat::Ember | Mat::Lava) {
                     burning = true;
                 }
@@ -454,15 +581,48 @@ impl Car {
         if burning {
             self.damage += 1;
         }
-        if self.damage > 90 || self.p.y > H as f32 + 24.0 {
+        let left_the_world = self.p.x < -20.0 || self.p.x > W as f32 + 20.0 || self.p.y < -400.0;
+        if self.damage > 40 || self.p.y > H as f32 + 16.0 || left_the_world {
             self.fate = Fate::Dead;
         }
         if let Some(e) = exit {
-            if (self.p - vec2(e.0 as f32, e.1 as f32)).length() < 18.0 {
+            if (self.p - vec2(e.0 as f32, e.1 as f32)).length() < 14.0 {
                 self.fate = Fate::Arrived;
             }
         }
     }
+}
+
+/// Two cars touching: a bump at walking pace pushes them apart; anything faster
+/// wrecks both at once. Returns true if they exploded.
+pub fn collide_cars(a: &mut Car, b: &mut Car) -> bool {
+    if a.fate != Fate::Driving || b.fate != Fate::Driving {
+        return false;
+    }
+    let (ra, rb) = (a.kind.model().hull_half * S + 3.0, b.kind.model().hull_half * S + 3.0);
+    let d = b.p - a.p;
+    let dist = d.length();
+    if dist >= ra + rb {
+        return false;
+    }
+    let rel = (a.v - b.v).length();
+    if rel > 0.35 * S {
+        a.fate = Fate::Exploded;
+        b.fate = Fate::Exploded;
+        return true;
+    }
+    // Gentle bump: separate and swap a little momentum.
+    let n = if dist > 1e-3 { d / dist } else { vec2(1.0, 0.0) };
+    let push = (ra + rb - dist) * 0.5;
+    a.p -= n * push;
+    b.p += n * push;
+    for w in a.wheels.iter_mut() {
+        w.pos -= n * push;
+    }
+    for w in b.wheels.iter_mut() {
+        w.pos += n * push;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -470,7 +630,7 @@ mod tests {
     use super::*;
 
     fn flat_world() -> World {
-        let mut w = World::new();
+        let mut w = World::new_static();
         for x in 0..600 {
             for y in 240..250 {
                 w.set(x, y, Mat::Stone);
@@ -508,7 +668,7 @@ mod tests {
     fn every_model_rides_flat_and_stays_upright() {
         let w = flat_world();
         for kind in ModelKind::ALL {
-            let car = drive(kind, &w, (40, 224), 300);
+            let car = drive(kind, &w, (40, 216), 300);
             assert_eq!(car.fate, Fate::Driving, "{kind:?}");
             assert!(car.angle.abs() < 0.3, "{kind:?} angle {}", car.angle);
             assert!(car.p.x > 80.0, "{kind:?} did not move: {}", car.p.x);
@@ -520,7 +680,7 @@ mod tests {
         let w = flat_world();
         let mut speeds = vec![];
         for kind in [ModelKind::Race, ModelKind::Buggy, ModelKind::Offroad, ModelKind::Truck] {
-            let mut car = Car::new(kind, (20, 224));
+            let mut car = Car::new(kind, (20, 216));
             let mut best = 0.0f32;
             for t in 0..400 {
                 car.step(&w, None);
@@ -540,14 +700,14 @@ mod tests {
     #[test]
     fn four_by_four_climbs_a_ramp() {
         let w = ramp_world(0.45);
-        let car = drive(ModelKind::Offroad, &w, (40, 224), 900);
+        let car = drive(ModelKind::Offroad, &w, (40, 216), 1500);
         assert_eq!(car.fate, Fate::Driving);
         assert!(car.p.x > 320.0, "stuck at {}", car.p.x);
     }
 
     #[test]
     fn explodes_when_dropped_from_high() {
-        let mut w = World::new();
+        let mut w = World::new_static();
         for x in 0..300 {
             for y in 340..350 {
                 w.set(x, y, Mat::Stone);
@@ -573,11 +733,95 @@ mod tests {
     #[test]
     fn reaches_the_exit() {
         let w = flat_world();
-        let mut car = Car::new(ModelKind::Buggy, (20, 224));
+        let mut car = Car::new(ModelKind::Buggy, (20, 216));
         for _ in 0..2000 {
             car.step(&w, Some((500, 225)));
         }
         assert_eq!(car.fate, Fate::Arrived);
+    }
+
+    #[test]
+    fn car_smashes_through_a_glass_wall() {
+        let mut w = flat_world();
+        for y in 200..240 {
+            for x in 300..304 {
+                w.set(x, y, Mat::Glass);
+            }
+        }
+        let mut car = Car::new(ModelKind::Buggy, (40, 216));
+        let mut smashed = 0;
+        for _ in 0..2500 {
+            car.step(&w, None);
+            for &(x, y) in &car.smashed {
+                smashed += 1;
+                w.shatter(x, y);
+            }
+            if car.p.x > 360.0 {
+                break;
+            }
+        }
+        assert!(smashed > 0, "never touched the glass");
+        assert!(car.p.x > 360.0, "stuck behind the glass at {}", car.p.x);
+    }
+
+    #[test]
+    fn tuning_changes_how_the_car_behaves() {
+        let w = flat_world();
+        let run = |t: Tuning| {
+            let mut car = Car::with_tuning(ModelKind::Buggy, (20, 216), t);
+            let mut best = 0.0f32;
+            for k in 0..500 {
+                car.step(&w, None);
+                if k > 200 {
+                    best = best.max(car.speed());
+                }
+            }
+            (best, car.fate)
+        };
+        let stock = run(Tuning::default());
+        let fast = run(Tuning { speed: 1.8, power: 1.8, ..Tuning::default() });
+        let slow = run(Tuning { speed: 0.5, ..Tuning::default() });
+        assert!(fast.0 > stock.0 * 1.2, "fast {:?} stock {:?}", fast, stock);
+        assert!(slow.0 < stock.0 * 0.8, "slow {:?} stock {:?}", slow, stock);
+        let big = Car::with_tuning(ModelKind::Buggy, (0, 0), Tuning { wheel: 1.5, ..Tuning::default() });
+        assert!(big.wheel_r(0) > Car::new(ModelKind::Buggy, (0, 0)).wheel_r(0) * 1.4);
+    }
+
+    #[test]
+    fn head_on_cars_explode_at_once() {
+        let w = flat_world();
+        let mut a = Car::new(ModelKind::Buggy, (100, 216));
+        let mut b = Car::new(ModelKind::Truck, (260, 216));
+        b.dir = -1.0;
+        let mut boom = false;
+        for t in 0..1200 {
+            a.step(&w, None);
+            b.step(&w, None);
+            if collide_cars(&mut a, &mut b) {
+                boom = true;
+                assert!(t < 1100, "took far too long");
+                break;
+            }
+        }
+        assert!(boom, "cars passed through each other");
+        assert_eq!(a.fate, Fate::Exploded);
+        assert_eq!(b.fate, Fate::Exploded);
+    }
+
+    #[test]
+    fn slow_bump_does_not_explode() {
+        let w = flat_world();
+        let mut a = Car::new(ModelKind::Buggy, (100, 216));
+        let mut b = Car::new(ModelKind::Buggy, (112, 216));
+        for _ in 0..30 {
+            a.step(&w, None);
+            b.step(&w, None);
+        }
+        a.v = Vec2::ZERO;
+        b.v = Vec2::ZERO;
+        let exploded = collide_cars(&mut a, &mut b);
+        assert!(!exploded);
+        assert_eq!(a.fate, Fate::Driving);
     }
 
     #[test]
@@ -588,11 +832,30 @@ mod tests {
                 w.set(x, y, Mat::Stone);
             }
         }
-        let mut car = Car::new(ModelKind::Buggy, (40, 224));
+        let mut car = Car::new(ModelKind::Buggy, (40, 216));
         for _ in 0..1500 {
             car.step(&w, None);
         }
         assert!(car.p.x < 300.0);
+    }
+
+    #[test]
+    fn leaving_the_world_sideways_loses_the_car() {
+        let mut w = World::new_static();
+        for x in 0..W as i32 {
+            for y in 240..250 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        let mut car = Car::new(ModelKind::Buggy, (60, 216));
+        car.dir = -1.0;
+        for _ in 0..1500 {
+            car.step(&w, None);
+            if car.fate != Fate::Driving {
+                break;
+            }
+        }
+        assert_eq!(car.fate, Fate::Dead, "car should be lost past the left edge, x = {}", car.p.x);
     }
 
     #[test]

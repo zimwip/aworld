@@ -2,10 +2,47 @@
 //! Rigid blocks live outside the grid; they are stamped into a mask each step
 //! so particles and the car treat them as solid.
 
-pub const W: usize = 640;
-pub const H: usize = 360;
+mod thermal;
+pub use thermal::{Season, DAY_STEPS};
+
+/// Landscape type chosen when a world is created; it also picks the backdrop.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Biome {
+    Countryside,
+    Mountain,
+    Sea,
+}
+
+impl Biome {
+    pub const ALL: [Biome; 3] = [Biome::Countryside, Biome::Mountain, Biome::Sea];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Biome::Countryside => "Campagne",
+            Biome::Mountain => "Montagne",
+            Biome::Sea => "Mer",
+        }
+    }
+
+    pub fn id(self) -> u8 {
+        match self {
+            Biome::Countryside => 0,
+            Biome::Mountain => 1,
+            Biome::Sea => 2,
+        }
+    }
+
+    pub fn from_id(id: u8) -> Biome {
+        Self::ALL.iter().copied().find(|b| b.id() == id).unwrap_or(Biome::Countryside)
+    }
+}
+
+pub const W: usize = 960;
+pub const H: usize = 540;
 /// Resolution factor relative to the 320x180 design grid.
-pub const K: i32 = 2;
+pub const K: i32 = 3;
+/// Above this row the air is cold: steam condenses into clouds.
+const COLD_Y: i32 = (H as i32) * 3 / 10;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -25,12 +62,30 @@ pub enum Mat {
     Lava,
     Ice,
     Gunpowder,
+    Dirt,
+    Grass,
+    Leaf,
+    Steel,
+    Cloud,
+    Seed,
+    Sapling,
+    Mud,
+    Glass,
+    Snow,
+    Shard,
+    DeadLeaf,
+    Branch,
+    Trunk,
+    Hail,
+    Oil,
+    Smoke,
 }
 
 impl Mat {
-    pub const ALL: [Mat; 15] = [
+    pub const ALL: [Mat; 32] = [
         Mat::Empty, Mat::Sand, Mat::Water, Mat::Fire, Mat::Steam, Mat::Iron, Mat::Wood, Mat::Stone,
-        Mat::Brick, Mat::Rust, Mat::Ash, Mat::Ember, Mat::Lava, Mat::Ice, Mat::Gunpowder,
+        Mat::Brick, Mat::Rust, Mat::Ash, Mat::Ember, Mat::Lava, Mat::Ice, Mat::Gunpowder, Mat::Dirt, Mat::Grass,
+        Mat::Leaf, Mat::Steel, Mat::Cloud, Mat::Seed, Mat::Sapling, Mat::Mud, Mat::Glass, Mat::Snow, Mat::Shard, Mat::DeadLeaf, Mat::Branch, Mat::Trunk, Mat::Hail, Mat::Oil, Mat::Smoke,
     ];
 
     pub fn from_u8(v: u8) -> Mat {
@@ -53,11 +108,11 @@ impl Mat {
         use Mat::*;
         match self {
             Empty => Kind::Empty,
-            Sand | Rust | Ash | Gunpowder => Kind::Powder,
-            Water | Lava => Kind::Liquid,
-            Steam => Kind::Gas,
+            Sand | Rust | Ash | Gunpowder | Seed | Mud | Snow | Shard | DeadLeaf | Hail => Kind::Powder,
+            Water | Lava | Oil => Kind::Liquid,
+            Steam | Cloud | Smoke => Kind::Gas,
             Fire => Kind::Flame,
-            Iron | Wood | Stone | Brick | Ember | Ice => Kind::Static,
+            Iron | Wood | Stone | Brick | Ember | Ice | Dirt | Grass | Leaf | Steel | Sapling | Glass | Branch | Trunk => Kind::Static,
         }
     }
 
@@ -66,7 +121,17 @@ impl Mat {
         matches!(self.kind(), Kind::Static | Kind::Powder)
     }
 
-    fn hot(self) -> bool {
+    /// Living tree parts: cars drive through them (trees never block the road).
+    pub fn is_vegetation(self) -> bool {
+        matches!(self, Mat::Trunk | Mat::Leaf | Mat::Branch | Mat::Sapling)
+    }
+
+    /// Anything that burns like wood.
+    pub fn is_wooden(self) -> bool {
+        matches!(self, Mat::Wood | Mat::Trunk | Mat::Leaf | Mat::Branch)
+    }
+
+    pub fn hot(self) -> bool {
         matches!(self, Mat::Fire | Mat::Ember | Mat::Lava)
     }
 }
@@ -80,12 +145,50 @@ pub struct Cell {
 
 const EMPTY: Cell = Cell { m: Mat::Empty, life: 0, stamp: 0 };
 
+/// A rigid piece of solid material that has lost its support and is falling.
+struct Piece {
+    cells: Vec<usize>,
+    /// Downward speed in cells per drop (negative while bouncing up).
+    vy: f32,
+    /// Made only of ice: it floats on liquids.
+    ice: bool,
+}
+
+/// A copy of everything that changes while the world runs (for undo).
+#[derive(Clone)]
+pub struct State {
+    cells: Vec<Cell>,
+    temp: Vec<f32>,
+    clock: u32,
+}
+
 pub struct World {
     pub cells: Vec<Cell>,
     frame: u8,
     rng: u32,
     seen: Vec<bool>,
     stack: Vec<usize>,
+    falling: Vec<Piece>,
+    ticks: u32,
+    /// Temperature in °C of every cell (air included).
+    pub temp: Vec<f32>,
+    /// Steps since the world began; drives the day and night cycle.
+    pub clock: u32,
+    /// When false the sun stands still.
+    pub day_cycle: bool,
+    thermal_flip: bool,
+    /// Tests (and calm sandboxes) can pin the air temperature everywhere.
+    pub climate_fixed: Option<f32>,
+    /// Wind, -1 (left) to 1 (right).
+    pub wind: f32,
+    /// Landscape type this world was generated as (picks the backdrop).
+    pub biome: Biome,
+    /// Cached seasonal colours (leaf rgb, autumn amount, grass rgb).
+    pub(crate) leaf_rgb: (i32, i32, i32),
+    pub(crate) autumn: f32,
+    pub(crate) grass_rgb: (i32, i32, i32),
+    /// When true, solids that are not attached to the floor of the world fall.
+    pub structures_fall: bool,
     mask: Vec<u16>,
     mask_prev: Vec<u16>,
     block_mat: Vec<Mat>,
@@ -103,6 +206,19 @@ impl World {
             rng: 0x1234_5678,
             seen: vec![false; W * H],
             stack: Vec::new(),
+            falling: Vec::new(),
+            ticks: 0,
+            temp: vec![15.0; W * H],
+            clock: DAY_STEPS / 5,
+            day_cycle: true,
+            thermal_flip: false,
+            climate_fixed: None,
+            wind: 0.0,
+            biome: Biome::Countryside,
+            leaf_rgb: (52, 140, 60),
+            autumn: 0.0,
+            grass_rgb: (88, 172, 64),
+            structures_fall: true,
             mask: vec![0; W * H],
             mask_prev: vec![0; W * H],
             block_mat: Vec::new(),
@@ -111,8 +227,20 @@ impl World {
         }
     }
 
+    /// A world where nothing falls apart: handy for tests with floating floors.
+    #[cfg(test)]
+    pub fn new_static() -> Self {
+        let mut w = Self::new();
+        w.structures_fall = false;
+        w.climate_fixed = Some(15.0);
+        w.reset_temps();
+        w
+    }
+
     pub fn clear(&mut self) {
         self.cells.fill(EMPTY);
+        self.reset_temps();
+        self.update_season_cache();
     }
 
     /// Replace the grid with saved materials (row by row, W*H entries).
@@ -120,6 +248,53 @@ impl World {
         for (i, m) in mats.iter().enumerate().take(W * H) {
             self.set((i % W) as i32, (i / W) as i32, *m);
         }
+    }
+
+    pub fn capture(&self) -> State {
+        State { cells: self.cells.clone(), temp: self.temp.clone(), clock: self.clock }
+    }
+
+    pub fn restore_state(&mut self, st: &State) {
+        self.cells.copy_from_slice(&st.cells);
+        self.temp.copy_from_slice(&st.temp);
+        self.clock = st.clock;
+        self.falling.clear();
+        self.touched.clear();
+        self.blasts.clear();
+        self.update_season_cache();
+    }
+
+    /// How many cells of each material are on screen (indexed by `Mat as usize`).
+    pub fn census(&self) -> [u32; 32] {
+        let mut n = [0u32; 32];
+        for c in &self.cells {
+            n[c.m as usize] += 1;
+        }
+        n
+    }
+
+    /// Removes `count` cells of the given materials, nearest to `near` first.
+    /// Returns false (and removes nothing) if there are not enough.
+    pub fn consume(&mut self, mats: &[Mat], count: u32, near: (i32, i32)) -> bool {
+        let mut found: Vec<(i64, usize)> = vec![];
+        for (i, c) in self.cells.iter().enumerate() {
+            if mats.contains(&c.m) {
+                let (x, y) = ((i % W) as i64 - near.0 as i64, (i / W) as i64 - near.1 as i64);
+                found.push((x * x + y * y, i));
+            }
+        }
+        if (found.len() as u32) < count {
+            return false;
+        }
+        let n = count as usize;
+        if n > 0 {
+            let k = (n - 1).min(found.len() - 1);
+            found.select_nth_unstable(k);
+        }
+        for &(_, i) in found.iter().take(n) {
+            self.cells[i] = EMPTY;
+        }
+        true
     }
 
     pub fn snapshot(&self) -> Vec<Cell> {
@@ -172,6 +347,34 @@ impl World {
         }
     }
 
+    /// Breaks the glass around a cell. Shards that land on something become
+    /// sand (glass is molten sand); the rest simply falls out of the way.
+    pub fn shatter(&mut self, cx: i32, cy: i32) {
+        let mut cells = vec![];
+        for dy in -3..=3 {
+            for dx in -3..=3 {
+                if self.raw(cx + dx, cy + dy) == Mat::Glass {
+                    cells.push((cx + dx, cy + dy));
+                }
+            }
+        }
+        for (x, y) in cells {
+            let rests = self.raw(x, y + 1).is_hard() && self.raw(x, y + 1) != Mat::Glass;
+            self.set(x, y, if rests { Mat::Shard } else { Mat::Empty });
+        }
+    }
+
+    /// Index of the rigid block covering this cell, if any.
+    pub fn block_at_cell(&self, x: i32, y: i32) -> Option<usize> {
+        if !Self::inb(x, y) {
+            return None;
+        }
+        match self.mask[Self::idx(x, y)] {
+            0 => None,
+            b => Some(b as usize - 1),
+        }
+    }
+
     /// Material of the grid itself, ignoring rigid blocks.
     pub fn raw(&self, x: i32, y: i32) -> Mat {
         if Self::inb(x, y) { self.cells[Self::idx(x, y)].m } else { Mat::Empty }
@@ -179,13 +382,12 @@ impl World {
 
     /// Obstacle test for the car; the world has no floor below it.
     pub fn hard_for_car(&self, x: i32, y: i32) -> bool {
-        if y >= H as i32 {
+        // Beyond the edges there is nothing to hold a car back.
+        if y >= H as i32 || y < 0 || x < 0 || x >= W as i32 {
             return false;
         }
-        if x < 0 || x >= W as i32 {
-            return true;
-        }
-        self.at(x, y).is_hard()
+        let m = self.at(x, y);
+        m.is_hard() && !m.is_vegetation()
     }
 
     pub fn set(&mut self, x: i32, y: i32, m: Mat) {
@@ -198,7 +400,13 @@ impl World {
             _ => 0,
         };
         let frame = self.frame;
-        self.cells[Self::idx(x, y)] = Cell { m, life, stamp: frame };
+        let i = Self::idx(x, y);
+        self.cells[i] = Cell { m, life, stamp: frame };
+        match m {
+            Mat::Fire => self.temp[i] = thermal::FIRE_C,
+            Mat::Ember => self.temp[i] = thermal::EMBER_C,
+            _ => {}
+        }
     }
 
     fn swap(&mut self, a: (i32, i32), b: (i32, i32)) {
@@ -208,6 +416,7 @@ impl World {
         }
         let (ia, ib) = (Self::idx(a.0, a.1), Self::idx(b.0, b.1));
         self.cells.swap(ia, ib);
+        self.temp.swap(ia, ib);
         self.cells[ia].stamp = self.frame;
         self.cells[ib].stamp = self.frame;
     }
@@ -268,7 +477,8 @@ impl World {
                     Kind::Empty => self.set(x, y, Mat::Empty),
                     Kind::Static => self.set(x, y, m),
                     Kind::Gas | Kind::Flame => {
-                        if self.at(x, y) == Mat::Empty && self.chance(3) {
+                        // Clouds are painted solid so they hold enough water to rain.
+                        if self.at(x, y) == Mat::Empty && (m == Mat::Cloud || self.chance(3)) {
                             self.set(x, y, m);
                         }
                     }
@@ -276,6 +486,15 @@ impl World {
                         if self.at(x, y) == Mat::Empty {
                             self.set(x, y, m);
                         }
+                    }
+                }
+                let i = Self::idx(x, y);
+                if self.cells[i].m == m {
+                    match m {
+                        Mat::Lava => self.temp[i] = thermal::LAVA_C,
+                        Mat::Ice | Mat::Snow => self.temp[i] = -15.0,
+                        Mat::Steam => self.temp[i] = 95.0,
+                        _ => {}
                     }
                 }
             }
@@ -291,31 +510,123 @@ impl World {
         }
     }
 
-    /// Blast: flames and smoke in a disc, loose stuff gets blown away.
+    /// How hard a solid material is to break (rock = 1).
+    fn hardness(m: Mat) -> f32 {
+        match m {
+            Mat::Stone => 1.0,
+            Mat::Brick => 0.7,
+            Mat::Iron | Mat::Steel => 2.4,
+            Mat::Glass => 0.2,
+            Mat::Ice => 0.35,
+            Mat::Dirt | Mat::Grass | Mat::Mud => 0.3,
+            Mat::Wood | Mat::Trunk | Mat::Branch => 0.4,
+            Mat::Leaf | Mat::Sapling => 0.15,
+            _ => 0.5,
+        }
+    }
+
+    /// An explosion: a ball of fire and smoke, rock and other solids shattered
+    /// into rubble (metal resists), and a pressure wave that shoves everything
+    /// loose outward.
     pub fn explode(&mut self, cx: i32, cy: i32, r: i32) {
-        if self.blasts.len() < 8 {
+        let heavy = self.blasts.len() < 8;
+        if heavy {
             self.blasts.push((cx, cy, r));
         }
+        let r2 = (r * r) as f32;
         for dy in -r..=r {
             for dx in -r..=r {
-                if dx * dx + dy * dy > r * r {
+                let d2 = (dx * dx + dy * dy) as f32;
+                if d2 > r2 {
                     continue;
                 }
                 let (x, y) = (cx + dx, cy + dy);
                 let m = self.raw(x, y);
-                if matches!(m.kind(), Kind::Powder | Kind::Liquid | Kind::Gas | Kind::Flame) || m == Mat::Empty {
-                    match self.rand() % 3 {
+                let f = d2 / r2;
+                match m.kind() {
+                    Kind::Powder | Kind::Liquid | Kind::Gas | Kind::Flame | Kind::Empty => match self.rand() % 6 {
                         0 => self.set(x, y, Mat::Fire),
-                        1 => self.set(x, y, Mat::Steam),
+                        1 | 2 => self.set(x, y, Mat::Smoke),
                         _ => self.set(x, y, Mat::Empty),
+                    },
+                    Kind::Static => {
+                        let h = Self::hardness(m);
+                        if f * h < 0.35 {
+                            // Shattered: rubble where it was rock, dust or embers otherwise.
+                            let into = match m {
+                                Mat::Stone => if self.chance(2) { Mat::Sand } else { Mat::Empty },
+                                Mat::Brick | Mat::Dirt | Mat::Grass | Mat::Mud => if self.chance(2) { Mat::Mud } else { Mat::Empty },
+                                Mat::Wood | Mat::Trunk | Mat::Branch => if self.chance(3) { Mat::Ember } else { Mat::Empty },
+                                Mat::Glass => if self.chance(2) { Mat::Shard } else { Mat::Empty },
+                                Mat::Ice => if self.chance(2) { Mat::Snow } else { Mat::Water },
+                                _ => Mat::Empty,
+                            };
+                            self.set(x, y, into);
+                        } else if m == Mat::Stone && f * h < 0.6 && self.chance(3) {
+                            // Fractured rock crumbles to sand.
+                            self.set(x, y, Mat::Sand);
+                        } else if m.is_wooden() && self.chance(3) {
+                            self.set(x, y, Mat::Ember);
+                        }
                     }
-                } else if m == Mat::Wood && self.chance(3) {
-                    self.set(x, y, Mat::Ember);
-                } else if m == Mat::Ice {
-                    self.set(x, y, Mat::Water);
                 }
             }
         }
+        if !heavy {
+            return;
+        }
+        // Pressure wave: loose matter near the blast is thrown outward, the closer
+        // the harder. Outer cells move first so they do not pile into inner ones.
+        let reach = (r as f32 * 2.3) as i32;
+        let reach2 = (reach * reach) as f32;
+        let mut shoved: Vec<(f32, i32, i32)> = vec![];
+        for dy in -reach..=reach {
+            for dx in -reach..=reach {
+                let d2 = (dx * dx + dy * dy) as f32;
+                if d2 > reach2 || d2 < 1.0 {
+                    continue;
+                }
+                let (x, y) = (cx + dx, cy + dy);
+                if matches!(self.raw(x, y).kind(), Kind::Powder | Kind::Liquid | Kind::Gas | Kind::Flame) && self.mask_free(x, y) {
+                    shoved.push((d2, x, y));
+                }
+            }
+        }
+        shoved.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        shoved.truncate(7000);
+        for (d2, x, y) in shoved {
+            let d = d2.sqrt();
+            let steps = (((1.0 - d / reach as f32) * r as f32 * 0.9).max(0.0)) as i32;
+            if steps <= 0 {
+                continue;
+            }
+            let (ux, uy) = ((x - cx) as f32 / d, (y - cy) as f32 / d);
+            let (mut tx, mut ty) = (x, y);
+            for k in 1..=steps {
+                let (nx, ny) = (x + (ux * k as f32).round() as i32, y + (uy * k as f32).round() as i32);
+                if self.at(nx, ny) == Mat::Empty {
+                    (tx, ty) = (nx, ny);
+                } else {
+                    break;
+                }
+            }
+            if (tx, ty) != (x, y) {
+                self.swap((x, y), (tx, ty));
+            }
+        }
+        // A billow of smoke around the fireball.
+        for dy in -(r * 3 / 2)..=(r * 3 / 2) {
+            for dx in -(r * 3 / 2)..=(r * 3 / 2) {
+                let d2 = dx * dx + dy * dy;
+                if d2 > r * r && d2 <= (r * 3 / 2) * (r * 3 / 2) && self.chance(9) && self.at(cx + dx, cy + dy) == Mat::Empty {
+                    self.set(cx + dx, cy + dy, Mat::Smoke);
+                }
+            }
+        }
+    }
+
+    fn mask_free(&self, x: i32, y: i32) -> bool {
+        !Self::inb(x, y) || self.mask[Self::idx(x, y)] == 0
     }
 
     // ----- generator --------------------------------------------------------
@@ -328,44 +639,91 @@ impl World {
         }
     }
 
-    /// Random hills, lakes and trees. Returns (entry, exit) positions.
+    /// Countryside by default; see [`World::generate_biome`].
     pub fn generate(&mut self, seed: u32) -> ((i32, i32), (i32, i32)) {
+        self.generate_biome(seed, Biome::Countryside)
+    }
+
+    /// Builds a whole world for a landscape type: terrain, lakes or sea, trees,
+    /// snow caps. Returns the (entry, exit) positions on the two ends.
+    pub fn generate_biome(&mut self, seed: u32, biome: Biome) -> ((i32, i32), (i32, i32)) {
         self.clear();
+        self.biome = biome;
         self.rng = seed.wrapping_mul(2654435761) | 1;
         let p: Vec<f32> = (0..6).map(|_| (self.rand() % 6283) as f32 / 1000.0).collect();
+        let island: Vec<f32> = (0..3).map(|_| 60.0 + (self.rand() % 200) as f32).collect();
         let mut hs = vec![0i32; W];
         for x in 0..W {
             let xf = x as f32 / K as f32;
-            let mut h = 112.0 + 6.0 * (xf * 0.018 + p[0]).sin() + 3.0 * (xf * 0.047 + p[1]).sin()
-                + 1.0 * (xf * 0.11 + p[2]).sin();
             let edge = (x.min(W - 1 - x) as f32 / (40 * K) as f32).min(1.0);
             let edge = edge * edge * (3.0 - 2.0 * edge);
-            h = 108.0 + (h - 108.0) * edge;
-            hs[x] = (h * K as f32) as i32;
+            let h = match biome {
+                Biome::Countryside => {
+                    let h = 112.0 + 6.0 * (xf * 0.018 + p[0]).sin() + 3.0 * (xf * 0.047 + p[1]).sin() + (xf * 0.11 + p[2]).sin();
+                    108.0 + (h - 108.0) * edge
+                }
+                Biome::Mountain => {
+                    // Ridged noise gives sharp peaks.
+                    let ridge = |f: f32, ph: f32| 1.0 - (xf * f + ph).sin().abs();
+                    let h = 140.0 - (70.0 * ridge(0.021, p[0]) + 30.0 * ridge(0.047, p[1]) + 10.0 * ridge(0.11, p[2]));
+                    128.0 + (h - 128.0) * edge
+                }
+                Biome::Sea => {
+                    let t = (xf - 160.0) / 150.0;
+                    let basin = (1.0 - t * t).max(0.0);
+                    let mut h = 118.0 + 38.0 * basin.powf(0.8) + 2.0 * (xf * 0.06 + p[0]).sin();
+                    for c in &island {
+                        h -= 34.0 * (-((xf - c) / 14.0).powi(2)).exp() * basin.min(1.0);
+                    }
+                    118.0 + (h - 118.0) * edge
+                }
+            };
+            hs[x] = ((h * K as f32) as i32).clamp(40, H as i32 - 40);
         }
-        let sea = 122 * K;
+        let sea = match biome {
+            Biome::Countryside => 122 * K,
+            Biome::Mountain => 135 * K,
+            Biome::Sea => 128 * K,
+        };
         for x in 0..W {
-            for y in hs[x]..H as i32 {
-                let m = if y < hs[x] + 3 * K { Mat::Sand } else { Mat::Stone };
+            let top = hs[x];
+            let beach = top > sea - 5 * K;
+            for y in top..H as i32 {
+                let depth = y - top;
+                let m = match biome {
+                    // Snow caps (ice) on the peaks, bare rock below them, grass in the valleys.
+                    Biome::Mountain if top < 250 && depth < 3 * K => Mat::Ice,
+                    Biome::Mountain if top < 320 && depth < 5 * K => Mat::Stone,
+                    _ if depth < 2 * K => {
+                        if beach { Mat::Sand } else { Mat::Grass }
+                    }
+                    _ if depth < 6 * K && !beach => Mat::Dirt,
+                    _ if depth < 3 * K => Mat::Sand,
+                    _ => Mat::Stone,
+                };
                 self.set(x as i32, y, m);
             }
-            for y in sea..hs[x] {
+            for y in sea..top {
                 self.set(x as i32, y, Mat::Water);
             }
         }
-        for _ in 0..3 {
+        let (tries, min_top) = match biome {
+            Biome::Countryside => (6, 0),
+            Biome::Mountain => (6, 330),
+            Biome::Sea => (3, 0),
+        };
+        for _ in 0..tries {
             let x = (50 * K) + (self.rand() % (W as u32 - 100 * K as u32)) as i32;
             let base = hs[x as usize];
-            if base >= sea {
+            if base >= sea - 4 * K || base < min_top {
                 continue;
             }
-            let hgt = (8 + (self.rand() % 7) as i32) * K;
-            self.fill_rect(x, base - hgt, 2 * K, hgt, Mat::Wood);
-            for k in 1..5 * K {
-                self.fill_rect(x - k, base - hgt + k, 1, K, Mat::Wood);
-                self.fill_rect(x + 2 * K + k - 1, base - hgt + k, 1, K, Mat::Wood);
-            }
+            let hgt = (8 + (self.rand() % 6) as i32) * K;
+            self.fill_rect(x, base - hgt, K, hgt, Mat::Trunk);
+            let top = base - hgt;
+            self.grow_crown(x, top);
         }
+        self.reset_temps();
         ((16 * K, hs[16 * K as usize] - 8 * K), (W as i32 - 16 * K, hs[W - 16 * K as usize] - 8 * K))
     }
 
@@ -383,20 +741,57 @@ impl World {
                     continue;
                 }
                 match c.m {
-                    Mat::Sand | Mat::Rust | Mat::Ash => self.step_powder(x, y),
+                    Mat::Rust => {
+                        self.step_powder(x, y);
+                    }
+                    Mat::Sand | Mat::Mud => self.step_sediment(x, y),
+                    Mat::Dirt => self.step_dirt(x, y),
+                    Mat::Grass => self.step_grass(x, y),
+                    Mat::Snow => self.step_snow(x, y),
+                    Mat::Hail => {
+                        self.step_powder(x, y);
+                    }
+                    Mat::Shard => self.step_shard(x, y),
+                    Mat::Ash => self.step_ash(x, y),
+                    Mat::Seed => self.step_seed(x, y),
+                    Mat::Sapling => self.step_sapling(x, y),
+                    Mat::Leaf => self.step_leaf(x, y),
+                    Mat::Wood | Mat::Trunk => self.step_wood(x, y),
+                    Mat::Branch => self.step_branch(x, y),
+                    Mat::DeadLeaf => self.step_dead_leaf(x, y),
+                    Mat::Cloud => self.step_cloud(x, y),
+                    Mat::Oil => self.step_oil(x, y),
+                    Mat::Smoke => self.step_smoke(x, y),
+                    Mat::Steel => self.step_iron(x, y, 1500),
                     Mat::Gunpowder => self.step_gunpowder(x, y),
                     Mat::Water => self.step_water(x, y),
                     Mat::Steam => self.step_steam(x, y),
                     Mat::Fire => self.step_fire(x, y),
                     Mat::Ember => self.step_ember(x, y),
                     Mat::Lava => self.step_lava(x, y),
-                    Mat::Iron => self.step_iron(x, y),
-                    Mat::Ice => self.step_ice(x, y),
+                    Mat::Iron => self.step_iron(x, y, 300),
                     _ => {}
                 }
             }
         }
-        if f & 1 == 0 {
+        self.ticks = self.ticks.wrapping_add(1);
+        if self.structures_fall && self.ticks % 8 == 0 {
+            self.structure_pass();
+        }
+        if self.structures_fall && self.ticks % 2 == 0 {
+            self.drop_structures();
+        }
+        self.update_wind();
+        if self.ticks % 64 == 0 {
+            self.update_season_cache();
+        }
+        if self.ticks % thermal::THERMAL_EVERY == 0 {
+            self.thermal_pass();
+        }
+        if self.day_cycle {
+            self.clock = self.clock.wrapping_add(1);
+        }
+        if f % 4 == 0 {
             self.level_water();
         }
     }
@@ -465,18 +860,102 @@ impl World {
             if self.block_mat[b as usize - 1] == Mat::Wood {
                 self.touched.push(b - 1);
             }
-        } else if self.cells[Self::idx(nx, ny)].m == Mat::Wood {
+        } else if self.cells[Self::idx(nx, ny)].m.is_wooden() {
             self.set(nx, ny, Mat::Ember);
         }
     }
 
-    fn step_powder(&mut self, x: i32, y: i32) {
+    /// First cell of `m` within `r` cells of (x, y).
+    fn find_near(&self, x: i32, y: i32, r: i32, m: Mat) -> Option<(i32, i32)> {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if self.raw(x + dx, y + dy) == m {
+                    return Some((x + dx, y + dy));
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns true if the cell moved.
+    fn step_powder(&mut self, x: i32, y: i32) -> bool {
         let d = self.dir();
         for dx in [0, d, -d] {
             if matches!(self.at(x + dx, y + 1).kind(), Kind::Empty | Kind::Liquid | Kind::Gas) {
                 self.swap((x, y), (x + dx, y + 1));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Water that moved during the last two steps is flowing, not resting.
+    fn flowing_water_near(&self, x: i32, y: i32) -> bool {
+        let f = self.frame;
+        Self::neighbors(x, y).iter().any(|&(nx, ny)| {
+            Self::inb(nx, ny) && {
+                let c = self.cells[Self::idx(nx, ny)];
+                c.m == Mat::Water && (c.stamp == f || c.stamp == f.wrapping_sub(1))
+            }
+        })
+    }
+
+    /// Loose sand and mud: flowing water drags them along (gullies, deltas);
+    /// mud that dries out consolidates back into soil.
+    fn step_sediment(&mut self, x: i32, y: i32) {
+        let mud = self.at(x, y) == Mat::Mud;
+        if self.flowing_water_near(x, y) && self.chance(if mud { 3 } else { 6 }) {
+            let d = self.dir();
+            for (dx, dy) in [(d, 0), (d, 1), (-d, 0), (-d, 1)] {
+                if matches!(self.at(x + dx, y + dy), Mat::Empty | Mat::Water) {
+                    self.swap((x, y), (x + dx, y + dy));
+                    return;
+                }
+            }
+        }
+        if mud && self.chance(4000) && Self::neighbors(x, y).iter().all(|&(nx, ny)| self.at(nx, ny) != Mat::Water) {
+            self.set(x, y, Mat::Dirt);
+            return;
+        }
+        self.step_powder(x, y);
+    }
+
+    /// Bare soil washes away under flowing water (grass roots protect it).
+    /// Grass dries out like soil, but its roots hold the earth against erosion.
+    fn step_grass(&mut self, x: i32, y: i32) {
+        let i = Self::idx(x, y);
+        if self.cells[i].life > 0 && self.chance(if self.sun() > 0.5 { 600 } else { 2500 }) {
+            self.cells[i].life -= 1;
+        }
+    }
+
+    fn step_dirt(&mut self, x: i32, y: i32) {
+        let i = Self::idx(x, y);
+        // Moisture slowly dries, faster in hot sun.
+        if self.cells[i].life > 0 && self.chance(if self.sun() > 0.5 { 600 } else { 2500 }) {
+            self.cells[i].life -= 1;
+        }
+        if self.chance(30) && self.flowing_water_near(x, y) && self.chance(8) {
+            self.set(x, y, Mat::Mud);
+        }
+    }
+
+    /// Snowflakes drift on the wind while they fall.
+    fn step_snow(&mut self, x: i32, y: i32) {
+        if self.at(x, y + 1) == Mat::Empty && self.wind.abs() > 0.1 && (self.rand() % 100) as f32 <= self.wind.abs() * 60.0 {
+            let w = if self.wind > 0.0 { 1 } else { -1 };
+            if self.at(x + w, y + 1) == Mat::Empty {
+                self.swap((x, y), (x + w, y + 1));
                 return;
             }
+        }
+        self.step_powder(x, y);
+    }
+
+    /// Glass shards pile up like sand and, given time, turn back into sand.
+    fn step_shard(&mut self, x: i32, y: i32) {
+        if !self.step_powder(x, y) && self.chance(4000) {
+            self.set(x, y, Mat::Sand);
         }
     }
 
@@ -484,15 +963,330 @@ impl World {
         for (nx, ny) in Self::neighbors(x, y) {
             if self.at(nx, ny).hot() {
                 self.set(x, y, Mat::Fire);
-                self.explode(x, y, 7 * K / 2 + 4);
+                self.explode(x, y, 4 * K + 4);
                 return;
             }
         }
         self.step_powder(x, y);
     }
 
-    fn step_water(&mut self, x: i32, y: i32) {
+    /// Ash is carbon: with water it turns into fertile soil.
+    fn step_ash(&mut self, x: i32, y: i32) {
+        let n = Self::neighbors(x, y)[(self.rand() % 4) as usize];
+        if self.at(n.0, n.1) == Mat::Water && self.chance(500) {
+            self.set(x, y, Mat::Dirt);
+            return;
+        }
+        self.step_powder(x, y);
+    }
+
+    /// Enough light for a plant: daytime and nothing leafy overhead.
+    fn lit(&self, x: i32, y: i32) -> bool {
+        if self.sun() < 0.1 {
+            return false;
+        }
+        (1..=4 * K).all(|dy| !matches!(self.raw(x, y - dy), Mat::Leaf | Mat::Branch | Mat::Trunk | Mat::Wood))
+    }
+
+    /// Soil that can still feed a plant: (cell index, moisture) within reach.
+    fn find_moist_soil(&self, x: i32, y: i32, reach: i32, depth: i32) -> Option<(i32, i32)> {
+        for dy in 0..=depth {
+            for dx in -reach..=reach {
+                let (sx, sy) = (x + dx, y + dy);
+                if Self::inb(sx, sy) && matches!(self.cells[Self::idx(sx, sy)].m, Mat::Dirt | Mat::Grass) && self.cells[Self::idx(sx, sy)].life >= 30 {
+                    return Some((sx, sy));
+                }
+            }
+        }
+        None
+    }
+
+    /// A plant needs a drink: standing water nearby, or moist soil.
+    fn drink(&mut self, x: i32, y: i32, reach: i32, depth: i32) -> bool {
+        for dy in 0..=depth {
+            for dx in -reach..=reach {
+                if self.raw(x + dx, y + dy) == Mat::Water {
+                    self.set(x + dx, y + dy, Mat::Empty);
+                    return true;
+                }
+            }
+        }
+        if let Some((sx, sy)) = self.find_moist_soil(x, y, reach, depth) {
+            let i = Self::idx(sx, sy);
+            self.cells[i].life -= 30;
+            return true;
+        }
+        false
+    }
+
+    /// Is there anything to drink within reach (standing water or moist soil)?
+    fn water_within(&self, x: i32, y: i32, reach: i32, depth: i32) -> bool {
+        for dy in 0..=depth {
+            for dx in -reach..=reach {
+                if self.raw(x + dx, y + dy) == Mat::Water {
+                    return true;
+                }
+            }
+        }
+        self.find_moist_soil(x, y, reach, depth).is_some()
+    }
+
+    /// A seed falls, then sprouts on moist soil in the light, with room to grow.
+    /// Seeds are short-lived: with no water around for a while, they rot into soil.
+    fn step_seed(&mut self, x: i32, y: i32) {
+        if self.step_powder(x, y) {
+            return;
+        }
+        if !self.water_within(x, y, 3, 3) {
+            if self.chance(2500) {
+                self.set(x, y, Mat::Dirt);
+            }
+            return;
+        }
+        if !matches!(self.at(x, y + 1), Mat::Dirt | Mat::Grass) || !self.lit(x, y) {
+            return;
+        }
+        if self.surface_temp_c() < 6.0 || self.find_near(x, y, 5 * K, Mat::Trunk).is_some() || self.find_near(x, y, 5 * K, Mat::Sapling).is_some() {
+            return;
+        }
+        if self.drink(x, y, 3, 3) {
+            let budget = 40 + (self.rand() % 40) as u8;
+            self.set(x, y, Mat::Empty);
+            for dx in -1..=1 {
+                if self.raw(x + dx, y) == Mat::Empty {
+                    self.set(x + dx, y, Mat::Sapling);
+                    let i = Self::idx(x + dx, y);
+                    self.cells[i].life = budget;
+                }
+            }
+        }
+    }
+
+    /// A crown of leaves around a branch core, centred just above the trunk top.
+    fn grow_crown(&mut self, x: i32, y: i32) {
+        let r = (4 + (self.rand() % 3) as i32) * K;
+        let cy = y - r / 2;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let (lx, ly) = (x + dx, cy + dy);
+                if dx * dx + dy * dy <= r * r && self.raw(lx, ly) == Mat::Empty {
+                    self.set(lx, ly, Mat::Leaf);
+                }
+            }
+        }
+        let core = (3 * K / 2).max(2);
+        for dy in -core..=core {
+            for dx in -core..=core {
+                if dx * dx + dy * dy <= core * core && matches!(self.raw(x + dx, cy + dy), Mat::Leaf | Mat::Empty) {
+                    self.set(x + dx, cy + dy, Mat::Branch);
+                }
+            }
+        }
+    }
+
+    /// A growing trunk tip: in the light it drinks to extend upward, then
+    /// finishes with a crown of leaves.
+    fn step_sapling(&mut self, x: i32, y: i32) {
+        let i = Self::idx(x, y);
+        let life = self.cells[i].life;
+        if self.at(x, y - 1) != Mat::Empty {
+            // Not a tip: it is trunk now.
+            if self.at(x, y - 1) != Mat::Sapling {
+                self.set(x, y, Mat::Trunk);
+            }
+            return;
+        }
+        if life == 0 {
+            self.set(x, y, Mat::Trunk);
+            self.grow_crown(x, y);
+            return;
+        }
+        if self.chance(30) && self.surface_temp_c() > 6.0 && self.lit(x, y) && self.drink(x, y, 8, 50) {
+            self.set(x, y, Mat::Trunk);
+            self.set(x, y - 1, Mat::Sapling);
+            let j = Self::idx(x, y - 1);
+            self.cells[j].life = life - 1;
+        }
+    }
+
+    /// Leaves follow the seasons: they turn in autumn, drop, and leave the tree bare in winter.
+    fn step_leaf(&mut self, x: i32, y: i32) {
+        match self.season() {
+            Season::Autumn => {
+                let late = 1.0 + self.season_progress() * 3.0;
+                if self.chance((14_000.0 / late) as u32) {
+                    self.set(x, y, Mat::DeadLeaf);
+                    return;
+                }
+            }
+            Season::Winter => {
+                if self.chance(2_500) {
+                    self.set(x, y, Mat::DeadLeaf);
+                    return;
+                }
+            }
+            _ => {}
+        }
+        if self.season() != Season::Winter && self.chance(500_000) && self.at(x, y + 1) == Mat::Empty {
+            self.set(x, y + 1, Mat::Seed);
+        }
+    }
+
+    /// A dead leaf falls, lies on the ground and slowly rots into soil.
+    fn step_dead_leaf(&mut self, x: i32, y: i32) {
+        if self.step_powder(x, y) {
+            return;
+        }
+        let wet = Self::neighbors(x, y).iter().any(|&(nx, ny)| self.at(nx, ny) == Mat::Water);
+        if self.chance(if wet { 1_500 } else { 6_000 }) {
+            self.set(x, y, Mat::Dirt);
+        }
+    }
+
+    /// The skeleton of a crown: in spring and summer it pushes new leaves out
+    /// through the foliage that is already there.
+    fn step_branch(&mut self, x: i32, y: i32) {
+        if matches!(self.season(), Season::Spring | Season::Summer) && self.surface_temp_c() > 2.0 && self.chance(500) {
+            let (mut cx, mut cy) = (x, y);
+            for _ in 0..6 * K {
+                let n = Self::neighbors(cx, cy)[(self.rand() % 4) as usize];
+                if matches!(self.raw(n.0, n.1), Mat::Leaf | Mat::Branch) {
+                    (cx, cy) = n;
+                }
+            }
+            let n = Self::neighbors(cx, cy)[(self.rand() % 4) as usize];
+            let r = 6 * K;
+            if self.raw(n.0, n.1) == Mat::Empty && (n.0 - x).pow(2) + (n.1 - y).pow(2) <= r * r {
+                self.set(n.0, n.1, Mat::Leaf);
+            }
+            return;
+        }
+        self.step_wood(x, y);
+    }
+
+    /// Wet wood slowly rots into soil.
+    fn step_wood(&mut self, x: i32, y: i32) {
+        // Wood buried for a long time, sealed in earth or rock, slowly becomes oil.
+        if self.chance(30_000) {
+            let mut cover = 0;
+            let mut sealed = true;
+            for (nx, ny) in Self::neighbors(x, y) {
+                match self.at(nx, ny) {
+                    Mat::Dirt | Mat::Stone | Mat::Sand | Mat::Mud => cover += 1,
+                    Mat::Wood | Mat::Trunk | Mat::Branch | Mat::Grass => {}
+                    _ => sealed = false,
+                }
+            }
+            if sealed && cover >= 2 {
+                self.set(x, y, Mat::Oil);
+                return;
+            }
+        }
+        if self.chance(20_000) {
+            let n = Self::neighbors(x, y)[(self.rand() % 4) as usize];
+            if self.at(n.0, n.1) == Mat::Water {
+                self.set(x, y, Mat::Dirt);
+            }
+        }
+    }
+
+    /// Oil is a slow, light liquid: it floats on water and burns ferociously.
+    fn step_oil(&mut self, x: i32, y: i32) {
+        for (nx, ny) in Self::neighbors(x, y) {
+            if matches!(self.at(nx, ny), Mat::Fire | Mat::Ember | Mat::Lava) && self.chance(2) {
+                self.ignite_oil(x, y);
+                return;
+            }
+        }
+        if self.at(x, y - 1) == Mat::Water && self.chance(2) {
+            self.swap((x, y), (x, y - 1));
+            return;
+        }
+        if self.chance(3) {
+            return;
+        }
         let d = self.dir();
+        for dx in [0, d, -d] {
+            if matches!(self.at(x + dx, y + 1).kind(), Kind::Empty | Kind::Gas) {
+                self.swap((x, y), (x + dx, y + 1));
+                return;
+            }
+        }
+        for dir in [d, -d] {
+            let mut k = 0;
+            while k < 2 * K && self.at(x + dir * (k + 1), y) == Mat::Empty {
+                k += 1;
+            }
+            if k > 0 {
+                self.swap((x, y), (x + dir * k, y));
+                return;
+            }
+        }
+    }
+
+    /// Burning oil: a long-lived, very hot flame that sets its neighbours alight.
+    pub(super) fn ignite_oil(&mut self, x: i32, y: i32) {
+        self.set(x, y, Mat::Fire);
+        let i = Self::idx(x, y);
+        self.cells[i].life = 150 + (self.rand() % 100) as u8;
+        if self.at(x, y - 1) == Mat::Empty {
+            self.set(x, y - 1, Mat::Fire);
+        }
+        if self.at(x, y - 2) == Mat::Empty && self.chance(2) {
+            self.set(x, y - 2, Mat::Smoke);
+        }
+    }
+
+    /// Smoke rises, drifts with the wind (wrapping at the sides) and thins out.
+    fn step_smoke(&mut self, x: i32, y: i32) {
+        if self.chance(900) {
+            self.set(x, y, Mat::Empty);
+            return;
+        }
+        if let Some(t) = self.wind_target(x, y) {
+            let t = (Self::wrap_x(t.0), t.1);
+            if self.at(t.0, t.1) == Mat::Empty {
+                self.swap((x, y), t);
+                return;
+            }
+        }
+        let d = self.dir();
+        let order: [(i32, i32); 3] = if self.rand() % 10 < 6 { [(0, -1), (d, -1), (d, 0)] } else { [(d, 0), (-d, 0), (0, -1)] };
+        for (dx, dy) in order {
+            let t = (Self::wrap_x(x + dx), y + dy);
+            if self.at(t.0, t.1) == Mat::Empty {
+                self.swap((x, y), t);
+                return;
+            }
+        }
+    }
+
+    fn step_water(&mut self, x: i32, y: i32) {
+        let i = Self::idx(x, y);
+        // Soil drinks the rain: the water is consumed and the soil gets moist.
+        if matches!(self.at(x, y + 1), Mat::Dirt | Mat::Grass) && self.chance(25) {
+            let j = Self::idx(x, y + 1);
+            self.cells[j].life = self.cells[j].life.saturating_add(60);
+            self.set(x, y, Mat::Empty);
+            return;
+        }
+        // The sun slowly evaporates a warm surface: the hotter, the faster.
+        if self.at(x, y - 1) == Mat::Empty {
+            let t = self.temp[i];
+            if t > 27.0 && self.chance((150_000.0 / (t - 26.0)) as u32) {
+                self.set(x, y, Mat::Steam);
+                return;
+            }
+        }
+        let d = self.dir();
+        // Falling drops are pushed along by the wind: the rain slants.
+        if self.at(x, y + 1) == Mat::Empty && self.wind.abs() > 0.15 && (self.rand() % 100) as f32 <= self.wind.abs() * 35.0 {
+            let w = if self.wind > 0.0 { 1 } else { -1 };
+            if self.at(x + w, y + 1) == Mat::Empty {
+                self.swap((x, y), (x + w, y + 1));
+                return;
+            }
+        }
         for dx in [0, d, -d] {
             if matches!(self.at(x + dx, y + 1).kind(), Kind::Empty | Kind::Gas) {
                 self.swap((x, y), (x + dx, y + 1));
@@ -511,11 +1305,17 @@ impl World {
         }
     }
 
+
     fn step_steam(&mut self, x: i32, y: i32) {
-        let limit = if y < 3 * K { 120 } else { 900 };
-        if self.chance(limit) {
-            self.set(x, y, Mat::Water);
-            return;
+        // Condensation is handled by temperature (see thermal.rs); here it only
+        // rises and drifts with the wind.
+        // Gas wraps around: what the wind blows off one side comes back on the other.
+        if let Some(t) = self.wind_target(x, y) {
+            let t = (Self::wrap_x(t.0), t.1);
+            if self.at(t.0, t.1) == Mat::Empty {
+                self.swap((x, y), t);
+                return;
+            }
         }
         let d = self.dir();
         let order: [(i32, i32); 3] = if self.rand() % 10 < 7 {
@@ -524,10 +1324,70 @@ impl World {
             [(d, 0), (-d, 0), (0, -1)]
         };
         for (dx, dy) in order {
-            if self.at(x + dx, y + dy) == Mat::Empty {
-                self.swap((x, y), (x + dx, y + dy));
+            let t = (Self::wrap_x(x + dx), y + dy);
+            if self.at(t.0, t.1) == Mat::Empty {
+                self.swap((x, y), t);
                 return;
             }
+        }
+    }
+
+    fn wrap_x(x: i32) -> i32 {
+        x.rem_euclid(W as i32)
+    }
+
+
+    fn step_cloud(&mut self, x: i32, y: i32) {
+        let i = Self::idx(x, y);
+        let mut near = 0;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if (dx != 0 || dy != 0) && self.raw(x + dx, y + dy) == Mat::Cloud {
+                    near += 1;
+                }
+            }
+        }
+        // Thick, cool clouds let go of their water: rain when it is mild, snow when
+        // it freezes, hail when it is very cold. A cloud warmed by the sun keeps
+        // its water as vapour and does not rain.
+        let t = self.temp[i];
+        if near >= 2 && t < 12.0 && self.at(x, y + 1) == Mat::Empty && self.chance(250) {
+            if t > -9.0 {
+                self.set(x, y, Mat::Water);
+                self.temp[i] = t.max(4.0);
+            } else if t > -22.0 {
+                self.set(x, y, Mat::Snow);
+            } else {
+                self.set(x, y, Mat::Hail);
+            }
+            return;
+        }
+        if t > 26.0 && self.chance(600) {
+            self.set(x, y, Mat::Steam);
+            return;
+        }
+        if near == 0 && self.chance(3000) {
+            self.set(x, y, Mat::Steam);
+            return;
+        }
+        // The wind pushes clouds along; otherwise they wander a little.
+        let target = if let Some(t) = self.wind_target(x, y) {
+            t
+        } else {
+            let d = self.dir();
+            let r = self.rand() % 10;
+            if r < 2 {
+                (x + d, y)
+            } else if r == 2 && y > COLD_Y {
+                (x, y - 1)
+            } else {
+                return;
+            }
+        };
+        // Wraps around the edges like steam does.
+        let target = (Self::wrap_x(target.0), target.1);
+        if self.at(target.0, target.1) == Mat::Empty {
+            self.swap((x, y), target);
         }
     }
 
@@ -540,18 +1400,27 @@ impl World {
         self.cells[i].life -= 1;
         for (nx, ny) in Self::neighbors(x, y) {
             match self.at(nx, ny) {
+                // Water puts the flame out (the warmth it took stays in the water).
                 Mat::Water => {
-                    self.set(x, y, Mat::Steam);
-                    if self.chance(2) {
-                        self.set(nx, ny, Mat::Steam);
+                    if self.chance(4) {
+                        self.set(x, y, Mat::Empty);
+                        return;
                     }
-                    return;
                 }
-                Mat::Wood => self.ignite(nx, ny, 25),
+                m if m.is_wooden() => self.ignite(nx, ny, 25),
+                Mat::Oil => {
+                    if self.chance(2) {
+                        self.ignite_oil(nx, ny);
+                    }
+                }
                 _ => {}
             }
         }
-        let d = self.dir();
+        if self.chance(10) && self.at(x, y - 1) == Mat::Empty {
+            self.set(x, y - 1, Mat::Smoke);
+        }
+        // Flames lean with the wind.
+        let d = if self.wind.abs() > 0.3 && self.chance(2) { self.wind.signum() as i32 } else { self.dir() };
         let r = self.rand() % 10;
         let order: [(i32, i32); 2] = if r < 6 { [(0, -1), (d, -1)] } else if r < 8 { [(d, 0), (-d, 0)] } else { return };
         for (dx, dy) in order {
@@ -561,6 +1430,7 @@ impl World {
             }
         }
     }
+
 
     fn step_ember(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
@@ -574,12 +1444,9 @@ impl World {
             match self.at(nx, ny) {
                 Mat::Water => {
                     self.set(x, y, Mat::Ash);
-                    if self.chance(3) {
-                        self.set(nx, ny, Mat::Steam);
-                    }
                     return;
                 }
-                Mat::Wood => self.ignite(nx, ny, 80),
+                m if m.is_wooden() => self.ignite(nx, ny, 80),
                 _ => {}
             }
         }
@@ -588,22 +1455,19 @@ impl World {
         }
     }
 
+
     fn step_lava(&mut self, x: i32, y: i32) {
         for (nx, ny) in Self::neighbors(x, y) {
             match self.at(nx, ny) {
+                // Quenched: the lava becomes rock and the water flashes to steam.
                 Mat::Water => {
                     self.set(x, y, Mat::Stone);
-                    if self.chance(4) {
-                        self.set(nx, ny, Mat::Steam);
-                    }
+                    self.set(nx, ny, Mat::Steam);
+                    let j = Self::idx(nx, ny);
+                    self.temp[j] = 100.0;
                     return;
                 }
-                Mat::Wood => self.ignite(nx, ny, 20),
-                Mat::Ice => {
-                    if self.chance(6) {
-                        self.set(nx, ny, Mat::Water);
-                    }
-                }
+                m if m.is_wooden() => self.ignite(nx, ny, 20),
                 _ => {}
             }
         }
@@ -630,18 +1494,181 @@ impl World {
         }
     }
 
-    fn step_ice(&mut self, x: i32, y: i32) {
+
+    /// Iron rusts in water; steel rusts much more slowly.
+    fn step_iron(&mut self, x: i32, y: i32, rust_one_in: u32) {
         let n = Self::neighbors(x, y)[(self.rand() % 4) as usize];
-        if self.at(n.0, n.1).hot() && self.chance(6) {
-            self.set(x, y, Mat::Water);
+        if self.at(n.0, n.1) == Mat::Water && self.chance(rust_one_in) {
+            self.set(x, y, Mat::Rust);
         }
     }
 
-    fn step_iron(&mut self, x: i32, y: i32) {
-        let n = Self::neighbors(x, y)[(self.rand() % 4) as usize];
-        if self.at(n.0, n.1) == Mat::Water && self.chance(300) {
-            self.set(x, y, Mat::Rust);
+    // ----- structures -------------------------------------------------------
+
+    fn structural(m: Mat) -> bool {
+        m.kind() == Kind::Static
+    }
+
+    /// Finds solid cells that are not connected to rock resting on the base of
+    /// the world and lists them, grouped by connected piece, so they can fall.
+    fn structure_pass(&mut self) {
+        let mut seen = std::mem::take(&mut self.seen);
+        let mut stack = std::mem::take(&mut self.stack);
+        seen.fill(false);
+        // There is no real ground: only rock resting on the base of the world holds
+        // everything else up. Whatever is not connected to it falls away.
+        for x in 0..W {
+            let i = (H - 1) * W + x;
+            if self.cells[i].m == Mat::Stone && self.mask[i] == 0 {
+                seen[i] = true;
+                stack.push(i);
+            }
         }
+        while let Some(i) = stack.pop() {
+            let (x, y) = ((i % W) as i32, (i / W) as i32);
+            for (nx, ny) in Self::neighbors(x, y) {
+                if Self::inb(nx, ny) {
+                    let j = Self::idx(nx, ny);
+                    if !seen[j] && Self::structural(self.cells[j].m) {
+                        seen[j] = true;
+                        stack.push(j);
+                    }
+                }
+            }
+        }
+        // A piece that was already falling keeps its speed (sampled cells are enough).
+        let mut speeds: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+        for p in &self.falling {
+            for c in p.cells.iter().step_by(5).take(400) {
+                speeds.insert(*c, p.vy);
+            }
+        }
+        // Group what is left into pieces.
+        self.falling.clear();
+        let mut budget = 300_000usize;
+        for start in 0..W * H {
+            if seen[start] || !Self::structural(self.cells[start].m) {
+                continue;
+            }
+            let mut cells = vec![];
+            seen[start] = true;
+            stack.push(start);
+            while let Some(i) = stack.pop() {
+                cells.push(i);
+                let (x, y) = ((i % W) as i32, (i / W) as i32);
+                for (nx, ny) in Self::neighbors(x, y) {
+                    if Self::inb(nx, ny) {
+                        let j = Self::idx(nx, ny);
+                        if !seen[j] && Self::structural(self.cells[j].m) {
+                            seen[j] = true;
+                            stack.push(j);
+                        }
+                    }
+                }
+            }
+            budget = budget.saturating_sub(cells.len());
+            let vy = cells.iter().step_by(5).filter_map(|c| speeds.get(c)).fold(0.0f32, |a, b| a.max(*b));
+            let ice = cells.iter().all(|&i| self.cells[i].m == Mat::Ice);
+            self.falling.push(Piece { cells, vy, ice });
+            if budget == 0 {
+                break;
+            }
+        }
+        self.seen = seen;
+        self.stack = stack;
+    }
+
+    /// Moves every unsupported piece down (accelerating) as a rigid whole. A fast
+    /// landing bounces a little. Ice pieces float on liquids instead of sinking.
+    fn drop_structures(&mut self) {
+        let mut pieces = std::mem::take(&mut self.falling);
+        for piece in &mut pieces {
+            piece.cells.sort_unstable_by(|a, b| b.cmp(a));
+            if piece.vy >= 0.0 {
+                // Falling: gravity builds up speed; move one cell at a time while it is free.
+                piece.vy = (piece.vy + 0.35).min(3.0);
+                for _ in 0..(piece.vy.max(1.0) as i32) {
+                    if !self.piece_can_move(piece, 1) {
+                        break;
+                    }
+                    self.piece_move(piece, 1);
+                }
+                if !self.piece_can_move(piece, 1) {
+                    // Touched down. A hard landing bounces right away; a soft one settles.
+                    if piece.vy > 1.4 {
+                        piece.vy = -piece.vy * 0.34;
+                        self.rise(piece);
+                    } else {
+                        piece.cells.clear();
+                    }
+                }
+            } else {
+                self.rise(piece);
+            }
+        }
+        pieces.retain(|p| !p.cells.is_empty());
+        self.falling = pieces;
+    }
+
+    /// The upward part of a bounce.
+    fn rise(&mut self, piece: &mut Piece) {
+        let up = (-piece.vy).max(1.0) as i32;
+        for _ in 0..up {
+            if !self.piece_can_move(piece, -1) {
+                piece.vy = 0.0;
+                return;
+            }
+            self.piece_move(piece, -1);
+        }
+        piece.vy += 0.5;
+    }
+
+    fn piece_can_move(&self, piece: &Piece, dir: i32) -> bool {
+        let in_piece = |i: usize| piece.cells.binary_search_by(|p| i.cmp(p)).is_ok();
+        piece.cells.iter().all(|&i| {
+            let target = i as i64 + dir as i64 * W as i64;
+            if target < 0 {
+                return false;
+            }
+            let target = target as usize;
+            if target >= W * H {
+                // Off the bottom of the world: it simply disappears.
+                return true;
+            }
+            in_piece(target)
+                || (self.mask[target] == 0
+                    && match self.cells[target].m.kind() {
+                        Kind::Empty | Kind::Gas | Kind::Powder | Kind::Flame => true,
+                        // Ice floats on water; everything else pushes liquid aside.
+                        Kind::Liquid => !piece.ice,
+                        Kind::Static => false,
+                    })
+        })
+    }
+
+    fn piece_move(&mut self, piece: &mut Piece, dir: i32) {
+        // Cells are processed leading edge first so nothing overwrites itself.
+        let order: Vec<usize> = if dir > 0 { (0..piece.cells.len()).collect() } else { (0..piece.cells.len()).rev().collect() };
+        let mut gone = vec![];
+        for k in order {
+            let i = piece.cells[k];
+            let target = i as i64 + dir as i64 * W as i64;
+            if target as usize >= W * H {
+                self.cells[i] = EMPTY;
+                gone.push(k);
+                continue;
+            }
+            let t = target as usize;
+            self.cells.swap(i, t);
+            self.temp.swap(i, t);
+            self.cells[i].stamp = self.frame;
+            self.cells[t].stamp = self.frame;
+            piece.cells[k] = t;
+        }
+        for k in gone.into_iter().rev() {
+            piece.cells.remove(k);
+        }
+        piece.cells.sort_unstable_by(|a, b| b.cmp(a));
     }
 
     /// Premultiplied RGBA of a cell; empty cells are fully transparent so the
@@ -655,12 +1682,17 @@ impl World {
         let v = ((h >> 7) & 15) as i32 - 8;
         let f = self.frame as u32;
         let flick = ((h ^ f.wrapping_mul(2654435761)) >> 11 & 31) as i32;
+        let t = self.temp[y * W + x];
         let (r, g, b, a): (i32, i32, i32, i32) = match c.m {
             Mat::Empty => (0, 0, 0, 0),
             Mat::Sand => (226 + v, 200 + v, 124 + v, 255),
-            Mat::Water => (44 + v / 2, 124 + v + flick / 4, 224 + v, 205),
+            Mat::Water => {
+                // Warm water shifts toward a pale, reddish tone just before it boils.
+                let warm = ((t - 30.0).max(0.0) * 1.3) as i32;
+                (44 + v / 2 + warm, 124 + v + flick / 4 + warm / 3, (224 + v - warm).max(0), 205)
+            }
             Mat::Fire => (255, (80 + c.life as i32 * 3).min(235), 30, 235),
-            Mat::Steam => (205 + v, 214 + v, 230 + v, 120 + flick),
+            Mat::Steam | Mat::Cloud => (0, 0, 0, 0),
             Mat::Iron => (146 + v, 156 + v, 174 + v, 255),
             Mat::Wood => (146 + v / 2 + (y as i32 % 3) * 6, 98 + v / 2, 54, 255),
             Mat::Stone => {
@@ -668,7 +1700,9 @@ impl World {
                 let patch = (((x / 7) as u32).wrapping_mul(2654435761) ^ ((y / 7) as u32).wrapping_mul(40503)) >> 13 & 7;
                 let depth = 1.0 - (y as f32 / H as f32) * 0.35;
                 let base = (108 + patch as i32 * 2) as f32 * depth;
-                (base as i32 + v, base as i32 + v, (base * 1.1) as i32 + v, 255)
+                // Hot rock glows red before it melts.
+                let heat = (((t - 300.0) / 2.5).clamp(0.0, 150.0)) as i32;
+                (base as i32 + v + heat, base as i32 + v - heat / 3, (base * 1.1) as i32 + v - heat / 2, 255)
             }
             Mat::Brick => (184 + v, 72 + v / 2, 56, 255),
             Mat::Rust => (156 + v, 84 + v / 2, 42, 255),
@@ -677,6 +1711,54 @@ impl World {
             Mat::Lava => (255, 78 + flick * 3 + v, 12, 255),
             Mat::Ice => (176 + v, 226 + v, 248, 225),
             Mat::Gunpowder => (62 + v, 58 + v, 66 + v + (flick / 8) * 6, 255),
+            Mat::Dirt => (112 + v, 78 + v / 2, 52 + v / 2, 255),
+            Mat::Grass => (self.grass_rgb.0 + v / 2, self.grass_rgb.1 + v, self.grass_rgb.2 + v / 2, 255),
+            Mat::Leaf => {
+                // In autumn each leaf takes its own colour: red, orange or yellow.
+                let (r, g, b) = self.leaf_rgb;
+                if self.autumn > 0.25 {
+                    let tone = ((h >> 5) & 3) as i32;
+                    let (tr, tg, tb) = match tone {
+                        0 => (196, 64, 32),
+                        1 => (220, 130, 30),
+                        2 => (224, 190, 52),
+                        _ => (172, 98, 36),
+                    };
+                    let k = self.autumn;
+                    (
+                        (r as f32 + (tr - r) as f32 * k) as i32 + v,
+                        (g as f32 + (tg - g) as f32 * k) as i32 + v,
+                        (b as f32 + (tb - b) as f32 * k) as i32 + v / 2,
+                        255,
+                    )
+                } else {
+                    (r + v / 2, g + v * 2, b + v / 2, 255)
+                }
+            }
+            Mat::DeadLeaf => {
+                let tone = ((h >> 5) & 3) as i32;
+                (170 + tone * 12 + v, 100 + tone * 14 + v, 40 + v / 2, 255)
+            }
+            Mat::Branch => (104 + v / 2, 70 + v / 2, 40, 255),
+            Mat::Trunk => (112 + v / 2 + (x as i32 % 2) * 8, 78 + v / 2, 46, 255),
+            Mat::Steel => (112 + v, 134 + v, 168 + v, 255),
+            Mat::Snow => (244 + v / 3, 247 + v / 3, 252, 255),
+            Mat::Hail => (210 + v, 236 + v, 252, 255),
+            Mat::Oil => {
+                // Almost black with a rainbow sheen where it catches the light.
+                let sheen = if (x / 3 + y / 2) % 7 == 0 { 26 } else { 0 };
+                (30 + v / 2 + sheen / 2, 26 + v / 2 + sheen, 28 + v / 2 + sheen * 2, 245)
+            }
+            Mat::Smoke => (0, 0, 0, 0),
+            Mat::Shard => (196 + v, 230 + v, 246, 170 + flick),
+            Mat::Seed => (138 + v, 96 + v, 50 + v / 2, 255),
+            Mat::Sapling => (110 + v, 206 + v, 84 + v, 255),
+            Mat::Mud => (88 + v, 62 + v / 2, 42 + v / 2, 255),
+            Mat::Glass => {
+                // Translucent, with a bright streak across it.
+                let streak = if (x + y) % 11 < 2 { 40 } else { 0 };
+                (190 + v + streak, 226 + v + streak / 2, 246, 120 + streak)
+            }
         };
         let (r, g, b, a) = (r.clamp(0, 255), g.clamp(0, 255), b.clamp(0, 255), a.clamp(0, 255));
         [(r * a / 255) as u8, (g * a / 255) as u8, (b * a / 255) as u8, a as u8]
@@ -689,7 +1771,7 @@ mod tests {
 
     #[test]
     fn sand_falls_and_lands_on_stone() {
-        let mut w = World::new();
+        let mut w = World::new_static();
         for x in 0..21 {
             w.set(x, 90, Mat::Stone);
         }
@@ -703,7 +1785,7 @@ mod tests {
 
     #[test]
     fn sand_vanishes_below_the_world() {
-        let mut w = World::new();
+        let mut w = World::new_static();
         w.set(10, 5, Mat::Sand);
         for _ in 0..900 {
             w.step();
@@ -712,36 +1794,51 @@ mod tests {
     }
 
     #[test]
-    fn water_extinguishes_fire() {
-        let mut w = World::new();
+    fn water_puts_out_fire_and_warms_up() {
+        let mut w = World::new_static();
         for x in 0..20 {
             w.set(x, 100, Mat::Stone);
             w.set(x, 99, Mat::Water);
         }
-        w.set(5, 98, Mat::Fire);
-        for _ in 0..5 {
-            w.step();
+        for y in 90..100 {
+            w.set(0, y, Mat::Stone);
+            w.set(19, y, Mat::Stone);
         }
-        assert!((0..20).any(|x| (90..100).any(|y| w.at(x, y) == Mat::Steam)));
+        let base = w.temp[99 * W + 10];
+        let mut warmed = false;
+        for _ in 0..300 {
+            if w.raw(5, 98) == Mat::Empty {
+                w.set(5, 98, Mat::Fire);
+            }
+            w.step();
+            warmed |= (1..19).any(|x| w.temp[99 * W + x] > base + 8.0);
+        }
+        assert!(warmed, "water never warmed up");
     }
 
     #[test]
     fn wood_burns_to_ash() {
-        let mut w = World::new();
+        let mut w = World::new_static();
         for x in 0..10 {
             w.set(x, 100, Mat::Stone);
             w.set(x, 99, Mat::Wood);
         }
-        w.set(0, 99, Mat::Ember);
-        for _ in 0..3000 {
+        for t in 0..4000 {
+            if t < 300 {
+                for x in 0..3 {
+                    if w.raw(x, 98) == Mat::Empty {
+                        w.set(x, 98, Mat::Fire);
+                    }
+                }
+            }
             w.step();
         }
-        assert!((0..10).all(|x| w.at(x, 99) != Mat::Wood));
+        assert!((0..10).all(|x| w.at(x, 99) != Mat::Wood), "wood left");
     }
 
     #[test]
     fn water_climbs_back_up_in_u_tube() {
-        let mut w = World::new();
+        let mut w = World::new_static();
         for x in 9..=18 {
             w.set(x, 100, Mat::Stone);
         }
@@ -767,7 +1864,7 @@ mod tests {
 
     #[test]
     fn lava_meets_water_makes_stone() {
-        let mut w = World::new();
+        let mut w = World::new_static();
         for x in 0..10 {
             w.set(x, 100, Mat::Stone);
         }
@@ -788,7 +1885,7 @@ mod tests {
 
     #[test]
     fn water_drains_over_the_edge() {
-        let mut w = World::new();
+        let mut w = World::new_static();
         for x in 0..10 {
             w.set(x, 100, Mat::Stone);
             w.set(x, 99, Mat::Water);
@@ -801,7 +1898,7 @@ mod tests {
 
     #[test]
     fn lava_melts_ice() {
-        let mut w = World::new();
+        let mut w = World::new_static();
         for x in 0..10 {
             w.set(x, 100, Mat::Stone);
             w.set(x, 99, Mat::Ice);
@@ -815,7 +1912,7 @@ mod tests {
 
     #[test]
     fn gunpowder_explodes_on_fire() {
-        let mut w = World::new();
+        let mut w = World::new_static();
         for x in 0..30 {
             w.set(x, 100, Mat::Stone);
             for y in 96..100 {
@@ -830,8 +1927,286 @@ mod tests {
     }
 
     #[test]
-    fn mask_blocks_sand_and_displaces_it() {
+    fn consume_takes_the_nearest_cells_or_nothing() {
+        let mut w = World::new_static();
+        for x in 100..110 {
+            w.set(x, 200, Mat::Iron);
+        }
+        let census = w.census();
+        assert_eq!(census[Mat::Iron as usize], 10);
+        assert!(!w.consume(&[Mat::Iron], 11, (0, 0)), "not enough iron");
+        assert_eq!(w.census()[Mat::Iron as usize], 10, "nothing removed on failure");
+        assert!(w.consume(&[Mat::Iron], 4, (100, 200)));
+        assert_eq!(w.census()[Mat::Iron as usize], 6);
+        assert!((100..104).all(|x| w.raw(x, 200) == Mat::Empty), "nearest cells go first");
+    }
+
+    #[test]
+    fn clouds_blown_off_one_side_come_back_on_the_other() {
+        let mut w = World::new_static();
+        for k in 0..6 {
+            w.set(W as i32 - 3 + (k % 3), 60 + k / 3, Mat::Cloud);
+        }
+        let total = w.cells.iter().filter(|c| c.m == Mat::Cloud).count();
+        let mut reappeared = false;
+        for _ in 0..600 {
+            w.wind = 1.0;
+            w.step();
+            reappeared |= (0..40).any(|x| (50..80).any(|y| w.raw(x, y) == Mat::Cloud));
+        }
+        let now = w.cells.iter().filter(|c| c.m == Mat::Cloud).count();
+        assert!(reappeared, "cloud never reached the other side");
+        assert!(now + 2 >= total, "clouds vanished at the edge: {now} of {total} left");
+    }
+
+    #[test]
+    fn a_dry_seed_rots_into_soil_but_a_watered_one_does_not() {
+        let mut w = World::new_static();
+        for x in 100..140 {
+            for y in 300..320 {
+                w.set(x, y, Mat::Dirt);
+            }
+        }
+        // One seed on dry soil, one on soil that is already damp.
+        w.set(110, 299, Mat::Seed);
+        w.set(130, 299, Mat::Seed);
+        for x in 126..135 {
+            let i = 300 * W + x;
+            w.cells[i].life = 220;
+        }
+        // Dark and cold enough that the damp seed cannot sprout: it just has to survive.
+        w.set_phase(0.75);
+        w.day_cycle = false;
+        let mut steps = 0;
+        while w.raw(110, 299) == Mat::Seed && steps < 40_000 {
+            w.step();
+            steps += 1;
+        }
+        assert_eq!(w.raw(110, 299), Mat::Dirt, "a seed with no water around should become soil");
+        assert_eq!(w.raw(130, 299), Mat::Seed, "the damp seed should still be waiting");
+    }
+
+    #[test]
+    fn rock_settles_on_the_base_but_soil_without_rock_falls_off_the_world() {
         let mut w = World::new();
+        w.day_cycle = false;
+        // A slab of rock with soil on top, floating a little above the base.
+        for x in 100..200 {
+            for y in 400..420 {
+                w.set(x, y, Mat::Stone);
+            }
+            for y in 380..400 {
+                w.set(x, y, Mat::Dirt);
+            }
+        }
+        // A block of soil with no rock anywhere near it.
+        for x in 300..360 {
+            for y in 300..330 {
+                w.set(x, y, Mat::Dirt);
+            }
+        }
+        for _ in 0..1200 {
+            w.step();
+        }
+        let lowest = |x: i32| (0..H as i32).rev().find(|&y| w.raw(x, y) != Mat::Empty).unwrap_or(-1);
+        assert_eq!(lowest(150), H as i32 - 1, "the rock slab comes to rest on the base of the world");
+        assert_eq!(w.raw(150, H as i32 - 21), Mat::Dirt, "its soil rides down with it");
+        assert_eq!(lowest(330), -1, "soil that nothing holds falls and disappears off the bottom");
+    }
+
+    #[test]
+    fn digging_out_the_base_lets_a_lake_drain() {
+        let mut w = World::new_static();
+        w.structures_fall = true;
+        for x in 100..200 {
+            for y in H as i32 - 6..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+            for y in H as i32 - 20..H as i32 - 6 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        for y in H as i32 - 20..H as i32 {
+            w.set(99, y, Mat::Stone);
+            w.set(200, y, Mat::Stone);
+        }
+        for _ in 0..200 {
+            w.step();
+        }
+        let before = w.cells.iter().filter(|c| c.m == Mat::Water).count();
+        assert!(before > 1000, "the lake holds: {before}");
+        for x in 140..160 {
+            for y in H as i32 - 6..H as i32 {
+                w.set(x, y, Mat::Empty);
+            }
+        }
+        for _ in 0..3000 {
+            w.step();
+        }
+        let after = w.cells.iter().filter(|c| c.m == Mat::Water).count();
+        assert!(after < before / 4, "the lake should drain through the hole: {after} of {before}");
+    }
+
+    #[test]
+    fn ice_falls_like_a_solid_bounces_a_little_and_floats_on_water() {
+        let mut w = World::new();
+        w.day_cycle = false;
+        w.climate_fixed = Some(-5.0);
+        w.reset_temps();
+        // Rock on the base; a block of ice dropped from high up.
+        for x in 100..300 {
+            for y in 500..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for x in 180..200 {
+            for y in 200..210 {
+                w.set(x, y, Mat::Ice);
+            }
+        }
+        let top = |w: &World| (0..H as i32).find(|&y| w.raw(190, y) == Mat::Ice).unwrap_or(-1);
+        let (mut went_down, mut bounced) = (false, false);
+        let mut last = top(&w);
+        for _ in 0..600 {
+            w.step();
+            let now = top(&w);
+            if now > last {
+                went_down = true;
+            }
+            if went_down && now < last && now > 0 {
+                bounced = true;
+            }
+            last = now;
+        }
+        assert!(went_down, "ice should fall");
+        assert!(bounced, "a hard landing should bounce a little");
+        assert!((480..500).contains(&top(&w)), "the ice rests on the rock, top at {}", top(&w));
+
+        // A block of ice over a lake floats instead of sinking.
+        let mut w = World::new();
+        w.day_cycle = false;
+        w.climate_fixed = Some(-5.0);
+        w.reset_temps();
+        for x in 100..300 {
+            for y in 520..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for y in 440..520 {
+            w.set(99, y, Mat::Stone);
+            w.set(300, y, Mat::Stone);
+        }
+        for x in 100..300 {
+            for y in 480..520 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        for x in 180..200 {
+            for y in 400..410 {
+                w.set(x, y, Mat::Ice);
+            }
+        }
+        for _ in 0..800 {
+            w.step();
+        }
+        let ice_y = (0..H as i32).find(|&y| w.raw(190, y) == Mat::Ice).unwrap_or(-1);
+        assert!(ice_y > 0 && ice_y < 500, "ice should float near the surface, y = {ice_y}");
+    }
+
+    #[test]
+    fn cold_snow_is_pressed_into_ice() {
+        let mut w = World::new_static();
+        w.climate_fixed = Some(-18.0);
+        w.reset_temps();
+        for x in 100..140 {
+            w.set(x, 300, Mat::Stone);
+            for y in 288..300 {
+                w.set(x, y, Mat::Snow);
+            }
+        }
+        for _ in 0..6000 {
+            w.step();
+        }
+        assert!(w.cells.iter().any(|c| c.m == Mat::Ice), "deep cold snow never compacted into ice");
+    }
+
+    #[test]
+    fn a_warm_cloud_keeps_its_water_a_cold_one_rains_and_a_freezing_one_hails() {
+        let run = |air: f32| {
+            let mut w = World::new_static();
+            w.climate_fixed = Some(air);
+            w.reset_temps();
+            w.day_cycle = false;
+            for x in 400..440 {
+                for y in 60..70 {
+                    w.set(x, y, Mat::Cloud);
+                }
+            }
+            let mut counts = (0, 0, 0);
+            for _ in 0..1200 {
+                w.step();
+                let c = |m| w.cells.iter().filter(|c| c.m == m).count();
+                counts = (counts.0.max(c(Mat::Water)), counts.1.max(c(Mat::Snow)), counts.2.max(c(Mat::Hail)));
+            }
+            counts
+        };
+        let warm = run(20.0);
+        let cold = run(2.0);
+        let freezing = run(-30.0);
+        assert_eq!((warm.0, warm.1, warm.2), (0, 0, 0), "a warm cloud must not rain: {warm:?}");
+        assert!(cold.0 > 0, "a cool cloud rains: {cold:?}");
+        assert!(freezing.2 > 0, "a very cold cloud drops hail: {freezing:?}");
+    }
+
+    #[test]
+    fn the_sun_warms_the_ground_most_nearby_and_the_air_cools_with_altitude() {
+        let mut w = World::new();
+        w.set_phase(0.25);
+        w.day_cycle = false;
+        for x in 0..W as i32 {
+            for y in 300..320 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        w.reset_temps();
+        for _ in 0..600 {
+            w.step();
+        }
+        let under = w.temp_c(W as i32 / 2, 300);
+        let far = w.temp_c(40, 300);
+        assert!(under > far + 1.5, "ground under the sun {under} vs far {far}");
+        assert!(w.temp_c(300, 80) < w.temp_c(300, 290) - 10.0, "air should cool with altitude");
+    }
+
+    #[test]
+    fn rain_slants_with_the_wind() {
+        let mut w = World::new_static();
+        w.wind = 0.9;
+        let mut sx = 0.0;
+        let mut n = 0;
+        for k in 0..200 {
+            w.set(400, 100 + (k % 3), Mat::Water);
+        }
+        let mut positions: Vec<i32> = vec![];
+        for _ in 0..40 {
+            w.step();
+            w.wind = 0.9;
+        }
+        for i in 0..W * H {
+            if w.cells[i].m == Mat::Water {
+                positions.push((i % W) as i32);
+            }
+        }
+        for p in positions {
+            sx += (p - 400) as f32;
+            n += 1;
+        }
+        assert!(n > 0 && sx / n as f32 > 1.0, "drops should drift right, mean offset {}", sx / n.max(1) as f32);
+    }
+
+    #[test]
+    fn mask_blocks_sand_and_displaces_it() {
+        let mut w = World::new_static();
         for x in 0..20 {
             w.set(x, 100, Mat::Stone);
         }
@@ -849,10 +2224,396 @@ mod tests {
     }
 
     #[test]
+    fn every_biome_makes_a_playable_world() {
+        for biome in Biome::ALL {
+            let mut w = World::new();
+            let (e, x) = w.generate_biome(5, biome);
+            assert_eq!(w.biome, biome);
+            assert_eq!(w.raw(e.0, e.1), Mat::Empty, "{biome:?} entry blocked");
+            assert_eq!(w.raw(x.0, x.1), Mat::Empty, "{biome:?} exit blocked");
+            let water = w.cells.iter().filter(|c| c.m == Mat::Water).count();
+            let solid = w.cells.iter().filter(|c| c.m.is_hard()).count();
+            assert!(solid > 50_000, "{biome:?} has no ground");
+            match biome {
+                Biome::Sea => assert!(water > 20_000, "the sea is missing: {water}"),
+                Biome::Mountain => assert!(w.cells.iter().any(|c| c.m == Mat::Ice), "no snow caps"),
+                Biome::Countryside => assert!(w.cells.iter().any(|c| c.m == Mat::Trunk), "no trees"),
+            }
+        }
+    }
+
+    #[test]
     fn generator_makes_ground() {
-        let mut w = World::new();
+        let mut w = World::new_static();
         let (e, _) = w.generate(7);
         assert_eq!(w.at(e.0, e.1), Mat::Empty);
         assert!(w.at(200, H as i32 - 2) == Mat::Stone);
+    }
+}
+
+#[cfg(test)]
+mod profile {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn where_the_time_goes() {
+        let mut w = World::new();
+        w.generate_biome(3, Biome::Countryside);
+        w.paint(300, 200, 40, Mat::Water);
+        w.paint(600, 150, 40, Mat::Sand);
+        for _ in 0..60 {
+            w.step();
+        }
+        let time = |name: &str, mut f: Box<dyn FnMut(&mut World)>, w: &mut World| {
+            let t = Instant::now();
+            for _ in 0..20 {
+                f(w);
+            }
+            eprintln!("PROF {name}: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 20.0);
+        };
+        time("full step", Box::new(|w| w.step()), &mut w);
+        time("thermal pass", Box::new(|w| w.thermal_pass()), &mut w);
+        time("level water", Box::new(|w| w.level_water()), &mut w);
+        time("structure pass", Box::new(|w| w.structure_pass()), &mut w);
+        time("census", Box::new(|w| {
+            let _ = w.census();
+        }), &mut w);
+    }
+}
+
+#[cfg(test)]
+mod perf {
+    use super::*;
+
+    #[test]
+    fn step_cost_report() {
+        let mut w = World::new();
+        w.generate(3);
+        // A busy scene: a big lake of water and a sand avalanche.
+        w.paint(300, 200, 40, Mat::Water);
+        w.paint(600, 150, 40, Mat::Sand);
+        let t = std::time::Instant::now();
+        for _ in 0..60 {
+            w.step();
+        }
+        eprintln!("PERF busy: {:.2} ms/step", t.elapsed().as_secs_f64() * 1000.0 / 60.0);
+        for _ in 0..600 {
+            w.step();
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..60 {
+            w.step();
+        }
+        eprintln!("PERF settled: {:.2} ms/step", t.elapsed().as_secs_f64() * 1000.0 / 60.0);
+    }
+}
+
+#[cfg(test)]
+mod science {
+    use super::*;
+
+    fn floor(w: &mut World, y: i32, x0: i32, x1: i32) {
+        for x in x0..x1 {
+            w.set(x, y, Mat::Stone);
+        }
+    }
+
+    fn count(w: &World, m: Mat) -> usize {
+        w.cells.iter().filter(|c| c.m == m).count()
+    }
+
+    #[test]
+    fn fire_heats_water_until_it_boils() {
+        let mut w = World::new_static();
+        floor(&mut w, 300, 100, 140);
+        for x in 100..140 {
+            for y in 280..300 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        for _ in 0..600 {
+            // A steady flame under the pot.
+            for x in 110..130 {
+                if w.raw(x, 299) != Mat::Fire {
+                    w.set(x, 299, Mat::Fire);
+                }
+            }
+            w.step();
+        }
+        assert!(count(&w, Mat::Steam) + count(&w, Mat::Cloud) > 0, "no steam");
+    }
+
+    #[test]
+    fn steam_condenses_into_cloud_which_rains() {
+        let mut w = World::new_static();
+        // Cool air: a cloud warmed by the sun would keep its water.
+        w.climate_fixed = Some(2.0);
+        w.reset_temps();
+        // Steam released high up in the cold layer.
+        for x in 300..340 {
+            for y in 20..30 {
+                w.set(x, y, Mat::Steam);
+            }
+        }
+        let mut seen_cloud = false;
+        let mut seen_rain = false;
+        for _ in 0..3000 {
+            w.step();
+            seen_cloud |= count(&w, Mat::Cloud) > 0;
+            seen_rain |= count(&w, Mat::Water) > 0;
+        }
+        assert!(seen_cloud, "never made a cloud");
+        assert!(seen_rain, "never rained");
+    }
+
+    #[test]
+    fn rock_melts_into_lava_after_a_long_time_in_fire() {
+        let mut w = World::new_static();
+        floor(&mut w, 300, 100, 140);
+        for x in 100..140 {
+            for y in 290..300 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for _ in 0..4000 {
+            for x in 100..140 {
+                if w.raw(x, 289) == Mat::Empty {
+                    w.set(x, 289, Mat::Fire);
+                }
+            }
+            w.step();
+        }
+        assert!(count(&w, Mat::Lava) > 0, "rock never melted");
+    }
+
+    #[test]
+    fn iron_ash_and_fire_make_steel() {
+        let mut w = World::new_static();
+        floor(&mut w, 300, 100, 120);
+        for x in 105..115 {
+            w.set(x, 299, Mat::Iron);
+            if x % 2 == 0 {
+                w.set(x, 298, Mat::Ash);
+            }
+        }
+        for _ in 0..800 {
+            for x in (105..115).filter(|x| x % 2 == 1) {
+                if w.raw(x, 298) == Mat::Empty {
+                    w.set(x, 298, Mat::Fire);
+                }
+            }
+            w.step();
+        }
+        assert!(count(&w, Mat::Steel) > 0, "no steel");
+    }
+
+    #[test]
+    fn rust_heated_in_fire_becomes_iron_again() {
+        let mut w = World::new_static();
+        floor(&mut w, 300, 100, 120);
+        for x in 105..115 {
+            w.set(x, 299, Mat::Rust);
+        }
+        for _ in 0..600 {
+            for x in 104..116 {
+                if w.raw(x, 298) == Mat::Empty {
+                    w.set(x, 298, Mat::Fire);
+                }
+            }
+            w.step();
+        }
+        assert!(count(&w, Mat::Iron) > 0, "rust never turned back into iron");
+    }
+
+    #[test]
+    fn steel_rusts_slower_than_iron() {
+        let mut w = World::new_static();
+        floor(&mut w, 300, 100, 160);
+        for x in 100..160 {
+            for y in 280..300 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        // Fence the pool so the water stays.
+        for y in 280..300 {
+            w.set(99, y, Mat::Stone);
+            w.set(160, y, Mat::Stone);
+        }
+        for x in 105..125 {
+            w.set(x, 299, Mat::Iron);
+        }
+        for x in 135..155 {
+            w.set(x, 299, Mat::Steel);
+        }
+        for _ in 0..1500 {
+            w.step();
+        }
+        let rusty_iron = (105..125).filter(|&x| w.raw(x, 299) == Mat::Rust).count();
+        let rusty_steel = (135..155).filter(|&x| w.raw(x, 299) == Mat::Rust).count();
+        assert!(rusty_iron > rusty_steel, "iron {rusty_iron} vs steel {rusty_steel}");
+    }
+
+    #[test]
+    fn seed_on_wet_soil_grows_into_a_tree() {
+        let mut w = World::new_static();
+        floor(&mut w, 320, 100, 220);
+        for x in 100..220 {
+            for y in 310..320 {
+                w.set(x, y, Mat::Dirt);
+            }
+        }
+        // A puddle next to the seed feeds the tree.
+        for x in 126..160 {
+            for y in 295..310 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        for y in 290..310 {
+            w.set(125, y, Mat::Stone);
+            w.set(160, y, Mat::Stone);
+        }
+        w.set(122, 309, Mat::Seed);
+        w.set(123, 309, Mat::Water);
+        w.set(124, 309, Mat::Water);
+        for _ in 0..4000 {
+            w.step();
+        }
+        let wood = count(&w, Mat::Wood) + count(&w, Mat::Trunk) + count(&w, Mat::Sapling);
+        assert!(wood >= 6, "tree only {wood} cells tall");
+    }
+
+    #[test]
+    fn floating_stone_falls_but_attached_stone_stays() {
+        let mut w = World::new();
+        floor(&mut w, H as i32 - 1, 0, W as i32);
+        // Attached pillar.
+        for y in 400..H as i32 - 1 {
+            w.set(50, y, Mat::Stone);
+        }
+        // Floating slab.
+        for x in 200..230 {
+            for y in 200..206 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for _ in 0..800 {
+            w.step();
+        }
+        assert_eq!(w.raw(50, 400), Mat::Stone, "attached stone moved");
+        assert_eq!(w.raw(215, 200), Mat::Empty, "slab still floating");
+        assert_eq!(w.raw(215, H as i32 - 2), Mat::Stone, "slab did not land");
+    }
+
+    #[test]
+    fn flowing_water_erodes_bare_soil() {
+        let mut w = World::new_static();
+        floor(&mut w, 340, 100, 300);
+        for x in 100..300 {
+            for y in 320..340 {
+                w.set(x, y, Mat::Dirt);
+            }
+        }
+        let before = count(&w, Mat::Dirt);
+        for t in 0..3000 {
+            if t < 2500 {
+                for x in 100..108 {
+                    w.set(x, 250, Mat::Water);
+                }
+            }
+            w.step();
+        }
+        assert!(count(&w, Mat::Dirt) < before, "no erosion");
+        assert!(count(&w, Mat::Mud) + count(&w, Mat::Sand) > 0 || count(&w, Mat::Dirt) < before);
+    }
+
+    #[test]
+    fn grass_protects_soil() {
+        let mut w = World::new_static();
+        floor(&mut w, 340, 100, 300);
+        for x in 100..300 {
+            for y in 320..340 {
+                w.set(x, y, Mat::Dirt);
+            }
+            for y in 318..320 {
+                w.set(x, y, Mat::Grass);
+            }
+        }
+        for t in 0..1500 {
+            if t < 1200 {
+                for x in 100..108 {
+                    w.set(x, 250, Mat::Water);
+                }
+            }
+            w.step();
+        }
+        assert_eq!(count(&w, Mat::Mud), 0, "grass should shield the soil below");
+    }
+
+    #[test]
+    fn ash_and_water_make_soil() {
+        let mut w = World::new_static();
+        floor(&mut w, 300, 99, 121);
+        for y in 290..300 {
+            w.set(99, y, Mat::Stone);
+            w.set(120, y, Mat::Stone);
+        }
+        for x in 100..120 {
+            w.set(x, 299, Mat::Ash);
+            w.set(x, 298, Mat::Water);
+        }
+        for _ in 0..3000 {
+            w.step();
+        }
+        assert!(count(&w, Mat::Dirt) + count(&w, Mat::Mud) > 0, "ash never turned to soil");
+    }
+}
+
+#[cfg(test)]
+mod glass {
+    use super::*;
+
+    #[test]
+    fn sand_fuses_into_glass_in_the_heat() {
+        let mut w = World::new_static();
+        for x in 100..140 {
+            w.set(x, 300, Mat::Stone);
+            for y in 292..300 {
+                w.set(x, y, Mat::Sand);
+            }
+        }
+        for _ in 0..2500 {
+            for x in 100..140 {
+                if w.raw(x, 291) == Mat::Empty {
+                    w.set(x, 291, Mat::Fire);
+                }
+            }
+            w.step();
+        }
+        assert!(w.cells.iter().any(|c| c.m == Mat::Glass), "sand never became glass");
+    }
+
+    #[test]
+    fn shattered_glass_leaves_shards_that_become_sand() {
+        let mut w = World::new_static();
+        for x in 100..110 {
+            for y in 290..300 {
+                w.set(x, y, Mat::Glass);
+            }
+        }
+        w.set(105, 300, Mat::Stone);
+        w.shatter(105, 297);
+        let shards = w.cells.iter().filter(|c| c.m == Mat::Shard).count();
+        assert!(shards > 0, "no shards");
+        for x in 100..120 {
+            w.set(x, 300, Mat::Stone);
+            for y in 296..300 {
+                w.set(x, y, Mat::Shard);
+            }
+        }
+        for _ in 0..12_000 {
+            w.step();
+        }
+        assert!(w.cells.iter().any(|c| c.m == Mat::Sand), "shards never turned back into sand");
     }
 }

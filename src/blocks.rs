@@ -8,13 +8,13 @@ use rapier2d::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 /// Size of one stud in cells; blocks snap to this grid.
-pub const STUD: f32 = 12.0;
+pub const STUD: f32 = 10.0;
 /// Cells per physics meter.
-const PX_PER_M: f32 = 20.0;
+const PX_PER_M: f32 = 16.0;
 const TILE: i32 = 16;
 /// Weld breaking limits (per step): force and torque impulses.
-const BREAK_FORCE: f32 = 2.8;
-const BREAK_TORQUE: f32 = 6.0;
+const BREAK_FORCE: f32 = 1.3;
+const BREAK_TORQUE: f32 = 3.2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockKind {
@@ -24,6 +24,10 @@ pub enum BlockKind {
     Beam,
     Cube,
     Wheel,
+    SteelBeam,
+    Glass,
+    GlassHalf,
+    GlassChip,
 }
 
 pub struct Spec {
@@ -34,28 +38,91 @@ pub struct Spec {
     pub round: bool,
     pub density: f32,
     pub color: (u8, u8, u8),
+    /// How hard a weld to this block is to break (relative).
+    pub strength: f32,
+    pub blurb: &'static str,
 }
 
 impl BlockKind {
-    pub const ALL: [BlockKind; 6] =
-        [BlockKind::Brick, BlockKind::Long, BlockKind::Plank, BlockKind::Beam, BlockKind::Cube, BlockKind::Wheel];
+    /// What a block is made of in the world: cells of these materials are used up
+    /// when it is built, and `units` is how many.
+    pub fn cost(self) -> (&'static [Mat], u32) {
+        let s = self.spec();
+        let area = if s.round { std::f32::consts::PI * (s.w / 2.0).powi(2) } else { s.w * s.h };
+        let units = (area * 0.25).ceil() as u32;
+        let from: &'static [Mat] = match self {
+            BlockKind::Brick | BlockKind::Long => &[Mat::Dirt],
+            BlockKind::Plank => &[Mat::Wood, Mat::Trunk, Mat::Branch],
+            BlockKind::Beam | BlockKind::Wheel => &[Mat::Iron],
+            BlockKind::SteelBeam => &[Mat::Steel],
+            BlockKind::Cube => &[Mat::Stone],
+            BlockKind::Glass | BlockKind::GlassHalf | BlockKind::GlassChip => &[Mat::Sand],
+        };
+        (from, units)
+    }
 
+    /// Every kind, including the smaller pieces glass breaks into.
+    pub const ALL: [BlockKind; 10] = [
+        BlockKind::Brick,
+        BlockKind::Long,
+        BlockKind::Plank,
+        BlockKind::Beam,
+        BlockKind::SteelBeam,
+        BlockKind::Cube,
+        BlockKind::Glass,
+        BlockKind::Wheel,
+        BlockKind::GlassHalf,
+        BlockKind::GlassChip,
+    ];
+
+    /// What can be picked from the palette.
+    pub const PLACEABLE: [BlockKind; 8] = [
+        BlockKind::Brick,
+        BlockKind::Long,
+        BlockKind::Plank,
+        BlockKind::Beam,
+        BlockKind::SteelBeam,
+        BlockKind::Cube,
+        BlockKind::Glass,
+        BlockKind::Wheel,
+    ];
+
+    pub fn is_glass(self) -> bool {
+        matches!(self, BlockKind::Glass | BlockKind::GlassHalf | BlockKind::GlassChip)
+    }
+
+    /// Stable numbers used in save files (never reorder).
     pub fn id(self) -> u8 {
-        Self::ALL.iter().position(|k| *k == self).unwrap() as u8
+        match self {
+            BlockKind::Brick => 0,
+            BlockKind::Long => 1,
+            BlockKind::Plank => 2,
+            BlockKind::Beam => 3,
+            BlockKind::Cube => 4,
+            BlockKind::Wheel => 5,
+            BlockKind::SteelBeam => 6,
+            BlockKind::Glass => 7,
+            BlockKind::GlassHalf => 8,
+            BlockKind::GlassChip => 9,
+        }
     }
 
     pub fn from_id(id: u8) -> Option<BlockKind> {
-        Self::ALL.get(id as usize).copied()
+        Self::ALL.iter().copied().find(|k| k.id() == id)
     }
 
     pub fn spec(self) -> Spec {
         match self {
-            BlockKind::Brick => Spec { name: "Brique", w: 24.0, h: 12.0, mat: Mat::Brick, round: false, density: 1.0, color: (205, 62, 52) },
-            BlockKind::Long => Spec { name: "Longue", w: 48.0, h: 12.0, mat: Mat::Brick, round: false, density: 1.0, color: (58, 112, 214) },
-            BlockKind::Plank => Spec { name: "Planche", w: 72.0, h: 6.0, mat: Mat::Wood, round: false, density: 0.6, color: (176, 124, 72) },
-            BlockKind::Beam => Spec { name: "Poutre", w: 96.0, h: 12.0, mat: Mat::Iron, round: false, density: 1.8, color: (150, 160, 178) },
-            BlockKind::Cube => Spec { name: "Cube", w: 24.0, h: 24.0, mat: Mat::Stone, round: false, density: 1.4, color: (120, 120, 134) },
-            BlockKind::Wheel => Spec { name: "Roue", w: 28.0, h: 28.0, mat: Mat::Iron, round: true, density: 1.2, color: (60, 62, 74) },
+            BlockKind::Brick => Spec { name: "Brique", w: 20.0, h: 10.0, mat: Mat::Brick, round: false, density: 1.0, color: (205, 62, 52), strength: 1.2, blurb: "Plastique solide" },
+            BlockKind::Long => Spec { name: "Longue", w: 40.0, h: 10.0, mat: Mat::Brick, round: false, density: 1.0, color: (58, 112, 214), strength: 1.2, blurb: "Brique de 4 plots" },
+            BlockKind::Plank => Spec { name: "Planche", w: 60.0, h: 5.0, mat: Mat::Wood, round: false, density: 0.6, color: (176, 124, 72), strength: 0.25, blurb: "Bois : léger, fragile, brûle" },
+            BlockKind::Beam => Spec { name: "Poutre fer", w: 80.0, h: 10.0, mat: Mat::Iron, round: false, density: 1.8, color: (150, 160, 178), strength: 2.0, blurb: "Fer : rouille dans l'eau" },
+            BlockKind::SteelBeam => Spec { name: "Poutre acier", w: 80.0, h: 10.0, mat: Mat::Steel, round: false, density: 1.8, color: (96, 128, 186), strength: 4.0, blurb: "Acier : fer + carbone, 2x plus solide" },
+            BlockKind::Glass => Spec { name: "Verre", w: 20.0, h: 10.0, mat: Mat::Glass, round: false, density: 0.9, color: (176, 222, 244), strength: 0.5, blurb: "Sable fondu : la voiture le brise" },
+            BlockKind::GlassHalf => Spec { name: "Verre (moitié)", w: 10.0, h: 10.0, mat: Mat::Glass, round: false, density: 0.9, color: (176, 222, 244), strength: 0.4, blurb: "Un morceau de verre : encore un coup et il se brise" },
+            BlockKind::GlassChip => Spec { name: "Verre (éclat)", w: 5.0, h: 5.0, mat: Mat::Glass, round: false, density: 0.9, color: (176, 222, 244), strength: 0.3, blurb: "Dernier morceau : il va se briser en éclats" },
+            BlockKind::Cube => Spec { name: "Cube", w: 20.0, h: 20.0, mat: Mat::Stone, round: false, density: 1.4, color: (120, 120, 134), strength: 1.4, blurb: "Pierre : lourde" },
+            BlockKind::Wheel => Spec { name: "Roue", w: 24.0, h: 24.0, mat: Mat::Iron, round: true, density: 1.2, color: (60, 62, 74), strength: 1.0, blurb: "Roule librement" },
         }
     }
 }
@@ -65,19 +132,27 @@ fn rot(a: f32, v: Vec2) -> Vec2 {
     vec2(v.x * c - v.y * s, v.x * s + v.y * c)
 }
 
+static NEXT_UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
 #[derive(Clone)]
 pub struct Block {
+    /// Stable identity (indices shift when blocks are removed).
+    pub uid: u32,
     pub kind: BlockKind,
     pub pos: Vec2,
     pub angle: f32,
     /// Accumulated fire damage (wood only).
     pub heat: u16,
+    /// Corrosion 0..1 (iron and steel in water).
+    pub rust: f32,
+    /// Steps before this block can take another blow (glass breaks in stages).
+    pub hurt: u16,
     pub body: Option<RigidBodyHandle>,
 }
 
 impl Block {
     pub fn new(kind: BlockKind, pos: Vec2, angle: f32) -> Self {
-        Block { kind, pos, angle, heat: 0, body: None }
+        Block { uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed), kind, pos, angle, heat: 0, rust: 0.0, hurt: 0, body: None }
     }
 
     pub fn spec(&self) -> Spec {
@@ -147,9 +222,12 @@ impl Block {
     }
 }
 
-/// Stamps the blocks into the world's solid mask.
-pub fn stamp_blocks(world: &mut World, blocks: &[Block]) {
-    world.begin_blocks(blocks.iter().map(|b| b.spec().mat).collect());
+/// Stamps blocks and free beams into the world's solid mask. Mask ids are the
+/// block indices first, then the beams (offset by the number of blocks).
+pub fn stamp_all(world: &mut World, blocks: &[Block], members: &[Member]) {
+    let mut mats: Vec<Mat> = blocks.iter().map(|b| b.spec().mat).collect();
+    mats.extend(members.iter().map(|m| m.mat.mat()));
+    world.begin_blocks(mats);
     for (id, b) in blocks.iter().enumerate() {
         let (x0, y0, x1, y1) = b.bounds();
         for y in y0..=y1 {
@@ -160,7 +238,22 @@ pub fn stamp_blocks(world: &mut World, blocks: &[Block]) {
             }
         }
     }
+    for (k, m) in members.iter().enumerate() {
+        let (x0, y0, x1, y1) = m.bounds();
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                if m.covers(vec2(x as f32 + 0.5, y as f32 + 0.5)) {
+                    world.mark_block(x, y, blocks.len() + k);
+                }
+            }
+        }
+    }
     world.end_blocks();
+}
+
+#[allow(dead_code)]
+pub fn stamp_blocks(world: &mut World, blocks: &[Block]) {
+    stamp_all(world, blocks, &[]);
 }
 
 /// Can a block of this shape sit here without cutting into terrain or others?
@@ -177,7 +270,8 @@ pub fn placement_ok(world: &World, blocks: &[Block], cand: &Block, ignore: Optio
             }
         }
     }
-    blocks.iter().enumerate().all(|(i, b)| Some(i) == ignore || cand.gap(b) > -1.0)
+    // Flush is fine (gap 0); any real overlap is refused.
+    blocks.iter().enumerate().all(|(i, b)| Some(i) == ignore || cand.gap(b) > -0.2)
 }
 
 /// Snap a block so its corner sits on the stud grid.
@@ -190,17 +284,363 @@ pub fn snap(kind: BlockKind, rot90: u8, mouse: Vec2) -> Vec2 {
     vec2(((mouse.x - w / 2.0) / STUD).round() * STUD + w / 2.0, ((mouse.y - h / 2.0) / STUD).round() * STUD + h / 2.0)
 }
 
+/// Distance (cells) within which a block is pulled onto its neighbours.
+pub const CLIP: f32 = 6.0;
+
+fn quarter_turns(angle: f32) -> Option<i32> {
+    let q = angle / std::f32::consts::FRAC_PI_2;
+    ((q - q.round()).abs() < 0.02).then(|| q.round() as i32)
+}
+
+/// Half-size of an axis-aligned block, or None for round / tilted blocks.
+fn flat_half(kind: BlockKind, angle: f32) -> Option<Vec2> {
+    let s = kind.spec();
+    if s.round {
+        return None;
+    }
+    let turns = quarter_turns(angle)?;
+    Some(if turns.rem_euclid(2) == 0 { vec2(s.w / 2.0, s.h / 2.0) } else { vec2(s.h / 2.0, s.w / 2.0) })
+}
+
+/// Magnetic clip: pull a block flush against nearby blocks (on top, below or
+/// beside) and onto their stud grid, like Lego bricks snapping together.
+pub fn clip(blocks: &[Block], kind: BlockKind, angle: f32, pos: Vec2) -> Vec2 {
+    let Some(h) = flat_half(kind, angle) else { return pos };
+    let mut best: Option<(f32, Vec2)> = None;
+    let mut consider = |cost: f32, p: Vec2| {
+        if best.map_or(true, |b| cost < b.0) {
+            best = Some((cost, p));
+        }
+    };
+    // Align an edge to the neighbour's stud grid when it is close enough.
+    let stud = |edge: f32, origin: f32| {
+        let snapped = origin + ((edge - origin) / STUD).round() * STUD;
+        if (snapped - edge).abs() < CLIP { snapped } else { edge }
+    };
+    for b in blocks {
+        let Some(bh) = flat_half(b.kind, b.angle) else { continue };
+        let (bl, br, bt, bb) = (b.pos.x - bh.x, b.pos.x + bh.x, b.pos.y - bh.y, b.pos.y + bh.y);
+        let (l, r, t, bot) = (pos.x - h.x, pos.x + h.x, pos.y - h.y, pos.y + h.y);
+        let x_overlap = r > bl + 1.0 && l < br - 1.0;
+        let y_overlap = bot > bt + 1.0 && t < bb - 1.0;
+        if x_overlap {
+            // On top of it.
+            if (bot - bt).abs() < CLIP {
+                consider((bot - bt).abs(), vec2(stud(l, bl) + h.x, bt - h.y));
+            }
+            // Hanging below it.
+            if (t - bb).abs() < CLIP {
+                consider((t - bb).abs(), vec2(stud(l, bl) + h.x, bb + h.y));
+            }
+        }
+        if y_overlap {
+            if (r - bl).abs() < CLIP {
+                consider((r - bl).abs(), vec2(bl - h.x, stud(t, bt) + h.y));
+            }
+            if (l - br).abs() < CLIP {
+                consider((l - br).abs(), vec2(br + h.x, stud(t, bt) + h.y));
+            }
+        }
+    }
+    best.map_or(pos, |b| b.1)
+}
+
 pub fn block_at(blocks: &[Block], p: Vec2) -> Option<usize> {
     blocks.iter().rposition(|b| b.covers(p))
 }
 
 // ---------------------------------------------------------------------------
+// Free beams (bridge-builder members)
+
+/// Longest beam that can be drawn in one go, in cells.
+pub const MEMBER_MAX_LEN: f32 = 110.0;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemberMat {
+    Wood,
+    Iron,
+    Steel,
+}
+
+impl MemberMat {
+    pub const ALL: [MemberMat; 3] = [MemberMat::Wood, MemberMat::Iron, MemberMat::Steel];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            MemberMat::Wood => "Bois",
+            MemberMat::Iron => "Fer",
+            MemberMat::Steel => "Acier",
+        }
+    }
+
+    pub fn mat(self) -> Mat {
+        match self {
+            MemberMat::Wood => Mat::Wood,
+            MemberMat::Iron => Mat::Iron,
+            MemberMat::Steel => Mat::Steel,
+        }
+    }
+
+    pub fn id(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_id(id: u8) -> MemberMat {
+        Self::ALL.iter().copied().find(|m| m.id() == id).unwrap_or(MemberMat::Wood)
+    }
+
+    /// Mass per area: wood is light, iron and steel are heavy.
+    pub fn density(self) -> f32 {
+        match self {
+            MemberMat::Wood => 0.6,
+            MemberMat::Iron => 1.8,
+            MemberMat::Steel => 1.9,
+        }
+    }
+
+    /// Force (impulse per step) the beam can carry before it breaks.
+    pub fn limit(self) -> f32 {
+        match self {
+            MemberMat::Wood => 0.8,
+            MemberMat::Iron => 2.4,
+            MemberMat::Steel => 5.0,
+        }
+    }
+
+    pub fn thickness(self) -> f32 {
+        match self {
+            MemberMat::Wood => 4.0,
+            MemberMat::Iron => 3.5,
+            MemberMat::Steel => 3.5,
+        }
+    }
+
+    pub fn color(self) -> (u8, u8, u8) {
+        match self {
+            MemberMat::Wood => (176, 124, 72),
+            MemberMat::Iron => (150, 160, 178),
+            MemberMat::Steel => (96, 128, 186),
+        }
+    }
+
+    /// Cells of these materials are used up to build a beam.
+    pub fn cost_from(self) -> &'static [Mat] {
+        match self {
+            MemberMat::Wood => &[Mat::Wood, Mat::Trunk, Mat::Branch],
+            MemberMat::Iron => &[Mat::Iron],
+            MemberMat::Steel => &[Mat::Steel],
+        }
+    }
+
+    pub fn cost(self, len: f32) -> u32 {
+        (len * self.thickness() * 0.25).ceil() as u32
+    }
+}
+
+/// A straight beam pinned at both ends: the building piece of a truss bridge.
+#[derive(Clone)]
+pub struct Member {
+    pub uid: u32,
+    pub mat: MemberMat,
+    pub a: Anchor,
+    pub b: Anchor,
+    /// Current end positions (follow the physics once it runs).
+    pub p0: Vec2,
+    pub p1: Vec2,
+    /// Load as a fraction of what the beam can take (1.0 = breaks).
+    pub stress: f32,
+    over: u8,
+    body: Option<RigidBodyHandle>,
+    joints: Vec<ImpulseJointHandle>,
+}
+
+static NEXT_MEMBER_UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+impl Member {
+    pub fn new(mat: MemberMat, a: Anchor, b: Anchor, p0: Vec2, p1: Vec2) -> Self {
+        Member {
+            uid: NEXT_MEMBER_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            mat,
+            a,
+            b,
+            p0,
+            p1,
+            stress: 0.0,
+            over: 0,
+            body: None,
+            joints: vec![],
+        }
+    }
+
+    pub fn len(&self) -> f32 {
+        (self.p1 - self.p0).length()
+    }
+
+    pub fn center(&self) -> Vec2 {
+        (self.p0 + self.p1) * 0.5
+    }
+
+    pub fn angle(&self) -> f32 {
+        let d = self.p1 - self.p0;
+        d.y.atan2(d.x)
+    }
+
+    /// A copy with no physics state (and the beam back at its start position).
+    pub fn fresh(&self) -> Member {
+        Member { body: None, joints: vec![], over: 0, stress: 0.0, ..self.clone() }
+    }
+
+    pub fn covers(&self, p: Vec2) -> bool {
+        self.distance_to(p) <= self.mat.thickness() / 2.0
+    }
+
+    pub fn distance_to(&self, p: Vec2) -> f32 {
+        let ab = self.p1 - self.p0;
+        let t = if ab.length_squared() > 0.0 { ((p - self.p0).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) } else { 0.0 };
+        (self.p0 + ab * t - p).length()
+    }
+
+    pub fn bounds(&self) -> (i32, i32, i32, i32) {
+        let r = self.mat.thickness() + 1.0;
+        (
+            ((self.p0.x.min(self.p1.x) - r).floor() as i32).max(0),
+            ((self.p0.y.min(self.p1.y) - r).floor() as i32).max(0),
+            ((self.p0.x.max(self.p1.x) + r).ceil() as i32).min(W as i32 - 1),
+            ((self.p0.y.max(self.p1.y) + r).ceil() as i32).min(H as i32 - 1),
+        )
+    }
+}
+
+/// Where a click lands on the structure: another beam's end, a block, or the ground.
+pub fn node_at(world: &World, blocks: &[Block], members: &[Member], p: Vec2) -> Option<Anchor> {
+    let mut best: Option<(f32, Anchor)> = None;
+    for m in members {
+        for (end, q) in [(0u8, m.p0), (1u8, m.p1)] {
+            let d = (q - p).length();
+            if d < 9.0 && best.map_or(true, |b| d < b.0) {
+                best = Some((d, Anchor::End { uid: m.uid, end }));
+            }
+        }
+    }
+    if let Some((_, a)) = best {
+        return Some(a);
+    }
+    anchor_at(world, blocks, p)
+}
+
+/// Cables and beams share the same snapping for the ground and blocks.
+
+// ---------------------------------------------------------------------------
+// Cables
+
+/// What one end of a cable is fixed to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Anchor {
+    Ground(Vec2),
+    /// A point on a block, in the block's own frame.
+    Block { uid: u32, local: Vec2 },
+    /// One end (0 or 1) of a free beam: a node other beams can pin to.
+    End { uid: u32, end: u8 },
+    /// Pinned to nothing (a loose end).
+    Free(Vec2),
+}
+
+#[derive(Clone)]
+pub struct Cable {
+    pub a: Anchor,
+    pub b: Anchor,
+    /// Rope length in cells (a little longer than the distance between the ends).
+    pub len: f32,
+    /// Points along the cable for drawing: both anchors and every link between.
+    pub pts: Vec<Vec2>,
+    pub snapped: bool,
+    links: Vec<RigidBodyHandle>,
+    joints: Vec<ImpulseJointHandle>,
+}
+
+impl Cable {
+    pub fn new(a: Anchor, b: Anchor, chord: f32) -> Self {
+        Cable { a, b, len: chord * 1.06, pts: vec![], snapped: false, links: vec![], joints: vec![] }
+    }
+
+    /// A copy with no physics state, as it was before the simulation started.
+    pub fn fresh(&self) -> Cable {
+        let mut c = Cable::new(self.a, self.b, self.len / 1.06);
+        c.len = self.len;
+        c
+    }
+
+    pub fn reset_runtime(&mut self) {
+        self.links.clear();
+        self.joints.clear();
+        self.pts.clear();
+        self.snapped = false;
+    }
+
+    pub fn has_body(&self) -> bool {
+        !self.links.is_empty()
+    }
+
+    pub fn attached_to(&self, uid: u32) -> bool {
+        matches!(self.a, Anchor::Block { uid: u, .. } if u == uid) || matches!(self.b, Anchor::Block { uid: u, .. } if u == uid)
+    }
+
+    /// Distance from `p` to the drawn cable (or `f32::MAX` before it has a shape).
+    pub fn distance_to(&self, p: Vec2) -> f32 {
+        let mut best = f32::MAX;
+        for w in self.pts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let ab = b - a;
+            let t = if ab.length_squared() > 0.0 { ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) } else { 0.0 };
+            best = best.min((a + ab * t - p).length());
+        }
+        best
+    }
+}
+
+pub fn anchor_world(anchor: &Anchor, blocks: &[Block], members: &[Member]) -> Option<Vec2> {
+    match anchor {
+        Anchor::Ground(p) | Anchor::Free(p) => Some(*p),
+        Anchor::Block { uid, local } => blocks.iter().find(|b| b.uid == *uid).map(|b| b.pos + rot(b.angle, *local)),
+        Anchor::End { uid, end } => members.iter().find(|m| m.uid == *uid).map(|m| if *end == 0 { m.p0 } else { m.p1 }),
+    }
+}
+
+/// Where a click would attach a cable: onto a block, or onto solid ground nearby.
+pub fn anchor_at(world: &World, blocks: &[Block], p: Vec2) -> Option<Anchor> {
+    if let Some(i) = block_at(blocks, p) {
+        let b = &blocks[i];
+        return Some(Anchor::Block { uid: b.uid, local: rot(-b.angle, p - b.pos) });
+    }
+    for r in 0..=4 {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let (x, y) = (p.x as i32 + dx, p.y as i32 + dy);
+                if world.raw(x, y).is_hard() {
+                    return Some(Anchor::Ground(vec2(x as f32 + 0.5, y as f32 + 0.5)));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Cables snap when a link carries more than this impulse in one step.
+const CABLE_BREAK: f32 = 6.0;
+const CABLE_SEGMENT: f32 = 8.0;
+const CABLE_STIFFNESS: f32 = 2600.0;
+const CABLE_DAMPING: f32 = 14.0;
 
 pub struct Physics {
     w: PhysicsWorld,
     terrain: RigidBodyHandle,
     tiles: HashMap<(i32, i32), (u64, Vec<ColliderHandle>)>,
+    /// Strength of each weld (a rusty or wooden block breaks its welds sooner).
+    welds: HashMap<ImpulseJointHandle, f32>,
+    last_vel: HashMap<RigidBodyHandle, Vector>,
+    impacts: Vec<u32>,
 }
+
 
 fn v2(v: Vec2) -> Vector {
     Vector::new(v.x / PX_PER_M, v.y / PX_PER_M)
@@ -212,7 +652,7 @@ impl Physics {
         w.gravity = Vector::new(0.0, 16.0);
         w.integration_parameters.dt = 1.0 / 60.0;
         let terrain = w.insert_body(RigidBodyBuilder::fixed());
-        Physics { w, terrain, tiles: HashMap::new() }
+        Physics { w, terrain, tiles: HashMap::new(), welds: HashMap::new(), last_vel: HashMap::new(), impacts: vec![] }
     }
 
     pub fn add_block(&mut self, b: &mut Block) {
@@ -239,6 +679,244 @@ impl Physics {
         }
     }
 
+    fn member_end_local(m: &Member, end: u8) -> Vector {
+        let h = m.len() / 2.0 / PX_PER_M;
+        Vector::new(if end == 0 { -h } else { h }, 0.0)
+    }
+
+    fn add_member_body(&mut self, m: &mut Member) {
+        let len = m.len().max(2.0);
+        let th = m.mat.thickness();
+        let rb = RigidBodyBuilder::dynamic()
+            .translation(v2(m.center()))
+            .rotation(m.angle())
+            .can_sleep(false)
+            .ccd_enabled(true)
+            .linear_damping(0.05)
+            .angular_damping(0.4);
+        let col = ColliderBuilder::cuboid(len / 2.0 / PX_PER_M, th / 2.0 / PX_PER_M)
+            .density(m.mat.density())
+            .friction(0.7)
+            .collision_groups(InteractionGroups { memberships: Group::GROUP_3, filter: Group::GROUP_1, test_mode: InteractionTestMode::And });
+        let (h, _) = self.w.insert(rb, col);
+        m.body = Some(h);
+    }
+
+    /// Pins both ends of a beam to whatever they are fixed to.
+    fn pin_member(&mut self, blocks: &[Block], members: &mut [Member], idx: usize) {
+        let me = members[idx].clone();
+        let Some(mb) = me.body else { return };
+        let mut handles = vec![];
+        for (end, anchor) in [(0u8, me.a), (1u8, me.b)] {
+            let target: Option<(RigidBodyHandle, Vector)> = match anchor {
+                Anchor::Ground(w) => Some((self.terrain, v2(w))),
+                Anchor::Block { uid, local } => blocks.iter().find(|b| b.uid == uid).and_then(|b| Some((b.body?, v2(local)))),
+                Anchor::End { uid, end: e } => members.iter().find(|o| o.uid == uid).and_then(|o| Some((o.body?, Self::member_end_local(o, e)))),
+                Anchor::Free(_) => None,
+            };
+            if let Some((tb, tl)) = target {
+                let j = RevoluteJointBuilder::new().local_anchor1(tl).local_anchor2(Self::member_end_local(&me, end)).contacts_enabled(false);
+                handles.push(self.w.insert_impulse_joint(tb, mb, j));
+            }
+        }
+        members[idx].joints.extend(handles);
+    }
+
+    pub fn build_members(&mut self, blocks: &[Block], members: &mut [Member]) {
+        for m in members.iter_mut() {
+            self.add_member_body(m);
+        }
+        for i in 0..members.len() {
+            self.pin_member(blocks, members, i);
+        }
+    }
+
+    pub fn add_member(&mut self, blocks: &[Block], members: &mut [Member], idx: usize) {
+        if members[idx].body.is_none() {
+            self.add_member_body(&mut members[idx]);
+        }
+        self.pin_member(blocks, members, idx);
+    }
+
+    pub fn remove_member(&mut self, m: &mut Member) {
+        if let Some(h) = m.body.take() {
+            self.w.remove_body(h);
+        }
+        m.joints.clear();
+    }
+
+    /// Follow the physics, measure how hard each beam is loaded, and snap the
+    /// ones that are overloaded. Returns where beams broke.
+    pub fn update_members(&mut self, world: &World, members: &mut Vec<Member>) -> Vec<Vec2> {
+        // Wooden beams float too.
+        let dt = self.w.integration_parameters.dt;
+        let g = self.w.gravity.y;
+        for m in members.iter() {
+            let Some(h) = m.body else { continue };
+            let n = ((m.len() / 6.0) as usize).max(2);
+            let (mut wet, mut c) = (0, Vec2::ZERO);
+            for k in 0..n {
+                let p = m.p0 + (m.p1 - m.p0) * ((k as f32 + 0.5) / n as f32);
+                let water = |dx: f32, dy: f32| world.raw((p.x + dx) as i32, (p.y + dy) as i32) == Mat::Water;
+                if water(0.0, 0.0) || water(-4.0, 0.0) || water(4.0, 0.0) || water(0.0, 4.0) {
+                    wet += 1;
+                    c += p;
+                }
+            }
+            let rb = &mut self.w.bodies[h];
+            if wet > 0 {
+                let f = wet as f32 / n as f32;
+                let area = m.len() * m.mat.thickness() / (PX_PER_M * PX_PER_M);
+                rb.apply_impulse_at_point(Vector::new(0.0, -area * f * g * dt), v2(c / wet as f32), true);
+                rb.set_linear_damping(0.05 + 2.5 * f);
+            } else {
+                rb.set_linear_damping(0.05);
+            }
+        }
+        let index: HashMap<RigidBodyHandle, usize> = members.iter().enumerate().filter_map(|(i, m)| m.body.map(|b| (b, i))).collect();
+        let mut ratio = vec![0.0f32; members.len()];
+        for (_, j) in self.w.impulse_joints() {
+            let f = (j.impulses.x * j.impulses.x + j.impulses.y * j.impulses.y).sqrt();
+            for body in [j.body1(), j.body2()] {
+                if let Some(&i) = index.get(&body) {
+                    ratio[i] = ratio[i].max(f / members[i].mat.limit());
+                }
+            }
+        }
+        let mut broke = vec![];
+        for (i, m) in members.iter_mut().enumerate() {
+            let Some(h) = m.body else { continue };
+            let rb = &self.w.bodies[h];
+            let (t, a) = (rb.translation(), rb.rotation().angle());
+            let c = vec2(t.x, t.y) * PX_PER_M;
+            let half = rot(a, vec2(m.len() / 2.0, 0.0));
+            m.p0 = c - half;
+            m.p1 = c + half;
+            m.stress = ratio[i];
+            m.over = if ratio[i] > 1.0 { m.over + 1 } else { 0 };
+            if m.over >= 3 {
+                broke.push(i);
+            }
+        }
+        let mut spots = vec![];
+        for &i in broke.iter().rev() {
+            let mut m = members.remove(i);
+            spots.push(m.center());
+            self.remove_member(&mut m);
+        }
+        spots
+    }
+
+    /// Weight on a beam at `point` for one step (a car driving over it).
+    pub fn press_member(&mut self, m: &Member, point: Vec2, weight_kg: f32) {
+        let Some(h) = m.body else { return };
+        let impulse = Vector::new(0.0, weight_kg * self.w.gravity.y * self.w.integration_parameters.dt);
+        self.w.bodies[h].apply_impulse_at_point(impulse, v2(point), true);
+    }
+
+    /// Builds the rope as a chain of light beads joined by rope joints.
+    pub fn add_cable(&mut self, blocks: &[Block], c: &mut Cable) {
+        let (Some(pa), Some(pb)) = (anchor_world(&c.a, blocks, &[]), anchor_world(&c.b, blocks, &[])) else { return };
+        // Long chains of light beads need more solver passes to hold a heavy load.
+        self.w.integration_parameters.num_solver_iterations = 12;
+        let n = ((c.len / CABLE_SEGMENT) as usize).clamp(4, 70);
+        let link_len = c.len / (n as f32 + 1.0);
+        // Slack gives a parabola; start from the hanging shape so nothing snaps at first.
+        let chord = (pb - pa).length();
+        let sag = 0.4 * (chord * (c.len - chord).max(0.0)).sqrt();
+        let mut bodies: Vec<RigidBodyHandle> = vec![];
+        for i in 1..=n {
+            let u = i as f32 / (n as f32 + 1.0);
+            let p = pa + (pb - pa) * u + vec2(0.0, sag * 4.0 * u * (1.0 - u));
+            let rb = RigidBodyBuilder::dynamic().translation(v2(p)).can_sleep(false).linear_damping(0.6).angular_damping(2.0);
+            let col = ColliderBuilder::ball(1.4 / PX_PER_M)
+                .density(12.0)
+                .friction(0.6)
+                .collision_groups(InteractionGroups { memberships: Group::GROUP_2, filter: Group::GROUP_1, test_mode: InteractionTestMode::And });
+            let (h, _) = self.w.insert(rb, col);
+            bodies.push(h);
+        }
+        let end_body = |this: &Physics, a: &Anchor| -> Option<(RigidBodyHandle, Vector)> {
+            match a {
+                Anchor::Ground(w) => Some((this.terrain, v2(*w))),
+                Anchor::Block { uid, local } => {
+                    let b = blocks.iter().find(|b| b.uid == *uid)?;
+                    Some((b.body?, v2(*local)))
+                }
+                _ => None,
+            }
+        };
+        let (Some((ha, la)), Some((hb, lb))) = (end_body(self, &c.a), end_body(self, &c.b)) else { return };
+        let rest = link_len / PX_PER_M;
+        let mut joints = vec![];
+        let chain: Vec<(RigidBodyHandle, Vector)> =
+            std::iter::once((ha, la)).chain(bodies.iter().map(|h| (*h, Vector::new(0.0, 0.0)))).chain(std::iter::once((hb, lb))).collect();
+        for pair in chain.windows(2) {
+            // An elastic rope: springs between the beads let it stretch a little.
+            let j = SpringJointBuilder::new(rest, CABLE_STIFFNESS, CABLE_DAMPING).local_anchor1(pair[0].1).local_anchor2(pair[1].1).contacts_enabled(false);
+            joints.push(self.w.insert_impulse_joint(pair[0].0, pair[1].0, j));
+        }
+        c.links = bodies;
+        c.joints = joints;
+        c.snapped = false;
+    }
+
+    pub fn remove_cable(&mut self, c: &mut Cable) {
+        for h in c.links.drain(..) {
+            self.w.remove_body(h);
+        }
+        c.joints.clear();
+    }
+
+    /// Copies bead positions into each cable and snaps the ones pulled too hard.
+    pub fn sync_cables(&mut self, blocks: &[Block], cables: &mut [Cable]) {
+        for c in cables.iter_mut() {
+            if !c.has_body() {
+                continue;
+            }
+            let mut broke = vec![];
+            for (k, h) in c.joints.iter().enumerate() {
+                if let Some(j) = self.w.impulse_joints.get(*h) {
+                    let f = (j.impulses.x * j.impulses.x + j.impulses.y * j.impulses.y).sqrt();
+                    if f > CABLE_BREAK {
+                        broke.push(k);
+                    }
+                }
+            }
+            for k in broke {
+                self.w.remove_impulse_joint(c.joints[k]);
+                c.snapped = true;
+            }
+            let mut pts = vec![];
+            if let Some(p) = anchor_world(&c.a, blocks, &[]) {
+                pts.push(p);
+            }
+            for h in &c.links {
+                let t = self.w.bodies[*h].translation();
+                pts.push(vec2(t.x, t.y) * PX_PER_M);
+            }
+            if let Some(p) = anchor_world(&c.b, blocks, &[]) {
+                pts.push(p);
+            }
+            c.pts = pts;
+        }
+    }
+
+    /// Two planks or beams of the same kind laid end to end in a straight line
+    /// act as one long rigid beam.
+    fn end_to_end(a: &Block, b: &Block) -> bool {
+        let beam = |k: BlockKind| matches!(k, BlockKind::Plank | BlockKind::Beam | BlockKind::SteelBeam);
+        if a.kind != b.kind || !beam(a.kind) {
+            return false;
+        }
+        let dir = rot(a.angle, vec2(1.0, 0.0));
+        let parallel = (a.angle - b.angle).sin().abs() < 0.03;
+        let d = b.pos - a.pos;
+        let along = d.dot(dir);
+        let lateral = (d - dir * along).length();
+        parallel && lateral < 1.5 && (along.abs() - a.spec().w).abs() < 2.0
+    }
+
     fn weld(&mut self, a: &Block, b: &Block) {
         let (Some(ha), Some(hb)) = (a.body, b.body) else { return };
         let mid = (a.pos + b.pos) * 0.5;
@@ -248,7 +926,10 @@ impl Physics {
             .local_frame1(Pose::new(Vector::new(la.x, la.y), 0.0))
             .local_frame2(Pose::new(Vector::new(lb.x, lb.y), a.angle - b.angle))
             .contacts_enabled(false);
-        self.w.insert_impulse_joint(ha, hb, joint);
+        let h = self.w.insert_impulse_joint(ha, hb, joint);
+        let q = |b: &Block| b.spec().strength * (1.0 - 0.7 * b.rust.clamp(0.0, 1.0));
+        let bonus = if Self::end_to_end(a, b) { 1.5 } else { 1.0 };
+        self.welds.insert(h, q(a).min(q(b)) * bonus);
     }
 
     /// Weld block `i` to every touching block (wheels stay free).
@@ -278,15 +959,53 @@ impl Physics {
         p
     }
 
+    #[cfg(test)]
     pub fn joint_count(&self) -> usize {
         self.w.impulse_joints().count()
     }
 
+    /// How close each block's welds are to breaking, 0 (idle) to 1 (about to snap).
+    pub fn stress(&self, blocks: &[Block]) -> HashMap<u32, f32> {
+        let mut out: HashMap<u32, f32> = HashMap::new();
+        for (h, j) in self.w.impulse_joints() {
+            let k = self.welds.get(&h).copied().unwrap_or(1.0);
+            let f = (j.impulses.x * j.impulses.x + j.impulses.y * j.impulses.y).sqrt() / (BREAK_FORCE * k);
+            let t = j.impulses.z.abs() / (BREAK_TORQUE * k);
+            let ratio = f.max(t);
+            for body in [j.body1(), j.body2()] {
+                if let Some(b) = blocks.iter().find(|b| b.body == Some(body)) {
+                    let e = out.entry(b.uid).or_insert(0.0);
+                    *e = e.max(ratio);
+                }
+            }
+        }
+        out
+    }
+
     /// Largest (force, torque) load currently carried by a weld.
+    #[cfg(test)]
     pub fn max_joint_load(&self) -> (f32, f32) {
         self.w.impulse_joints().fold((0.0, 0.0), |(f, t): (f32, f32), (_, j)| {
             (f.max((j.impulses.x * j.impulses.x + j.impulses.y * j.impulses.y).sqrt()), t.max(j.impulses.z.abs()))
         })
+    }
+
+    /// Press down on a block at `point` (cells) with `weight_kg` for one step,
+    /// for example under a car wheel.
+    pub fn press(&mut self, b: &Block, point: Vec2, weight_kg: f32) {
+        let Some(h) = b.body else { return };
+        let rb = &mut self.w.bodies[h];
+        let impulse = Vector::new(0.0, weight_kg * self.w.gravity.y * self.w.integration_parameters.dt);
+        rb.apply_impulse_at_point(impulse, v2(point), true);
+    }
+
+    /// A hammer blow: a small shove at `point`, away from it.
+    pub fn knock(&mut self, b: &Block, point: Vec2, dir: Vec2) {
+        let Some(h) = b.body else { return };
+        let rb = &mut self.w.bodies[h];
+        let m = rb.mass();
+        let impulse = Vector::new(dir.x, dir.y) * (m * 3.0);
+        rb.apply_impulse_at_point(impulse, v2(point), true);
     }
 
     /// Push bodies away from an explosion.
@@ -305,21 +1024,112 @@ impl Physics {
         }
     }
 
+    /// Water holds things up: the more of a body is under water, the harder it is
+    /// pushed up. Light things (wood) float, heavy ones (iron, stone) sink.
+    fn buoyancy(&mut self, world: &World, blocks: &[Block]) {
+        let dt = self.w.integration_parameters.dt;
+        let g = self.w.gravity.y;
+        for b in blocks {
+            let Some(h) = b.body else { continue };
+            let s = b.spec();
+            let half = b.half();
+            let reach = half.length() + 2.0;
+            let (nx, ny) = (((s.w / 4.0) as i32).max(2), ((s.h / 4.0) as i32).max(2));
+            let (mut wet, mut total) = (0, 0);
+            let mut centroid = Vec2::ZERO;
+            for i in 0..nx {
+                for j in 0..ny {
+                    let local = vec2(((i as f32 + 0.5) / nx as f32 - 0.5) * s.w, ((j as f32 + 0.5) / ny as f32 - 0.5) * s.h);
+                    if s.round && local.length() > s.w / 2.0 {
+                        continue;
+                    }
+                    total += 1;
+                    let p = b.pos + rot(b.angle, local);
+                    let in_water = |dx: f32| world.raw((p.x + dx) as i32, p.y as i32) == Mat::Water;
+                    if in_water(-reach) || in_water(reach) || in_water(0.0) {
+                        wet += 1;
+                        centroid += p;
+                    }
+                }
+            }
+            let rb = &mut self.w.bodies[h];
+            if total == 0 || wet == 0 {
+                rb.set_linear_damping(0.05);
+                rb.set_angular_damping(0.3);
+                continue;
+            }
+            let f = wet as f32 / total as f32;
+            let area = s.w * s.h / (PX_PER_M * PX_PER_M);
+            let lift = 1.0 * area * f * g * dt;
+            rb.apply_impulse_at_point(Vector::new(0.0, -lift), v2(centroid / wet as f32), true);
+            rb.set_linear_damping(0.05 + 2.5 * f);
+            rb.set_angular_damping(0.3 + 2.0 * f);
+        }
+    }
+
+    /// Glass blocks that took a hard knock this step (something fast hit them, or
+    /// they stopped suddenly after a fall).
+    pub fn take_impacts(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.impacts)
+    }
+
+    fn detect_impacts(&mut self, blocks: &[Block]) {
+        let vel = |this: &Physics, b: &Block| b.body.map(|h| this.w.bodies[h].linvel());
+        let speeds: Vec<Option<Vector>> = blocks.iter().map(|b| vel(self, b)).collect();
+        for (i, g) in blocks.iter().enumerate() {
+            if !g.kind.is_glass() {
+                continue;
+            }
+            let (Some(h), Some(v)) = (g.body, speeds[i]) else { continue };
+            // It was moving fast and has just been stopped or deflected.
+            if let Some(prev) = self.last_vel.get(&h) {
+                let dv = Vector::new(v.x - prev.x, v.y - prev.y);
+                if (dv.x * dv.x + dv.y * dv.y).sqrt() > 4.6 {
+                    self.impacts.push(g.uid);
+                    continue;
+                }
+            }
+            // A fast object slams into it.
+            for (j, o) in blocks.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                let Some(vo) = speeds[j] else { continue };
+                let rel = Vector::new(vo.x - v.x, vo.y - v.y);
+                if (rel.x * rel.x + rel.y * rel.y).sqrt() > 4.6 && g.gap(o) < 1.5 {
+                    self.impacts.push(g.uid);
+                    break;
+                }
+            }
+        }
+        self.last_vel.clear();
+        for (b, v) in blocks.iter().zip(speeds) {
+            if let (Some(h), Some(v)) = (b.body, v) {
+                self.last_vel.insert(h, v);
+            }
+        }
+    }
+
     pub fn step(&mut self, world: &World, blocks: &mut [Block]) {
         self.refresh_tiles(world, blocks);
+        self.buoyancy(world, blocks);
         self.w.step();
+        self.detect_impacts(blocks);
 
+        let welds = &self.welds;
         let broken: Vec<ImpulseJointHandle> = self
             .w
             .impulse_joints()
-            .filter(|(_, j)| {
+            .filter(|(h, j)| {
+                let k = welds.get(h).copied().unwrap_or(1.0);
                 let f = (j.impulses.x * j.impulses.x + j.impulses.y * j.impulses.y).sqrt();
-                f > BREAK_FORCE || j.impulses.z.abs() > BREAK_TORQUE
+                f > BREAK_FORCE * k || j.impulses.z.abs() > BREAK_TORQUE * k
             })
             .map(|(h, _)| h)
             .collect();
         for h in broken {
             self.w.remove_impulse_joint(h);
+            self.welds.remove(&h);
         }
 
         for b in blocks.iter_mut() {
@@ -423,7 +1233,7 @@ mod tests {
     use super::*;
 
     fn ground() -> World {
-        let mut w = World::new();
+        let mut w = World::new_static();
         for x in 0..640 {
             for y in 300..320 {
                 w.set(x, y, Mat::Stone);
@@ -446,8 +1256,8 @@ mod tests {
         let mut blocks = vec![Block::new(BlockKind::Brick, vec2(100.0, 250.0), 0.0)];
         let mut phys = Physics::build(&mut blocks);
         settle(&mut world, &mut blocks, &mut phys, 240);
-        // Resting on y = 300: centre at 300 - 6.
-        assert!((blocks[0].pos.y - 294.0).abs() < 2.0, "y = {}", blocks[0].pos.y);
+        // Resting on y = 300: centre at 300 - 5.
+        assert!((blocks[0].pos.y - 295.0).abs() < 2.0, "y = {}", blocks[0].pos.y);
         assert!(blocks[0].angle.abs() < 0.05);
     }
 
@@ -469,16 +1279,16 @@ mod tests {
     fn welded_stack_stays_together() {
         let mut world = ground();
         let mut blocks = vec![
-            Block::new(BlockKind::Brick, vec2(100.0, 294.0), 0.0),
-            Block::new(BlockKind::Brick, vec2(100.0, 282.0), 0.0),
-            Block::new(BlockKind::Brick, vec2(100.0, 270.0), 0.0),
+            Block::new(BlockKind::Brick, vec2(100.0, 295.0), 0.0),
+            Block::new(BlockKind::Brick, vec2(100.0, 285.0), 0.0),
+            Block::new(BlockKind::Brick, vec2(100.0, 275.0), 0.0),
         ];
         let mut phys = Physics::build(&mut blocks);
         settle(&mut world, &mut blocks, &mut phys, 300);
         for (i, b) in blocks.iter().enumerate() {
             assert!((b.pos.x - 100.0).abs() < 2.0, "block {i} x = {}", b.pos.x);
         }
-        assert!((blocks[2].pos.y - 270.0).abs() < 2.0, "top y = {}", blocks[2].pos.y);
+        assert!((blocks[2].pos.y - 275.0).abs() < 2.0, "top y = {}", blocks[2].pos.y);
     }
 
     #[test]
@@ -492,11 +1302,11 @@ mod tests {
         }
         let mut blocks = vec![];
         for i in 0..6 {
-            blocks.push(Block::new(BlockKind::Long, vec2(180.0 + 24.0 + 48.0 * i as f32, 294.0), 0.0));
+            blocks.push(Block::new(BlockKind::Long, vec2(180.0 + 20.0 + 40.0 * i as f32, 295.0), 0.0));
         }
         // Heavy cubes in the middle.
         for k in 0..4 {
-            blocks.push(Block::new(BlockKind::Cube, vec2(300.0 + 24.0 * k as f32, 270.0), 0.0));
+            blocks.push(Block::new(BlockKind::Cube, vec2(300.0 + 20.0 * k as f32, 270.0), 0.0));
         }
         let mut phys = Physics::build(&mut blocks);
         let mut peak = (0.0f32, 0.0f32);
@@ -519,11 +1329,11 @@ mod tests {
         }
         let mut blocks = vec![];
         for i in 0..6 {
-            blocks.push(Block::new(BlockKind::Long, vec2(180.0 + 24.0 + 48.0 * i as f32, 294.0), 0.0));
+            blocks.push(Block::new(BlockKind::Long, vec2(180.0 + 20.0 + 40.0 * i as f32, 295.0), 0.0));
         }
         for k in 0..5 {
             for row in 0..4 {
-                blocks.push(Block::new(BlockKind::Cube, vec2(276.0 + 24.0 * k as f32, 276.0 - 24.0 * row as f32), 0.0));
+                blocks.push(Block::new(BlockKind::Cube, vec2(270.0 + 20.0 * k as f32, 280.0 - 20.0 * row as f32), 0.0));
             }
         }
         let mut phys = Physics::build(&mut blocks);
@@ -544,26 +1354,262 @@ mod tests {
         let mut blocks = vec![Block::new(BlockKind::Wheel, vec2(100.0, 280.0), 0.0)];
         let mut phys = Physics::build(&mut blocks);
         settle(&mut world, &mut blocks, &mut phys, 200);
-        assert!((blocks[0].pos.y - 286.0).abs() < 2.0, "y = {}", blocks[0].pos.y);
+        assert!((blocks[0].pos.y - 288.0).abs() < 2.0, "y = {}", blocks[0].pos.y);
+    }
+
+    /// Drives a car across a gap bridged with the given blocks.
+    fn cross_bridge(kind: crate::car::ModelKind, spans: Vec<Block>) -> (bool, f32, usize, usize, (f32, f32)) {
+        use crate::car::{Car, Fate};
+        let mut world = ground();
+        for x in 300..400 {
+            for y in 300..320 {
+                world.set(x, y, Mat::Empty);
+            }
+        }
+        let mut blocks = spans;
+        // Cut a recess under every block end so the deck sits flush with the ground.
+        for b in &blocks {
+            let (x0, y0, x1, y1) = b.bounds();
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    if b.covers(vec2(x as f32 + 0.5, y as f32 + 0.5)) {
+                        world.set(x, y, Mat::Empty);
+                    }
+                }
+            }
+        }
+        let mut phys = Physics::build(&mut blocks);
+        let joints = phys.joint_count();
+        let mut car = Car::new(kind, (230, 276));
+        let mut made_it = false;
+        let mut peak = (0.0f32, 0.0f32);
+        for _ in 0..3000 {
+            world.step();
+            car.step(&world, None);
+            let weight = kind.model().mass;
+            for (pt, share) in car.loads.clone() {
+                if let Some(id) = world.block_at_cell(pt.x.floor() as i32, pt.y.floor() as i32) {
+                    let b = blocks[id].clone();
+                    phys.press(&b, pt, weight * share);
+                }
+            }
+            phys.step(&world, &mut blocks);
+            let l = phys.max_joint_load();
+            peak = (peak.0.max(l.0), peak.1.max(l.1));
+            stamp_blocks(&mut world, &blocks);
+            if car.p.x > 450.0 {
+                made_it = true;
+                break;
+            }
+            if car.fate != Fate::Driving {
+                break;
+            }
+        }
+        (made_it, car.p.x, joints, phys.joint_count(), peak)
+    }
+
+    #[test]
+    fn bridges_depend_on_the_material() {
+        use crate::car::ModelKind;
+        let planks = |n: usize| -> Vec<Block> {
+            (0..n).map(|i| Block::new(BlockKind::Plank, vec2(295.0 + 30.0 + 60.0 * i as f32, 302.5), 0.0)).collect()
+        };
+        let beams = |n: usize| -> Vec<Block> {
+            (0..n).map(|i| Block::new(BlockKind::Beam, vec2(260.0 + 40.0 + 80.0 * i as f32, 305.0), 0.0)).collect()
+        };
+        let longs = |n: usize| -> Vec<Block> {
+            (0..n).map(|i| Block::new(BlockKind::Long, vec2(290.0 + 20.0 + 40.0 * i as f32, 305.0), 0.0)).collect()
+        };
+        let steel = |n: usize| -> Vec<Block> {
+            (0..n).map(|i| Block::new(BlockKind::SteelBeam, vec2(260.0 + 40.0 + 80.0 * i as f32, 305.0), 0.0)).collect()
+        };
+        // A light car crosses everything; a heavy truck snaps a wooden bridge
+        // but not iron or steel beams.
+        assert!(cross_bridge(ModelKind::Buggy, planks(2)).0, "buggy on planks");
+        assert!(cross_bridge(ModelKind::Buggy, beams(2)).0, "buggy on beams");
+        assert!(cross_bridge(ModelKind::Buggy, longs(3)).0, "buggy on bricks");
+        let truck_planks = cross_bridge(ModelKind::Truck, planks(2));
+        assert!(truck_planks.3 < truck_planks.2, "wooden bridge should snap under a truck: {truck_planks:?}");
+        assert!(cross_bridge(ModelKind::Truck, beams(2)).0, "truck on iron beams");
+        assert!(cross_bridge(ModelKind::Truck, steel(2)).0, "truck on steel beams");
+    }
+
+    #[test]
+    fn cable_holds_a_hanging_block() {
+        let mut world = ground();
+        let mut blocks = vec![Block::new(BlockKind::Cube, vec2(200.0, 250.0), 0.0)];
+        let uid = blocks[0].uid;
+        let mut cables = vec![Cable::new(Anchor::Ground(vec2(200.0, 100.0)), Anchor::Block { uid, local: vec2(0.0, -10.0) }, 140.0)];
+        let mut phys = Physics::build(&mut blocks);
+        phys.add_cable(&blocks, &mut cables[0]);
+        for _ in 0..600 {
+            phys.step(&world, &mut blocks);
+            phys.sync_cables(&blocks, &mut cables);
+            stamp_blocks(&mut world, &blocks);
+            world.step();
+        }
+        assert!(!cables[0].snapped, "cable snapped under a light cube");
+        assert!(blocks[0].pos.y < 281.0, "cube fell to the ground: y = {}", blocks[0].pos.y);
+        assert!(cables[0].pts.len() > 5);
+        assert!(cables[0].distance_to(vec2(200.0, 180.0)) < 8.0, "cable should hang straight down");
+    }
+
+    #[test]
+    fn cable_ropes_over_a_pulley_free_span() {
+        // A rope strung between two posts sags but does not pass through the ground.
+        let mut world = ground();
+        let mut blocks: Vec<Block> = vec![];
+        let mut cable = Cable::new(Anchor::Ground(vec2(100.0, 250.0)), Anchor::Ground(vec2(220.0, 250.0)), 120.0);
+        let mut phys = Physics::build(&mut blocks);
+        phys.add_cable(&blocks, &mut cable);
+        for _ in 0..400 {
+            phys.step(&world, &mut blocks);
+            phys.sync_cables(&blocks, std::slice::from_mut(&mut cable));
+            world.step();
+        }
+        let lowest = cable.pts.iter().map(|p| p.y).fold(0.0f32, f32::max);
+        assert!(lowest > 252.0, "rope should sag, lowest = {lowest}");
+        assert!(lowest < 300.0, "rope went through the ground, lowest = {lowest}");
+    }
+
+    #[test]
+    fn a_falling_glass_block_registers_an_impact_but_a_gentle_one_does_not() {
+        let mut world = ground();
+        let mut blocks = vec![Block::new(BlockKind::Glass, vec2(100.0, 120.0), 0.0), Block::new(BlockKind::Glass, vec2(300.0, 294.0), 0.0)];
+        let (high, low) = (blocks[0].uid, blocks[1].uid);
+        let mut phys = Physics::build(&mut blocks);
+        let mut hit = vec![];
+        for _ in 0..240 {
+            phys.step(&world, &mut blocks);
+            hit.extend(phys.take_impacts());
+            stamp_blocks(&mut world, &blocks);
+        }
+        assert!(hit.contains(&high), "a glass block falling 180 cells should shatter on landing");
+        assert!(!hit.contains(&low), "a block set down gently must survive");
+    }
+
+    /// Hangs `cubes` stacked cubes from one beam; returns (beam survived, peak stress).
+    fn hang_from_beam(mat: MemberMat, cubes: usize) -> (bool, f32) {
+        let mut world = ground();
+        let mut blocks: Vec<Block> = (0..cubes).map(|k| Block::new(BlockKind::Cube, vec2(140.0, 190.0 + 20.0 * k as f32), 0.0)).collect();
+        let top = blocks[0].uid;
+        let mut phys = Physics::build(&mut blocks);
+        let mut members = vec![Member::new(mat, Anchor::Ground(vec2(100.0, 100.0)), Anchor::Block { uid: top, local: vec2(0.0, -10.0) }, vec2(100.0, 100.0), vec2(140.0, 180.0))];
+        phys.build_members(&blocks, &mut members);
+        let mut peak = 0.0f32;
+        for _ in 0..400 {
+            phys.step(&world, &mut blocks);
+            phys.update_members(&world, &mut members);
+            if let Some(m) = members.first() {
+                peak = peak.max(m.stress);
+            }
+            stamp_all(&mut world, &blocks, &members);
+        }
+        (!members.is_empty(), peak)
+    }
+
+    #[test]
+    fn beams_carry_loads_according_to_their_material() {
+        let wood_light = hang_from_beam(MemberMat::Wood, 1);
+        let wood_heavy = hang_from_beam(MemberMat::Wood, 3);
+        let iron_heavy = hang_from_beam(MemberMat::Iron, 3);
+        let steel_heavy = hang_from_beam(MemberMat::Steel, 3);
+        eprintln!("BEAM wood1 {wood_light:?} wood3 {wood_heavy:?} iron3 {iron_heavy:?} steel3 {steel_heavy:?}");
+        assert!(wood_light.0, "a wooden beam holds one cube");
+        assert!(!wood_heavy.0, "a wooden beam snaps under three cubes");
+        assert!(iron_heavy.0 && steel_heavy.0, "iron and steel hold three cubes");
+        assert!(steel_heavy.1 < iron_heavy.1 + 0.01 || steel_heavy.1 < 1.0, "steel is less stressed than iron for the same load");
+    }
+
+    #[test]
+    fn a_truss_stays_up_and_shows_load_in_its_members() {
+        let mut world = ground();
+        // Two ground posts, a horizontal chord and two diagonals meeting at a node.
+        let mut blocks: Vec<Block> = vec![];
+        let mut phys = Physics::build(&mut blocks);
+        let (a, b, apex) = (vec2(100.0, 250.0), vec2(200.0, 250.0), vec2(150.0, 190.0));
+        let mut m1 = Member::new(MemberMat::Steel, Anchor::Ground(a), Anchor::Free(apex), a, apex);
+        let m2 = Member::new(MemberMat::Steel, Anchor::Ground(b), Anchor::End { uid: m1.uid, end: 1 }, b, apex);
+        m1.b = Anchor::Free(apex);
+        let mut members = vec![m1, m2];
+        phys.build_members(&blocks, &mut members);
+        for _ in 0..300 {
+            phys.step(&world, &mut blocks);
+            phys.update_members(&world, &mut members);
+            stamp_all(&mut world, &blocks, &members);
+        }
+        assert_eq!(members.len(), 2, "an unloaded truss must not collapse");
+        assert!((members[0].p1 - apex).length() < 6.0, "apex moved to {:?}", members[0].p1);
+    }
+
+    #[test]
+    fn wood_floats_and_iron_sinks() {
+        let mut world = World::new_static();
+        // A stone basin full of water.
+        for x in 100..300 {
+            world.set(x, 320, Mat::Stone);
+        }
+        for y in 250..320 {
+            world.set(99, y, Mat::Stone);
+            world.set(300, y, Mat::Stone);
+        }
+        for x in 100..300 {
+            for y in 270..320 {
+                world.set(x, y, Mat::Water);
+            }
+        }
+        let mut blocks = vec![
+            Block::new(BlockKind::Plank, vec2(160.0, 240.0), 0.0),
+            Block::new(BlockKind::Beam, vec2(240.0, 240.0), 0.0),
+        ];
+        let mut phys = Physics::build(&mut blocks);
+        let mut plank_sum = 0.0;
+        for t in 0..800 {
+            phys.step(&world, &mut blocks);
+            stamp_blocks(&mut world, &blocks);
+            world.step();
+            if t >= 400 {
+                plank_sum += blocks[0].pos.y;
+            }
+        }
+        let plank = plank_sum / 400.0;
+        // The water surface is around y = 270: wood bobs there, iron lies on the bottom.
+        assert!(plank < 282.0, "the plank should float, mean y = {plank}");
+        assert!(blocks[1].pos.y > 300.0, "the iron beam should sink, y = {}", blocks[1].pos.y);
+    }
+
+    #[test]
+    fn bricks_clip_onto_each_other() {
+        let base = Block::new(BlockKind::Brick, vec2(100.0, 295.0), 0.0);
+        // Hovering 3 cells too high and 4 cells off the stud grid.
+        let p = clip(&[base.clone()], BlockKind::Brick, 0.0, vec2(106.0, 282.0));
+        assert!((p.y - 285.0).abs() < 1e-3, "y = {}", p.y);
+        assert!(((p.x - 100.0) % STUD).abs() < 1e-3, "x = {}", p.x);
+        // Too far away: untouched.
+        let far = clip(&[base.clone()], BlockKind::Brick, 0.0, vec2(106.0, 250.0));
+        assert_eq!(far, vec2(106.0, 250.0));
+        // Beside it, flush.
+        let side = clip(&[base], BlockKind::Brick, 0.0, vec2(123.0, 297.0));
+        assert!((side.x - 120.0).abs() < 1e-3 && (side.y - 295.0).abs() < 1e-3, "{side:?}");
     }
 
     #[test]
     fn snap_aligns_to_studs() {
         let p = snap(BlockKind::Brick, 0, vec2(103.0, 87.0));
-        assert_eq!((p.x - 12.0) % STUD, 0.0);
-        assert_eq!((p.y - 6.0) % STUD, 0.0);
+        assert_eq!((p.x - 10.0) % STUD, 0.0);
+        assert_eq!((p.y - 5.0) % STUD, 0.0);
     }
 
     #[test]
     fn placement_rejects_overlap_and_terrain() {
         let world = ground();
-        let a = Block::new(BlockKind::Brick, vec2(100.0, 294.0), 0.0);
+        let a = Block::new(BlockKind::Brick, vec2(100.0, 295.0), 0.0);
         assert!(placement_ok(&world, &[], &a, None));
         let in_ground = Block::new(BlockKind::Brick, vec2(100.0, 302.0), 0.0);
         assert!(!placement_ok(&world, &[], &in_ground, None));
-        let overlap = Block::new(BlockKind::Brick, vec2(110.0, 294.0), 0.0);
+        let overlap = Block::new(BlockKind::Brick, vec2(110.0, 295.0), 0.0);
         assert!(!placement_ok(&world, &[a.clone()], &overlap, None));
-        let beside = Block::new(BlockKind::Brick, vec2(124.0, 294.0), 0.0);
+        let beside = Block::new(BlockKind::Brick, vec2(120.0, 295.0), 0.0);
         assert!(placement_ok(&world, &[a], &beside, None));
     }
 }

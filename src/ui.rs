@@ -30,6 +30,18 @@ pub enum Icon {
     Full,
     Eraser,
     Flag,
+    Hammer,
+    Cable,
+    Loupe,
+    Thermo,
+    Science,
+    Pick,
+    Sun,
+    Moon,
+    Undo,
+    Gauge,
+    Wind,
+    Eye,
 }
 
 pub struct Ui {
@@ -108,6 +120,28 @@ pub fn draw_icon(icon: Icon, c: Vec2, s: f32, col: Color) {
             let tip = c + vec2(a.cos(), a.sin()) * s * 0.38;
             arrow_head(tip, vec2(-a.sin(), a.cos()) * -1.0, s * 0.45, col);
         }
+        Icon::Wind => {
+            for (k, len) in [(-0.22f32, 0.8f32), (0.0, 0.6), (0.22, 0.75)] {
+                draw_line(c.x - s * 0.4, c.y + s * k, c.x - s * 0.4 + s * len, c.y + s * k, th * 0.9, col);
+            }
+            arrow_head(vec2(c.x + s * 0.42, c.y), vec2(1.0, 0.0), s * 0.4, col);
+        }
+        Icon::Eye => {
+            arc(c + vec2(0.0, s * 0.18), s * 0.36, 215.0, 325.0, th, col);
+            arc(c - vec2(0.0, s * 0.18), s * 0.36, 35.0, 145.0, th, col);
+            draw_circle(c.x, c.y, s * 0.13, col);
+        }
+        Icon::Gauge => {
+            arc(c + vec2(0.0, s * 0.18), s * 0.42, 180.0, 360.0, th, col);
+            draw_line(c.x, c.y + s * 0.18, c.x + s * 0.28, c.y - s * 0.12, th, col);
+            draw_circle(c.x, c.y + s * 0.18, s * 0.07, col);
+        }
+        Icon::Undo => {
+            arc(c + vec2(0.0, s * 0.05), s * 0.34, 200.0, 440.0, th, col);
+            let a = 200.0f32.to_radians();
+            let tip = c + vec2(0.0, s * 0.05) + vec2(a.cos(), a.sin()) * s * 0.34;
+            arrow_head(tip, vec2(a.sin(), -a.cos()) * -1.0, s * 0.45, col);
+        }
         Icon::Rotate => {
             arc(c, s * 0.38, -60.0, 240.0, th, col);
             let a = (-60.0f32).to_radians();
@@ -154,6 +188,51 @@ pub fn draw_icon(icon: Icon, c: Vec2, s: f32, col: Color) {
             draw_rectangle_ex(c.x - s * 0.1, c.y - s * 0.22, s * 0.6, s * 0.4, DrawRectangleParams { offset: vec2(0.5, 0.5), rotation: -0.6, color: col });
             draw_rectangle_ex(c.x - s * 0.1, c.y - s * 0.22, s * 0.28, s * 0.4, DrawRectangleParams { offset: vec2(-0.6, 0.5), rotation: -0.6, color: Color::new(1.0, 0.55, 0.6, 1.0) });
         }
+        Icon::Hammer => {
+            draw_line(c.x - s * 0.35, c.y + s * 0.4, c.x + s * 0.2, c.y - s * 0.15, th * 1.3, col);
+            draw_rectangle_ex(c.x + s * 0.18, c.y - s * 0.28, s * 0.5, s * 0.3, DrawRectangleParams { offset: vec2(0.5, 0.5), rotation: -0.7, color: col });
+        }
+        Icon::Cable => {
+            draw_circle(c.x - s * 0.38, c.y + s * 0.22, s * 0.16, col);
+            draw_circle(c.x - s * 0.38, c.y + s * 0.22, s * 0.06, BG);
+            let mut prev = vec2(c.x - s * 0.22, c.y + s * 0.22);
+            for i in 1..=8 {
+                let t = i as f32 / 8.0;
+                let p = vec2(c.x - s * 0.22 + s * 0.62 * t, c.y + s * 0.22 - s * 0.55 * t + (t * std::f32::consts::PI).sin() * s * 0.28);
+                draw_line(prev.x, prev.y, p.x, p.y, th, col);
+                prev = p;
+            }
+            draw_circle(prev.x, prev.y, s * 0.09, col);
+        }
+        Icon::Loupe => {
+            draw_circle_lines(c.x - s * 0.1, c.y - s * 0.1, s * 0.3, th, col);
+            draw_line(c.x + s * 0.12, c.y + s * 0.12, c.x + s * 0.42, c.y + s * 0.42, th * 1.4, col);
+        }
+        Icon::Thermo => {
+            draw_rectangle(c.x - th * 0.6, c.y - s * 0.42, th * 1.2, s * 0.6, col);
+            draw_circle(c.x, c.y + s * 0.26, s * 0.2, col);
+            draw_circle(c.x, c.y + s * 0.26, s * 0.1, RED);
+        }
+        Icon::Science => {
+            draw_rectangle(c.x - s * 0.1, c.y - s * 0.42, s * 0.2, s * 0.3, col);
+            draw_triangle(vec2(c.x - s * 0.1, c.y - s * 0.12), vec2(c.x + s * 0.1, c.y - s * 0.12), vec2(c.x + s * 0.4, c.y + s * 0.4), col);
+            draw_triangle(vec2(c.x - s * 0.1, c.y - s * 0.12), vec2(c.x - s * 0.4, c.y + s * 0.4), vec2(c.x + s * 0.4, c.y + s * 0.4), col);
+        }
+        Icon::Pick => {
+            draw_triangle(vec2(c.x - s * 0.3, c.y - s * 0.42), vec2(c.x - s * 0.3, c.y + s * 0.3), vec2(c.x + s * 0.3, c.y + s * 0.02), col);
+        }
+        Icon::Sun => {
+            draw_circle(c.x, c.y, s * 0.22, col);
+            for k in 0..8 {
+                let a = k as f32 * std::f32::consts::TAU / 8.0;
+                let (d0, d1) = (vec2(a.cos(), a.sin()) * s * 0.32, vec2(a.cos(), a.sin()) * s * 0.46);
+                draw_line(c.x + d0.x, c.y + d0.y, c.x + d1.x, c.y + d1.y, th, col);
+            }
+        }
+        Icon::Moon => {
+            draw_circle(c.x, c.y, s * 0.36, col);
+            draw_circle(c.x + s * 0.18, c.y - s * 0.1, s * 0.3, BG);
+        }
         Icon::Flag => {
             draw_rectangle(c.x - s * 0.3, c.y - s * 0.45, th, s * 0.9, col);
             draw_triangle(vec2(c.x - s * 0.3 + th, c.y - s * 0.45), vec2(c.x - s * 0.3 + th, c.y), vec2(c.x + s * 0.4, c.y - s * 0.22), col);
@@ -194,20 +273,78 @@ impl Ui {
         if !active && enabled {
             rrect(Rect::new(r.x + 2.0, r.y + 2.0, r.w - 4.0, r.h * 0.45), 8.0, Color::new(1.0, 1.0, 1.0, 0.05));
         }
-        let size = 20u16;
+        let size = 16u16;
         let has_icon = icon != Icon::None;
         let tw = if label.is_empty() { 0.0 } else { self.text_w(label, size) };
-        let icon_w = if has_icon { 26.0 } else { 0.0 };
-        let gap = if has_icon && !label.is_empty() { 8.0 } else { 0.0 };
+        let icon_w = if has_icon { 19.0 } else { 0.0 };
+        let gap = if has_icon && !label.is_empty() { 5.0 } else { 0.0 };
         let total = icon_w + gap + tw;
         let x0 = r.x + (r.w - total) / 2.0;
         if has_icon {
-            draw_icon(icon, vec2(x0 + icon_w / 2.0, r.y + r.h / 2.0), 22.0, fg);
+            draw_icon(icon, vec2(x0 + icon_w / 2.0, r.y + r.h / 2.0), 18.0, fg);
         }
         if !label.is_empty() {
-            self.text(label, x0 + icon_w + gap, r.y + r.h / 2.0 + 6.5, size, fg);
+            self.text(label, x0 + icon_w + gap, r.y + r.h / 2.0 + 5.5, size, fg);
         }
         hot && self.pressed
+    }
+
+    /// Horizontal slider; returns true while the value is being changed.
+    pub fn slider(&mut self, r: Rect, value: &mut f32, min: f32, max: f32, col: Color) -> bool {
+        rrect(Rect::new(r.x, r.y + r.h / 2.0 - 3.0, r.w, 6.0), 3.0, Color::new(0.0, 0.0, 0.0, 0.4));
+        let t = ((*value - min) / (max - min)).clamp(0.0, 1.0);
+        rrect(Rect::new(r.x, r.y + r.h / 2.0 - 3.0, (r.w * t).max(6.0), 6.0), 3.0, col);
+        let hot = r.contains(self.mouse);
+        let mut changed = false;
+        if hot && is_mouse_button_down(MouseButton::Left) {
+            let nt = ((self.mouse.x - r.x) / r.w).clamp(0.0, 1.0);
+            *value = min + (max - min) * nt;
+            changed = true;
+        }
+        let knob = vec2(r.x + r.w * t, r.y + r.h / 2.0);
+        draw_circle(knob.x, knob.y, if hot { 8.5 } else { 7.0 }, WHITE);
+        draw_circle(knob.x, knob.y, 4.0, col);
+        changed
+    }
+
+    /// Height `wrapped` would use, without drawing.
+    pub fn wrapped_height(&self, text: &str, max_w: f32, size: u16) -> f32 {
+        let mut line = String::new();
+        let mut h = 0.0;
+        for word in text.split_whitespace() {
+            let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+            if self.text_w(&candidate, size) > max_w && !line.is_empty() {
+                h += size as f32 + 3.0;
+                line = word.to_string();
+            } else {
+                line = candidate;
+            }
+        }
+        if !line.is_empty() {
+            h += size as f32 + 3.0;
+        }
+        h
+    }
+
+    /// Word-wrapped text; returns the height used.
+    pub fn wrapped(&self, text: &str, x: f32, y: f32, max_w: f32, size: u16, col: Color) -> f32 {
+        let mut line = String::new();
+        let mut cy = y;
+        for word in text.split_whitespace() {
+            let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+            if self.text_w(&candidate, size) > max_w && !line.is_empty() {
+                self.text(&line, x, cy, size, col);
+                cy += size as f32 + 3.0;
+                line = word.to_string();
+            } else {
+                line = candidate;
+            }
+        }
+        if !line.is_empty() {
+            self.text(&line, x, cy, size, col);
+            cy += size as f32 + 3.0;
+        }
+        cy - y
     }
 
     /// Palette tile: `draw` paints the swatch inside the given rect.
@@ -215,8 +352,9 @@ impl Ui {
         let hot = self.hover(r);
         rrect(Rect::new(r.x, r.y + 2.0, r.w, r.h), 12.0, Color::new(0.0, 0.0, 0.0, 0.35));
         rrect(r, 12.0, if hot { TILE_HOT } else { TILE });
-        draw(Rect::new(r.x + 8.0, r.y + 7.0, r.w - 16.0, r.h - 34.0));
-        self.text_center(label, r.x + r.w / 2.0, r.y + r.h - 9.0, 18, if selected { ACCENT } else { TEXT });
+        draw(Rect::new(r.x + 7.0, r.y + 6.0, r.w - 14.0, r.h - 28.0));
+        let size = if self.text_w(label, 16) > r.w - 6.0 { 13 } else { 16 };
+        self.text_center(label, r.x + r.w / 2.0, r.y + r.h - 7.0, size, if selected { ACCENT } else { TEXT });
         if selected {
             rrect_lines(r, 12.0, 3.5, ACCENT);
         }
