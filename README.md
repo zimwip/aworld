@@ -35,10 +35,12 @@ cargo run --release
 ## Construire
 - **Blocs façon Lego** : brique, longue, planche, poutre fer, poutre acier, cube, verre, roue. Aimantés sur la grille de plots
   et sur leurs voisins (Maj = libre), pas de superposition, molette ou Q/E pour tourner. Les blocs qui se touchent sont soudés ;
-  bout à bout, planches et poutres forment une seule pièce plus rigide.
+  bout à bout, les tiges de même matière forment une seule pièce plus rigide.
 - **Tiges** (bois, fer, acier) : un clic fixe un bout (sol, bloc ou nœud), tire, un second clic fixe l'autre. Longueur max 110.
   Elles pivotent aux nœuds : on dessine des fermes de pont. Le bois est léger et fragile, le fer lourd, l'acier lourd et solide.
-- **Câble** : deux points, élastique, il prend la forme d'une parabole sous son poids.
+- **Câble** (acier, fer, corde) : deux points — bloc, tige (bout ou milieu), sol ou n'importe quel bord du monde, ciel compris (les tiges, ressorts, élastiques et câbles s'y accrochent). Élastique : il prend la forme
+  d'une parabole sous son poids. Le curseur d'élasticité le rend plus ou moins raide ; l'acier tient le plus, la corde s'étire.
+  Une tige posée sans attache tombe.
 - **Matériaux** : un bloc consomme des cellules de la matière dont il est fait (brique = terre, planche = bois, poutre = fer...).
   En édition on peut choisir « illimité » ; en simulation c'est toujours limité.
 - **Marteau** : casse le verre en 3 étapes (bloc → moitiés → éclats → sable) et la glace. Un choc, une chute ou une voiture aussi.

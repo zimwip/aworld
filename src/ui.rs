@@ -289,6 +289,21 @@ impl Ui {
         hot && self.pressed
     }
 
+    /// A check box with a label; returns true when clicked.
+    pub fn checkbox(&mut self, r: Rect, label: &str, checked: bool, enabled: bool) -> bool {
+        let hot = enabled && self.hover(r);
+        rrect(r, 8.0, if hot { TILE_HOT } else { TILE });
+        let boxr = Rect::new(r.x + 7.0, r.y + (r.h - 16.0) / 2.0, 16.0, 16.0);
+        rrect(boxr, 4.0, if checked { GREEN } else { Color::new(0.0, 0.0, 0.0, 0.4) });
+        if checked {
+            draw_line(boxr.x + 3.5, boxr.y + 8.5, boxr.x + 7.0, boxr.y + 12.0, 2.4, WHITE);
+            draw_line(boxr.x + 7.0, boxr.y + 12.0, boxr.x + 13.0, boxr.y + 4.5, 2.4, WHITE);
+        }
+        let col = if enabled { TEXT } else { Color::new(0.45, 0.47, 0.55, 1.0) };
+        self.text(label, r.x + 30.0, r.y + r.h / 2.0 + 5.0, 14, col);
+        hot && self.pressed
+    }
+
     /// Horizontal slider; returns true while the value is being changed.
     pub fn slider(&mut self, r: Rect, value: &mut f32, min: f32, max: f32, col: Color) -> bool {
         rrect(Rect::new(r.x, r.y + r.h / 2.0 - 3.0, r.w, 6.0), 3.0, Color::new(0.0, 0.0, 0.0, 0.4));

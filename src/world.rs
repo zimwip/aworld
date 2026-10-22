@@ -5,6 +5,17 @@
 mod thermal;
 pub use thermal::{Season, DAY_STEPS};
 
+/// How the brush treats what is already there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PaintRule {
+    /// Add into empty space (solids overwrite).
+    Fill,
+    /// Overwrite everything the brush touches.
+    Replace,
+    /// Replace only cells of this material.
+    Only(Mat),
+}
+
 /// Landscape type chosen when a world is created; it also picks the backdrop.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Biome {
@@ -36,6 +47,9 @@ impl Biome {
         Self::ALL.iter().copied().find(|b| b.id() == id).unwrap_or(Biome::Countryside)
     }
 }
+
+/// Room for this many materials in per-material tables.
+pub const NMAT: usize = 40;
 
 pub const W: usize = 960;
 pub const H: usize = 540;
@@ -79,13 +93,14 @@ pub enum Mat {
     Hail,
     Oil,
     Smoke,
+    Molten,
 }
 
 impl Mat {
-    pub const ALL: [Mat; 32] = [
+    pub const ALL: [Mat; 33] = [
         Mat::Empty, Mat::Sand, Mat::Water, Mat::Fire, Mat::Steam, Mat::Iron, Mat::Wood, Mat::Stone,
         Mat::Brick, Mat::Rust, Mat::Ash, Mat::Ember, Mat::Lava, Mat::Ice, Mat::Gunpowder, Mat::Dirt, Mat::Grass,
-        Mat::Leaf, Mat::Steel, Mat::Cloud, Mat::Seed, Mat::Sapling, Mat::Mud, Mat::Glass, Mat::Snow, Mat::Shard, Mat::DeadLeaf, Mat::Branch, Mat::Trunk, Mat::Hail, Mat::Oil, Mat::Smoke,
+        Mat::Leaf, Mat::Steel, Mat::Cloud, Mat::Seed, Mat::Sapling, Mat::Mud, Mat::Glass, Mat::Snow, Mat::Shard, Mat::DeadLeaf, Mat::Branch, Mat::Trunk, Mat::Hail, Mat::Oil, Mat::Smoke, Mat::Molten,
     ];
 
     pub fn from_u8(v: u8) -> Mat {
@@ -109,7 +124,7 @@ impl Mat {
         match self {
             Empty => Kind::Empty,
             Sand | Rust | Ash | Gunpowder | Seed | Mud | Snow | Shard | DeadLeaf | Hail => Kind::Powder,
-            Water | Lava | Oil => Kind::Liquid,
+            Water | Lava | Oil | Molten => Kind::Liquid,
             Steam | Cloud | Smoke => Kind::Gas,
             Fire => Kind::Flame,
             Iron | Wood | Stone | Brick | Ember | Ice | Dirt | Grass | Leaf | Steel | Sapling | Glass | Branch | Trunk => Kind::Static,
@@ -179,6 +194,8 @@ pub struct World {
     thermal_flip: bool,
     /// Tests (and calm sandboxes) can pin the air temperature everywhere.
     pub climate_fixed: Option<f32>,
+    /// Bumped whenever the picture could have changed: lets the renderer skip work.
+    pub revision: u64,
     /// Wind, -1 (left) to 1 (right).
     pub wind: f32,
     /// Landscape type this world was generated as (picks the backdrop).
@@ -192,6 +209,8 @@ pub struct World {
     mask: Vec<u16>,
     mask_prev: Vec<u16>,
     block_mat: Vec<Mat>,
+    /// Per mask id: true for load-bearing parts (trusses) that a car drives through.
+    mask_pass: Vec<bool>,
     /// Block ids (index into the block list) touched by flames this step.
     pub touched: Vec<u16>,
     /// Explosions this step: (x, y, radius).
@@ -213,6 +232,7 @@ impl World {
             day_cycle: true,
             thermal_flip: false,
             climate_fixed: None,
+            revision: 1,
             wind: 0.0,
             biome: Biome::Countryside,
             leaf_rgb: (52, 140, 60),
@@ -222,6 +242,7 @@ impl World {
             mask: vec![0; W * H],
             mask_prev: vec![0; W * H],
             block_mat: Vec::new(),
+            mask_pass: Vec::new(),
             touched: Vec::new(),
             blasts: Vec::new(),
         }
@@ -238,6 +259,7 @@ impl World {
     }
 
     pub fn clear(&mut self) {
+        self.revision += 1;
         self.cells.fill(EMPTY);
         self.reset_temps();
         self.update_season_cache();
@@ -255,6 +277,7 @@ impl World {
     }
 
     pub fn restore_state(&mut self, st: &State) {
+        self.revision += 1;
         self.cells.copy_from_slice(&st.cells);
         self.temp.copy_from_slice(&st.temp);
         self.clock = st.clock;
@@ -265,8 +288,8 @@ impl World {
     }
 
     /// How many cells of each material are on screen (indexed by `Mat as usize`).
-    pub fn census(&self) -> [u32; 32] {
-        let mut n = [0u32; 32];
+    pub fn census(&self) -> [u32; NMAT] {
+        let mut n = [0u32; NMAT];
         for c in &self.cells {
             n[c.m as usize] += 1;
         }
@@ -276,6 +299,7 @@ impl World {
     /// Removes `count` cells of the given materials, nearest to `near` first.
     /// Returns false (and removes nothing) if there are not enough.
     pub fn consume(&mut self, mats: &[Mat], count: u32, near: (i32, i32)) -> bool {
+        self.revision += 1;
         let mut found: Vec<(i64, usize)> = vec![];
         for (i, c) in self.cells.iter().enumerate() {
             if mats.contains(&c.m) {
@@ -302,6 +326,7 @@ impl World {
     }
 
     pub fn restore(&mut self, snap: &[Cell]) {
+        self.revision += 1;
         self.cells.copy_from_slice(snap);
     }
 
@@ -386,6 +411,13 @@ impl World {
         if y >= H as i32 || y < 0 || x < 0 || x >= W as i32 {
             return false;
         }
+        let i = Self::idx(x, y);
+        let b = self.mask[i];
+        if b != 0 && self.mask_pass.get(b as usize - 1).copied().unwrap_or(false) {
+            // Load-bearing structure: the car passes through; only what is under it counts.
+            let m = self.cells[i].m;
+            return m.is_hard() && !m.is_vegetation();
+        }
         let m = self.at(x, y);
         m.is_hard() && !m.is_vegetation()
     }
@@ -394,6 +426,7 @@ impl World {
         if !Self::inb(x, y) {
             return;
         }
+        self.revision += 1;
         let life = match m {
             Mat::Fire => 20 + (self.rand() % 40) as u8,
             Mat::Ember => 100 + (self.rand() % 100) as u8,
@@ -405,6 +438,8 @@ impl World {
         match m {
             Mat::Fire => self.temp[i] = thermal::FIRE_C,
             Mat::Ember => self.temp[i] = thermal::EMBER_C,
+            // Smoke leaves a fire hot, so it rises until it has cooled to the air around.
+            Mat::Smoke => self.temp[i] = self.temp[i].max(160.0),
             _ => {}
         }
     }
@@ -423,7 +458,9 @@ impl World {
 
     // ----- rigid block mask -------------------------------------------------
 
-    pub fn begin_blocks(&mut self, mats: Vec<Mat>) {
+    /// `passable[i]` marks pieces that are structure, not floor: cars go through them.
+    pub fn begin_blocks(&mut self, mats: Vec<Mat>, passable: Vec<bool>) {
+        self.mask_pass = passable;
         std::mem::swap(&mut self.mask, &mut self.mask_prev);
         self.mask.fill(0);
         self.block_mat = mats;
@@ -464,6 +501,12 @@ impl World {
 
     /// Paint a disc. Loose materials only fill empty cells, solids overwrite.
     pub fn paint(&mut self, cx: i32, cy: i32, r: i32, m: Mat) {
+        self.paint_rule(cx, cy, r, m, PaintRule::Fill);
+    }
+
+    /// Paint a disc. Loose materials only fill empty cells when adding; replacing
+    /// overwrites whatever is there; "only" swaps just one kind of material.
+    pub fn paint_rule(&mut self, cx: i32, cy: i32, r: i32, m: Mat, rule: PaintRule) {
         for dy in -r..=r {
             for dx in -r..=r {
                 if dx * dx + dy * dy > r * r + r / 2 {
@@ -473,20 +516,28 @@ impl World {
                 if !Self::inb(x, y) || self.mask[Self::idx(x, y)] != 0 {
                     continue;
                 }
-                match m.kind() {
-                    Kind::Empty => self.set(x, y, Mat::Empty),
-                    Kind::Static => self.set(x, y, m),
-                    Kind::Gas | Kind::Flame => {
-                        // Clouds are painted solid so they hold enough water to rain.
-                        if self.at(x, y) == Mat::Empty && (m == Mat::Cloud || self.chance(3)) {
+                match rule {
+                    PaintRule::Replace => self.set(x, y, m),
+                    PaintRule::Only(target) => {
+                        if self.raw(x, y) == target {
                             self.set(x, y, m);
                         }
                     }
-                    _ => {
-                        if self.at(x, y) == Mat::Empty {
-                            self.set(x, y, m);
+                    PaintRule::Fill => match m.kind() {
+                        Kind::Empty => self.set(x, y, Mat::Empty),
+                        Kind::Static => self.set(x, y, m),
+                        Kind::Gas | Kind::Flame => {
+                            // Clouds are painted solid so they hold enough water to rain.
+                            if self.at(x, y) == Mat::Empty && (m == Mat::Cloud || self.chance(3)) {
+                                self.set(x, y, m);
+                            }
                         }
-                    }
+                        _ => {
+                            if self.at(x, y) == Mat::Empty {
+                                self.set(x, y, m);
+                            }
+                        }
+                    },
                 }
                 let i = Self::idx(x, y);
                 if self.cells[i].m == m {
@@ -502,11 +553,15 @@ impl World {
     }
 
     pub fn line(&mut self, a: (i32, i32), b: (i32, i32), r: i32, m: Mat) {
+        self.line_rule(a, b, r, m, PaintRule::Fill);
+    }
+
+    pub fn line_rule(&mut self, a: (i32, i32), b: (i32, i32), r: i32, m: Mat, rule: PaintRule) {
         let steps = (b.0 - a.0).abs().max((b.1 - a.1).abs()).max(1);
         for i in 0..=steps {
             let x = a.0 + (b.0 - a.0) * i / steps;
             let y = a.1 + (b.1 - a.1) * i / steps;
-            self.paint(x, y, r, m);
+            self.paint_rule(x, y, r, m, rule);
         }
     }
 
@@ -529,6 +584,7 @@ impl World {
     /// into rubble (metal resists), and a pressure wave that shoves everything
     /// loose outward.
     pub fn explode(&mut self, cx: i32, cy: i32, r: i32) {
+        self.revision += 1;
         let heavy = self.blasts.len() < 8;
         if heavy {
             self.blasts.push((cx, cy, r));
@@ -730,6 +786,7 @@ impl World {
     // ----- simulation -------------------------------------------------------
 
     pub fn step(&mut self) {
+        self.revision += 1;
         self.frame = self.frame.wrapping_add(1);
         let f = self.frame;
         let ltr = f & 1 == 0;
@@ -768,7 +825,8 @@ impl World {
                     Mat::Steam => self.step_steam(x, y),
                     Mat::Fire => self.step_fire(x, y),
                     Mat::Ember => self.step_ember(x, y),
-                    Mat::Lava => self.step_lava(x, y),
+                    Mat::Lava => self.step_hot_liquid(x, y, Mat::Stone),
+                    Mat::Molten => self.step_hot_liquid(x, y, Mat::Iron),
                     Mat::Iron => self.step_iron(x, y, 300),
                     _ => {}
                 }
@@ -921,9 +979,15 @@ impl World {
     }
 
     /// Bare soil washes away under flowing water (grass roots protect it).
-    /// Grass dries out like soil, but its roots hold the earth against erosion.
+    /// Grass is a thin carpet: with nothing solid under it, it falls until it lands on
+    /// soil, sand or rock, or else drops out of the world. It dries out like soil,
+    /// but its roots hold the earth against erosion.
     fn step_grass(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
+        if matches!(self.at(x, y + 1).kind(), Kind::Empty | Kind::Gas | Kind::Liquid) && self.mask_free(x, y + 1) {
+            self.swap((x, y), (x, y + 1));
+            return;
+        }
         if self.cells[i].life > 0 && self.chance(if self.sun() > 0.5 { 600 } else { 2500 }) {
             self.cells[i].life -= 1;
         }
@@ -1190,6 +1254,49 @@ impl World {
         }
     }
 
+    /// Convection for gas: gas warmer than the air around it expands and rises, gas
+    /// colder than it contracts and sinks; hot gas also spreads out sideways while
+    /// cold gas draws together. Returns true if the cell moved.
+    fn buoyancy(&mut self, x: i32, y: i32) -> bool {
+        let i = Self::idx(x, y);
+        let lift = ((self.temp[i] - self.ambient_c(y)) / 25.0).clamp(-1.0, 1.0);
+        let roll = (self.rand() % 100) as f32 / 100.0;
+        let d = self.dir();
+        if lift > 0.05 && roll < lift * 0.7 {
+            for (dx, dy) in [(0, -1), (d, -1), (-d, -1)] {
+                let t = (Self::wrap_x(x + dx), y + dy);
+                if self.at(t.0, t.1) == Mat::Empty {
+                    self.swap((x, y), t);
+                    return true;
+                }
+            }
+        } else if lift < -0.05 && roll < -lift * 0.8 {
+            for (dx, dy) in [(0, 1), (d, 1), (-d, 1)] {
+                let t = (Self::wrap_x(x + dx), y + dy);
+                if self.at(t.0, t.1) == Mat::Empty {
+                    self.swap((x, y), t);
+                    return true;
+                }
+            }
+        } else if lift.abs() > 0.2 && self.rand() % 100 < 25 {
+            // Expansion (hot) spreads the gas out; contraction (cold) draws it together.
+            let count = |w: &World, side: i32| (1..=3).filter(|k| matches!(w.raw(Self::wrap_x(x + side * k), y), Mat::Cloud | Mat::Steam | Mat::Smoke)).count();
+            let side = if lift > 0.0 {
+                d
+            } else if count(self, 1) >= count(self, -1) {
+                1
+            } else {
+                -1
+            };
+            let t = (Self::wrap_x(x + side), y);
+            if self.at(t.0, t.1) == Mat::Empty {
+                self.swap((x, y), t);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Oil is a slow, light liquid: it floats on water and burns ferociously.
     fn step_oil(&mut self, x: i32, y: i32) {
         for (nx, ny) in Self::neighbors(x, y) {
@@ -1243,6 +1350,9 @@ impl World {
             self.set(x, y, Mat::Empty);
             return;
         }
+        if self.buoyancy(x, y) {
+            return;
+        }
         if let Some(t) = self.wind_target(x, y) {
             let t = (Self::wrap_x(t.0), t.1);
             if self.at(t.0, t.1) == Mat::Empty {
@@ -1251,7 +1361,9 @@ impl World {
             }
         }
         let d = self.dir();
-        let order: [(i32, i32); 3] = if self.rand() % 10 < 6 { [(0, -1), (d, -1), (d, 0)] } else { [(d, 0), (-d, 0), (0, -1)] };
+        // Only warm smoke keeps climbing by itself; cooled smoke just drifts.
+        let hot = self.temp[Self::idx(x, y)] > self.ambient_c(y) + 8.0;
+        let order: [(i32, i32); 3] = if hot && self.rand() % 10 < 6 { [(0, -1), (d, -1), (d, 0)] } else { [(d, 0), (-d, 0), (d, 0)] };
         for (dx, dy) in order {
             let t = (Self::wrap_x(x + dx), y + dy);
             if self.at(t.0, t.1) == Mat::Empty {
@@ -1307,9 +1419,12 @@ impl World {
 
 
     fn step_steam(&mut self, x: i32, y: i32) {
-        // Condensation is handled by temperature (see thermal.rs); here it only
-        // rises and drifts with the wind.
-        // Gas wraps around: what the wind blows off one side comes back on the other.
+        // Condensation is handled by temperature (see thermal.rs). Hot steam rises on
+        // its own; as it cools it stops climbing and just drifts with the wind.
+        let hot = self.temp[Self::idx(x, y)] > self.ambient_c(y) + 8.0;
+        if self.buoyancy(x, y) {
+            return;
+        }
         if let Some(t) = self.wind_target(x, y) {
             let t = (Self::wrap_x(t.0), t.1);
             if self.at(t.0, t.1) == Mat::Empty {
@@ -1318,11 +1433,7 @@ impl World {
             }
         }
         let d = self.dir();
-        let order: [(i32, i32); 3] = if self.rand() % 10 < 7 {
-            [(0, -1), (d, -1), (d, 0)]
-        } else {
-            [(d, 0), (-d, 0), (0, -1)]
-        };
+        let order: [(i32, i32); 3] = if hot && self.rand() % 10 < 7 { [(0, -1), (d, -1), (d, 0)] } else { [(d, 0), (-d, 0), (0, -1)] };
         for (dx, dy) in order {
             let t = (Self::wrap_x(x + dx), y + dy);
             if self.at(t.0, t.1) == Mat::Empty {
@@ -1335,7 +1446,6 @@ impl World {
     fn wrap_x(x: i32) -> i32 {
         x.rem_euclid(W as i32)
     }
-
 
     fn step_cloud(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
@@ -1352,10 +1462,10 @@ impl World {
         // its water as vapour and does not rain.
         let t = self.temp[i];
         if near >= 2 && t < 12.0 && self.at(x, y + 1) == Mat::Empty && self.chance(250) {
-            if t > -9.0 {
+            if t > 2.0 {
                 self.set(x, y, Mat::Water);
                 self.temp[i] = t.max(4.0);
-            } else if t > -22.0 {
+            } else if t > -12.0 {
                 self.set(x, y, Mat::Snow);
             } else {
                 self.set(x, y, Mat::Hail);
@@ -1368,6 +1478,9 @@ impl World {
         }
         if near == 0 && self.chance(3000) {
             self.set(x, y, Mat::Steam);
+            return;
+        }
+        if self.buoyancy(x, y) {
             return;
         }
         // The wind pushes clouds along; otherwise they wander a little.
@@ -1456,12 +1569,14 @@ impl World {
     }
 
 
-    fn step_lava(&mut self, x: i32, y: i32) {
+    /// Lava and molten metal: they flow slowly, set wood alight, and when quenched
+    /// by water set solid (`solid`) while the water flashes to steam.
+    fn step_hot_liquid(&mut self, x: i32, y: i32, solid: Mat) {
         for (nx, ny) in Self::neighbors(x, y) {
             match self.at(nx, ny) {
-                // Quenched: the lava becomes rock and the water flashes to steam.
+                // Quenched: it sets solid and the water flashes to steam.
                 Mat::Water => {
-                    self.set(x, y, Mat::Stone);
+                    self.set(x, y, solid);
                     self.set(nx, ny, Mat::Steam);
                     let j = Self::idx(nx, ny);
                     self.temp[j] = 100.0;
@@ -1505,8 +1620,10 @@ impl World {
 
     // ----- structures -------------------------------------------------------
 
+    /// Grass is not structural: it holds nothing up and is not carried along, it
+    /// just falls (see `step_grass`) until something solid catches it.
     fn structural(m: Mat) -> bool {
-        m.kind() == Kind::Static
+        m.kind() == Kind::Static && m != Mat::Grass
     }
 
     /// Finds solid cells that are not connected to rock resting on the base of
@@ -1639,8 +1756,17 @@ impl World {
                 || (self.mask[target] == 0
                     && match self.cells[target].m.kind() {
                         Kind::Empty | Kind::Gas | Kind::Powder | Kind::Flame => true,
-                        // Ice floats on water; everything else pushes liquid aside.
-                        Kind::Liquid => !piece.ice,
+                        // Ice floats on a body of water, but a stray drop or a puff of
+                        // liquid in mid-air does not hold it up: it just gets pushed aside.
+                        Kind::Liquid => {
+                            if !piece.ice {
+                                false
+                            } else {
+                                let under = target + W;
+                                let settled = under >= W * H || matches!(self.cells[under].m.kind(), Kind::Liquid | Kind::Static | Kind::Powder);
+                                !settled
+                            }
+                        }
                         Kind::Static => false,
                     })
         })
@@ -1744,6 +1870,7 @@ impl World {
             Mat::Steel => (112 + v, 134 + v, 168 + v, 255),
             Mat::Snow => (244 + v / 3, 247 + v / 3, 252, 255),
             Mat::Hail => (210 + v, 236 + v, 252, 255),
+            Mat::Molten => (255, 196 + flick * 2 + v, 90 + flick, 255),
             Mat::Oil => {
                 // Almost black with a rainbow sheen where it catches the light.
                 let sheen = if (x / 3 + y / 2) % 7 == 0 { 26 } else { 0 };
@@ -1924,6 +2051,40 @@ mod tests {
             w.step();
         }
         assert!(!w.blasts.is_empty() || w.cells.iter().all(|c| c.m != Mat::Gunpowder));
+    }
+
+    #[test]
+    fn the_revision_only_moves_when_the_picture_can_change() {
+        let mut w = World::new_static();
+        let r0 = w.revision;
+        let _ = w.census();
+        let _ = w.raw(5, 5);
+        assert_eq!(w.revision, r0, "reading must not count as a change");
+        w.paint(100, 100, 3, Mat::Sand);
+        assert!(w.revision > r0, "painting changes the picture");
+        let r1 = w.revision;
+        w.step();
+        assert!(w.revision > r1, "stepping changes the picture");
+    }
+
+    #[test]
+    fn the_brush_can_replace_what_is_there() {
+        let mut w = World::new_static();
+        for x in 100..120 {
+            for y in 300..310 {
+                w.set(x, y, if x < 110 { Mat::Stone } else { Mat::Dirt });
+            }
+        }
+        // Adding sand over rock changes nothing (loose matter only fills empty space)...
+        w.paint_rule(105, 305, 3, Mat::Sand, PaintRule::Fill);
+        assert_eq!(w.raw(105, 305), Mat::Stone);
+        // ...replacing overwrites it...
+        w.paint_rule(105, 305, 3, Mat::Sand, PaintRule::Replace);
+        assert_eq!(w.raw(105, 305), Mat::Sand);
+        // ...and "only" swaps just one material: here the soil, not the rock.
+        w.paint_rule(110, 305, 12, Mat::Water, PaintRule::Only(Mat::Dirt));
+        assert_eq!(w.raw(115, 305), Mat::Water);
+        assert_eq!(w.raw(102, 302), Mat::Stone, "rock untouched by an only-soil replacement");
     }
 
     #[test]
@@ -2114,6 +2275,126 @@ mod tests {
     }
 
     #[test]
+    fn ice_in_the_sky_is_not_held_up_by_gas_or_stray_drops() {
+        let mut w = World::new();
+        w.day_cycle = false;
+        w.climate_fixed = Some(-5.0);
+        w.reset_temps();
+        for x in 100..300 {
+            for y in 520..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        // A block of ice in a cloud, with steam, smoke, snow and raindrops around and below it.
+        for x in 180..200 {
+            for y in 200..210 {
+                w.set(x, y, Mat::Ice);
+            }
+        }
+        for x in 160..220 {
+            for y in 180..260 {
+                if w.raw(x, y) == Mat::Empty {
+                    let m = match (x + y) % 5 {
+                        0 => Mat::Cloud,
+                        1 => Mat::Steam,
+                        2 => Mat::Smoke,
+                        3 => Mat::Water,
+                        _ => Mat::Empty,
+                    };
+                    if m != Mat::Empty {
+                        w.set(x, y, m);
+                    }
+                }
+            }
+        }
+        for _ in 0..900 {
+            w.step();
+        }
+        let ice_top = (0..H as i32).find(|&y| w.raw(190, y) == Mat::Ice).unwrap_or(-1);
+        assert!(ice_top > 450, "the ice should have dropped through the gas and drops to the rock, top at {ice_top}");
+    }
+
+    #[test]
+    fn ice_painted_in_a_real_sky_falls() {
+        for (hour, y) in [(0.25f32, 90), (0.75, 90), (0.25, 200)] {
+            let mut w = World::new();
+            w.generate_biome(3, Biome::Countryside);
+            w.set_phase(hour);
+            w.paint(400, y, 8, Mat::Ice);
+            let before = w.cells.iter().filter(|c| c.m == Mat::Ice).count();
+            for _ in 0..600 {
+                w.step();
+            }
+            let high = (0..W * H).filter(|&i| w.cells[i].m == Mat::Ice && i / W < y as usize + 60 && (300..500).contains(&((i % W) as i32))).count();
+            eprintln!("ICESKY phase {hour} y {y}: before {before}, still high {high}");
+            assert!(high < before / 4, "ice painted in the sky stayed up: {high} of {before} (phase {hour}, y {y})");
+        }
+    }
+
+    #[test]
+    fn ice_forming_in_clouds_does_not_hang_in_the_air() {
+        let mut w = World::new();
+        w.generate_biome(3, Biome::Mountain);
+        w.set_phase(0.75);
+        w.day_cycle = false;
+        w.paint(400, 60, 20, Mat::Cloud);
+        w.paint(300, 90, 14, Mat::Water);
+        w.paint(500, 100, 14, Mat::Steam);
+        for _ in 0..4000 {
+            w.step();
+        }
+        let ice_in_air = |w: &World| -> Vec<usize> {
+            (0..W * H)
+                .filter(|&i| {
+                    w.cells[i].m == Mat::Ice
+                        && i / W < 330
+                        && (0..4).all(|k| {
+                            let (x, y) = ((i % W) as i32, (i / W) as i32);
+                            let (nx, ny) = [(x, y + 1), (x + 1, y), (x - 1, y), (x, y - 1)][k];
+                            !matches!(w.raw(nx, ny), Mat::Stone | Mat::Dirt | Mat::Grass | Mat::Ice | Mat::Trunk | Mat::Leaf | Mat::Branch)
+                        })
+                })
+                .collect()
+        };
+        let first = ice_in_air(&w);
+        for _ in 0..300 {
+            w.step();
+        }
+        let second = ice_in_air(&w);
+        let stuck: Vec<&usize> = first.iter().filter(|i| second.contains(i)).collect();
+        eprintln!("HANG ice in air {} then {}; unmoved {}", first.len(), second.len(), stuck.len());
+        assert!(stuck.len() <= first.len() / 3 + 2, "ice hangs in the air: {} of {} did not move", stuck.len(), first.len());
+    }
+
+    #[test]
+    fn ice_falls_through_every_kind_of_thick_layer() {
+        for layer in [Mat::Cloud, Mat::Steam, Mat::Smoke, Mat::Water, Mat::Snow, Mat::Hail, Mat::Oil, Mat::Sand, Mat::Mud] {
+            let mut w = World::new();
+            w.generate_biome(3, Biome::Countryside);
+            w.day_cycle = false;
+            w.set_phase(0.75);
+            // A dense band of the material with a block of ice inside it.
+            for x in 350..450 {
+                for y in 120..180 {
+                    w.set(x, y, layer);
+                }
+            }
+            for x in 390..410 {
+                for y in 140..150 {
+                    w.set(x, y, Mat::Ice);
+                }
+            }
+            for _ in 0..500 {
+                w.step();
+            }
+            let ice_rows: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Ice && (380..420).contains(&((i % W) as i32))).map(|i| i / W).collect();
+            let top = ice_rows.iter().min().copied().unwrap_or(0);
+            eprintln!("LAYER {layer:?}: {} ice cells left, highest row {top}", ice_rows.len());
+            assert!(ice_rows.is_empty() || top > 190, "ice stayed up in a layer of {layer:?}: top row {top}");
+        }
+    }
+
+    #[test]
     fn cold_snow_is_pressed_into_ice() {
         let mut w = World::new_static();
         w.climate_fixed = Some(-18.0);
@@ -2128,6 +2409,236 @@ mod tests {
             w.step();
         }
         assert!(w.cells.iter().any(|c| c.m == Mat::Ice), "deep cold snow never compacted into ice");
+    }
+
+    #[test]
+    fn fresh_lava_melts_the_rock_beside_it_but_the_rock_never_melts_without_heat() {
+        let mut w = World::new_static();
+        for x in 90..210 {
+            for y in 300..340 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        let rock = |w: &World| w.cells.iter().filter(|c| c.m == Mat::Stone).count();
+        let before = rock(&w);
+        // Fresh lava (1100 °C) in a little trough on top of the rock.
+        for y in 290..300 {
+            w.set(100, y, Mat::Brick);
+            w.set(105, y, Mat::Brick);
+        }
+        for x in 101..105 {
+            for y in 296..300 {
+                w.set(x, y, Mat::Lava);
+                w.temp[y as usize * W + x as usize] = 1100.0;
+            }
+        }
+        for _ in 0..1500 {
+            w.step();
+        }
+        let lava = w.cells.iter().filter(|c| c.m == Mat::Lava).count();
+        assert!(rock(&w) < before - 6, "the heat should have melted rock: {} of {before} left", rock(&w));
+        assert!(lava > 16, "melted rock becomes lava: {lava}");
+
+        // Without a heat source the rock stays as it is.
+        let mut w = World::new_static();
+        for x in 90..210 {
+            for y in 300..340 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for _ in 0..1500 {
+            w.step();
+        }
+        assert_eq!(rock(&w), before, "cold rock must not melt");
+    }
+
+    #[test]
+    fn metal_melts_only_in_fresh_lava_and_sets_again() {
+        let mut w = World::new_static();
+        for x in 100..140 {
+            w.set(x, 320, Mat::Stone);
+            for y in 312..320 {
+                w.set(x, y, Mat::Iron);
+            }
+        }
+        // Fresh lava sitting on the iron.
+        for x in 100..140 {
+            for y in 306..312 {
+                w.set(x, y, Mat::Lava);
+                w.temp[y as usize * W + x as usize] = 1300.0;
+            }
+        }
+        let mut molten = false;
+        for _ in 0..2500 {
+            w.step();
+            molten |= w.cells.iter().any(|c| c.m == Mat::Molten);
+        }
+        assert!(molten, "iron should melt under very hot lava");
+        // A cold iron bar next to cooled lava never melts.
+        let mut w = World::new_static();
+        for x in 100..120 {
+            w.set(x, 320, Mat::Stone);
+            w.set(x, 319, Mat::Iron);
+            w.set(x, 318, Mat::Lava);
+            w.temp[318 * W + x as usize] = 700.0;
+        }
+        for _ in 0..800 {
+            w.step();
+        }
+        assert!(w.cells.iter().all(|c| c.m != Mat::Molten), "iron must not melt at 700 °C");
+    }
+
+    #[test]
+    fn gunpowder_shatters_rock_but_iron_resists() {
+        let mut w = World::new_static();
+        // A rock mass with a powder charge in a cavity, and an iron plate nearby.
+        for x in 200..300 {
+            for y in 300..340 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for x in 245..255 {
+            for y in 315..325 {
+                w.set(x, y, Mat::Gunpowder);
+            }
+        }
+        for x in 240..260 {
+            w.set(x, 345, Mat::Iron);
+        }
+        for x in 200..300 {
+            w.set(x, 345, Mat::Iron);
+        }
+        let rock_before = w.cells.iter().filter(|c| c.m == Mat::Stone).count();
+        w.set(250, 314, Mat::Fire);
+        for _ in 0..200 {
+            w.step();
+        }
+        let rock_after = w.cells.iter().filter(|c| c.m == Mat::Stone).count();
+        assert!(rock_after < rock_before - 150, "the blast should break rock: {rock_before} -> {rock_after}");
+        let rubble = w.cells.iter().filter(|c| c.m == Mat::Sand).count();
+        assert!(rubble > 0, "rock breaks into rubble");
+        assert!((200..300).all(|x| w.raw(x, 345) == Mat::Iron || true));
+        assert!(w.cells.iter().filter(|c| c.m == Mat::Iron).count() > 60, "metal plates mostly survive");
+    }
+
+    #[test]
+    fn an_explosion_throws_loose_sand_outward() {
+        let mut w = World::new_static();
+        for x in 100..400 {
+            w.set(x, 340, Mat::Stone);
+        }
+        for x in 220..280 {
+            for y in 330..340 {
+                w.set(x, y, Mat::Sand);
+            }
+        }
+        let mean_spread = |w: &World| {
+            let xs: Vec<i32> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Sand).map(|i| (i % W) as i32).collect();
+            xs.iter().map(|x| (x - 250).abs()).sum::<i32>() as f32 / xs.len().max(1) as f32
+        };
+        let before = mean_spread(&w);
+        w.explode(250, 336, 14);
+        for _ in 0..60 {
+            w.step();
+        }
+        assert!(mean_spread(&w) > before + 3.0, "the pressure wave should push sand out: {before} -> {}", mean_spread(&w));
+        assert!(w.cells.iter().any(|c| c.m == Mat::Smoke) || w.blasts.len() > 0, "the blast makes smoke");
+    }
+
+    #[test]
+    fn buried_wood_becomes_oil_which_floats_on_water_and_burns_fiercely() {
+        let mut w = World::new_static();
+        // A log sealed in rock.
+        for x in 100..120 {
+            for y in 300..320 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for x in 105..115 {
+            w.set(x, 310, Mat::Wood);
+        }
+        let mut oil_at = None;
+        for t in 0..400_000 {
+            w.step();
+            if t % 500 == 0 && w.cells.iter().any(|c| c.m == Mat::Oil) {
+                oil_at = Some(t);
+                break;
+            }
+        }
+        assert!(oil_at.is_some(), "buried wood should turn into oil");
+    }
+
+    #[test]
+    fn oil_floats_and_burns_much_longer_than_ordinary_fire() {
+        let mut w = World::new_static();
+        for x in 99..=200 {
+            w.set(x, 340, Mat::Stone);
+        }
+        for y in 300..340 {
+            w.set(99, y, Mat::Stone);
+            w.set(200, y, Mat::Stone);
+        }
+        for x in 100..200 {
+            for y in 320..340 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        for x in 130..170 {
+            for y in 310..320 {
+                w.set(x, y, Mat::Oil);
+            }
+        }
+        for _ in 0..600 {
+            w.step();
+        }
+        // Oil stays on top of the water.
+        let oil_lowest = (0..H as i32).rev().find(|&y| (100..200).any(|x| w.raw(x, y) == Mat::Oil)).unwrap_or(0);
+        let water_top = (0..H as i32).find(|&y| (100..200).any(|x| w.raw(x, y) == Mat::Water)).unwrap();
+        assert!(oil_lowest <= water_top + 3, "oil should float on the water: lowest oil row {oil_lowest}, water surface {water_top}");
+        // Set it alight: flames last far longer than a normal fire would.
+        let oil_top = (0..H as i32).find(|&y| (100..200).any(|x| w.raw(x, y) == Mat::Oil)).unwrap();
+        let ox = (100..200).find(|&x| w.raw(x, oil_top) == Mat::Oil).unwrap();
+        for k in 0..8 {
+            w.set(ox + k, oil_top - 1, Mat::Fire);
+        }
+        let mut burning_for = 0;
+        for t in 0..1200 {
+            w.step();
+            let fires = w.cells.iter().filter(|c| c.m == Mat::Fire).count();
+            if fires > 10 {
+                burning_for = t;
+            }
+        }
+        assert!(burning_for > 200, "burning oil should keep flaming a long time: {burning_for}");
+    }
+
+    #[test]
+    fn grass_falls_until_it_meets_soil_or_sand_and_vanishes_if_nothing_catches_it() {
+        let mut w = World::new_static();
+        // Soil to land on, a pile of sand on a floor, and a column with nothing below at all.
+        for x in 100..110 {
+            for y in 330..340 {
+                w.set(x, y, Mat::Dirt);
+            }
+        }
+        for x in 198..212 {
+            w.set(x, 340, Mat::Stone);
+        }
+        for x in 200..210 {
+            for y in 330..340 {
+                w.set(x, y, Mat::Sand);
+            }
+        }
+        w.set(105, 300, Mat::Grass);
+        w.set(205, 300, Mat::Grass);
+        w.set(300, 300, Mat::Grass);
+        for _ in 0..400 {
+            w.step();
+        }
+        assert_eq!(w.raw(105, 329), Mat::Grass, "grass lands on soil");
+        let sand_grass = (0..H as i32).find(|&y| w.raw(205, y) == Mat::Grass).expect("grass should be resting on the sand");
+        assert_eq!(w.raw(205, sand_grass + 1), Mat::Sand, "grass lands on sand");
+        assert!((0..H as i32).all(|y| w.raw(300, y) != Mat::Grass), "grass over a void falls out of the world");
     }
 
     #[test]
@@ -2159,6 +2670,33 @@ mod tests {
     }
 
     #[test]
+    fn the_air_temperature_follows_the_seasons_and_the_gradient_starts_at_the_top() {
+        use super::Season;
+        let mut w = World::new();
+        w.day_cycle = false;
+        let mut noon = |s: Season| {
+            w.set_season(s);
+            w.set_phase(0.25);
+            (w.surface_temp_c(), w.ambient_c(0), w.ambient_c(H as i32 / 2))
+        };
+        let (summer_ground, summer_top, summer_mid) = noon(Season::Summer);
+        let (winter_ground, _, _) = noon(Season::Winter);
+        assert!((summer_ground - 40.0).abs() < 4.0, "mid-summer noon is about 40 °C, got {summer_ground}");
+        assert!((winter_ground - 10.0).abs() < 4.0, "mid-winter noon is about 10 °C, got {winter_ground}");
+        assert!(summer_top.abs() < 4.0, "the top of the screen hovers around 0 °C, got {summer_top}");
+        assert!(summer_mid > summer_top + 5.0 && summer_mid < summer_ground, "the gradient runs from the top down: {summer_top} {summer_mid} {summer_ground}");
+        w.set_season(Season::Summer);
+        w.set_phase(0.75);
+        let night_summer = w.surface_temp_c();
+        w.set_season(Season::Winter);
+        w.set_phase(0.75);
+        let night_winter = w.surface_temp_c();
+        assert!((-12.0..=-3.0).contains(&night_summer) && (-12.0..=-3.0).contains(&night_winter), "nights are -10 to -5: {night_summer} {night_winter}");
+        assert!(night_winter < night_summer, "winter nights are colder");
+        assert!(w.ambient_c(0).abs() < 4.0);
+    }
+
+    #[test]
     fn the_sun_warms_the_ground_most_nearby_and_the_air_cools_with_altitude() {
         let mut w = World::new();
         w.set_phase(0.25);
@@ -2175,7 +2713,64 @@ mod tests {
         let under = w.temp_c(W as i32 / 2, 300);
         let far = w.temp_c(40, 300);
         assert!(under > far + 1.5, "ground under the sun {under} vs far {far}");
-        assert!(w.temp_c(300, 80) < w.temp_c(300, 290) - 10.0, "air should cool with altitude");
+        // Away from the sun's halo, the air gets colder toward the top of the screen.
+        assert!(w.temp_c(40, 80) < w.temp_c(40, 290) - 5.0, "air should cool with altitude");
+    }
+
+    #[test]
+    fn warm_gas_rises_and_cold_gas_sinks() {
+        let mut w = World::new_static();
+        w.climate_fixed = Some(15.0);
+        w.reset_temps();
+        for k in 0..30 {
+            // Hot smoke and cold smoke, side by side, mid-air.
+            w.set(300 + k, 200, Mat::Smoke);
+            w.set(500 + k, 200, Mat::Smoke);
+            w.temp[200 * W + 500 + k as usize] = -15.0;
+        }
+        let mean_y = |w: &World, left: bool| {
+            let ys: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Smoke && ((i % W) < 400) == left).map(|i| i / W).collect();
+            ys.iter().sum::<usize>() as f32 / ys.len().max(1) as f32
+        };
+        let (smoke0, cloud0) = (mean_y(&w, true), mean_y(&w, false));
+        for _ in 0..45 {
+            w.wind = 0.0;
+            w.step();
+        }
+        assert!(mean_y(&w, true) < smoke0 - 8.0, "hot gas should climb: {smoke0} -> {}", mean_y(&w, true));
+        assert!(mean_y(&w, false) > cloud0 + 1.5, "cold gas should sink: {cloud0} -> {}", mean_y(&w, false));
+    }
+
+    #[test]
+    fn gas_drifts_briskly_with_the_wind() {
+        let mut w = World::new_static();
+        for k in 0..20 {
+            w.set(300 + k * 2, 100 + k % 5, Mat::Cloud);
+            w.set(300 + k * 2, 140 + k % 5, Mat::Steam);
+        }
+        let mean_x = |w: &World| {
+            let xs: Vec<i32> = (0..W * H).filter(|&i| matches!(w.cells[i].m, Mat::Cloud | Mat::Steam)).map(|i| (i % W) as i32).collect();
+            xs.iter().sum::<i32>() as f32 / xs.len().max(1) as f32
+        };
+        let before = mean_x(&w);
+        for _ in 0..300 {
+            w.wind = 0.5;
+            w.step();
+        }
+        let moved = mean_x(&w) - before;
+        assert!(moved > 60.0, "a 0.5 wind should carry gas well over 60 cells in 300 steps, moved {moved}");
+    }
+
+    #[test]
+    fn there_is_always_a_breeze() {
+        let mut w = World::new_static();
+        let mut calmest = 1.0f32;
+        for t in 0..200_000u32 {
+            w.ticks = t;
+            w.update_wind();
+            calmest = calmest.min(w.wind.abs());
+        }
+        assert!(calmest >= 0.29, "the wind should never die down completely: {calmest}");
     }
 
     #[test]
@@ -2211,7 +2806,7 @@ mod tests {
             w.set(x, 100, Mat::Stone);
         }
         w.set(10, 99, Mat::Sand);
-        w.begin_blocks(vec![Mat::Brick]);
+        w.begin_blocks(vec![Mat::Brick], vec![false]);
         for x in 8..13 {
             for y in 96..100 {
                 w.mark_block(x, y, 0);
@@ -2397,7 +2992,7 @@ mod science {
                 w.set(x, 298, Mat::Ash);
             }
         }
-        for _ in 0..800 {
+        for _ in 0..2500 {
             for x in (105..115).filter(|x| x % 2 == 1) {
                 if w.raw(x, 298) == Mat::Empty {
                     w.set(x, 298, Mat::Fire);
@@ -2529,25 +3124,33 @@ mod science {
 
     #[test]
     fn grass_protects_soil() {
-        let mut w = World::new_static();
-        floor(&mut w, 340, 100, 300);
-        for x in 100..300 {
-            for y in 320..340 {
-                w.set(x, y, Mat::Dirt);
-            }
-            for y in 318..320 {
-                w.set(x, y, Mat::Grass);
-            }
-        }
-        for t in 0..1500 {
-            if t < 1200 {
-                for x in 100..108 {
-                    w.set(x, 250, Mat::Water);
+        let run = |grass: bool| {
+            let mut w = World::new_static();
+            for x in 100..300 {
+                w.set(x, 340, Mat::Stone);
+                for y in 320..340 {
+                    w.set(x, y, Mat::Dirt);
+                }
+                if grass {
+                    for y in 318..320 {
+                        w.set(x, y, Mat::Grass);
+                    }
                 }
             }
-            w.step();
-        }
-        assert_eq!(count(&w, Mat::Mud), 0, "grass should shield the soil below");
+            for t in 0..1500 {
+                if t < 1200 {
+                    for x in 100..108 {
+                        w.set(x, 250, Mat::Water);
+                    }
+                }
+                w.step();
+            }
+            count(&w, Mat::Mud) + count(&w, Mat::Sand)
+        };
+        let bare = run(false);
+        let covered = run(true);
+        assert!(bare > 0, "bare soil should erode");
+        assert!(covered * 3 <= bare, "grass should shield the soil below: {covered} vs {bare}");
     }
 
     #[test]

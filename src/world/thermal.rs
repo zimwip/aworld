@@ -21,6 +21,9 @@ pub const MELT_C: f32 = 3.0;
 pub const LAVA_SOLID_C: f32 = 390.0;
 pub const ROCK_MELT_C: f32 = 540.0;
 pub const GLASS_C: f32 = 600.0;
+/// Metal melts only in fresh lava and sets again once it cools below this.
+pub const METAL_MELT_C: f32 = 1000.0;
+pub const METAL_SOLID_C: f32 = 850.0;
 pub const STEEL_C: f32 = 450.0;
 pub const SMELT_C: f32 = 400.0;
 pub const WOOD_IGNITE_C: f32 = 300.0;
@@ -49,6 +52,7 @@ fn props(m: Mat) -> (f32, f32) {
         Mat::Iron | Mat::Steel => (0.5, 2.5),
         Mat::Glass | Mat::Shard => (0.08, 3.0),
         Mat::Lava => (0.2, 400.0),
+        Mat::Molten => (0.5, 300.0),
         Mat::Fire => (0.4, 1.0),
         Mat::Ember => (0.25, 1.0),
         Mat::Gunpowder | Mat::Ash | Mat::Rust => (0.04, 1.2),
@@ -56,28 +60,54 @@ fn props(m: Mat) -> (f32, f32) {
 }
 
 struct Tables {
-    k: [f32; 32],
-    inv_c: [f32; 32],
-    reactive: [bool; 32],
+    k: [f32; NMAT],
+    inv_c: [f32; NMAT],
+    reactive: [bool; NMAT],
 }
 
 fn tables() -> &'static Tables {
     static T: std::sync::OnceLock<Tables> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        let mut t = Tables { k: [0.1; 32], inv_c: [1.0; 32], reactive: [false; 32] };
+        let mut t = Tables { k: [0.1; NMAT], inv_c: [1.0; NMAT], reactive: [false; NMAT] };
         for m in Mat::ALL {
             let (k, c) = props(m);
             t.k[m as usize] = k;
             t.inv_c[m as usize] = 1.0 / c;
             t.reactive[m as usize] = matches!(
                 m,
-                Mat::Water | Mat::Ice | Mat::Snow | Mat::Hail | Mat::Steam | Mat::Lava | Mat::Stone | Mat::Sand | Mat::Shard
-                    | Mat::Glass | Mat::Rust | Mat::Iron | Mat::Wood | Mat::Trunk | Mat::Leaf | Mat::Branch | Mat::DeadLeaf
+                Mat::Water | Mat::Ice | Mat::Snow | Mat::Hail | Mat::Steam | Mat::Lava | Mat::Molten | Mat::Stone | Mat::Sand
+                    | Mat::Shard | Mat::Glass | Mat::Rust | Mat::Iron | Mat::Steel | Mat::Wood | Mat::Trunk | Mat::Leaf | Mat::Branch | Mat::DeadLeaf
                     | Mat::Grass | Mat::Seed | Mat::Sapling | Mat::Gunpowder | Mat::Oil
             );
         }
         t
     })
+}
+
+/// Where a material changes state. Every solid/liquid/gas change goes through
+/// this one table, the same way for all of them: above the first threshold it
+/// becomes the first material, below the second it becomes the second.
+struct Phase {
+    up: Option<(f32, Mat, u32)>,
+    down: Option<(f32, Mat, u32)>,
+}
+
+fn phase(m: Mat) -> Phase {
+    let none = Phase { up: None, down: None };
+    match m {
+        // ice <-> water <-> steam
+        Mat::Water => Phase { up: Some((BOIL_C, Mat::Steam, 1)), down: Some((FREEZE_C, Mat::Ice, 1)) },
+        Mat::Ice | Mat::Snow | Mat::Hail => Phase { up: Some((MELT_C, Mat::Water, 1)), down: None },
+        // rock <-> lava
+        Mat::Stone => Phase { up: Some((ROCK_MELT_C, Mat::Lava, 30)), down: None },
+        Mat::Lava => Phase { up: None, down: Some((LAVA_SOLID_C, Mat::Stone, 20)) },
+        // iron and steel <-> molten metal (only fresh lava is hot enough)
+        Mat::Iron | Mat::Steel => Phase { up: Some((METAL_MELT_C, Mat::Molten, 40)), down: None },
+        Mat::Molten => Phase { up: None, down: Some((METAL_SOLID_C, Mat::Iron, 20)) },
+        // sand fuses into glass
+        Mat::Sand | Mat::Shard => Phase { up: Some((GLASS_C, Mat::Glass, 15)), down: None },
+        _ => none,
+    }
 }
 
 /// How much of the sun's light a material soaks up.
@@ -145,12 +175,23 @@ impl World {
     }
 
     /// Seasonal shift of the air temperature: warmest mid-summer, coldest mid-winter.
-    fn season_offset_c(&self) -> f32 {
-        12.0 * ((self.year_phase() - 0.125) * std::f32::consts::TAU).sin() - 1.0
+    fn season_wave(&self) -> f32 {
+        ((self.year_phase() - 0.125) * std::f32::consts::TAU).sin()
+    }
+
+    /// Warmest the ground gets by day: 10 °C mid-winter up to 40 °C mid-summer.
+    pub fn day_peak_c(&self) -> f32 {
+        25.0 + 15.0 * self.season_wave()
+    }
+
+    /// Coldest the ground gets by night: -10 °C mid-winter, -5 °C mid-summer.
+    pub fn night_low_c(&self) -> f32 {
+        -7.5 + 2.5 * self.season_wave()
     }
 
     /// Refreshes the leaf and grass colours for the current season.
     pub(super) fn update_season_cache(&mut self) {
+        self.revision += 1;
         let p = self.season_progress();
         let mix = |a: (i32, i32, i32), b: (i32, i32, i32), t: f32| {
             let f = |x: i32, y: i32| (x as f32 + (y - x) as f32 * t.clamp(0.0, 1.0)) as i32;
@@ -201,7 +242,13 @@ impl World {
         if let Some(t) = self.climate_fixed {
             return t;
         }
-        5.0 + 15.0 * (self.phase() * std::f32::consts::TAU).sin() + self.season_offset_c()
+        let (peak, low) = (self.day_peak_c(), self.night_low_c());
+        0.5 * (peak + low) + 0.5 * (peak - low) * (self.phase() * std::f32::consts::TAU).sin()
+    }
+
+    /// Temperature at the very top of the screen: it hovers around zero all the time.
+    pub fn sky_top_c(&self) -> f32 {
+        2.5 * (self.phase() * std::f32::consts::TAU).sin()
     }
 
     /// Air temperature at a row: it gets colder with altitude.
@@ -209,8 +256,11 @@ impl World {
         if let Some(t) = self.climate_fixed {
             return t;
         }
-        let alt = ((GROUND_Y - y as f32) / GROUND_Y).clamp(0.0, 1.0);
-        self.surface_temp_c() - 40.0 * alt
+        // The gradient starts at the top of the screen (around 0 °C) and runs down to
+        // the air temperature at ground level.
+        let f = (y as f32 / GROUND_Y).clamp(0.0, 1.0);
+        let top = self.sky_top_c();
+        top + (self.surface_temp_c() - top) * f
     }
 
     /// Where the sun (by day) sits in the world, in cells; matches the backdrop.
@@ -225,6 +275,7 @@ impl World {
 
     /// Everything starts at the temperature of the air around it.
     pub fn reset_temps(&mut self) {
+        self.revision += 1;
         for y in 0..H {
             let amb = self.ambient_c(y as i32);
             for x in 0..W {
@@ -241,22 +292,35 @@ impl World {
 
     // ----- wind -------------------------------------------------------------
 
-    /// Slowly changing wind, -1 (blowing left) to 1 (blowing right).
+    /// Slowly changing wind, -1 (blowing left) to 1 (blowing right). It is never
+    /// dead calm: the direction changes slowly but there is always a breeze.
     pub(super) fn update_wind(&mut self) {
         let t = self.ticks as f32;
         let tau = std::f32::consts::TAU;
-        self.wind = (0.6 * (t * tau / 7200.0 + 1.3).sin() + 0.3 * (t * tau / 1900.0 + 0.4).sin() + 0.15 * (t / 300.0).sin())
-            .clamp(-1.0, 1.0);
+        let base = 0.6 * (t * tau / 7200.0 + 1.3).sin() + 0.3 * (t * tau / 1900.0 + 0.4).sin() + 0.15 * (t / 300.0).sin();
+        let base = base.clamp(-1.0, 1.0);
+        self.wind = base.signum() * (0.3 + 0.7 * base.abs());
     }
 
-    /// Where the wind would carry a gas cell this step, if anywhere.
+    /// Where the wind carries a gas cell this step: up to a few cells along, the
+    /// farther the stronger the wind. Layers of air at different heights move at
+    /// slightly different speeds, which keeps the clouds shearing and drifting.
     pub(super) fn wind_target(&mut self, x: i32, y: i32) -> Option<(i32, i32)> {
         let altitude = 1.0 - y as f32 / H as f32;
-        let strength = self.wind.abs() * (0.4 + altitude);
-        if (self.rand() % 100) as f32 >= strength * 55.0 {
+        let layer = 1.0 + 0.35 * (y as f32 * 0.045 + self.ticks as f32 * 0.0015).sin();
+        let strength = (self.wind * layer).abs() * (0.5 + altitude);
+        if (self.rand() % 100) as f32 >= strength * 95.0 {
             return None;
         }
-        Some((x + if self.wind > 0.0 { 1 } else { -1 }, y))
+        let dir = if self.wind > 0.0 { 1 } else { -1 };
+        let reach = 1 + (strength * 2.5) as i32;
+        for k in (1..=reach).rev() {
+            let tx = (x + dir * k).rem_euclid(W as i32);
+            if self.at(tx, y) == Mat::Empty {
+                return Some((tx, y));
+            }
+        }
+        None
     }
 
     // ----- heat flow --------------------------------------------------------
@@ -292,6 +356,9 @@ impl World {
                 // Flames and embers pour heat into whatever touches them.
                 let k = if mi == Mat::Fire as usize || mi == Mat::Ember as usize || mj == Mat::Fire as usize || mj == Mat::Ember as usize {
                     0.25
+                } else if mi == Mat::Lava as usize || mj == Mat::Lava as usize || mi == Mat::Molten as usize || mj == Mat::Molten as usize {
+                    // Lava and molten metal soak into whatever they touch.
+                    0.2
                 } else {
                     tb.k[mi].min(tb.k[mj])
                 };
@@ -319,7 +386,7 @@ impl World {
                 let i = y * W + x;
                 let m = self.cells[i].m;
                 let t = self.temp[i];
-                let amb = if fixed { base } else { base + 16.0 * sun * gx[x] * gy[y] };
+                let amb = if fixed { base } else { base + 12.0 * sun * gx[x] * gy[y] };
                 match m {
                     Mat::Empty => self.temp[i] = t + (amb - t) * 0.12 * TS,
                     Mat::Steam | Mat::Cloud | Mat::Snow | Mat::Hail | Mat::Smoke => self.temp[i] = t + (amb - t) * 0.03 * TS,
@@ -345,7 +412,7 @@ impl World {
                     match m {
                         Mat::Empty => {}
                         Mat::Cloud | Mat::Steam => {
-                            let target = surf + 38.0 * light * 0.5;
+                            let target = surf + 12.0 * light * 0.5;
                             if target > self.temp[i] {
                                 self.temp[i] += (target - self.temp[i]) * 0.04 * TS;
                             }
@@ -353,7 +420,7 @@ impl World {
                         }
                         Mat::Fire | Mat::Ember | Mat::Lava => {}
                         _ => {
-                            let target = surf + 38.0 * light * absorb(m);
+                            let target = surf + 15.0 * light * absorb(m);
                             if target > self.temp[i] {
                                 self.temp[i] += (target - self.temp[i]) * 0.05 * TS;
                             }
@@ -369,18 +436,35 @@ impl World {
     /// Material changes driven by temperature. Transformations consume their
     /// inputs: water that boils is gone, steam that condenses is a cloud.
     fn react(&mut self, i: usize, x: i32, y: i32, m: Mat, t: f32, can_condense: bool) {
-        match m {
-            Mat::Water => {
-                if t >= BOIL_C {
-                    self.set(x, y, Mat::Steam);
-                } else if t <= FREEZE_C {
-                    self.set(x, y, Mat::Ice);
-                }
+        // Melting, boiling, freezing, setting: one rule for every material.
+        let ph = phase(m);
+        if let Some((th, to, rate)) = ph.up {
+            if t >= th && self.chance(rate) {
+                self.set(x, y, to);
+                // The new phase takes the heat from whatever made it change: halfway
+                // between the threshold and its hottest neighbour. That is how fresh
+                // lava keeps melting the rock beside it, layer after layer, until the
+                // heat has thinned out.
+                let hottest = Self::neighbors(x, y)
+                    .iter()
+                    .filter(|&&(nx, ny)| Self::inb(nx, ny))
+                    .map(|&(nx, ny)| self.temp[Self::idx(nx, ny)])
+                    .fold(th, f32::max);
+                self.temp[i] = (0.5 * (th + hottest)).min(1300.0);
+                return;
             }
+        }
+        if let Some((th, to, rate)) = ph.down {
+            if t <= th && self.chance(rate) {
+                self.set(x, y, to);
+                self.temp[i] = t.max(th);
+                return;
+            }
+        }
+        match m {
+            Mat::Water | Mat::Molten => {}
             Mat::Ice | Mat::Snow | Mat::Hail => {
-                if t >= MELT_C {
-                    self.set(x, y, Mat::Water);
-                } else if m == Mat::Snow && t < -2.0 {
+                if m == Mat::Snow && t < -2.0 {
                     // Deep, cold snow is pressed into ice (the way a glacier forms).
                     let above = (1..=3).filter(|d| matches!(self.raw(x, y - d), Mat::Snow | Mat::Ice | Mat::Hail)).count();
                     if (above >= 2 && self.chance(500)) || (t < -12.0 && above >= 1 && self.chance(4000)) {
@@ -393,15 +477,9 @@ impl World {
                     self.set(x, y, Mat::Cloud);
                 }
             }
-            Mat::Lava => {
-                if t < LAVA_SOLID_C && self.chance(20) {
-                    self.set(x, y, Mat::Stone);
-                }
-            }
+            Mat::Lava => {}
             Mat::Stone => {
-                if t >= ROCK_MELT_C && self.chance(30) {
-                    self.set(x, y, Mat::Lava);
-                } else if t > -8.0 && t < 6.0 && self.chance(20_000) {
+                if t > -8.0 && t < 6.0 && self.chance(20_000) {
                     // Frost weathering: water in the cracks freezes and thaws, rock crumbles to sand.
                     let wet = Self::neighbors(x, y).iter().any(|&(nx, ny)| matches!(self.raw(nx, ny), Mat::Water | Mat::Ice));
                     if wet {
@@ -409,11 +487,7 @@ impl World {
                     }
                 }
             }
-            Mat::Sand | Mat::Shard => {
-                if t >= GLASS_C && self.chance(15) {
-                    self.set(x, y, Mat::Glass);
-                }
-            }
+            Mat::Sand | Mat::Shard => {}
             Mat::Glass => {
                 // Thermal shock: neighbours at very different temperatures crack it.
                 let mut worst = 0.0f32;

@@ -7,13 +7,13 @@ mod science;
 mod ui;
 mod world;
 
-use blocks::{anchor_at, anchor_world, block_at, clip, node_at, placement_ok, snap, stamp_all, Anchor, Block, BlockKind, Cable, Member, MemberMat, Physics, MEMBER_MAX_LEN};
+use blocks::{anchor_world, block_at, clip, node_at, placement_ok, snap, stamp_all, Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, Physics, Spring, SpringKind, MEMBER_MAX_LEN, SPRING_MAX_LEN};
 use car::{collide_cars, Car, Fate, ModelKind, Tuning};
 use macroquad::prelude::*;
-use render::{cable_preview, draw_block, draw_block_shape, draw_booms, draw_cable, draw_car, draw_flag, draw_member, Boom, Renderer, View};
+use render::{cable_preview, draw_block, draw_block_shape, draw_booms, draw_cable, draw_car, draw_flag, draw_member, draw_spring, draw_spring_between, Boom, Renderer, View};
 use science::{info, mat_color, RECIPES};
 use ui::{draw_icon, rrect, Icon, Ui, ACCENT, BG, BLUE, DIM, GREEN, PANEL, RED, TEXT};
-use world::{Biome, Cell, Mat, Season, World, H, W};
+use world::{Biome, Cell, Mat, PaintRule, Season, World, H, W};
 
 const PANEL_W: f32 = 244.0;
 const TOP_H: f32 = 48.0;
@@ -39,10 +39,18 @@ enum ViewMode {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+enum PaintMode {
+    Add,
+    Replace,
+    Only,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum Tool {
     Mat(Mat),
     Block(BlockKind),
-    Cable,
+    Cable(CableMat),
+    Spring(SpringKind),
     Beam(MemberMat),
     Eraser,
     Rotate,
@@ -75,9 +83,18 @@ struct Snapshot {
     blocks: Vec<Block>,
     cables: Vec<Cable>,
     members: Vec<Member>,
+    springs: Vec<Spring>,
     cars: Vec<Car>,
     arrived: u32,
     lost: u32,
+}
+
+/// A spring being set up: first end fixed, rest length chosen, far end still to place.
+struct SpringDraft {
+    a: Anchor,
+    pa: Vec2,
+    /// Where the rest length was set (the second click) and that length.
+    rest: Option<(Vec2, f32)>,
 }
 
 struct Game {
@@ -87,10 +104,15 @@ struct Game {
     snap_blocks: Vec<Block>,
     snap_cables: Vec<Cable>,
     snap_members: Vec<Member>,
+    snap_springs: Vec<Spring>,
     blocks: Vec<Block>,
     cables: Vec<Cable>,
     members: Vec<Member>,
+    springs: Vec<Spring>,
+    spring_draft: Option<SpringDraft>,
     cable_from: Option<Anchor>,
+    /// Cable elasticity setting (1 = as the material is, higher = stretchier).
+    cable_soft: f32,
     member_from: Option<(Anchor, Vec2)>,
     phys: Option<Physics>,
     cars: Vec<Car>,
@@ -116,14 +138,24 @@ struct Game {
     time: f32,
     fullscreen: bool,
     mode: ViewMode,
+    /// How the brush treats existing material, and the material "only" mode targets.
+    paint_mode: PaintMode,
+    only_target: Mat,
     /// 0 = palette tucked away, 1 = fully out.
     views_open: f32,
     views_pin: bool,
     views_hit: Rect,
+    /// Camera shake in pixels (explosions), and frame-rate watching for auto speed.
+    shake: f32,
+    frame_ema: f32,
+    slow_frames: u32,
     beam_broke: bool,
-    /// Edit mode only: building does not use up the world's materials.
+    broken_members: Vec<u32>,
+    /// Building does not use up the world's materials: one choice for the editing
+    /// phase and one for the simulation (picked while editing).
     unlimited: bool,
-    census: [u32; 32],
+    unlimited_sim: bool,
+    census: [u32; world::NMAT],
     show_science: bool,
     hover_info: Option<(String, String)>,
 }
@@ -138,11 +170,15 @@ impl Game {
             snap_blocks: vec![],
             snap_cables: vec![],
             snap_members: vec![],
+            snap_springs: vec![],
             world,
             blocks: vec![],
             cables: vec![],
             members: vec![],
+            springs: vec![],
+            spring_draft: None,
             cable_from: None,
+            cable_soft: 1.0,
             member_from: None,
             phys: None,
             cars: vec![],
@@ -168,12 +204,19 @@ impl Game {
             time: 0.0,
             fullscreen: false,
             mode: ViewMode::Normal,
+            paint_mode: PaintMode::Add,
+            only_target: Mat::Empty,
             views_open: 0.0,
             views_pin: false,
             views_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
+            shake: 0.0,
+            frame_ema: 0.016,
+            slow_frames: 0,
             beam_broke: false,
+            broken_members: vec![],
             unlimited: true,
-            census: [0; 32],
+            unlimited_sim: false,
+            census: [0; world::NMAT],
             show_science: false,
             hover_info: None,
         }
@@ -186,6 +229,7 @@ impl Game {
             blocks: self.blocks.iter().map(|b| Block { body: None, ..b.clone() }).collect(),
             cables: self.cables.iter().map(Cable::fresh).collect(),
             members: self.members.iter().map(Member::fresh).collect(),
+            springs: self.springs.iter().map(Spring::fresh).collect(),
             cars: self.cars.clone(),
             arrived: self.arrived,
             lost: self.lost,
@@ -204,6 +248,8 @@ impl Game {
         self.blocks = s.blocks;
         self.cables = s.cables;
         self.members = s.members;
+        self.springs = s.springs;
+        self.spring_draft = None;
         self.cars = s.cars;
         self.arrived = s.arrived;
         self.lost = s.lost;
@@ -220,6 +266,11 @@ impl Game {
 
     /// Placeholder: breaking glass is not an undoable edit.
     fn checkpoint_quiet(&mut self) {}
+
+    /// Is building free right now? Depends on the phase we are in.
+    fn free_now(&self) -> bool {
+        if self.running { self.unlimited_sim } else { self.unlimited }
+    }
 
     fn say(&mut self, s: impl Into<String>) {
         self.toast = Some((s.into(), 2.5));
@@ -243,7 +294,11 @@ impl Game {
         p.build_members(&self.blocks, &mut self.members);
         for c in &mut self.cables {
             c.reset_runtime();
-            p.add_cable(&self.blocks, c);
+            p.add_cable(&self.blocks, &self.members, c);
+        }
+        for sp in &mut self.springs {
+            *sp = sp.fresh();
+            p.add_spring(&self.blocks, &self.members, sp);
         }
         self.phys = Some(p);
     }
@@ -254,6 +309,7 @@ impl Game {
             self.snap_blocks = self.blocks.iter().map(|b| Block { body: None, ..b.clone() }).collect();
             self.snap_cables = self.cables.iter().map(Cable::fresh).collect();
             self.snap_members = self.members.iter().map(Member::fresh).collect();
+            self.snap_springs = self.springs.iter().map(Spring::fresh).collect();
             if self.phys.is_none() {
                 self.build_physics();
             }
@@ -266,6 +322,8 @@ impl Game {
         self.blocks = self.snap_blocks.clone();
         self.cables = self.snap_cables.iter().map(Cable::fresh).collect();
         self.members = self.snap_members.iter().map(Member::fresh).collect();
+        self.springs = self.snap_springs.iter().map(Spring::fresh).collect();
+        self.spring_draft = None;
         self.cable_from = None;
         self.member_from = None;
         self.phys = None;
@@ -279,6 +337,8 @@ impl Game {
         self.blocks.clear();
         self.cables.clear();
         self.members.clear();
+        self.springs.clear();
+        self.spring_draft = None;
         self.cable_from = None;
         self.member_from = None;
         self.phys = None;
@@ -292,6 +352,7 @@ impl Game {
         self.snap_blocks.clear();
         self.snap_cables.clear();
         self.snap_members.clear();
+        self.snap_springs.clear();
     }
 
     fn new_world(&mut self, biome: Biome) {
@@ -329,7 +390,7 @@ impl Game {
     }
 
     fn save(&mut self) {
-        match save::save_slot(self.slot, &self.world, self.entry, self.exit, &self.blocks, &self.cables, &self.members) {
+        match save::save_slot(self.slot, &self.world, self.entry, self.exit, &self.blocks, &self.cables, &self.members, &self.springs) {
             Ok(()) => self.say(format!("Monde sauvegardé (emplacement {})", self.slot + 1)),
             Err(e) => self.say(format!("Échec de la sauvegarde : {e}")),
         }
@@ -349,9 +410,11 @@ impl Game {
                 self.blocks = l.blocks;
                 self.cables = l.cables;
                 self.members = l.members;
+                self.springs = l.springs;
                 self.snap_blocks = self.blocks.clone();
                 self.snap_cables = self.cables.iter().map(Cable::fresh).collect();
                 self.snap_members = self.members.iter().map(Member::fresh).collect();
+                self.snap_springs = self.springs.iter().map(Spring::fresh).collect();
                 self.refresh_mask();
                 self.say(format!("Monde chargé (emplacement {})", self.slot + 1));
             }
@@ -383,7 +446,7 @@ impl Game {
             return;
         }
         let (from, units) = kind.cost();
-        let free = self.unlimited && !self.running;
+        let free = self.free_now();
         if !free {
             self.census = self.world.census();
             let have: u32 = from.iter().map(|m| self.census[*m as usize]).sum();
@@ -421,9 +484,24 @@ impl Game {
         self.cables = keep;
     }
 
+    fn remove_springs_where(&mut self, test: impl Fn(&Spring) -> bool) {
+        let mut keep = vec![];
+        for mut sp in self.springs.drain(..) {
+            if test(&sp) {
+                if let Some(p) = &mut self.phys {
+                    p.remove_spring(&mut sp);
+                }
+            } else {
+                keep.push(sp);
+            }
+        }
+        self.springs = keep;
+    }
+
     fn remove_block(&mut self, i: usize) {
         let uid = self.blocks[i].uid;
         self.remove_cables_of(uid);
+        self.remove_springs_where(|sp| sp.attached_to(uid));
         let mut b = self.blocks.remove(i);
         if let Some(p) = &mut self.phys {
             p.remove_block(&mut b);
@@ -449,7 +527,11 @@ impl Game {
             p.weld_neighbours(&self.blocks, i);
             for c in self.cables.iter_mut().filter(|c| c.attached_to(uid)) {
                 p.remove_cable(c);
-                p.add_cable(&self.blocks, c);
+                p.add_cable(&self.blocks, &self.members, c);
+            }
+            for sp in self.springs.iter_mut().filter(|sp| sp.attached_to(uid)) {
+                p.remove_spring(sp);
+                p.add_spring(&self.blocks, &self.members, sp);
             }
         }
         self.refresh_mask();
@@ -513,9 +595,9 @@ impl Game {
         self.crumble(i, Mat::Ember, false);
     }
 
-    fn cable_click(&mut self, at: Vec2) {
-        let Some(anchor) = anchor_at(&self.world, &self.blocks, at) else {
-            self.say("Accroche le câble sur un bloc ou sur le sol");
+    fn cable_click(&mut self, mat: CableMat, at: Vec2) {
+        let Some(anchor) = node_at(&self.world, &self.blocks, &self.members, at) else {
+            self.say("Accroche le câble sur un bloc, une tige, le sol ou le bord du monde");
             return;
         };
         match self.cable_from.take() {
@@ -528,12 +610,85 @@ impl Game {
                     self.cable_from = Some(first);
                     return;
                 }
+                let units = mat.cost(chord * 1.06);
+                let free = self.free_now();
+                if !free {
+                    self.census = self.world.census();
+                    let have: u32 = mat.cost_from().iter().map(|m| self.census[*m as usize]).sum();
+                    if have < units {
+                        self.say(format!("Pas assez de {} pour ce câble : il en faut {units}, il y en a {have}", info(mat.cost_from()[0]).name.to_lowercase()));
+                        self.cable_from = Some(first);
+                        return;
+                    }
+                }
                 self.checkpoint();
-                let mut c = Cable::new(first, anchor, chord);
+                if !free {
+                    self.world.consume(mat.cost_from(), units, (a.x as i32, a.y as i32));
+                }
+                let mut c = Cable::new(first, anchor, chord).made_of(mat, self.cable_soft);
                 if let Some(p) = &mut self.phys {
-                    p.add_cable(&self.blocks, &mut c);
+                    p.add_cable(&self.blocks, &self.members, &mut c);
                 }
                 self.cables.push(c);
+            }
+        }
+    }
+
+    /// Three clicks: fix the first end, set the rest length, then pull the far end
+    /// out to where it should be attached (or leave it loose by clicking in the air).
+    fn spring_click(&mut self, kind: SpringKind, at: Vec2) {
+        let Some(mut d) = self.spring_draft.take() else {
+            match node_at(&self.world, &self.blocks, &self.members, at) {
+                Some(a) => {
+                    if let Some(p) = anchor_world(&a, &self.blocks, &self.members) {
+                        self.spring_draft = Some(SpringDraft { a, pa: p, rest: None });
+                    }
+                }
+                None => self.say("Fixe le premier bout sur un bloc, une tige, le sol ou le bord du monde"),
+            }
+            return;
+        };
+        match d.rest {
+            None => {
+                let len = (at - d.pa).length().min(SPRING_MAX_LEN);
+                if len < 10.0 {
+                    self.say("Éloigne le deuxième clic : il donne la longueur au repos");
+                    self.spring_draft = Some(d);
+                    return;
+                }
+                let end = d.pa + (at - d.pa).clamp_length_max(SPRING_MAX_LEN);
+                d.rest = Some((end, len));
+                self.spring_draft = Some(d);
+            }
+            Some((rest_pt, rest)) => {
+                // Third click: attach the far end where it was pulled to, or leave it at rest.
+                let (b, p1) = match node_at(&self.world, &self.blocks, &self.members, at) {
+                    Some(a) => match anchor_world(&a, &self.blocks, &self.members) {
+                        Some(p) if (p - d.pa).length() <= SPRING_MAX_LEN * 2.5 && a != d.a => (a, p),
+                        _ => (Anchor::Free(rest_pt), rest_pt),
+                    },
+                    None => (Anchor::Free(rest_pt), rest_pt),
+                };
+                let units = kind.cost(rest);
+                let free = self.free_now();
+                if !free {
+                    self.census = self.world.census();
+                    let have: u32 = kind.cost_from().iter().map(|m| self.census[*m as usize]).sum();
+                    if have < units {
+                        self.say(format!("Pas assez de {} : il en faut {units}, il y en a {have}", info(kind.cost_from()[0]).name.to_lowercase()));
+                        self.spring_draft = Some(d);
+                        return;
+                    }
+                }
+                self.checkpoint();
+                if !free {
+                    self.world.consume(kind.cost_from(), units, (d.pa.x as i32, d.pa.y as i32));
+                }
+                let mut sp = Spring::new(kind, d.a, b, rest, self.cable_soft, d.pa, p1);
+                if let Some(p) = &mut self.phys {
+                    p.add_spring(&self.blocks, &self.members, &mut sp);
+                }
+                self.springs.push(sp);
             }
         }
     }
@@ -572,8 +727,25 @@ impl Game {
         }
     }
 
+    /// Cables fixed to a rod that is gone are cut loose.
+    fn cut_cables_of_member(&mut self, uid: u32) {
+        self.remove_springs_where(|sp| sp.attached_to_member(uid));
+        let mut keep = vec![];
+        for mut c in self.cables.drain(..) {
+            if c.attached_to_member(uid) {
+                if let Some(p) = &mut self.phys {
+                    p.remove_cable(&mut c);
+                }
+            } else {
+                keep.push(c);
+            }
+        }
+        self.cables = keep;
+    }
+
     fn remove_member_at(&mut self, i: usize) {
         let mut m = self.members.remove(i);
+        self.cut_cables_of_member(m.uid);
         if let Some(p) = &mut self.phys {
             p.remove_member(&mut m);
         }
@@ -606,7 +778,11 @@ impl Game {
                         self.member_from = Some((a, p));
                     }
                 }
-                None => self.say("Commence sur le sol, un bloc ou un nœud de poutre"),
+                None => {
+                    // No attachment: the rod is allowed, and it will simply fall.
+                    self.member_from = Some((Anchor::Free(at), at));
+                    self.say("Sans attache : la tige tombera");
+                }
             },
             Some((a, p0)) => {
                 let (b, p1) = self.beam_end(p0, at, &a);
@@ -617,7 +793,7 @@ impl Game {
                     return;
                 }
                 let units = mat.cost(len);
-                let free = self.unlimited && !self.running;
+                let free = self.free_now();
                 if !free {
                     self.census = self.world.census();
                     let have: u32 = mat.cost_from().iter().map(|m| self.census[*m as usize]).sum();
@@ -719,6 +895,7 @@ impl Game {
             } else {
                 self.cable_from = None;
                 self.member_from = None;
+                self.spring_draft = None;
             }
         }
         if is_key_pressed(KeyCode::Space) {
@@ -828,9 +1005,10 @@ impl Game {
         let click = is_mouse_button_pressed(MouseButton::Left);
         let rclick = is_mouse_button_pressed(MouseButton::Right);
 
-        if rclick && (self.cable_from.is_some() || self.member_from.is_some()) {
+        if rclick && (self.cable_from.is_some() || self.member_from.is_some() || self.spring_draft.is_some()) {
             self.cable_from = None;
             self.member_from = None;
+            self.spring_draft = None;
             return;
         }
         if right || (left && self.tool == Tool::Eraser) {
@@ -841,6 +1019,13 @@ impl Game {
                 }
                 if let Some(i) = self.members.iter().position(|m| m.distance_to(at) < m.mat.thickness() / 2.0 + 3.0) {
                     self.remove_member_at(i);
+                    return;
+                }
+                if let Some(i) = self.springs.iter().position(|sp| sp.distance_to(at) < 5.0) {
+                    let mut sp = self.springs.remove(i);
+                    if let Some(p) = &mut self.phys {
+                        p.remove_spring(&mut sp);
+                    }
                     return;
                 }
                 if let Some(i) = self.cables.iter().position(|c| c.distance_to(at) < 4.0) {
@@ -855,9 +1040,23 @@ impl Game {
             return;
         }
         match self.tool {
-            Tool::Mat(m) => self.world.line(from, g, self.brush, m),
+            Tool::Mat(m) => {
+                let rule = match self.paint_mode {
+                    PaintMode::Add => PaintRule::Fill,
+                    PaintMode::Replace => PaintRule::Replace,
+                    PaintMode::Only => {
+                        // The material under the first click is the one being replaced.
+                        if click {
+                            self.only_target = self.world.raw(g.0, g.1);
+                        }
+                        PaintRule::Only(self.only_target)
+                    }
+                };
+                self.world.line_rule(from, g, self.brush, m, rule);
+            }
             Tool::Block(k) if click => self.place_block(k, at),
-            Tool::Cable if click => self.cable_click(at),
+            Tool::Cable(m) if click => self.cable_click(m, at),
+            Tool::Spring(k) if click => self.spring_click(k, at),
             Tool::Beam(m) if click => self.beam_click(m, at),
             Tool::Hammer if click => self.hammer(at),
             Tool::Rotate if click => {
@@ -886,7 +1085,25 @@ impl Game {
 
     fn update(&mut self, dt: f32) {
         self.time += dt;
-        if self.tab == Tab::Blocks && (self.time * 4.0) as u32 != ((self.time - dt) * 4.0) as u32 {
+        self.shake *= 0.88f32.powf(dt * 60.0);
+        if self.shake < 0.15 {
+            self.shake = 0.0;
+        }
+        // Keep the game smooth: if frames stay slow while simulating, run fewer steps per frame.
+        self.frame_ema = self.frame_ema * 0.92 + dt * 0.08;
+        if self.running && self.frame_ema > 0.026 {
+            self.slow_frames += 1;
+        } else {
+            self.slow_frames = self.slow_frames.saturating_sub(2);
+        }
+        if self.slow_frames > 60 && self.speed > 1 {
+            self.speed -= 1;
+            self.slow_frames = 0;
+            self.frame_ema = 0.016;
+            self.say(format!("Vitesse réduite à x{} pour rester fluide", self.speed));
+        }
+        let building = matches!(self.tool, Tool::Block(_) | Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(_));
+        if (self.tab == Tab::Blocks || building) && (self.time * 4.0) as u32 != ((self.time - dt) * 4.0) as u32 {
             self.census = self.world.census();
         }
         for b in &mut self.booms {
@@ -963,10 +1180,15 @@ impl Game {
             }
             p.step(&self.world, &mut self.blocks);
             impacts = p.take_impacts();
-            p.sync_cables(&self.blocks, &mut self.cables);
-            for spot in p.update_members(&self.world, &mut self.members) {
+            let broken = p.update_members(&self.world, &mut self.members);
+            p.sync_cables(&self.blocks, &self.members, &mut self.cables);
+            for _gone in p.sync_springs(&self.blocks, &self.members, &mut self.springs) {
+                self.booms.push(Boom { pos: self.cars.first().map_or(vec2(0.0, 0.0), |c| c.p), t: 0.9, color: Color::new(1.0, 1.0, 1.0, 1.0) });
+            }
+            for (spot, uid) in broken {
                 self.booms.push(Boom { pos: spot, t: 0.5, color: Color::new(0.9, 0.7, 0.4, 1.0) });
                 self.beam_broke = true;
+                self.broken_members.push(uid);
             }
         }
         for uid in impacts {
@@ -979,6 +1201,9 @@ impl Game {
         }
         if self.beam_broke {
             self.beam_broke = false;
+            for uid in std::mem::take(&mut self.broken_members) {
+                self.cut_cables_of_member(uid);
+            }
             self.fix_dangling_anchors();
         }
         stamp_all(&mut self.world, &self.blocks, &self.members);
@@ -1033,6 +1258,8 @@ impl Game {
                 }
             }
             self.booms.push(Boom { pos: c, t: 0.0, color: Color::new(1.0, 0.5, 0.1, 1.0) });
+            // The pressure wave rattles the whole picture.
+            self.shake = self.shake.max((r as f32 * 0.75).min(18.0));
         }
         let outside = |p: Vec2| p.y > H as f32 + 60.0 || p.x < -60.0 || p.x > W as f32 + 60.0;
         let mut gone: Vec<(usize, u8)> = vec![];
@@ -1105,9 +1332,13 @@ impl Game {
         for m in &self.members {
             draw_member(m, view, self.mode == ViewMode::Stress);
         }
+        for sp in &self.springs {
+            draw_spring(sp, view, self.mode == ViewMode::Stress);
+        }
         for c in &self.cables {
             let pts = self.cable_points(c);
-            draw_cable(&pts, view, c.snapped, true);
+            let st = if self.mode == ViewMode::Stress { Some(c.stress) } else { None };
+            draw_cable(&pts, view, c.snapped, true, c.mat.color(), st);
         }
         if let Some(e) = self.entry {
             draw_flag(view, e, GREEN, false);
@@ -1133,6 +1364,8 @@ impl Game {
         }
         if !thermal {
             backdrop::draw_night(view, day);
+        } else {
+            self.draw_sun_on_thermal(view, ui);
         }
         if self.mode == ViewMode::Wind {
             self.draw_wind_field(view);
@@ -1144,9 +1377,33 @@ impl Game {
         if let Some(a) = &self.cable_from {
             if let Some(p) = anchor_world(a, &self.blocks, &self.members) {
                 let end = if inside { view.to_world(ui.mouse) } else { p };
-                let ok = inside && anchor_at(&self.world, &self.blocks, end).is_some();
+                let ok = inside && node_at(&self.world, &self.blocks, &self.members, end).is_some();
                 let pts = cable_preview(p, end, (end - p).length());
-                draw_cable(&pts, view, false, ok);
+                let rgb = if let Tool::Cable(m) = self.tool { m.color() } else { (62, 66, 78) };
+                draw_cable(&pts, view, false, ok, rgb, None);
+            }
+        }
+        if let (Tool::Spring(kind), Some(d)) = (self.tool, self.spring_draft.as_ref()) {
+            let cursor = if inside { view.to_world(ui.mouse) } else { d.pa };
+            match d.rest {
+                None => {
+                    let end = d.pa + (cursor - d.pa).clamp_length_max(SPRING_MAX_LEN);
+                    draw_spring_between(d.pa, end, (end - d.pa).length(), kind, view, None, 0.7);
+                    let label = format!("repos : {:.0}", (end - d.pa).length());
+                    let s = view.to_screen(end);
+                    ui.text(&label, s.x + 10.0, s.y - 8.0, 15, WHITE);
+                }
+                Some((rest_pt, rest)) => {
+                    // The spring at rest as a ghost, and the stretched one that follows the cursor.
+                    draw_spring_between(d.pa, rest_pt, rest, kind, view, None, 0.25);
+                    let target = match node_at(&self.world, &self.blocks, &self.members, cursor) {
+                        Some(a) => anchor_world(&a, &self.blocks, &self.members).unwrap_or(rest_pt),
+                        None => rest_pt,
+                    };
+                    draw_spring_between(d.pa, target, rest, kind, view, None, 0.9);
+                    let s = view.to_screen(target);
+                    draw_circle_lines(s.x, s.y, 5.0 * view.s, 2.0, if target != rest_pt { GREEN } else { ACCENT });
+                }
             }
         }
         if let (Tool::Beam(mat), Some((a, p0))) = (self.tool, self.member_from) {
@@ -1168,8 +1425,8 @@ impl Game {
             match self.tool {
                 Tool::Block(k) => {
                     let cand = self.candidate(k, at);
-                    let ok = placement_ok(&self.world, &self.blocks, &cand, None);
-                    let tint = if ok { Color::new(0.3, 1.0, 0.5, 1.0) } else { Color::new(1.0, 0.3, 0.3, 1.0) };
+                    let ok = placement_ok(&self.world, &self.blocks, &cand, None) && self.missing_for_tool(at).is_none();
+                    let tint = if ok { Color::new(0.3, 1.0, 0.5, 1.0) } else { Color::new(1.0, 0.1, 0.1, 1.0) };
                     draw_block_shape(k, view.to_screen(cand.pos), view.s, cand.angle, Some(tint), 0.0, 0.0, None);
                 }
                 Tool::Mat(_) | Tool::Eraser => {
@@ -1184,11 +1441,12 @@ impl Game {
                     }
                 }
                 Tool::Beam(_) => {
-                    let ok = node_at(&self.world, &self.blocks, &self.members, at).is_some() || self.member_from.is_some();
-                    draw_circle_lines(ui.mouse.x, ui.mouse.y, 5.0 * view.s, 2.0, if ok { GREEN } else { RED });
+                    // Green: it will be pinned there. Orange: no attachment, the rod will fall.
+                    let pinned = node_at(&self.world, &self.blocks, &self.members, at).is_some();
+                    draw_circle_lines(ui.mouse.x, ui.mouse.y, 5.0 * view.s, 2.0, if pinned { GREEN } else { ACCENT });
                 }
-                Tool::Cable => {
-                    let ok = anchor_at(&self.world, &self.blocks, at).is_some();
+                Tool::Cable(_) => {
+                    let ok = node_at(&self.world, &self.blocks, &self.members, at).is_some();
                     let col = if ok { GREEN } else { RED };
                     draw_circle_lines(ui.mouse.x, ui.mouse.y, 5.0 * view.s, 2.0, col);
                 }
@@ -1198,7 +1456,39 @@ impl Game {
             }
         }
 
+        // Right at the cursor: building is impossible, the materials are missing.
+        if inside {
+            if let Some((name, units, have)) = self.missing_for_tool(view.to_world(ui.mouse)) {
+                let text = format!("Pas assez de {name} : {have} / {units}");
+                let w = ui.text_w(&text, 16) + 22.0;
+                let r = Rect::new((ui.mouse.x + 16.0).min(view.rect().x + view.rect().w - w - 4.0), ui.mouse.y + 18.0, w, 26.0);
+                rrect(r, 13.0, Color::new(0.85, 0.05, 0.05, 0.95));
+                ui.text(&text, r.x + 11.0, r.y + 18.0, 16, WHITE);
+                draw_circle_lines(ui.mouse.x, ui.mouse.y, 6.0 * view.s.max(1.0), 3.0, Color::new(1.0, 0.1, 0.1, 1.0));
+            }
+        }
         self.draw_hud(ui, view);
+    }
+
+    /// The sky is not drawn in the temperature view, so mark where the sun (or the
+    /// moon) is: the sun is the hottest thing up there and warms the air around it.
+    fn draw_sun_on_thermal(&self, view: View, ui: &Ui) {
+        let w = &self.world;
+        let phase = w.phase();
+        if w.sun() > 0.0 {
+            let (sx, sy) = w.sun_position();
+            let c = view.to_screen(vec2(sx, sy));
+            for (r, a) in [(64.0, 0.10), (44.0, 0.18), (28.0, 0.32), (16.0, 0.9)] {
+                draw_circle(c.x, c.y, r * view.s.max(0.8), Color::new(1.0, 0.92 - r * 0.002, 0.55, a));
+            }
+            draw_circle_lines(c.x, c.y, 16.0 * view.s.max(0.8), 2.0, WHITE);
+            ui.text("Soleil", c.x + 24.0, c.y - 20.0, 15, WHITE);
+        } else {
+            let u = ((phase - 0.5) / 0.5).clamp(0.0, 1.0);
+            let c = view.to_screen(vec2(W as f32 * (0.08 + 0.84 * u), H as f32 * (0.64 - 0.52 * (std::f32::consts::PI * u).sin())));
+            draw_circle(c.x, c.y, 12.0 * view.s.max(0.8), Color::new(0.75, 0.82, 1.0, 0.8));
+            ui.text("Lune", c.x + 18.0, c.y - 14.0, 14, Color::new(0.85, 0.9, 1.0, 1.0));
+        }
     }
 
     fn draw_loupe(&self, ui: &Ui, view: View, at: Vec2) {
@@ -1459,7 +1749,25 @@ impl Game {
         rrect(bar, 7.0, Color::new(0.0, 0.0, 0.0, 0.35));
         rrect(Rect::new(bar.x, bar.y, (bar.w * (self.brush as f32 + 1.0) / 41.0).max(14.0), bar.h), 7.0, ACCENT);
 
-        let grid_top = top + 34.0;
+        // Add, replace everything, or replace only the material first clicked on.
+        let third = (PANEL_W - 24.0) / 3.0;
+        for (i, (mode, label)) in [(PaintMode::Add, "Ajouter"), (PaintMode::Replace, "Remplacer"), (PaintMode::Only, "Seulement")].iter().enumerate() {
+            let r = Rect::new(6.0 + i as f32 * (third + 6.0), top + 34.0, third, 24.0);
+            if ui.hover(r) {
+                self.hover_info = Some((
+                    label.to_string(),
+                    match mode {
+                        PaintMode::Add => "Le pinceau remplit le vide ; il ne touche pas à ce qui est déjà là.".into(),
+                        PaintMode::Replace => "Le pinceau remplace tout ce qu'il touche, roche, eau, terre...".into(),
+                        PaintMode::Only => "Clique sur une matière : seule cette matière est remplacée, en glissant.".into(),
+                    },
+                ));
+            }
+            if ui.button(r, label, Icon::None, self.paint_mode == *mode, true, ACCENT) {
+                self.paint_mode = *mode;
+            }
+        }
+        let grid_top = top + 34.0 + 30.0;
         for (i, m) in MATTER.iter().enumerate() {
             let r = Self::tile_rect(i, 3, grid_top, 48.0);
             let inf = info(*m);
@@ -1480,13 +1788,46 @@ impl Game {
         }
     }
 
+    /// Vivid red over an element that cannot be built: the materials are missing.
+    fn mark_missing(r: Rect) {
+        rrect(r, 12.0, Color::new(0.95, 0.08, 0.08, 0.6));
+        ui::rrect_lines(r, 12.0, 3.0, Color::new(1.0, 0.15, 0.15, 1.0));
+    }
+
+    /// If the selected tool cannot be used for lack of materials: what is missing,
+    /// how much it takes and how much there is. `at` is the cursor in world cells.
+    fn missing_for_tool(&self, at: Vec2) -> Option<(String, u32, u32)> {
+        if self.free_now() {
+            return None;
+        }
+        let drafted = |from: Vec2| (at - from).length();
+        let (from, units): (&[Mat], u32) = match self.tool {
+            Tool::Block(k) => k.cost(),
+            Tool::Cable(m) => {
+                let len = self.cable_from.as_ref().and_then(|a| anchor_world(a, &self.blocks, &self.members)).map_or(60.0, drafted);
+                (m.cost_from(), m.cost(len * 1.06))
+            }
+            Tool::Spring(k) => {
+                let len = self.spring_draft.as_ref().map_or(60.0, |d| d.rest.map_or_else(|| drafted(d.pa).min(SPRING_MAX_LEN), |r| r.1));
+                (k.cost_from(), k.cost(len))
+            }
+            Tool::Beam(m) => {
+                let len = self.member_from.as_ref().map_or(60.0, |f| drafted(f.1).min(MEMBER_MAX_LEN));
+                (m.cost_from(), m.cost(len))
+            }
+            _ => return None,
+        };
+        let have = self.stock(from);
+        (have < units).then(|| (info(from[0]).name.to_lowercase(), units, have))
+    }
+
     fn stock(&self, from: &[Mat]) -> u32 {
         from.iter().map(|m| self.census[*m as usize]).sum()
     }
 
     fn panel_blocks(&mut self, ui: &mut Ui, top: f32) {
         let angle = self.rot90 as f32 * std::f32::consts::FRAC_PI_2;
-        let free = self.unlimited && !self.running;
+        let free = self.free_now();
         for (i, k) in BlockKind::PLACEABLE.iter().enumerate() {
             let r = Self::tile_rect(i, 3, top, 54.0);
             let spec = k.spec();
@@ -1504,29 +1845,70 @@ impl Game {
                 self.tool = Tool::Block(*k);
             }
             if short {
-                rrect(r, 12.0, Color::new(0.7, 0.1, 0.1, 0.38));
+                Self::mark_missing(r);
             }
         }
+        // Cables of three materials: they differ in elasticity, strength and weight.
         let i = BlockKind::PLACEABLE.len();
-        let r = Self::tile_rect(i, 3, top, 54.0);
-        if ui.hover(r) {
-            self.hover_info = Some(("Câble".into(), "Clique un premier point, tire, clique un second point : la physique fait le reste. Il casse si on tire trop fort.".into()));
+        for (k, mat) in CableMat::ALL.iter().enumerate() {
+            let r = Self::tile_rect(i + k, 3, top, 54.0);
+            if ui.hover(r) {
+                self.hover_info = Some((
+                    format!("Câble {}", mat.name()),
+                    "Clique un premier point (bloc, tige, sol ou bord du monde), tire, clique un second point. Il pend en parabole et casse si on tire trop fort.".into(),
+                ));
+            }
+            let (cr, cg, cb) = mat.color();
+            let col = Color::from_rgba(cr.max(120), cg.max(120), cb.max(120), 255);
+            let label = format!("Câble {}", mat.name());
+            let short = !free && self.stock(mat.cost_from()) < mat.cost(60.0);
+            if ui.tile(r, &label, self.tool == Tool::Cable(*mat), |s| {
+                draw_icon(Icon::Cable, vec2(s.x + s.w / 2.0, s.y + s.h / 2.0), 28.0, col);
+            }) {
+                self.tool = Tool::Cable(*mat);
+            }
+            if short {
+                Self::mark_missing(r);
+            }
         }
-        if ui.tile(r, "Câble", self.tool == Tool::Cable, |s| {
-            draw_icon(Icon::Cable, vec2(s.x + s.w / 2.0, s.y + s.h / 2.0), 30.0, TEXT);
-        }) {
-            self.tool = Tool::Cable;
+        let i = i + CableMat::ALL.len();
+        // Springs and elastic cords: three clicks.
+        for (k, kind) in SpringKind::ALL.iter().enumerate() {
+            let r = Self::tile_rect(i + k, 3, top, 54.0);
+            if ui.hover(r) {
+                self.hover_info = Some((
+                    kind.name().to_string(),
+                    "Trois clics : le premier fixe un bout, le deuxième donne la longueur au repos, le troisième attache l'autre bout en le tirant (clique dans le vide pour le laisser libre).".into(),
+                ));
+            }
+            let (cr, cg, cb) = kind.color();
+            let short = !free && self.stock(kind.cost_from()) < kind.cost(60.0);
+            if ui.tile(r, kind.name(), self.tool == Tool::Spring(*kind), |s| {
+                let (a, b) = (vec2(s.x + 8.0, s.y + s.h / 2.0), vec2(s.x + s.w - 8.0, s.y + s.h / 2.0));
+                let mut prev = a;
+                for j in 1..=12 {
+                    let t = j as f32 / 12.0;
+                    let q = vec2(a.x + (b.x - a.x) * t, a.y + if j % 2 == 0 { 5.0 } else { -5.0 } * if j == 12 { 0.0 } else { 1.0 });
+                    draw_line(prev.x, prev.y, q.x, q.y, 2.0, Color::from_rgba(cr, cg, cb, 255));
+                    prev = q;
+                }
+            }) {
+                self.tool = Tool::Spring(*kind);
+            }
+            if short {
+                Self::mark_missing(r);
+            }
         }
-
+        let i = i + SpringKind::ALL.len();
         // Free beams: pinned at both ends, like a bridge-building game.
         for (k, mat) in MemberMat::ALL.iter().enumerate() {
-            let r = Self::tile_rect(i + 1 + k, 3, top, 54.0);
+            let r = Self::tile_rect(i + k, 3, top, 54.0);
             let (units, from) = (mat.cost(60.0), mat.cost_from());
             if ui.hover(r) {
                 self.hover_info = Some((
                     format!("Tige {}", mat.name().to_lowercase()),
                     format!(
-                        "Un clic pour fixer un bout (sol, bloc ou nœud), tire, un second clic pour l'autre bout. Longueur max {:.0}. 60 de long coûte {units} de {}.",
+                        "Un clic fixe un bout (sol, bloc ou nœud ; sans attache la tige tombe), tire, un second clic pour l'autre bout. Longueur max {:.0}. 60 de long coûte {units} de {}.",
                         MEMBER_MAX_LEN,
                         info(from[0]).name.to_lowercase()
                     ),
@@ -1534,6 +1916,7 @@ impl Game {
             }
             let (cr, cg, cb) = mat.color();
             let label = format!("Tige {}", mat.name().to_lowercase());
+            let short = !free && self.stock(mat.cost_from()) < mat.cost(60.0);
             if ui.tile(r, &label, self.tool == Tool::Beam(*mat), |s| {
                 let (a, b) = (vec2(s.x + 10.0, s.y + s.h - 6.0), vec2(s.x + s.w - 10.0, s.y + 6.0));
                 draw_line(a.x, a.y, b.x, b.y, 6.0, Color::from_rgba(cr, cg, cb, 255));
@@ -1544,13 +1927,28 @@ impl Game {
             }) {
                 self.tool = Tool::Beam(*mat);
             }
+            if short {
+                Self::mark_missing(r);
+            }
         }
 
+        // Cable elasticity.
+        let rows_used = (i + MemberMat::ALL.len() + 2) / 3;
+        let sy = top + rows_used as f32 * 60.0 + 2.0;
+        ui.text("Élasticité câble", 10.0, sy + 11.0, 13, DIM);
+        ui.slider(Rect::new(110.0, sy, PANEL_W - 150.0, 18.0), &mut self.cable_soft, 0.4, 3.0, ACCENT);
+        ui.text(&format!("x{:.1}", self.cable_soft), PANEL_W - 34.0, sy + 11.0, 13, TEXT);
+
         // Materials: a block uses up what it is made of from the screen.
-        let y0 = top + 4.0 * 60.0 + 8.0;
-        let label = if self.running { "Matériaux limités (simulation)" } else if self.unlimited { "Matériaux illimités" } else { "Matériaux limités" };
-        if ui.button(Rect::new(6.0, y0, PANEL_W - 12.0, 26.0), label, Icon::None, free, !self.running, GREEN) {
+        let y0 = sy + 26.0;
+        // Free building can be chosen for each phase; the simulation one is picked while editing.
+        let half = (PANEL_W - 18.0) / 2.0;
+        ui.text("Matériaux illimités :", 10.0, y0 + 10.0, 13, DIM);
+        if ui.checkbox(Rect::new(6.0, y0 + 16.0, half, 24.0), "Édition", self.unlimited, !self.running) {
             self.unlimited = !self.unlimited;
+        }
+        if ui.checkbox(Rect::new(12.0 + half, y0 + 16.0, half, 24.0), "Simulation", self.unlimited_sim, !self.running) {
+            self.unlimited_sim = !self.unlimited_sim;
         }
         let rows: [(&str, &[Mat]); 6] = [
             ("Terre", &[Mat::Dirt]),
@@ -1561,7 +1959,7 @@ impl Game {
             ("Sable", &[Mat::Sand]),
         ];
         for (i, (name, mats)) in rows.iter().enumerate() {
-            let y = y0 + 34.0 + i as f32 * 19.0;
+            let y = y0 + 46.0 + i as f32 * 19.0;
             let n = self.stock(mats);
             let col = mat_color(mats[0]);
             ui.text(name, 10.0, y + 11.0, 13, DIM);
@@ -1570,7 +1968,7 @@ impl Game {
             rrect(Rect::new(bar.x, bar.y, (bar.w * (n as f32 / 3000.0).min(1.0)).max(if n > 0 { 6.0 } else { 0.0 }), bar.h), 6.0, col);
             ui.text(&format!("{n}"), bar.x + bar.w + 8.0, y + 11.0, 12, TEXT);
         }
-        ui.text("Peins de la matière pour en avoir.", 10.0, y0 + 34.0 + 6.0 * 19.0 + 10.0, 12, DIM);
+        ui.text("Rouge vif = pas assez : peins-en !", 10.0, y0 + 46.0 + 6.0 * 19.0 + 10.0, 12, DIM);
     }
 
     fn panel_tools(&mut self, ui: &mut Ui, top: f32) {
@@ -1582,7 +1980,7 @@ impl Game {
             (Tool::Pick, "Voiture", Icon::Pick, "Clique une voiture en piste pour régler ses caractéristiques."),
             (Tool::Entry, "Entrée", Icon::Flag, "Où partent les voitures."),
             (Tool::Exit, "Sortie", Icon::Flag, "Où elles doivent arriver."),
-            (Tool::Cable, "Câble", Icon::Cable, "Accroche un câble entre deux points."),
+            (Tool::Cable(CableMat::Iron), "Câble", Icon::Cable, "Accroche un câble entre deux points (bloc, tige, sol, bord du monde)."),
         ];
         for (i, (t, label, icon, text)) in tools.iter().enumerate() {
             let r = Self::tile_rect(i, 3, top, 54.0);
@@ -2015,7 +2413,14 @@ async fn main() {
         game.update(get_frame_time().min(0.05));
 
         clear_background(BG);
-        game.draw_scene(view, &mut renderer, &ui);
+        // Explosions shake the picture of the world (input keeps using the steady view).
+        let mut shaken = view;
+        if game.shake > 0.0 {
+            let t = game.time;
+            shaken.ox += (t * 97.0).sin() * game.shake;
+            shaken.oy += (t * 83.0).cos() * game.shake;
+        }
+        game.draw_scene(shaken, &mut renderer, &ui);
         game.draw_ui(&mut ui, sw, sh);
 
         frame += 1;
@@ -2057,6 +2462,65 @@ mod tests {
         assert_eq!(g.world.raw(10, 10), sand_before);
         g.undo();
         assert!(g.toast.is_some(), "nothing left to undo");
+    }
+
+    #[test]
+    fn unlimited_materials_can_be_chosen_separately_for_editing_and_simulation() {
+        let mut g = Game::new();
+        g.unlimited = true;
+        g.unlimited_sim = false;
+        assert!(g.free_now(), "editing is free");
+        g.set_running(true);
+        assert!(!g.free_now(), "the simulation is limited");
+        g.running = false;
+        g.unlimited_sim = true;
+        g.set_running(true);
+        assert!(g.free_now(), "the simulation was made free while editing");
+    }
+
+    #[test]
+    fn the_cursor_reports_missing_materials_for_every_building_tool() {
+        let mut g = Game::new();
+        g.empty_world();
+        g.unlimited = false;
+        g.census = g.world.census();
+        let at = vec2(300.0, 200.0);
+        for tool in [Tool::Block(BlockKind::Wheel), Tool::Cable(CableMat::Steel), Tool::Spring(SpringKind::Coil), Tool::Beam(MemberMat::Iron)] {
+            g.tool = tool;
+            let m = g.missing_for_tool(at);
+            assert!(m.is_some(), "an empty world has nothing to build with ({:?})", m);
+            let (_, need, have) = m.unwrap();
+            assert!(need > have);
+        }
+        g.tool = Tool::Mat(Mat::Sand);
+        assert!(g.missing_for_tool(at).is_none(), "painting never costs anything");
+        // With iron on screen the wheel is affordable; with unlimited materials everything is.
+        for x in 0..40 {
+            for y in 0..40 {
+                g.world.set(x, y, Mat::Iron);
+            }
+        }
+        g.census = g.world.census();
+        g.tool = Tool::Block(BlockKind::Wheel);
+        assert!(g.missing_for_tool(at).is_none());
+        g.unlimited = true;
+        g.tool = Tool::Cable(CableMat::Steel);
+        assert!(g.missing_for_tool(at).is_none());
+    }
+
+    #[test]
+    fn an_explosion_shakes_the_camera_which_then_settles() {
+        let mut g = Game::new();
+        g.empty_world();
+        assert_eq!(g.shake, 0.0);
+        g.set_running(true);
+        g.world.explode(300, 300, 16);
+        g.sim_step();
+        assert!(g.shake > 5.0, "a blast should shake the view, got {}", g.shake);
+        for _ in 0..120 {
+            g.update(1.0 / 60.0);
+        }
+        assert_eq!(g.shake, 0.0, "the shaking dies down");
     }
 
     #[test]

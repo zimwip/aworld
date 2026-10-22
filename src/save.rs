@@ -1,6 +1,6 @@
 //! Saving and loading worlds: grid (run-length encoded), blocks, entry/exit.
 
-use crate::blocks::{Anchor, Block, BlockKind, Cable, Member, MemberMat};
+use crate::blocks::{Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, Spring, SpringKind};
 use crate::world::{Biome, Mat, World, DAY_STEPS, H, W};
 use macroquad::prelude::{vec2, Vec2};
 use std::fs;
@@ -8,7 +8,7 @@ use std::io::{self, Error, ErrorKind};
 use std::path::PathBuf;
 
 const MAGIC: &[u8; 4] = b"AWLD";
-const VERSION: u8 = 3;
+const VERSION: u8 = 5;
 
 pub struct Loaded {
     pub mats: Vec<Mat>,
@@ -17,6 +17,7 @@ pub struct Loaded {
     pub blocks: Vec<Block>,
     pub cables: Vec<Cable>,
     pub members: Vec<Member>,
+    pub springs: Vec<Spring>,
     pub biome: Biome,
     pub clock: u32,
 }
@@ -40,7 +41,7 @@ fn put_point(out: &mut Vec<u8>, p: Option<(i32, i32)>) {
     out.extend(y.to_le_bytes());
 }
 
-pub fn encode(world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>, blocks: &[Block], cables: &[Cable], members: &[Member]) -> Vec<u8> {
+pub fn encode(world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>, blocks: &[Block], cables: &[Cable], members: &[Member], springs: &[Spring]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend(MAGIC);
     out.push(VERSION);
@@ -100,16 +101,29 @@ pub fn encode(world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>
             out.extend(p.x.to_le_bytes());
             out.extend(p.y.to_le_bytes());
         }
+        Anchor::Along { uid, t } => {
+            out.push(4);
+            out.extend((member_index(*uid).unwrap_or(0) as u16).to_le_bytes());
+            out.extend(t.to_le_bytes());
+        }
     };
     let saved: Vec<&Cable> = cables
         .iter()
-        .filter(|c| [c.a, c.b].iter().all(|a| !matches!(a, Anchor::Block { uid, .. } if index_of(*uid).is_none())))
+        .filter(|c| {
+            [c.a, c.b].iter().all(|a| match a {
+                Anchor::Block { uid, .. } => index_of(*uid).is_some(),
+                Anchor::End { uid, .. } | Anchor::Along { uid, .. } => member_index(*uid).is_some(),
+                _ => true,
+            })
+        })
         .collect();
     out.extend((saved.len() as u16).to_le_bytes());
     for c in saved {
         put_anchor(&mut out, &c.a);
         put_anchor(&mut out, &c.b);
         out.extend(c.len.to_le_bytes());
+        out.push(c.mat.id());
+        out.extend(c.soft.to_le_bytes());
     }
     out.extend((members.len() as u16).to_le_bytes());
     for m in members {
@@ -117,6 +131,15 @@ pub fn encode(world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>
         put_anchor(&mut out, &m.a);
         put_anchor(&mut out, &m.b);
         for v in [m.p0.x, m.p0.y, m.p1.x, m.p1.y] {
+            out.extend(v.to_le_bytes());
+        }
+    }
+    out.extend((springs.len() as u16).to_le_bytes());
+    for sp in springs {
+        out.push(sp.kind.id());
+        put_anchor(&mut out, &sp.a);
+        put_anchor(&mut out, &sp.b);
+        for v in [sp.rest, sp.soft, sp.p0.x, sp.p0.y, sp.p1.x, sp.p1.y] {
             out.extend(v.to_le_bytes());
         }
     }
@@ -164,7 +187,7 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
         return Err(bad("ce n'est pas un monde AWorld"));
     }
     let version = r.u8()?;
-    if !(1..=3).contains(&version) {
+    if !(1..=5).contains(&version) {
         return Err(bad("version de fichier inconnue"));
     }
     if r.u16()? as usize != W || r.u16()? as usize != H {
@@ -194,10 +217,12 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
         let (x, y, a) = (r.f32()?, r.f32()?, r.f32()?);
         blocks.push(Block::new(kind, vec2(x, y), a));
     }
-    // Anchors: 0 ground, 1 block, 2 beam end (resolved later), 3 free.
+    // Anchors: 0 ground, 1 block, 2 rod end and 4 point along a rod (resolved once
+    // the rods exist), 3 free.
     enum Raw {
         Done(Anchor),
         End(usize, u8),
+        Along(usize, f32),
     }
     let anchor = |r: &mut Reader| -> io::Result<Raw> {
         Ok(match r.u8()? {
@@ -209,25 +234,24 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
                 Raw::Done(Anchor::Block { uid, local })
             }
             2 => Raw::End(r.u16()? as usize, r.u8()?),
+            4 => Raw::Along(r.u16()? as usize, r.f32()?),
             _ => Raw::Done(Anchor::Free(vec2(r.f32()?, r.f32()?))),
         })
     };
-    let mut cables = vec![];
+    let mut raw_cables: Vec<(Raw, Raw, f32, CableMat, f32)> = vec![];
     if version >= 2 {
         let count = r.u16()?;
         for _ in 0..count {
             let (a, b) = (anchor(&mut r)?, anchor(&mut r)?);
             let len = r.f32()?;
-            let (Raw::Done(a), Raw::Done(b)) = (a, b) else { return Err(bad("câble mal formé")) };
-            let mut c = Cable::new(a, b, len / 1.06);
-            c.len = len;
-            cables.push(c);
+            let (mat, soft) = if version >= 4 { (CableMat::from_id(r.u8()?), r.f32()?) } else { (CableMat::Iron, 1.0) };
+            raw_cables.push((a, b, len, mat, soft));
         }
     }
     let mut members: Vec<Member> = vec![];
+    let mut pending: Vec<(Raw, Raw)> = vec![];
     if version >= 3 {
         let count = r.u16()?;
-        let mut pending: Vec<(Raw, Raw)> = vec![];
         for _ in 0..count {
             let mat = MemberMat::from_id(r.u8()?);
             let (a, b) = (anchor(&mut r)?, anchor(&mut r)?);
@@ -235,22 +259,50 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
             members.push(Member::new(mat, Anchor::Free(p0), Anchor::Free(p1), p0, p1));
             pending.push((a, b));
         }
-        let uids: Vec<u32> = members.iter().map(|m| m.uid).collect();
-        let resolve = |raw: Raw, fallback: Vec2| match raw {
-            Raw::Done(a) => a,
-            Raw::End(i, e) => uids.get(i).map_or(Anchor::Free(fallback), |u| Anchor::End { uid: *u, end: e }),
-        };
-        for (m, (a, b)) in members.iter_mut().zip(pending) {
-            m.a = resolve(a, m.p0);
-            m.b = resolve(b, m.p1);
+    }
+    let mut raw_springs: Vec<(SpringKind, Raw, Raw, [f32; 6])> = vec![];
+    if version >= 5 {
+        let count = r.u16()?;
+        for _ in 0..count {
+            let kind = SpringKind::from_id(r.u8()?);
+            let (a, b) = (anchor(&mut r)?, anchor(&mut r)?);
+            let vals = [r.f32()?, r.f32()?, r.f32()?, r.f32()?, r.f32()?, r.f32()?];
+            raw_springs.push((kind, a, b, vals));
         }
     }
-    Ok(Loaded { mats, entry, exit, blocks, cables, members, biome, clock })
+    let uids: Vec<u32> = members.iter().map(|m| m.uid).collect();
+    let resolve = |raw: Raw, fallback: Vec2| match raw {
+        Raw::Done(a) => a,
+        Raw::End(i, e) => uids.get(i).map_or(Anchor::Free(fallback), |u| Anchor::End { uid: *u, end: e }),
+        Raw::Along(i, t) => uids.get(i).map_or(Anchor::Free(fallback), |u| Anchor::Along { uid: *u, t }),
+    };
+    for (m, (a, b)) in members.iter_mut().zip(pending) {
+        m.a = resolve(a, m.p0);
+        m.b = resolve(b, m.p1);
+    }
+    let mut cables = vec![];
+    for (a, b, len, mat, soft) in raw_cables {
+        let (a, b) = (resolve(a, Vec2::ZERO), resolve(b, Vec2::ZERO));
+        // A cable fixed to a rod that is missing is dropped.
+        if matches!(a, Anchor::Free(_)) || matches!(b, Anchor::Free(_)) {
+            continue;
+        }
+        let mut c = Cable::new(a, b, len / 1.06).made_of(mat, soft);
+        c.len = len;
+        cables.push(c);
+    }
+    let mut springs = vec![];
+    for (kind, a, b, v) in raw_springs {
+        let (p0, p1) = (vec2(v[2], v[3]), vec2(v[4], v[5]));
+        let (a, b) = (resolve(a, p0), resolve(b, p1));
+        springs.push(Spring::new(kind, a, b, v[0], v[1], p0, p1));
+    }
+    Ok(Loaded { mats, entry, exit, blocks, cables, members, springs, biome, clock })
 }
 
-pub fn save_slot(slot: usize, world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>, blocks: &[Block], cables: &[Cable], members: &[Member]) -> io::Result<()> {
+pub fn save_slot(slot: usize, world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>, blocks: &[Block], cables: &[Cable], members: &[Member], springs: &[Spring]) -> io::Result<()> {
     fs::create_dir_all(dir())?;
-    fs::write(slot_path(slot), encode(world, entry, exit, blocks, cables, members))
+    fs::write(slot_path(slot), encode(world, entry, exit, blocks, cables, members, springs))
 }
 
 pub fn load_slot(slot: usize) -> io::Result<Loaded> {
@@ -270,19 +322,26 @@ mod tests {
             Block::new(BlockKind::Wheel, vec2(300.5, 80.0), 1.5),
         ];
         let uid = blocks[0].uid;
-        let cables = vec![Cable::new(Anchor::Ground(vec2(5.0, 6.0)), Anchor::Block { uid, local: vec2(1.0, 2.0) }, 90.0)];
+        let cables = vec![Cable::new(Anchor::Ground(vec2(5.0, 6.0)), Anchor::Block { uid, local: vec2(1.0, 2.0) }, 90.0).made_of(CableMat::Steel, 1.7)];
         w.set_season(crate::world::Season::Autumn);
         let m1 = Member::new(MemberMat::Iron, Anchor::Ground(vec2(10.0, 10.0)), Anchor::Free(vec2(60.0, 10.0)), vec2(10.0, 10.0), vec2(60.0, 10.0));
         let m2 = Member::new(MemberMat::Wood, Anchor::End { uid: m1.uid, end: 1 }, Anchor::Free(vec2(90.0, 40.0)), vec2(60.0, 10.0), vec2(90.0, 40.0));
         let members = vec![m1, m2];
-        let bytes = encode(&w, Some(e), Some(x), &blocks, &cables, &members);
+        let sp = Spring::new(SpringKind::Elastic, Anchor::Ground(vec2(3.0, 4.0)), Anchor::End { uid: members[1].uid, end: 0 }, 40.0, 1.5, vec2(3.0, 4.0), vec2(9.0, 9.0));
+        let bytes = encode(&w, Some(e), Some(x), &blocks, &cables, &members, &[sp]);
         assert!(bytes.len() < W * H / 4, "RLE should compress: {}", bytes.len());
         let l = decode(&bytes).unwrap();
         assert_eq!(l.entry, Some(e));
         assert_eq!(l.exit, Some(x));
         assert_eq!(l.blocks.len(), 2);
         assert_eq!(l.cables.len(), 1);
+        assert_eq!(l.cables[0].mat, CableMat::Steel);
+        assert!((l.cables[0].soft - 1.7).abs() < 1e-6);
         assert_eq!(l.members.len(), 2);
+        assert_eq!(l.springs.len(), 1);
+        assert_eq!(l.springs[0].kind, SpringKind::Elastic);
+        assert!((l.springs[0].rest - 40.0).abs() < 1e-6 && (l.springs[0].soft - 1.5).abs() < 1e-6);
+        assert_eq!(l.springs[0].b, Anchor::End { uid: l.members[1].uid, end: 0 });
         assert_eq!(l.members[1].mat, MemberMat::Wood);
         assert_eq!(l.members[1].a, Anchor::End { uid: l.members[0].uid, end: 1 }, "beam link survives");
         assert_eq!(l.members[0].a, Anchor::Ground(vec2(10.0, 10.0)));
@@ -309,7 +368,7 @@ mod tests {
         assert!(decode(b"nope").is_err());
         assert!(decode(&[]).is_err());
         let mut w = World::new();
-        let mut bytes = encode(&w, None, None, &[], &[], &[]);
+        let mut bytes = encode(&w, None, None, &[], &[], &[], &[]);
         bytes.truncate(bytes.len() / 2);
         assert!(decode(&bytes).is_err());
         w.clear();

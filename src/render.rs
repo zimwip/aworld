@@ -1,6 +1,6 @@
 //! Drawing: sky, world texture with a glow shader, blocks, cars, markers.
 
-use crate::blocks::{Block, BlockKind, Member, MemberMat, STUD};
+use crate::blocks::{Block, BlockKind, Member, MemberMat, Spring, SpringKind, STUD};
 use crate::car::{Car, ModelKind};
 use crate::world::{Mat, World, H, W};
 use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation, PipelineParams};
@@ -115,6 +115,11 @@ pub struct Renderer {
     gas_image: Image,
     gas_texture: Texture2D,
     gas_material: Material,
+    /// What the textures currently show, so unchanged frames cost nothing.
+    rev_world: u64,
+    rev_gas: u64,
+    last_thermal: bool,
+    has_gas: bool,
 }
 
 impl Renderer {
@@ -144,37 +149,53 @@ impl Renderer {
             },
         )
         .expect("gas shader");
-        Renderer { image, texture, material, gas_image, gas_texture, gas_material }
+        Renderer { image, texture, material, gas_image, gas_texture, gas_material, rev_world: 0, rev_gas: 0, last_thermal: false, has_gas: false }
     }
 
     /// Fills the texture in parallel from a per-cell colour function.
-    fn fill(image: &mut Image, color: impl Fn(usize, usize) -> [u8; 4] + Sync) {
+    /// Returns how many pixels are not fully transparent.
+    fn fill(image: &mut Image, color: impl Fn(usize, usize) -> [u8; 4] + Sync) -> usize {
         let px = image.get_image_data_mut();
         let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).min(8);
         let rows = H.div_ceil(threads);
         let color = &color;
         std::thread::scope(|scope| {
-            for (i, chunk) in px.chunks_mut(rows * W).enumerate() {
-                scope.spawn(move || {
-                    for (j, out) in chunk.iter_mut().enumerate() {
-                        let idx = i * rows * W + j;
-                        *out = color(idx % W, idx / W);
-                    }
-                });
-            }
-        });
+            let handles: Vec<_> = px
+                .chunks_mut(rows * W)
+                .enumerate()
+                .map(|(i, chunk)| {
+                    scope.spawn(move || {
+                        let mut visible = 0;
+                        for (j, out) in chunk.iter_mut().enumerate() {
+                            let idx = i * rows * W + j;
+                            *out = color(idx % W, idx / W);
+                            visible += (out[3] != 0) as usize;
+                        }
+                        visible
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
+        })
     }
 
     pub fn draw_world(&mut self, world: &World, v: View, thermal: bool) {
         let size = DrawTextureParams { dest_size: Some(vec2(W as f32 * v.s, H as f32 * v.s)), ..Default::default() };
-        if thermal {
-            Self::fill(&mut self.image, |x, y| world.thermal_color(x, y));
+        // Only rebuild the picture when the world (or the view mode) actually changed.
+        if self.rev_world != world.revision || self.last_thermal != thermal {
+            if thermal {
+                Self::fill(&mut self.image, |x, y| world.thermal_color(x, y));
+            } else {
+                Self::fill(&mut self.image, |x, y| world.color(x, y));
+            }
             self.texture.update(&self.image);
+            self.rev_world = world.revision;
+            self.last_thermal = thermal;
+        }
+        if thermal {
             draw_texture_ex(&self.texture, v.ox, v.oy, WHITE, size);
             return;
         }
-        Self::fill(&mut self.image, |x, y| world.color(x, y));
-        self.texture.update(&self.image);
         self.material.set_uniform("texel", vec2(1.0 / W as f32, 1.0 / H as f32));
         gl_use_material(&self.material);
         draw_texture_ex(&self.texture, v.ox, v.oy, WHITE, size);
@@ -183,8 +204,17 @@ impl Renderer {
 
     /// Clouds and steam as soft blobs, drawn over the landscape.
     pub fn draw_gas(&mut self, world: &World, v: View) {
-        Self::fill(&mut self.gas_image, |x, y| world.gas_color(x, y));
-        self.gas_texture.update(&self.gas_image);
+        if self.rev_gas != world.revision {
+            self.has_gas = Self::fill(&mut self.gas_image, |x, y| world.gas_color(x, y)) > 0;
+            if self.has_gas {
+                self.gas_texture.update(&self.gas_image);
+            }
+            self.rev_gas = world.revision;
+        }
+        // No clouds, steam or smoke: skip the expensive blur pass altogether.
+        if !self.has_gas {
+            return;
+        }
         self.gas_material.set_uniform("texel", vec2(1.0 / W as f32, 1.0 / H as f32));
         gl_use_material(&self.gas_material);
         draw_texture_ex(
@@ -196,7 +226,6 @@ impl Renderer {
         );
         gl_use_default_material();
     }
-
 }
 
 fn quad(a: Vec2, b: Vec2, c: Vec2, d: Vec2, col: Color) {
@@ -423,11 +452,20 @@ pub fn draw_booms(booms: &[Boom], v: View) {
 }
 
 /// A cable as a polyline with a highlight and round fixings.
-pub fn draw_cable(pts: &[Vec2], v: View, snapped: bool, valid: bool) {
+pub fn draw_cable(pts: &[Vec2], v: View, snapped: bool, valid: bool, rgb: (u8, u8, u8), stress: Option<f32>) {
     if pts.len() < 2 {
         return;
     }
-    let col = if !valid { Color::new(0.95, 0.3, 0.3, 0.9) } else if snapped { Color::from_rgba(150, 60, 50, 255) } else { Color::from_rgba(52, 56, 66, 255) };
+    let (sr, sg, sb) = stress.map(stress_rgb).unwrap_or((0.0, 0.0, 0.0));
+    let col = if !valid {
+        Color::new(0.95, 0.3, 0.3, 0.9)
+    } else if snapped {
+        Color::from_rgba(150, 60, 50, 255)
+    } else if stress.is_some() {
+        Color::new(sr, sg, sb, 1.0)
+    } else {
+        Color::from_rgba(rgb.0, rgb.1, rgb.2, 255)
+    };
     let s = v.s;
     for w in pts.windows(2) {
         let (a, b) = (v.to_screen(w[0]), v.to_screen(w[1]));
@@ -469,6 +507,11 @@ pub fn draw_member(m: &Member, v: View, stress: bool) {
     draw_line(a.x, a.y, b.x, b.y, th * 0.68, col);
     let hi = n * (-th * 0.18);
     draw_line(a.x + hi.x, a.y + hi.y, b.x + hi.x, b.y + hi.y, (th * 0.18).max(1.0), Color::new(1.0, 1.0, 1.0, 0.28));
+    if m.is_deck() {
+        // The floor a car drives on gets a bright running surface.
+        let top = n * (-th * 0.5);
+        draw_line(a.x + top.x, a.y + top.y, b.x + top.x, b.y + top.y, (th * 0.16).max(1.2), Color::new(1.0, 0.95, 0.6, 0.9));
+    }
     match m.mat {
         MemberMat::Wood => {
             let len = (b - a).length();
@@ -493,4 +536,47 @@ pub fn draw_member(m: &Member, v: View, stress: bool) {
         draw_circle(p.x, p.y, th * 0.78, Color::from_rgba(226, 228, 236, 255));
         draw_circle(p.x, p.y, th * 0.34, Color::from_rgba(60, 64, 78, 255));
     }
+}
+
+/// A coil spring or an elastic cord between two points. The number of turns stays
+/// the same however far it is pulled, so a stretched one looks stretched.
+pub fn draw_spring_between(p0: Vec2, p1: Vec2, rest: f32, kind: SpringKind, v: View, stress: Option<f32>, alpha: f32) {
+    let (a, b) = (v.to_screen(p0), v.to_screen(p1));
+    let len = (b - a).length();
+    if len < 2.0 {
+        return;
+    }
+    let d = (b - a) / len;
+    let n = vec2(-d.y, d.x);
+    let turns = ((rest / 5.0) as i32).max(5);
+    let (amp, thick) = match kind {
+        SpringKind::Coil => (4.2 * v.s, 1.7 * v.s),
+        SpringKind::Elastic => (2.0 * v.s, 1.2 * v.s),
+    };
+    let (cr, cg, cb) = kind.color();
+    let mut col = Color::from_rgba(cr, cg, cb, (255.0 * alpha) as u8);
+    if let Some(st) = stress {
+        let (r, g, bl) = stress_rgb(st);
+        col = Color::new(r, g, bl, alpha);
+    }
+    // Straight lead-ins at both ends, then the coil in between.
+    let lead = (len * 0.1).min(10.0 * v.s);
+    let mut prev = a;
+    let segs = turns * 2;
+    for i in 1..=segs {
+        let t = i as f32 / segs as f32;
+        let along = a + d * (lead + (len - 2.0 * lead) * t);
+        let side = if i == segs { 0.0 } else if i % 2 == 0 { amp } else { -amp };
+        let q = if i == segs { b } else { along + n * side };
+        draw_line(prev.x, prev.y, q.x, q.y, thick, col);
+        prev = q;
+    }
+    draw_line(a.x, a.y, a.x + d.x * lead, a.y + d.y * lead, thick, col);
+    for p in [a, b] {
+        draw_circle(p.x, p.y, 2.6 * v.s, Color::from_rgba(226, 228, 236, (255.0 * alpha) as u8));
+    }
+}
+
+pub fn draw_spring(sp: &Spring, v: View, stress: bool) {
+    draw_spring_between(sp.p0, sp.p1, sp.rest, sp.kind, v, if stress { Some(sp.stress) } else { None }, 1.0);
 }

@@ -233,6 +233,12 @@ pub struct Car {
     /// Glass cells the hull smashed through this step.
     pub smashed: Vec<(i32, i32)>,
     smash_grace: u32,
+    /// Ticks spent nearly stopped while the engine pushes (a snag).
+    stall: u32,
+    /// While > 0 the driver floors it: more torque and grip to get over an obstacle.
+    boost: u32,
+    /// Snags that the boost could not get past in the current window.
+    failed_boosts: u32,
     damage: u32,
     ticks: u32,
     last_x: f32,
@@ -318,6 +324,9 @@ impl Car {
             loads: Vec::new(),
             smashed: Vec::new(),
             smash_grace: 0,
+            stall: 0,
+            boost: 0,
+            failed_boosts: 0,
             damage: 0,
             ticks: 0,
             last_x: p.x,
@@ -332,6 +341,10 @@ impl Car {
     }
 
     /// Weight pressed on whatever it drives over, in kg.
+    fn speed_along_dir(&self) -> f32 {
+        self.v.x * self.dir
+    }
+
     pub fn weight_kg(&self) -> f32 {
         self.kind.model().mass * self.tuning.weight
     }
@@ -454,7 +467,8 @@ impl Car {
                 let rc = pos - self.p;
                 let vhub = self.v + vec2(-(pos - self.p).y, (pos - self.p).x) * self.omega;
                 let slip = self.wheels[i].spin * r - vhub.dot(t);
-                ft = (SLIP_GAIN * slip).clamp(-m.grip * self.tuning.grip * normal_force, m.grip * self.tuning.grip * normal_force);
+                let grip = m.grip * self.tuning.grip * if self.boost > 0 { 1.35 } else { 1.0 };
+                ft = (SLIP_GAIN * slip).clamp(-grip * normal_force, grip * normal_force);
                 let tf = t * ft;
                 acc += tf;
                 torque += cross(rc, tf);
@@ -465,7 +479,7 @@ impl Car {
             if self.is_driven(i) {
                 let w_max = m.top_speed * self.tuning.speed * S / r;
                 let forward = (self.dir * self.wheels[i].spin).max(ground_speed / r);
-                te = self.dir * m.torque * self.tuning.power * S * S * (1.0 - forward / w_max).clamp(-0.2, 1.5);
+                te = self.dir * m.torque * self.tuning.power * S * S * if self.boost > 0 { 2.6 } else { 1.25 } * (1.0 - forward / w_max).clamp(-0.2, 1.5);
             }
             let w = &mut self.wheels[i];
             w.spin += (te - ft * r) / WHEEL_INERTIA;
@@ -551,38 +565,57 @@ impl Car {
             self.upside_down = 0;
         }
 
-        // Turn around when blocked (lemmings style).
+        // Snagged on something? Floor it before giving up and turning around.
         self.progress += (self.p.x - self.last_x) * self.dir;
         self.last_x = self.p.x;
         if touching > 0 {
             self.grounded += 1;
         }
-        if self.ticks % 60 == 0 {
-            if self.grounded >= 30 && self.progress < 3.0 * S {
+        let creeping = touching > 0 && self.speed_along_dir() < 0.1 * S;
+        self.stall = if creeping { self.stall + 1 } else { 0 };
+        if self.boost > 0 {
+            self.boost -= 1;
+        } else if self.stall > 14 {
+            self.boost = 55;
+            self.stall = 0;
+            self.failed_boosts += 1;
+            // A little hop forward to get the front wheels up onto a ledge.
+            self.v.y -= 0.55 * S * (1.0 + self.tuning.power * 0.3);
+            self.v.x += 0.35 * S * self.dir;
+            self.omega -= 0.01 * self.dir;
+        }
+        // Lemmings: only after a couple of boosted attempts fail do we turn around.
+        if self.ticks % 90 == 0 {
+            if self.grounded >= 45 && self.progress < 3.0 * S && self.failed_boosts >= 2 {
                 self.dir = -self.dir;
+                self.failed_boosts = 0;
+            } else if self.progress >= 3.0 * S {
+                self.failed_boosts = 0;
             }
             self.progress = 0.0;
             self.grounded = 0;
         }
 
-        // Fire hurts.
-        let mut burning = false;
+        // Fire and lava wreck it fast: it blows up.
+        let mut heat = 0u32;
         let mut pts = vec![self.p];
         pts.extend(self.wheels.iter().map(|w| w.pos));
         for p in pts {
             for k in 0..8 {
                 let a = k as f32 / 8.0 * std::f32::consts::TAU;
                 let q = p + vec2(a.cos(), a.sin()) * (10.0 * S);
-                if matches!(world.at(q.x.floor() as i32, q.y.floor() as i32), Mat::Fire | Mat::Ember | Mat::Lava) {
-                    burning = true;
+                match world.at(q.x.floor() as i32, q.y.floor() as i32) {
+                    Mat::Lava | Mat::Molten => heat += 30,
+                    Mat::Fire | Mat::Ember => heat += 3,
+                    _ => {}
                 }
             }
         }
-        if burning {
-            self.damage += 1;
-        }
+        self.damage += heat;
         let left_the_world = self.p.x < -20.0 || self.p.x > W as f32 + 20.0 || self.p.y < -400.0;
-        if self.damage > 40 || self.p.y > H as f32 + 16.0 || left_the_world {
+        if self.damage > 40 {
+            self.fate = Fate::Exploded;
+        } else if self.p.y > H as f32 + 16.0 || left_the_world {
             self.fate = Fate::Dead;
         }
         if let Some(e) = exit {
@@ -837,6 +870,77 @@ mod tests {
             car.step(&w, None);
         }
         assert!(car.p.x < 300.0);
+    }
+
+    #[test]
+    fn a_car_in_fire_or_lava_explodes() {
+        for (burning, label) in [(Mat::Fire, "fire"), (Mat::Lava, "lava")] {
+            let mut w = flat_world();
+            let mut car = Car::new(ModelKind::Buggy, (100, 216));
+            for _ in 0..40 {
+                car.step(&w, None);
+            }
+            // The ground around the car catches fire (or turns to lava).
+            for x in 80..130 {
+                for y in 215..240 {
+                    if w.raw(x, y) == Mat::Empty {
+                        w.set(x, y, burning);
+                    }
+                }
+            }
+            let mut steps = 0;
+            while car.fate == Fate::Driving && steps < 200 {
+                car.step(&w, None);
+                steps += 1;
+            }
+            assert_eq!(car.fate, Fate::Exploded, "a car in {label} should explode");
+            assert!(steps < 30, "it should not take long: {steps} steps in {label}");
+        }
+    }
+
+    /// Furthest x reached on a course with a step of `height` cells or a ramp.
+    fn reach(kind: ModelKind, step: f32, slope: f32) -> f32 {
+        let mut w = flat_world();
+        if step > 0.0 {
+            for x in 200..500 {
+                for y in (240 - step as i32)..240 {
+                    w.set(x, y, Mat::Stone);
+                }
+            }
+        }
+        if slope > 0.0 {
+            for x in 200..320 {
+                let h = ((x - 200) as f32 * slope) as i32;
+                for y in 240 - h..240 {
+                    w.set(x, y, Mat::Stone);
+                }
+            }
+            for x in 320..500 {
+                let h = (120.0 * slope) as i32;
+                for y in 240 - h..240 {
+                    w.set(x, y, Mat::Stone);
+                }
+            }
+        }
+        let mut car = Car::new(kind, (40, 216));
+        let mut best = 0.0f32;
+        for _ in 0..1800 {
+            car.step(&w, None);
+            best = best.max(car.p.x);
+            if car.fate != Fate::Driving {
+                break;
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn survey() {
+        for kind in ModelKind::ALL {
+            let steps: Vec<String> = [4.0, 6.0, 8.0, 10.0, 14.0].iter().map(|&h| format!("{:.0}", reach(kind, h, 0.0))).collect();
+            let ramps: Vec<String> = [0.3, 0.5, 0.7, 0.9].iter().map(|&sl| format!("{:.0}", reach(kind, 0.0, sl))).collect();
+            eprintln!("SURVEY {kind:?} steps(4,6,8,10,14)={steps:?} ramps(.3,.5,.7,.9)={ramps:?}");
+        }
     }
 
     #[test]

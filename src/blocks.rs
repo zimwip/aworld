@@ -76,12 +76,9 @@ impl BlockKind {
     ];
 
     /// What can be picked from the palette.
-    pub const PLACEABLE: [BlockKind; 8] = [
+    pub const PLACEABLE: [BlockKind; 5] = [
         BlockKind::Brick,
         BlockKind::Long,
-        BlockKind::Plank,
-        BlockKind::Beam,
-        BlockKind::SteelBeam,
         BlockKind::Cube,
         BlockKind::Glass,
         BlockKind::Wheel,
@@ -116,8 +113,8 @@ impl BlockKind {
             BlockKind::Brick => Spec { name: "Brique", w: 20.0, h: 10.0, mat: Mat::Brick, round: false, density: 1.0, color: (205, 62, 52), strength: 1.2, blurb: "Plastique solide" },
             BlockKind::Long => Spec { name: "Longue", w: 40.0, h: 10.0, mat: Mat::Brick, round: false, density: 1.0, color: (58, 112, 214), strength: 1.2, blurb: "Brique de 4 plots" },
             BlockKind::Plank => Spec { name: "Planche", w: 60.0, h: 5.0, mat: Mat::Wood, round: false, density: 0.6, color: (176, 124, 72), strength: 0.25, blurb: "Bois : léger, fragile, brûle" },
-            BlockKind::Beam => Spec { name: "Poutre fer", w: 80.0, h: 10.0, mat: Mat::Iron, round: false, density: 1.8, color: (150, 160, 178), strength: 2.0, blurb: "Fer : rouille dans l'eau" },
-            BlockKind::SteelBeam => Spec { name: "Poutre acier", w: 80.0, h: 10.0, mat: Mat::Steel, round: false, density: 1.8, color: (96, 128, 186), strength: 4.0, blurb: "Acier : fer + carbone, 2x plus solide" },
+            BlockKind::Beam => Spec { name: "Tige fer", w: 80.0, h: 10.0, mat: Mat::Iron, round: false, density: 1.8, color: (150, 160, 178), strength: 2.0, blurb: "Fer : rouille dans l'eau" },
+            BlockKind::SteelBeam => Spec { name: "Tige acier", w: 80.0, h: 10.0, mat: Mat::Steel, round: false, density: 1.8, color: (96, 128, 186), strength: 4.0, blurb: "Acier : fer + carbone, 2x plus solide" },
             BlockKind::Glass => Spec { name: "Verre", w: 20.0, h: 10.0, mat: Mat::Glass, round: false, density: 0.9, color: (176, 222, 244), strength: 0.5, blurb: "Sable fondu : la voiture le brise" },
             BlockKind::GlassHalf => Spec { name: "Verre (moitié)", w: 10.0, h: 10.0, mat: Mat::Glass, round: false, density: 0.9, color: (176, 222, 244), strength: 0.4, blurb: "Un morceau de verre : encore un coup et il se brise" },
             BlockKind::GlassChip => Spec { name: "Verre (éclat)", w: 5.0, h: 5.0, mat: Mat::Glass, round: false, density: 0.9, color: (176, 222, 244), strength: 0.3, blurb: "Dernier morceau : il va se briser en éclats" },
@@ -227,7 +224,9 @@ impl Block {
 pub fn stamp_all(world: &mut World, blocks: &[Block], members: &[Member]) {
     let mut mats: Vec<Mat> = blocks.iter().map(|b| b.spec().mat).collect();
     mats.extend(members.iter().map(|m| m.mat.mat()));
-    world.begin_blocks(mats);
+    let mut passable = vec![false; blocks.len()];
+    passable.extend(members.iter().map(|m| !m.is_deck()));
+    world.begin_blocks(mats, passable);
     for (id, b) in blocks.iter().enumerate() {
         let (x0, y0, x1, y1) = b.bounds();
         for y in y0..=y1 {
@@ -476,6 +475,15 @@ impl Member {
         (self.p1 - self.p0).length()
     }
 
+    /// Floor or structure? A rod lying roughly flat (within about 20 degrees) is
+    /// deck: a car drives on it and its weight rests on it. A steeper rod is
+    /// load-bearing structure (a truss diagonal, a post): it carries the loads but
+    /// does not block the car.
+    pub fn is_deck(&self) -> bool {
+        let d = self.p1 - self.p0;
+        d.y.abs() < 0.36 * d.x.abs().max(1e-3)
+    }
+
     pub fn center(&self) -> Vec2 {
         (self.p0 + self.p1) * 0.5
     }
@@ -511,7 +519,11 @@ impl Member {
     }
 }
 
-/// Where a click lands on the structure: another beam's end, a block, or the ground.
+/// How close to the edge of the world (cells) a click snaps onto it.
+pub const BORDER_REACH: f32 = 16.0;
+
+/// Where a click lands on the structure: the end of a rod, a block, the middle of
+/// a rod, the ground, or the edge of the world. Used by rods and cables alike.
 pub fn node_at(world: &World, blocks: &[Block], members: &[Member], p: Vec2) -> Option<Anchor> {
     let mut best: Option<(f32, Anchor)> = None;
     for m in members {
@@ -524,6 +536,17 @@ pub fn node_at(world: &World, blocks: &[Block], members: &[Member], p: Vec2) -> 
     }
     if let Some((_, a)) = best {
         return Some(a);
+    }
+    if let Some(i) = block_at(blocks, p) {
+        let b = &blocks[i];
+        return Some(Anchor::Block { uid: b.uid, local: rot(-b.angle, p - b.pos) });
+    }
+    for m in members {
+        if m.distance_to(p) <= m.mat.thickness() / 2.0 + 3.0 {
+            let ab = m.p1 - m.p0;
+            let t = ((p - m.p0).dot(ab) / ab.length_squared().max(1.0)).clamp(0.0, 1.0);
+            return Some(Anchor::Along { uid: m.uid, t });
+        }
     }
     anchor_at(world, blocks, p)
 }
@@ -539,8 +562,10 @@ pub enum Anchor {
     Ground(Vec2),
     /// A point on a block, in the block's own frame.
     Block { uid: u32, local: Vec2 },
-    /// One end (0 or 1) of a free beam: a node other beams can pin to.
+    /// One end (0 or 1) of a free rod: a node other rods and cables can pin to.
     End { uid: u32, end: u8 },
+    /// A point along a rod, `t` from 0 (first end) to 1 (second end).
+    Along { uid: u32, t: f32 },
     /// Pinned to nothing (a loose end).
     Free(Vec2),
 }
@@ -551,6 +576,11 @@ pub struct Cable {
     pub b: Anchor,
     /// Rope length in cells (a little longer than the distance between the ends).
     pub len: f32,
+    pub mat: CableMat,
+    /// Elasticity multiplier: above 1 it stretches more, below 1 it is stiffer.
+    pub soft: f32,
+    /// Load as a fraction of what it can carry (1 = snaps).
+    pub stress: f32,
     /// Points along the cable for drawing: both anchors and every link between.
     pub pts: Vec<Vec2>,
     pub snapped: bool,
@@ -560,12 +590,18 @@ pub struct Cable {
 
 impl Cable {
     pub fn new(a: Anchor, b: Anchor, chord: f32) -> Self {
-        Cable { a, b, len: chord * 1.06, pts: vec![], snapped: false, links: vec![], joints: vec![] }
+        Cable { a, b, len: chord * 1.06, mat: CableMat::Iron, soft: 1.0, stress: 0.0, pts: vec![], snapped: false, links: vec![], joints: vec![] }
+    }
+
+    pub fn made_of(mut self, mat: CableMat, soft: f32) -> Self {
+        self.mat = mat;
+        self.soft = soft;
+        self
     }
 
     /// A copy with no physics state, as it was before the simulation started.
     pub fn fresh(&self) -> Cable {
-        let mut c = Cable::new(self.a, self.b, self.len / 1.06);
+        let mut c = Cable::new(self.a, self.b, self.len / 1.06).made_of(self.mat, self.soft);
         c.len = self.len;
         c
     }
@@ -579,6 +615,11 @@ impl Cable {
 
     pub fn has_body(&self) -> bool {
         !self.links.is_empty()
+    }
+
+    pub fn attached_to_member(&self, uid: u32) -> bool {
+        let on = |a: &Anchor| matches!(a, Anchor::End { uid: u, .. } | Anchor::Along { uid: u, .. } if *u == uid);
+        on(&self.a) || on(&self.b)
     }
 
     pub fn attached_to(&self, uid: u32) -> bool {
@@ -603,6 +644,7 @@ pub fn anchor_world(anchor: &Anchor, blocks: &[Block], members: &[Member]) -> Op
         Anchor::Ground(p) | Anchor::Free(p) => Some(*p),
         Anchor::Block { uid, local } => blocks.iter().find(|b| b.uid == *uid).map(|b| b.pos + rot(b.angle, *local)),
         Anchor::End { uid, end } => members.iter().find(|m| m.uid == *uid).map(|m| if *end == 0 { m.p0 } else { m.p1 }),
+        Anchor::Along { uid, t } => members.iter().find(|m| m.uid == *uid).map(|m| m.p0 + (m.p1 - m.p0) * *t),
     }
 }
 
@@ -622,14 +664,240 @@ pub fn anchor_at(world: &World, blocks: &[Block], p: Vec2) -> Option<Anchor> {
             }
         }
     }
+    // The edges of the world are solid to hang things from.
+    // Near any edge of the world, including the top of the sky: it snaps to the edge.
+    let (w, h) = (W as f32, H as f32);
+    let near = BORDER_REACH;
+    if p.x < near {
+        return Some(Anchor::Ground(vec2(0.0, p.y.clamp(0.0, h))));
+    }
+    if p.x > w - near {
+        return Some(Anchor::Ground(vec2(w, p.y.clamp(0.0, h))));
+    }
+    if p.y < near {
+        return Some(Anchor::Ground(vec2(p.x.clamp(0.0, w), 0.0)));
+    }
+    if p.y > h - near {
+        return Some(Anchor::Ground(vec2(p.x.clamp(0.0, w), h)));
+    }
     None
 }
 
-/// Cables snap when a link carries more than this impulse in one step.
-const CABLE_BREAK: f32 = 6.0;
+/// What a cable is made of: how stiff it is (elasticity), how much it can take,
+/// how heavy it is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CableMat {
+    Steel,
+    Iron,
+    Wood,
+}
+
+impl CableMat {
+    pub const ALL: [CableMat; 3] = [CableMat::Steel, CableMat::Iron, CableMat::Wood];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            CableMat::Steel => "acier",
+            CableMat::Iron => "fer",
+            CableMat::Wood => "corde",
+        }
+    }
+
+    pub fn id(self) -> u8 {
+        match self {
+            CableMat::Steel => 0,
+            CableMat::Iron => 1,
+            CableMat::Wood => 2,
+        }
+    }
+
+    pub fn from_id(id: u8) -> CableMat {
+        Self::ALL.iter().copied().find(|m| m.id() == id).unwrap_or(CableMat::Iron)
+    }
+
+    /// Spring stiffness of each link: steel hardly stretches, rope stretches a lot.
+    pub fn stiffness(self) -> f32 {
+        match self {
+            CableMat::Steel => 4200.0,
+            CableMat::Iron => 2600.0,
+            CableMat::Wood => 700.0,
+        }
+    }
+
+    /// Impulse per step a link can carry before the cable snaps.
+    pub fn limit(self) -> f32 {
+        match self {
+            CableMat::Steel => 12.0,
+            CableMat::Iron => 6.0,
+            CableMat::Wood => 2.4,
+        }
+    }
+
+    /// Bead density: steel is heavy, rope is light.
+    pub fn density(self) -> f32 {
+        match self {
+            CableMat::Steel => 20.0,
+            CableMat::Iron => 12.0,
+            CableMat::Wood => 5.0,
+        }
+    }
+
+    pub fn color(self) -> (u8, u8, u8) {
+        match self {
+            CableMat::Steel => (92, 118, 168),
+            CableMat::Iron => (62, 66, 78),
+            CableMat::Wood => (176, 140, 88),
+        }
+    }
+
+    pub fn cost_from(self) -> &'static [Mat] {
+        match self {
+            CableMat::Steel => &[Mat::Steel],
+            CableMat::Iron => &[Mat::Iron],
+            CableMat::Wood => &[Mat::Wood, Mat::Trunk, Mat::Branch],
+        }
+    }
+
+    pub fn cost(self, len: f32) -> u32 {
+        (len * 0.15).ceil() as u32
+    }
+}
+
 const CABLE_SEGMENT: f32 = 8.0;
-const CABLE_STIFFNESS: f32 = 2600.0;
-const CABLE_DAMPING: f32 = 14.0;
+
+// ---------------------------------------------------------------------------
+// Springs and elastic cords
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpringKind {
+    /// A steel coil: strong, fairly stiff.
+    Coil,
+    /// An elastic cord: weak and very stretchy.
+    Elastic,
+}
+
+impl SpringKind {
+    pub const ALL: [SpringKind; 2] = [SpringKind::Coil, SpringKind::Elastic];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            SpringKind::Coil => "Ressort",
+            SpringKind::Elastic => "Élastique",
+        }
+    }
+
+    pub fn id(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_id(id: u8) -> SpringKind {
+        Self::ALL.iter().copied().find(|k| k.id() == id).unwrap_or(SpringKind::Coil)
+    }
+
+    /// Newtons per metre in the physics world.
+    pub fn stiffness(self) -> f32 {
+        match self {
+            SpringKind::Coil => 420.0,
+            SpringKind::Elastic => 55.0,
+        }
+    }
+
+    /// It snaps when stretched beyond this many times its rest length.
+    pub fn max_stretch(self) -> f32 {
+        match self {
+            SpringKind::Coil => 2.4,
+            SpringKind::Elastic => 3.6,
+        }
+    }
+
+    pub fn color(self) -> (u8, u8, u8) {
+        match self {
+            SpringKind::Coil => (170, 176, 192),
+            SpringKind::Elastic => (206, 96, 84),
+        }
+    }
+
+    pub fn cost_from(self) -> &'static [Mat] {
+        match self {
+            SpringKind::Coil => &[Mat::Steel],
+            SpringKind::Elastic => &[Mat::Wood, Mat::Trunk, Mat::Branch],
+        }
+    }
+
+    pub fn cost(self, rest: f32) -> u32 {
+        (rest * 0.2).ceil() as u32
+    }
+}
+
+/// Longest rest length of a spring, in cells.
+pub const SPRING_MAX_LEN: f32 = 140.0;
+
+/// A spring or elastic cord: set up with three clicks (first end, rest length,
+/// then the far end, pulled out to wherever it should be attached).
+#[derive(Clone)]
+pub struct Spring {
+    pub uid: u32,
+    pub kind: SpringKind,
+    pub a: Anchor,
+    pub b: Anchor,
+    /// Length at rest, in cells.
+    pub rest: f32,
+    /// Elasticity multiplier (above 1 = softer).
+    pub soft: f32,
+    /// Current end points, for drawing.
+    pub p0: Vec2,
+    pub p1: Vec2,
+    /// How far it is stretched (0 = at rest, 1 = about to snap).
+    pub stress: f32,
+    pub snapped: bool,
+    bead: Option<RigidBodyHandle>,
+    joint: Option<ImpulseJointHandle>,
+}
+
+static NEXT_SPRING_UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+impl Spring {
+    pub fn new(kind: SpringKind, a: Anchor, b: Anchor, rest: f32, soft: f32, p0: Vec2, p1: Vec2) -> Self {
+        Spring {
+            uid: NEXT_SPRING_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            kind,
+            a,
+            b,
+            rest,
+            soft,
+            p0,
+            p1,
+            stress: 0.0,
+            snapped: false,
+            bead: None,
+            joint: None,
+        }
+    }
+
+    pub fn has_body(&self) -> bool {
+        self.joint.is_some()
+    }
+
+    pub fn fresh(&self) -> Spring {
+        Spring { bead: None, joint: None, stress: 0.0, snapped: false, ..self.clone() }
+    }
+
+    pub fn attached_to(&self, uid: u32) -> bool {
+        let on = |a: &Anchor| matches!(a, Anchor::Block { uid: u, .. } if *u == uid);
+        on(&self.a) || on(&self.b)
+    }
+
+    pub fn attached_to_member(&self, uid: u32) -> bool {
+        let on = |a: &Anchor| matches!(a, Anchor::End { uid: u, .. } | Anchor::Along { uid: u, .. } if *u == uid);
+        on(&self.a) || on(&self.b)
+    }
+
+    pub fn distance_to(&self, p: Vec2) -> f32 {
+        let ab = self.p1 - self.p0;
+        let t = if ab.length_squared() > 0.0 { ((p - self.p0).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) } else { 0.0 };
+        (self.p0 + ab * t - p).length()
+    }
+}
 
 pub struct Physics {
     w: PhysicsWorld,
@@ -712,6 +980,7 @@ impl Physics {
                 Anchor::Ground(w) => Some((self.terrain, v2(w))),
                 Anchor::Block { uid, local } => blocks.iter().find(|b| b.uid == uid).and_then(|b| Some((b.body?, v2(local)))),
                 Anchor::End { uid, end: e } => members.iter().find(|o| o.uid == uid).and_then(|o| Some((o.body?, Self::member_end_local(o, e)))),
+                Anchor::Along { uid, t } => members.iter().find(|o| o.uid == uid).and_then(|o| Some((o.body?, Vector::new((t - 0.5) * o.len() / PX_PER_M, 0.0)))),
                 Anchor::Free(_) => None,
             };
             if let Some((tb, tl)) = target {
@@ -747,7 +1016,7 @@ impl Physics {
 
     /// Follow the physics, measure how hard each beam is loaded, and snap the
     /// ones that are overloaded. Returns where beams broke.
-    pub fn update_members(&mut self, world: &World, members: &mut Vec<Member>) -> Vec<Vec2> {
+    pub fn update_members(&mut self, world: &World, members: &mut Vec<Member>) -> Vec<(Vec2, u32)> {
         // Wooden beams float too.
         let dt = self.w.integration_parameters.dt;
         let g = self.w.gravity.y;
@@ -801,7 +1070,7 @@ impl Physics {
         let mut spots = vec![];
         for &i in broke.iter().rev() {
             let mut m = members.remove(i);
-            spots.push(m.center());
+            spots.push((m.center(), m.uid));
             self.remove_member(&mut m);
         }
         spots
@@ -814,9 +1083,96 @@ impl Physics {
         self.w.bodies[h].apply_impulse_at_point(impulse, v2(point), true);
     }
 
+    fn anchor_body(&self, blocks: &[Block], members: &[Member], a: &Anchor) -> Option<(RigidBodyHandle, Vector)> {
+        match a {
+            Anchor::Ground(w) => Some((self.terrain, v2(*w))),
+            Anchor::Block { uid, local } => {
+                let b = blocks.iter().find(|b| b.uid == *uid)?;
+                Some((b.body?, v2(*local)))
+            }
+            Anchor::End { uid, end } => {
+                let m = members.iter().find(|m| m.uid == *uid)?;
+                Some((m.body?, Self::member_end_local(m, *end)))
+            }
+            Anchor::Along { uid, t } => {
+                let m = members.iter().find(|m| m.uid == *uid)?;
+                Some((m.body?, Vector::new((t - 0.5) * m.len() / PX_PER_M, 0.0)))
+            }
+            Anchor::Free(_) => None,
+        }
+    }
+
+    /// One spring joint between its two ends. A loose end gets a small weight to
+    /// hang from the spring.
+    pub fn add_spring(&mut self, blocks: &[Block], members: &[Member], sp: &mut Spring) {
+        let (Some(pa), Some(pb)) = (anchor_world(&sp.a, blocks, members), anchor_world(&sp.b, blocks, members)) else { return };
+        let Some((ha, la)) = self.anchor_body(blocks, members, &sp.a) else { return };
+        let (hb, lb) = match self.anchor_body(blocks, members, &sp.b) {
+            Some(x) => x,
+            None => {
+                let rb = RigidBodyBuilder::dynamic().translation(v2(pb)).can_sleep(false).linear_damping(0.4).angular_damping(2.0);
+                let col = ColliderBuilder::ball(2.0 / PX_PER_M)
+                    .density(40.0)
+                    .collision_groups(InteractionGroups { memberships: Group::GROUP_2, filter: Group::GROUP_1, test_mode: InteractionTestMode::And });
+                let (h, _) = self.w.insert(rb, col);
+                sp.bead = Some(h);
+                (h, Vector::new(0.0, 0.0))
+            }
+        };
+        let k = sp.kind.stiffness() / sp.soft.clamp(0.3, 4.0);
+        let damping = 0.3 * k.sqrt();
+        let j = SpringJointBuilder::new(sp.rest / PX_PER_M, k, damping).local_anchor1(la).local_anchor2(lb).contacts_enabled(false);
+        sp.joint = Some(self.w.insert_impulse_joint(ha, hb, j));
+        sp.p0 = pa;
+        sp.p1 = pb;
+    }
+
+    pub fn remove_spring(&mut self, sp: &mut Spring) {
+        if let Some(j) = sp.joint.take() {
+            self.w.remove_impulse_joint(j);
+        }
+        if let Some(h) = sp.bead.take() {
+            self.w.remove_body(h);
+        }
+    }
+
+    /// Follow the physics; springs stretched or crushed too far snap. Returns the
+    /// uids of those that snapped.
+    pub fn sync_springs(&mut self, blocks: &[Block], members: &[Member], springs: &mut Vec<Spring>) -> Vec<u32> {
+        let mut gone = vec![];
+        for sp in springs.iter_mut() {
+            if !sp.has_body() {
+                continue;
+            }
+            if let Some(p) = anchor_world(&sp.a, blocks, members) {
+                sp.p0 = p;
+            }
+            sp.p1 = match sp.bead {
+                Some(h) => {
+                    let t = self.w.bodies[h].translation();
+                    vec2(t.x, t.y) * PX_PER_M
+                }
+                None => anchor_world(&sp.b, blocks, members).unwrap_or(sp.p1),
+            };
+            let len = (sp.p1 - sp.p0).length();
+            let stretch = len / sp.rest.max(1.0);
+            sp.stress = ((stretch - 1.0).abs() / (sp.kind.max_stretch() - 1.0)).clamp(0.0, 1.0);
+            if stretch > sp.kind.max_stretch() {
+                gone.push(sp.uid);
+            }
+        }
+        for uid in &gone {
+            if let Some(i) = springs.iter().position(|s| s.uid == *uid) {
+                let mut sp = springs.remove(i);
+                self.remove_spring(&mut sp);
+            }
+        }
+        gone
+    }
+
     /// Builds the rope as a chain of light beads joined by rope joints.
-    pub fn add_cable(&mut self, blocks: &[Block], c: &mut Cable) {
-        let (Some(pa), Some(pb)) = (anchor_world(&c.a, blocks, &[]), anchor_world(&c.b, blocks, &[])) else { return };
+    pub fn add_cable(&mut self, blocks: &[Block], members: &[Member], c: &mut Cable) {
+        let (Some(pa), Some(pb)) = (anchor_world(&c.a, blocks, members), anchor_world(&c.b, blocks, members)) else { return };
         // Long chains of light beads need more solver passes to hold a heavy load.
         self.w.integration_parameters.num_solver_iterations = 12;
         let n = ((c.len / CABLE_SEGMENT) as usize).clamp(4, 70);
@@ -830,7 +1186,7 @@ impl Physics {
             let p = pa + (pb - pa) * u + vec2(0.0, sag * 4.0 * u * (1.0 - u));
             let rb = RigidBodyBuilder::dynamic().translation(v2(p)).can_sleep(false).linear_damping(0.6).angular_damping(2.0);
             let col = ColliderBuilder::ball(1.4 / PX_PER_M)
-                .density(12.0)
+                .density(c.mat.density())
                 .friction(0.6)
                 .collision_groups(InteractionGroups { memberships: Group::GROUP_2, filter: Group::GROUP_1, test_mode: InteractionTestMode::And });
             let (h, _) = self.w.insert(rb, col);
@@ -843,17 +1199,28 @@ impl Physics {
                     let b = blocks.iter().find(|b| b.uid == *uid)?;
                     Some((b.body?, v2(*local)))
                 }
-                _ => None,
+                Anchor::End { uid, end } => {
+                    let m = members.iter().find(|m| m.uid == *uid)?;
+                    Some((m.body?, Self::member_end_local(m, *end)))
+                }
+                Anchor::Along { uid, t } => {
+                    let m = members.iter().find(|m| m.uid == *uid)?;
+                    Some((m.body?, Vector::new((t - 0.5) * m.len() / PX_PER_M, 0.0)))
+                }
+                Anchor::Free(_) => None,
             }
         };
         let (Some((ha, la)), Some((hb, lb))) = (end_body(self, &c.a), end_body(self, &c.b)) else { return };
         let rest = link_len / PX_PER_M;
+        // A softer cable has weaker springs (it stretches more); damping follows the stiffness.
+        let stiffness = c.mat.stiffness() / c.soft.clamp(0.3, 4.0);
+        let damping = 0.27 * stiffness.sqrt();
         let mut joints = vec![];
         let chain: Vec<(RigidBodyHandle, Vector)> =
             std::iter::once((ha, la)).chain(bodies.iter().map(|h| (*h, Vector::new(0.0, 0.0)))).chain(std::iter::once((hb, lb))).collect();
         for pair in chain.windows(2) {
             // An elastic rope: springs between the beads let it stretch a little.
-            let j = SpringJointBuilder::new(rest, CABLE_STIFFNESS, CABLE_DAMPING).local_anchor1(pair[0].1).local_anchor2(pair[1].1).contacts_enabled(false);
+            let j = SpringJointBuilder::new(rest, stiffness, damping).local_anchor1(pair[0].1).local_anchor2(pair[1].1).contacts_enabled(false);
             joints.push(self.w.insert_impulse_joint(pair[0].0, pair[1].0, j));
         }
         c.links = bodies;
@@ -869,33 +1236,36 @@ impl Physics {
     }
 
     /// Copies bead positions into each cable and snaps the ones pulled too hard.
-    pub fn sync_cables(&mut self, blocks: &[Block], cables: &mut [Cable]) {
+    pub fn sync_cables(&mut self, blocks: &[Block], members: &[Member], cables: &mut [Cable]) {
         for c in cables.iter_mut() {
             if !c.has_body() {
                 continue;
             }
             let mut broke = vec![];
+            let mut worst = 0.0f32;
             for (k, h) in c.joints.iter().enumerate() {
                 if let Some(j) = self.w.impulse_joints.get(*h) {
                     let f = (j.impulses.x * j.impulses.x + j.impulses.y * j.impulses.y).sqrt();
-                    if f > CABLE_BREAK {
+                    worst = worst.max(f / c.mat.limit());
+                    if f > c.mat.limit() {
                         broke.push(k);
                     }
                 }
             }
+            c.stress = worst;
             for k in broke {
                 self.w.remove_impulse_joint(c.joints[k]);
                 c.snapped = true;
             }
             let mut pts = vec![];
-            if let Some(p) = anchor_world(&c.a, blocks, &[]) {
+            if let Some(p) = anchor_world(&c.a, blocks, members) {
                 pts.push(p);
             }
             for h in &c.links {
                 let t = self.w.bodies[*h].translation();
                 pts.push(vec2(t.x, t.y) * PX_PER_M);
             }
-            if let Some(p) = anchor_world(&c.b, blocks, &[]) {
+            if let Some(p) = anchor_world(&c.b, blocks, members) {
                 pts.push(p);
             }
             c.pts = pts;
@@ -1441,10 +1811,10 @@ mod tests {
         let uid = blocks[0].uid;
         let mut cables = vec![Cable::new(Anchor::Ground(vec2(200.0, 100.0)), Anchor::Block { uid, local: vec2(0.0, -10.0) }, 140.0)];
         let mut phys = Physics::build(&mut blocks);
-        phys.add_cable(&blocks, &mut cables[0]);
+        phys.add_cable(&blocks, &[], &mut cables[0]);
         for _ in 0..600 {
             phys.step(&world, &mut blocks);
-            phys.sync_cables(&blocks, &mut cables);
+            phys.sync_cables(&blocks, &[], &mut cables);
             stamp_blocks(&mut world, &blocks);
             world.step();
         }
@@ -1461,10 +1831,10 @@ mod tests {
         let mut blocks: Vec<Block> = vec![];
         let mut cable = Cable::new(Anchor::Ground(vec2(100.0, 250.0)), Anchor::Ground(vec2(220.0, 250.0)), 120.0);
         let mut phys = Physics::build(&mut blocks);
-        phys.add_cable(&blocks, &mut cable);
+        phys.add_cable(&blocks, &[], &mut cable);
         for _ in 0..400 {
             phys.step(&world, &mut blocks);
-            phys.sync_cables(&blocks, std::slice::from_mut(&mut cable));
+            phys.sync_cables(&blocks, &[], std::slice::from_mut(&mut cable));
             world.step();
         }
         let lowest = cable.pts.iter().map(|p| p.y).fold(0.0f32, f32::max);
@@ -1576,6 +1946,218 @@ mod tests {
         // The water surface is around y = 270: wood bobs there, iron lies on the bottom.
         assert!(plank < 282.0, "the plank should float, mean y = {plank}");
         assert!(blocks[1].pos.y > 300.0, "the iron beam should sink, y = {}", blocks[1].pos.y);
+    }
+
+    #[test]
+    fn a_cable_can_hang_from_a_rod_and_from_the_edge_of_the_world() {
+        // From the middle of a rod pinned to the ground at both ends.
+        let mut world = ground();
+        let mut blocks = vec![Block::new(BlockKind::Cube, vec2(200.0, 250.0), 0.0)];
+        let uid = blocks[0].uid;
+        let (a, b) = (vec2(150.0, 150.0), vec2(250.0, 150.0));
+        let mut members = vec![Member::new(MemberMat::Steel, Anchor::Ground(a), Anchor::Ground(b), a, b)];
+        let rod = members[0].uid;
+        let mut cables = vec![Cable::new(Anchor::Along { uid: rod, t: 0.5 }, Anchor::Block { uid, local: vec2(0.0, -10.0) }, 90.0)];
+        let mut phys = Physics::build(&mut blocks);
+        phys.build_members(&blocks, &mut members);
+        phys.add_cable(&blocks, &members, &mut cables[0]);
+        for _ in 0..500 {
+            phys.step(&world, &mut blocks);
+            phys.update_members(&world, &mut members);
+            phys.sync_cables(&blocks, &members, &mut cables);
+            stamp_all(&mut world, &blocks, &members);
+        }
+        assert!(!cables[0].snapped && members.len() == 1, "rod and cable hold a cube");
+        assert!(blocks[0].pos.y < 262.0, "the cube hangs from the rod, y = {}", blocks[0].pos.y);
+
+        // From the left edge of the world.
+        let world = ground();
+        let mut blocks = vec![Block::new(BlockKind::Cube, vec2(100.0, 250.0), 0.0)];
+        let uid = blocks[0].uid;
+        let edge = anchor_at(&world, &blocks, vec2(2.0, 150.0)).expect("the world's edge is a valid anchor");
+        assert_eq!(edge, Anchor::Ground(vec2(0.0, 150.0)));
+        let mut cable = Cable::new(edge, Anchor::Block { uid, local: vec2(-10.0, 0.0) }, 110.0);
+        let mut phys = Physics::build(&mut blocks);
+        phys.add_cable(&blocks, &[], &mut cable);
+        for _ in 0..400 {
+            phys.step(&world, &mut blocks);
+            phys.sync_cables(&blocks, &[], std::slice::from_mut(&mut cable));
+        }
+        assert!(!cable.snapped);
+        assert!(blocks[0].pos.y < 290.0, "the cube hangs from the wall: y = {}", blocks[0].pos.y);
+    }
+
+    /// How far a cube stretches the cable it hangs from (steady state).
+    fn stretch_of(mat: CableMat, soft: f32) -> (f32, bool) {
+        let mut world = ground();
+        let mut blocks = vec![Block::new(BlockKind::Cube, vec2(200.0, 230.0), 0.0)];
+        let uid = blocks[0].uid;
+        let mut cables = vec![Cable::new(Anchor::Ground(vec2(200.0, 100.0)), Anchor::Block { uid, local: vec2(0.0, -10.0) }, 110.0).made_of(mat, soft)];
+        let mut phys = Physics::build(&mut blocks);
+        phys.add_cable(&blocks, &[], &mut cables[0]);
+        let mut y_sum = 0.0;
+        for t in 0..700 {
+            phys.step(&world, &mut blocks);
+            phys.sync_cables(&blocks, &[], &mut cables);
+            stamp_blocks(&mut world, &blocks);
+            if t >= 600 {
+                y_sum += blocks[0].pos.y;
+            }
+        }
+        (y_sum / 100.0, cables[0].snapped)
+    }
+
+    #[test]
+    fn cable_material_and_elasticity_change_how_far_it_stretches() {
+        let steel = stretch_of(CableMat::Steel, 1.0);
+        let iron = stretch_of(CableMat::Iron, 1.0);
+        let rope = stretch_of(CableMat::Wood, 1.0);
+        let soft_iron = stretch_of(CableMat::Iron, 3.0);
+        eprintln!("STRETCH steel {steel:?} iron {iron:?} rope {rope:?} soft iron {soft_iron:?}");
+        assert!(steel.0 < iron.0 && iron.0 < rope.0, "stiffer cables hold the cube higher: steel {} iron {} rope {}", steel.0, iron.0, rope.0);
+        assert!(soft_iron.0 > iron.0 + 2.0, "a softer setting stretches more: {} vs {}", soft_iron.0, iron.0);
+        assert!(!steel.1 && !iron.1, "steel and iron hold a cube");
+    }
+
+    fn spring_with_cube(kind: SpringKind, rest: f32) -> (f32, bool) {
+        let mut world = ground();
+        let mut blocks = vec![Block::new(BlockKind::Cube, vec2(200.0, 200.0), 0.0)];
+        let uid = blocks[0].uid;
+        let a = vec2(200.0, 100.0);
+        let b = vec2(200.0, 190.0);
+        let mut springs = vec![Spring::new(kind, Anchor::Ground(a), Anchor::Block { uid, local: vec2(0.0, -10.0) }, rest, 1.0, a, b)];
+        let mut phys = Physics::build(&mut blocks);
+        phys.add_spring(&blocks, &[], &mut springs[0]);
+        let mut y_sum = 0.0;
+        for t in 0..900 {
+            phys.step(&world, &mut blocks);
+            phys.sync_springs(&blocks, &[], &mut springs);
+            stamp_blocks(&mut world, &blocks);
+            if t >= 800 {
+                y_sum += blocks[0].pos.y;
+            }
+        }
+        (y_sum / 100.0, springs.is_empty())
+    }
+
+    #[test]
+    fn springs_stretch_under_load_and_an_elastic_cord_stretches_much_more() {
+        let coil = spring_with_cube(SpringKind::Coil, 60.0);
+        let elastic = spring_with_cube(SpringKind::Elastic, 60.0);
+        eprintln!("SPRING coil {coil:?} elastic {elastic:?}");
+        assert!(!coil.1 && !elastic.1, "neither should snap under one cube");
+        // The cube hangs lower on the stretchy cord, and both are longer than at rest.
+        assert!(coil.0 > 100.0 + 60.0 + 10.0 - 10.0, "the coil stretches a little under the weight: cube at {}", coil.0);
+        assert!(elastic.0 > coil.0 + 8.0, "the elastic cord stretches far more: {} vs {}", elastic.0, coil.0);
+    }
+
+    #[test]
+    fn a_spring_pulled_too_far_snaps_and_a_free_end_hangs_a_weight() {
+        let world = ground();
+        let mut blocks: Vec<Block> = vec![];
+        let mut phys = Physics::build(&mut blocks);
+        // Rest length 40, ends pulled 160 apart: 4x its length.
+        let (a, b) = (vec2(100.0, 200.0), vec2(260.0, 200.0));
+        let mut springs = vec![Spring::new(SpringKind::Elastic, Anchor::Ground(a), Anchor::Ground(b), 40.0, 1.0, a, b)];
+        phys.add_spring(&blocks, &[], &mut springs[0]);
+        let mut snapped = false;
+        for _ in 0..20 {
+            phys.step(&world, &mut blocks);
+            snapped |= !phys.sync_springs(&blocks, &[], &mut springs).is_empty();
+        }
+        assert!(snapped && springs.is_empty(), "stretched past its limit it snaps");
+
+        // A spring whose far end is not attached carries a small weight on it.
+        let mut springs = vec![Spring::new(SpringKind::Coil, Anchor::Ground(vec2(200.0, 100.0)), Anchor::Free(vec2(200.0, 160.0)), 60.0, 1.0, vec2(200.0, 100.0), vec2(200.0, 160.0))];
+        phys.add_spring(&blocks, &[], &mut springs[0]);
+        for _ in 0..300 {
+            phys.step(&world, &mut blocks);
+            phys.sync_springs(&blocks, &[], &mut springs);
+        }
+        let end = springs[0].p1;
+        assert!(end.y > 158.0 && end.y < 230.0, "the loose end bobs below the rest length, at {end:?}");
+    }
+
+    #[test]
+    fn rods_springs_and_cables_snap_onto_every_edge_of_the_world() {
+        let world = World::new_static();
+        for (p, want) in [
+            (vec2(9.0, 200.0), Anchor::Ground(vec2(0.0, 200.0))),
+            (vec2(W as f32 - 12.0, 150.0), Anchor::Ground(vec2(W as f32, 150.0))),
+            (vec2(400.0, 10.0), Anchor::Ground(vec2(400.0, 0.0))),
+            (vec2(400.0, H as f32 - 9.0), Anchor::Ground(vec2(400.0, H as f32))),
+        ] {
+            assert_eq!(node_at(&world, &[], &[], p), Some(want), "click at {p:?}");
+        }
+        assert_eq!(node_at(&world, &[], &[], vec2(400.0, 200.0)), None, "open sky is not an anchor");
+    }
+
+    #[test]
+    fn flat_rods_are_deck_and_steep_ones_are_structure() {
+        let rod = |a: Vec2, b: Vec2| Member::new(MemberMat::Steel, Anchor::Free(a), Anchor::Free(b), a, b);
+        assert!(rod(vec2(0.0, 100.0), vec2(80.0, 100.0)).is_deck(), "level rod is floor");
+        assert!(rod(vec2(0.0, 100.0), vec2(80.0, 112.0)).is_deck(), "a gentle ramp is still floor");
+        assert!(!rod(vec2(0.0, 100.0), vec2(40.0, 140.0)).is_deck(), "a 45 degree diagonal is structure");
+        assert!(!rod(vec2(0.0, 100.0), vec2(2.0, 160.0)).is_deck(), "a post is structure");
+    }
+
+    #[test]
+    fn a_car_drives_through_the_structure_of_a_bridge_but_rides_its_deck() {
+        use crate::car::{Car, Fate, ModelKind};
+        let mut world = ground();
+        // A 100-wide gap crossed by a flat deck with two diagonals underneath and a post.
+        for x in 300..400 {
+            for y in 300..320 {
+                world.set(x, y, Mat::Empty);
+            }
+        }
+        let (l, r) = (vec2(296.0, 300.0), vec2(404.0, 300.0));
+        let mid = vec2(350.0, 340.0);
+        let deck = Member::new(MemberMat::Steel, Anchor::Ground(l), Anchor::Ground(r), l, r);
+        let d1 = Member::new(MemberMat::Steel, Anchor::Ground(l), Anchor::Free(mid), l, mid);
+        let d2 = Member::new(MemberMat::Steel, Anchor::Ground(r), Anchor::Free(mid), r, mid);
+        // A tall post standing right in the car's way: structure, so it does not block.
+        let (pb, pt) = (vec2(250.0, 300.0), vec2(251.0, 250.0));
+        let post = Member::new(MemberMat::Wood, Anchor::Ground(pb), Anchor::Free(pt), pb, pt);
+        let members = vec![deck, d1, d2, post];
+        assert!(members[0].is_deck() && !members[1].is_deck() && !members[3].is_deck());
+        stamp_all(&mut world, &[], &members);
+        // The post's cells are there for sand and water, but a car can pass.
+        assert!(world.at(250, 280).is_hard());
+        assert!(!world.hard_for_car(250, 280), "structure must not block the car");
+        assert!(world.hard_for_car(350, 300), "the deck holds the car up");
+
+        let mut car = Car::new(ModelKind::Buggy, (200, 276));
+        let mut crossed = false;
+        for _ in 0..2500 {
+            car.step(&world, None);
+            if car.p.x > 440.0 {
+                crossed = true;
+                break;
+            }
+            if car.fate != Fate::Driving {
+                break;
+            }
+        }
+        assert!(crossed, "the car should pass the post and cross on the deck; ended at x = {} ({:?})", car.p.x, car.fate);
+    }
+
+    #[test]
+    fn a_rod_with_no_attachment_falls_and_lands() {
+        let mut world = ground();
+        let mut blocks: Vec<Block> = vec![];
+        let mut phys = Physics::build(&mut blocks);
+        let (a, b) = (vec2(100.0, 200.0), vec2(160.0, 200.0));
+        let mut members = vec![Member::new(MemberMat::Iron, Anchor::Free(a), Anchor::Free(b), a, b)];
+        phys.build_members(&blocks, &mut members);
+        for _ in 0..300 {
+            phys.step(&world, &mut blocks);
+            phys.update_members(&world, &mut members);
+            stamp_all(&mut world, &blocks, &members);
+        }
+        assert_eq!(members.len(), 1, "a falling rod must not break");
+        assert!(members[0].center().y > 285.0, "the loose rod should have fallen to the ground, y = {}", members[0].center().y);
+        assert!((members[0].p1.y - members[0].p0.y).abs() < 10.0, "it lies flat");
     }
 
     #[test]
