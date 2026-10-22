@@ -42,6 +42,8 @@ pub enum Icon {
     Eye,
     Shovel,
     Select,
+    Drop,
+    Pin,
 }
 
 pub struct Ui {
@@ -127,6 +129,17 @@ pub fn draw_icon(icon: Icon, c: Vec2, s: f32, col: Color) {
                 draw_line(c.x - s * 0.4, c.y + s * k, c.x - s * 0.4 + s * len, c.y + s * k, th * 0.9, col);
             }
             arrow_head(vec2(c.x + s * 0.42, c.y), vec2(1.0, 0.0), s * 0.4, col);
+        }
+        Icon::Pin => {
+            // A push-pin.
+            draw_circle(c.x, c.y - s * 0.2, s * 0.2, col);
+            draw_line(c.x - s * 0.3, c.y + s * 0.02, c.x + s * 0.3, c.y + s * 0.02, th, col);
+            draw_line(c.x, c.y + s * 0.02, c.x, c.y + s * 0.44, th * 0.8, col);
+        }
+        Icon::Drop => {
+            // A drop: round belly, pointed top.
+            draw_circle(c.x, c.y + s * 0.14, s * 0.3, col);
+            draw_triangle(vec2(c.x, c.y - s * 0.42), vec2(c.x - s * 0.27, c.y + s * 0.02), vec2(c.x + s * 0.27, c.y + s * 0.02), col);
         }
         Icon::Eye => {
             arc(c + vec2(0.0, s * 0.18), s * 0.36, 215.0, 325.0, th, col);

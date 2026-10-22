@@ -2036,6 +2036,102 @@ impl World {
         }
     }
 
+    /// Relative humidity of the air at every cell (0..1). Water vapour and clouds count toward it, set
+    /// against how much the air can hold at its temperature (cold air holds little), and the air
+    /// over and around water is damper to begin with. Liquids themselves are always 1.
+    pub fn humidity_field(&self) -> Vec<f32> {
+        const B: usize = 8;
+        let (bw, bh) = (W / B, H.div_ceil(B));
+        let (mut vapour, mut wet, mut temp) = (vec![0.0f32; bw * bh], vec![0.0f32; bw * bh], vec![0.0f32; bw * bh]);
+        let mut air = vec![0.0f32; bw * bh];
+        for y in 0..H {
+            for x in 0..W {
+                let i = y * W + x;
+                let k = (y / B) * bw + (x / B).min(bw - 1);
+                match self.cells[i].m {
+                    Mat::Steam | Mat::Cloud => vapour[k] += 1.0,
+                    Mat::Water => wet[k] += 1.0,
+                    Mat::Empty | Mat::Smoke => {
+                        temp[k] += self.temp[i];
+                        air[k] += 1.0;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let cell = (B * B) as f32;
+        let blur = |src: &[f32], r: i32| -> Vec<f32> {
+            let mut out = vec![0.0f32; bw * bh];
+            for j in 0..bh as i32 {
+                for i in 0..bw as i32 {
+                    let (mut sum, mut n) = (0.0, 0.0);
+                    for dj in -r..=r {
+                        for di in -r..=r {
+                            let (ii, jj) = (i + di, j + dj);
+                            if ii >= 0 && jj >= 0 && ii < bw as i32 && jj < bh as i32 {
+                                sum += src[jj as usize * bw + ii as usize];
+                                n += 1.0;
+                            }
+                        }
+                    }
+                    out[j as usize * bw + i as usize] = sum / n;
+                }
+            }
+            out
+        };
+        let vapour_b = blur(&vapour.iter().map(|v| v / cell).collect::<Vec<_>>(), 1);
+        let wet_b = blur(&wet.iter().map(|v| v / cell).collect::<Vec<_>>(), 3);
+        let rh: Vec<f32> = (0..bw * bh)
+            .map(|k| {
+                let t = if air[k] > 4.0 { temp[k] / air[k] } else { self.ambient_c(((k / bw) * B) as i32) };
+                let capacity = (0.05 * (0.07 * t).exp()).clamp(0.01, 2.0);
+                let base = 0.18 + 0.55 * (wet_b[k] * 4.0).min(1.0);
+                (base + vapour_b[k] / capacity).clamp(0.0, 1.0)
+            })
+            .collect();
+        let mut out = vec![0.0f32; W * H];
+        for y in 0..H {
+            let fy = ((y as f32 + 0.5) / B as f32 - 0.5).clamp(0.0, bh as f32 - 1.0);
+            let (j0, ty) = (fy as usize, fy.fract());
+            let j1 = (j0 + 1).min(bh - 1);
+            for x in 0..W {
+                let fx = ((x as f32 + 0.5) / B as f32 - 0.5).clamp(0.0, bw as f32 - 1.0);
+                let (i0, tx) = (fx as usize, fx.fract());
+                let i1 = (i0 + 1).min(bw - 1);
+                let top = rh[j0 * bw + i0] * (1.0 - tx) + rh[j0 * bw + i1] * tx;
+                let bot = rh[j1 * bw + i0] * (1.0 - tx) + rh[j1 * bw + i1] * tx;
+                out[y * W + x] = top * (1.0 - ty) + bot * ty;
+            }
+        }
+        out
+    }
+
+    /// Colour of a cell in the humidity view: dry tan, through green, to wet blue.
+    pub fn humidity_color(&self, field: &[f32], x: usize, y: usize) -> [u8; 4] {
+        let m = self.at(x as i32, y as i32);
+        let rh = match m.kind() {
+            Kind::Liquid => Some(1.0),
+            Kind::Empty | Kind::Gas => Some(if matches!(m, Mat::Cloud | Mat::Steam) { 1.0f32.min(field[y * W + x] + 0.15) } else { field[y * W + x] }),
+            _ => match m {
+                // Soil holds moisture of its own.
+                Mat::Mud => Some(1.0),
+                Mat::Dirt | Mat::Grass => Some((self.cells[y * W + x].life as f32 / 200.0).clamp(0.0, 1.0) * 0.8 + 0.1),
+                _ => None,
+            },
+        };
+        let Some(rh) = rh else {
+            // Dry solids: dim, so that the picture reads as shapes.
+            return [58, 62, 74, 255];
+        };
+        const STOPS: [(f32, [f32; 3]); 4] = [(0.0, [186.0, 134.0, 66.0]), (0.35, [214.0, 196.0, 96.0]), (0.65, [90.0, 180.0, 140.0]), (1.0, [40.0, 100.0, 235.0])];
+        let k = STOPS.iter().position(|s| s.0 >= rh).unwrap_or(STOPS.len() - 1).max(1);
+        let ((p0, c0), (p1, c1)) = (STOPS[k - 1], STOPS[k]);
+        let f = ((rh - p0) / (p1 - p0)).clamp(0.0, 1.0);
+        let c = |a: f32, b: f32| (a + (b - a) * f) as u8;
+        let tint = if matches!(m, Mat::Dirt | Mat::Grass) { 0.7 } else { 1.0 };
+        [(c(c0[0], c1[0]) as f32 * tint) as u8, (c(c0[1], c1[1]) as f32 * tint) as u8, (c(c0[2], c1[2]) as f32 * tint) as u8, 255]
+    }
+
     pub fn cell_mat(&self, x: usize, y: usize) -> Mat {
         self.cells[y * W + x].m
     }
@@ -2298,6 +2394,27 @@ mod tests {
         let above = (4..17).filter(|&x| (100..150).any(|y| w.at(x, y) == Mat::Water)).count();
         let below = (4..17).filter(|&x| (160..200).any(|y| w.at(x, y) == Mat::Water)).count();
         assert!(above == 0 && below > 0, "the water went through the leaves (above {above}, below {below})");
+    }
+
+    #[test]
+    fn humidity_is_full_in_liquids_damp_near_water_and_high_in_clouds() {
+        let mut w = World::new_static();
+        for x in 100..140 {
+            for y in 300..310 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        for x in 600..640 {
+            for y in 100..112 {
+                w.set(x, y, Mat::Cloud);
+            }
+        }
+        let f = w.humidity_field();
+        assert_eq!(w.humidity_color(&f, 120, 305), [40, 100, 235, 255], "liquids are at 100 %");
+        let (near, far, cloud) = (f[290 * W + 120], f[50 * W + 400], f[106 * W + 620]);
+        assert!(near > far + 0.15, "air over water is damper: {near} vs {far}");
+        assert!(cloud > 0.95, "inside a cloud the air is saturated: {cloud}");
+        assert!(far < 0.3, "dry air far from water: {far}");
     }
 
     #[test]

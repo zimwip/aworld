@@ -444,29 +444,91 @@ impl Game {
         match sel {
             Sel::Block(u) => {
                 if let Some(b) = self.blocks.iter().find(|b| b.uid == u) {
-                    let (x0, y0, x1, y1) = b.bounds();
-                    let (p, q) = (view.to_screen(vec2(x0 as f32, y0 as f32)), view.to_screen(vec2(x1 as f32 + 1.0, y1 as f32 + 1.0)));
-                    draw_rectangle_lines(p.x - 2.0, p.y - 2.0, q.x - p.x + 4.0, q.y - p.y + 4.0, 2.5, col);
+                    let h = b.half();
+                    if b.spec().round {
+                        outline_circle(s, (h.x + 1.5) * view.s, col);
+                    } else {
+                        let pts: Vec<Vec2> = [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+                            .iter()
+                            .map(|(sx, sy)| view.to_screen(b.pos + sel_rot(b.angle, vec2(sx * (h.x + 1.5), sy * (h.y + 1.5)))))
+                            .collect();
+                        outline(&pts, col);
+                    }
                 }
             }
             Sel::Gear(u) => {
                 if let Some(g) = self.mech.gears.iter().find(|g| g.uid == u) {
-                    draw_circle_lines(s.x, s.y, (g.size.radius() + 4.0) * view.s, 2.5, col);
+                    outline_circle(s, (g.size.radius() + 2.5) * view.s, col);
                 }
             }
             Sel::Pulley(u) => {
                 if let Some(p) = self.mech.pulleys.iter().find(|p| p.uid == u) {
-                    draw_circle_lines(s.x, s.y, (p.radius + 3.0) * view.s, 2.5, col);
+                    outline_circle(s, (p.radius + 2.5) * view.s, col);
                 }
             }
             Sel::Car(id) => {
                 if let Some(c) = self.cars.iter().find(|c| c.id == id) {
-                    draw_circle_lines(s.x, s.y, (c.kind.model().hull_half * car::S + 8.0) * view.s, 2.5, col);
+                    outline_car(c, view, col);
                 }
             }
-            _ => draw_circle_lines(s.x, s.y, 11.0 * view.s, 2.5, col),
+            Sel::Valve(_) | Sel::Pump(_) => {
+                // A little box around it, turned along its pipe.
+                let pipe_uid = match sel {
+                    Sel::Valve(u) => self.mech.plumbing.valves.iter().find(|v| v.uid == u).map(|v| v.pipe),
+                    Sel::Pump(u) => self.mech.plumbing.pumps.iter().find(|p| p.uid == u).map(|p| p.pipe),
+                    _ => None,
+                };
+                let dir = pipe_uid
+                    .and_then(|pu| self.mech.plumbing.pipes.iter().find(|p| p.uid == pu))
+                    .map(|p| vec2(p.b.0 - p.a.0, p.b.1 - p.a.1).normalize_or_zero())
+                    .filter(|d| d.length() > 0.5)
+                    .unwrap_or(vec2(1.0, 0.0));
+                let (hx, hy) = (9.0f32, 7.0f32);
+                let pts: Vec<Vec2> = [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+                    .iter()
+                    .map(|(sx, sy)| view.to_screen(c + dir * (sx * hx) + vec2(-dir.y, dir.x) * (sy * hy)))
+                    .collect();
+                outline(&pts, col);
+            }
+            _ => outline_circle(s, 8.0 * view.s, col),
         }
-        draw_circle(s.x, s.y, 2.6, col);
+    }
+}
+
+fn sel_rot(a: f32, v: Vec2) -> Vec2 {
+    let (sn, cs) = a.sin_cos();
+    vec2(v.x * cs - v.y * sn, v.x * sn + v.y * cs)
+}
+
+/// A closed outline with a soft halo under it.
+fn outline(pts: &[Vec2], col: Color) {
+    let halo = Color::new(col.r, col.g, col.b, 0.28);
+    for k in 0..pts.len() {
+        let (a, b) = (pts[k], pts[(k + 1) % pts.len()]);
+        draw_line(a.x, a.y, b.x, b.y, 6.0, halo);
+    }
+    for k in 0..pts.len() {
+        let (a, b) = (pts[k], pts[(k + 1) % pts.len()]);
+        draw_line(a.x, a.y, b.x, b.y, 2.4, col);
+    }
+}
+
+/// The outline of something round (a wheel, a gear, a pulley).
+fn outline_circle(c: Vec2, r: f32, col: Color) {
+    draw_circle_lines(c.x, c.y, r, 6.0, Color::new(col.r, col.g, col.b, 0.28));
+    draw_circle_lines(c.x, c.y, r, 2.4, col);
+}
+
+/// A car's outline: its body and each of its wheels.
+pub fn outline_car(c: &car::Car, view: View, col: Color) {
+    let m = c.kind.model();
+    let (hl, top, bot) = (m.hull_half, m.hull_top, m.hull_bottom);
+    let slab_top = top * 0.3;
+    let p = |lx: f32, ly: f32| view.to_screen(c.p + sel_rot(c.angle, vec2(lx * c.dir, ly) * car::S));
+    let body = [p(-hl - 1.0, bot + 1.0), p(hl + 1.0, bot + 1.0), p(hl + 1.0, slab_top - 1.0), p(hl * 0.5, top - 1.5), p(-hl * 0.7, top - 1.5), p(-hl - 1.0, slab_top - 1.0)];
+    outline(&body, col);
+    for (i, w) in c.wheels.iter().enumerate() {
+        outline_circle(view.to_screen(w.pos), (c.wheel_r(i) + 1.0) * view.s, col);
     }
 }
 

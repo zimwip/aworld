@@ -12,12 +12,21 @@ pub struct View {
     pub ox: f32,
     pub oy: f32,
     pub s: f32,
+    /// The part of the window the world is shown in.
+    pub area: Rect,
 }
 
 impl View {
+    /// The world fills the whole area: a little is cropped (sides centred, the sky rather than the ground)
+    /// when the window is not the same shape as the world.
     pub fn fit(area: Rect) -> View {
-        let s = (area.w / W as f32).min(area.h / H as f32);
-        View { ox: area.x + (area.w - W as f32 * s) / 2.0, oy: area.y + (area.h - H as f32 * s) / 2.0, s }
+        let s = (area.w / W as f32).max(area.h / H as f32);
+        View { ox: area.x + (area.w - W as f32 * s) / 2.0, oy: area.y + area.h - H as f32 * s, s, area }
+    }
+
+    /// What can be seen of the world, in screen pixels.
+    pub fn visible(&self) -> Rect {
+        self.area
     }
 
     pub fn to_screen(&self, p: Vec2) -> Vec2 {
@@ -114,6 +123,7 @@ pub enum RenderMode {
     Normal = 0,
     Thermal = 1,
     Pressure = 2,
+    Humidity = 3,
 }
 
 pub struct Renderer {
@@ -224,6 +234,11 @@ impl Renderer {
                     self.pressure = world.pressure_field();
                     let field = &self.pressure;
                     Self::fill(&mut self.image, |x, y| world.pressure_color(field, x, y));
+                }
+                RenderMode::Humidity => {
+                    self.pressure = world.humidity_field();
+                    let field = &self.pressure;
+                    Self::fill(&mut self.image, |x, y| world.humidity_color(field, x, y));
                 }
                 RenderMode::Normal => {
                     Self::fill(&mut self.image, |x, y| world.color_without_trees(x, y));

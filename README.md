@@ -175,3 +175,18 @@ et faire des loopings et des culbutes. S'il touche quoi que ce soit (sol, eau, b
 - La palette de gauche se cache comme celle de droite : elle sort quand la souris va au bord gauche. La petite poignée en
   haut la garde dehors (et l'image se place à côté).
 - Les feuillages laissent passer l'eau : elle goutte à travers les arbres.
+
+## Vue hygrométrie (touche Y, ou Vues > Hygrométrie)
+
+Humidité relative de l'air : la vapeur d'eau et les nuages, rapportés à ce que l'air peut tenir à sa température (l'air
+froid en tient peu), plus un fond d'humidité autour des étendues d'eau. Du sec (ocre) à l'humide (bleu). Les liquides sont
+toujours à 100 %, la terre montre son humidité, les solides secs sont en gris.
+
+## Voitures, matériaux, palette épinglée
+
+- Une barre flottante en haut de l'image lance une voiture par modèle (un bouton par modèle). Une fois lancée, ses
+  réglages sont dans le panneau sous les vues. L'onglet Voitures règle le modèle lui-même (puissance, vitesse, couleur...) :
+  les prochaines voitures partent avec ces réglages. Entrée et Sortie y restent.
+- « Matériaux illimités » (Édition / Simulation) est dans les palettes Matières et Blocs, modifiable à tout moment.
+- La punaise à droite de Annuler épingle la palette (la poignée du bord gauche fait la même chose).
+- Le monde remplit toute la fenêtre : un peu de ciel est recadré en haut si la fenêtre n'est pas en 16:9.

@@ -51,6 +51,7 @@ enum ViewMode {
     Stress,
     Wind,
     Pressure,
+    Humidity,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -156,6 +157,7 @@ struct Game {
     tools_hit: Rect,
     corner_hit: Rect,
     hud_hit: Rect,
+    launch_hit: Rect,
     /// The left palette hides like the views on the right: 1 = fully out. `panel_pin` keeps it out (and
     /// the picture beside it); `panel_hit` is where it is, so that clicks on it do not paint the world.
     panel_open: f32,
@@ -269,6 +271,7 @@ impl Game {
             tools_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             corner_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             hud_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
+            launch_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             panel_open: 1.0,
             panel_pin: false,
             panel_hit: Rect::new(0.0, 0.0, PANEL_W, 10000.0),
@@ -515,7 +518,7 @@ impl Game {
 
     fn launch_car(&mut self) {
         let Some(e) = self.entry else {
-            self.say("Pose d'abord une Entrée (onglet Outils)");
+            self.say("Pose d'abord une Entrée (onglet Voitures)");
             return;
         };
         let crowded = self.cars.iter().any(|c| (c.p - vec2(e.0 as f32, e.1 as f32)).length() < 45.0);
@@ -1184,6 +1187,9 @@ impl Game {
                 self.say("Un Béluga passe dans le ciel !");
             }
         }
+        if is_key_pressed(KeyCode::Y) {
+            self.mode = if self.mode == ViewMode::Humidity { ViewMode::Normal } else { ViewMode::Humidity };
+        }
         if is_key_pressed(KeyCode::P) {
             self.mode = if self.mode == ViewMode::Pressure { ViewMode::Normal } else { ViewMode::Pressure };
         }
@@ -1234,8 +1240,8 @@ impl Game {
         if self.show_science || self.quit_modal {
             return;
         }
-        let over_ui = self.panel_hit.contains(ui.mouse) || self.views_hit.contains(ui.mouse) || self.tools_hit.contains(ui.mouse) || self.corner_hit.contains(ui.mouse) || self.hud_hit.contains(ui.mouse);
-        let inside = !over_ui && view.rect().contains(ui.mouse);
+        let over_ui = self.panel_hit.contains(ui.mouse) || self.views_hit.contains(ui.mouse) || self.tools_hit.contains(ui.mouse) || self.corner_hit.contains(ui.mouse) || self.hud_hit.contains(ui.mouse) || self.launch_hit.contains(ui.mouse);
+        let inside = !over_ui && view.visible().contains(ui.mouse);
         let wheel = mouse_wheel().1;
         if inside && wheel != 0.0 {
             let d = if wheel > 0.0 { 1 } else { -1 };
@@ -1630,10 +1636,11 @@ impl Game {
         let day = backdrop::daylight(phase);
         let thermal = self.mode == ViewMode::Thermal;
         // The thermal and pressure views paint the whole picture themselves.
-        let flat = thermal || self.mode == ViewMode::Pressure;
+        let flat = thermal || matches!(self.mode, ViewMode::Pressure | ViewMode::Humidity);
         let render_mode = match self.mode {
             ViewMode::Thermal => RenderMode::Thermal,
             ViewMode::Pressure => RenderMode::Pressure,
+            ViewMode::Humidity => RenderMode::Humidity,
             _ => RenderMode::Normal,
         };
         if !flat {
@@ -1660,8 +1667,8 @@ impl Game {
             let st = if self.mode == ViewMode::Stress { Some(c.stress) } else { None };
             draw_cable(&pts, view, c.snapped, true, c.mat.color(), st);
         }
-        let over_ui_now = self.panel_hit.contains(ui.mouse) || self.views_hit.contains(ui.mouse) || self.tools_hit.contains(ui.mouse) || self.corner_hit.contains(ui.mouse) || self.hud_hit.contains(ui.mouse);
-        let inside_now = !over_ui_now && view.rect().contains(ui.mouse) && !self.show_science;
+        let over_ui_now = self.panel_hit.contains(ui.mouse) || self.views_hit.contains(ui.mouse) || self.tools_hit.contains(ui.mouse) || self.corner_hit.contains(ui.mouse) || self.hud_hit.contains(ui.mouse) || self.launch_hit.contains(ui.mouse);
+        let inside_now = !over_ui_now && view.visible().contains(ui.mouse) && !self.show_science;
         self.draw_pipes(view, ui, inside_now);
         self.draw_mech(view, ui, inside_now);
         self.draw_selection(view);
@@ -1673,9 +1680,8 @@ impl Game {
         }
         for c in &self.cars {
             draw_car(c, view);
-            if self.selected_car == Some(c.id) {
-                let s = view.to_screen(c.p);
-                draw_circle_lines(s.x, s.y, (c.kind.model().hull_half * car::S + 8.0) * view.s, 2.0, ACCENT);
+            if self.selected_car == Some(c.id) && self.selection != Some(select::Sel::Car(c.id)) {
+                select::outline_car(c, view, ACCENT);
             }
         }
         draw_booms(&self.booms, view);
@@ -1697,8 +1703,8 @@ impl Game {
         }
 
         // Cursor preview.
-        let over_ui = self.panel_hit.contains(ui.mouse) || self.views_hit.contains(ui.mouse) || self.tools_hit.contains(ui.mouse) || self.corner_hit.contains(ui.mouse) || self.hud_hit.contains(ui.mouse);
-        let inside = !over_ui && view.rect().contains(ui.mouse) && !self.show_science;
+        let over_ui = self.panel_hit.contains(ui.mouse) || self.views_hit.contains(ui.mouse) || self.tools_hit.contains(ui.mouse) || self.corner_hit.contains(ui.mouse) || self.hud_hit.contains(ui.mouse) || self.launch_hit.contains(ui.mouse);
+        let inside = !over_ui && view.visible().contains(ui.mouse) && !self.show_science;
         if let Some(a) = &self.cable_from {
             if let Some(p) = anchor_world(a, &self.blocks, &self.members) {
                 let cursor = if inside { view.to_world(ui.mouse) } else { p };
@@ -1817,7 +1823,7 @@ impl Game {
             if let Some((name, units, have)) = self.missing_for_tool(view.to_world(ui.mouse)) {
                 let text = format!("Pas assez de {name} : {have} / {units}");
                 let w = ui.text_w(&text, 16) + 22.0;
-                let r = Rect::new((ui.mouse.x + 16.0).min(view.rect().x + view.rect().w - w - 4.0), ui.mouse.y + 18.0, w, 26.0);
+                let r = Rect::new((ui.mouse.x + 16.0).min(view.visible().x + view.visible().w - w - 4.0), ui.mouse.y + 18.0, w, 26.0);
                 rrect(r, 13.0, Color::new(0.85, 0.05, 0.05, 0.95));
                 ui.text(&text, r.x + 11.0, r.y + 18.0, 16, WHITE);
                 draw_circle_lines(ui.mouse.x, ui.mouse.y, 6.0 * view.s.max(1.0), 3.0, Color::new(1.0, 0.1, 0.1, 1.0));
@@ -1848,7 +1854,7 @@ impl Game {
     }
 
     fn draw_hud(&mut self, ui: &Ui, view: View) {
-        let r = view.rect();
+        let r = view.visible();
         let w = &self.world;
         let night = w.sun() <= 0.0;
         let arrow = if w.wind > 0.08 { "→" } else if w.wind < -0.08 { "←" } else { "·" };
@@ -1905,6 +1911,35 @@ impl Game {
         -PANEL_W * (1.0 - self.panel_open)
     }
 
+    /// The cars' launch bar, floating at the top of the picture: one button per model.
+    fn draw_launch_bar(&mut self, ui: &mut Ui, sw: f32) {
+        let (bw, gap, pad) = (92.0, 6.0, 8.0);
+        let n = ModelKind::ALL.len() as f32;
+        let total = n * bw + (n - 1.0) * gap + pad * 2.0;
+        let l = self.left();
+        let bar = Rect::new(l + (sw - l - total) / 2.0, TOP_H + 6.0, total, 50.0);
+        self.launch_hit = bar;
+        rrect(bar, 16.0, Color::new(0.06, 0.07, 0.13, 0.9));
+        for (i, k) in ModelKind::ALL.iter().enumerate() {
+            let m = k.model();
+            let r = Rect::new(bar.x + pad + i as f32 * (bw + gap), bar.y + 5.0, bw, 40.0);
+            let hot = ui.hover(r);
+            rrect(r, 10.0, if hot { ui::TILE_HOT } else { ui::TILE });
+            let c = self.tunings[i].color.unwrap_or(m.color);
+            draw_car_icon(vec2(r.x + 20.0, r.y + 19.0), Color::from_rgba(c.0, c.1, c.2, 255), 0.8);
+            ui.text(m.name, r.x + 40.0, r.y + 24.0, 13, TEXT);
+            if hot {
+                self.hover_info = Some((m.name.to_string(), format!("{} Clique pour lancer la voiture ; ses réglages s'affichent sous les vues, et ceux du modèle sont dans l'onglet Voitures.", m.blurb)));
+            }
+            if hot && ui.pressed && !self.quit_modal {
+                self.model = *k;
+                self.launch_car();
+                self.car_remote = true;
+                self.selected_motor = None;
+            }
+        }
+    }
+
     fn draw_ui(&mut self, ui: &mut Ui, sw: f32, sh: f32) {
         self.hover_info = None;
         // Under the leave-the-game window nothing answers a click.
@@ -1944,6 +1979,7 @@ impl Game {
         self.panel_hit = if self.panel_open > 0.02 { Rect::new(0.0, TOP_H, edge.max(0.0) + handle_w, sh - TOP_H) } else { handle };
         self.draw_tools_strip(ui, sh);
         self.draw_corner_buttons(ui, sw);
+        self.draw_launch_bar(ui, sw);
         self.draw_views(ui, sw, sh);
         self.draw_player(ui, sw, sh);
         if self.show_science {
@@ -1958,7 +1994,7 @@ impl Game {
             let a = (*t / 0.5).min(1.0);
             let w = ui.text_w(msg, 20) + 40.0;
             let l = self.left();
-            let r = Rect::new(l + (sw - l - w) / 2.0, TOP_H + 46.0, w, 42.0);
+            let r = Rect::new(l + (sw - l - w) / 2.0, TOP_H + 64.0, w, 42.0);
             rrect(r, 21.0, Color::new(0.05, 0.06, 0.1, 0.92 * a));
             ui.text(msg, r.x + 20.0, r.y + 27.0, 20, Color::new(1.0, 1.0, 1.0, a));
         }
@@ -2057,8 +2093,15 @@ impl Game {
             Tab::Planet => self.panel_planet(ui, top),
         }
         // Back and undo at the foot of the palette: they are about building.
-        let half = (PANEL_W - 18.0) / 2.0;
+        let pin_w = 34.0;
+        let half = (PANEL_W - 24.0 - pin_w) / 2.0;
         let y = sh - 138.0;
+        if ui.button(Rect::new(18.0 + 2.0 * half, y, pin_w, 32.0), "", Icon::Pin, self.panel_pin, true, ACCENT) {
+            self.panel_pin = !self.panel_pin;
+        }
+        if ui.hover(Rect::new(18.0 + 2.0 * half, y, pin_w, 32.0)) {
+            self.hover_info = Some(("Épingler la palette".to_string(), "Épinglée, la palette reste ouverte et l'image se place à côté. Sinon elle se cache et ressort quand la souris touche le bord gauche.".to_string()));
+        }
         if ui.button(Rect::new(6.0, y, half, 32.0), "Retour", Icon::Reset, false, true, ACCENT) {
             self.reset();
         }
@@ -2166,6 +2209,8 @@ impl Game {
                 self.tool = Tool::Mat(*m);
             }
         }
+        let rows = MATTER.len().div_ceil(3);
+        self.unlimited_toggles(ui, grid_top + rows as f32 * 54.0 + 2.0);
     }
 
     /// Vivid red over an element that cannot be built: the materials are missing.
@@ -2205,6 +2250,22 @@ impl Game {
 
     fn stock(&self, from: &[Mat]) -> u32 {
         from.iter().map(|m| self.census[*m as usize]).sum()
+    }
+
+    /// Free building (materials not used up), chosen separately for editing and for the simulation, and
+    /// changeable at any time. Shown in the matter and blocks palettes.
+    fn unlimited_toggles(&mut self, ui: &mut Ui, y0: f32) {
+        let half = (PANEL_W - 18.0) / 2.0;
+        ui.text("Matériaux illimités :", 10.0, y0 + 10.0, 13, DIM);
+        if ui.checkbox(Rect::new(6.0, y0 + 16.0, half, 24.0), "Édition", self.unlimited, true) {
+            self.unlimited = !self.unlimited;
+        }
+        if ui.checkbox(Rect::new(12.0 + half, y0 + 16.0, half, 24.0), "Simulation", self.unlimited_sim, true) {
+            self.unlimited_sim = !self.unlimited_sim;
+        }
+        if ui.hover(Rect::new(6.0, y0 + 16.0, PANEL_W - 12.0, 24.0)) {
+            self.hover_info = Some(("Matériaux illimités".to_string(), "Coché : les blocs, câbles, tiges et mécanismes ne consomment pas la matière du monde. Édition : quand le jeu est à l'arrêt. Simulation : quand il tourne. Décoché : ils prennent la matière (terre, bois, fer, acier, pierre, sable) autour du pointeur.".to_string()));
+        }
     }
 
     fn panel_blocks(&mut self, ui: &mut Ui, top: f32) {
@@ -2323,15 +2384,7 @@ impl Game {
 
         // Materials: a block uses up what it is made of from the screen.
         let y0 = sy + 26.0;
-        // Free building can be chosen for each phase; the simulation one is picked while editing.
-        let half = (PANEL_W - 18.0) / 2.0;
-        ui.text("Matériaux illimités :", 10.0, y0 + 10.0, 13, DIM);
-        if ui.checkbox(Rect::new(6.0, y0 + 16.0, half, 24.0), "Édition", self.unlimited, !self.running) {
-            self.unlimited = !self.unlimited;
-        }
-        if ui.checkbox(Rect::new(12.0 + half, y0 + 16.0, half, 24.0), "Simulation", self.unlimited_sim, !self.running) {
-            self.unlimited_sim = !self.unlimited_sim;
-        }
+        self.unlimited_toggles(ui, y0);
         let rows: [(&str, &[Mat]); 6] = [
             ("Terre", &[Mat::Dirt]),
             ("Bois", &[Mat::Wood, Mat::Trunk, Mat::Branch]),
@@ -2366,10 +2419,13 @@ impl Game {
         if ui.hover(Rect::new(6.0, top + 22.0, PANEL_W - 12.0, 30.0)) {
             self.hover_info = Some(("Entrée / Sortie".to_string(), "Choisis, puis clique dans le monde : l'entrée est le départ des voitures, la sortie l'arrivée. Reclique le bouton pour revenir à la sélection.".to_string()));
         }
-        ui.text("Clique un modèle : la voiture part", 10.0, top + 70.0, 13, DIM);
+        // Each model's settings: the cars launched from the bar at the top start with these. Once a car is
+        // on the track its own settings are in the panel under the views.
+        ui.text("Réglages des modèles", 10.0, top + 74.0, 15, ACCENT);
+        let tile_w = (PANEL_W - 18.0) / 2.0;
         for (i, k) in ModelKind::ALL.iter().enumerate() {
             let m = k.model();
-            let r = Rect::new(6.0, top + 78.0 + i as f32 * 40.0, PANEL_W - 12.0, 36.0);
+            let r = Rect::new(6.0 + (i % 2) as f32 * (tile_w + 6.0), top + 82.0 + (i / 2) as f32 * 40.0, tile_w, 36.0);
             let sel = self.model == *k;
             let hot = ui.hover(r);
             rrect(r, 10.0, if hot { ui::TILE_HOT } else { ui::TILE });
@@ -2378,22 +2434,19 @@ impl Game {
             }
             let c = self.tunings[i].color.unwrap_or(m.color);
             let c = Color::from_rgba(c.0, c.1, c.2, 255);
-            rrect(Rect::new(r.x + 7.0, r.y + 16.0, 34.0, 10.0), 3.0, c);
-            rrect(Rect::new(r.x + 13.0, r.y + 8.0, 18.0, 10.0), 3.0, c);
-            draw_circle(r.x + 14.0, r.y + 28.0, 5.0, Color::from_rgba(26, 26, 32, 255));
-            draw_circle(r.x + 34.0, r.y + 28.0, 5.0, Color::from_rgba(26, 26, 32, 255));
-            ui.text(m.name, r.x + 50.0, r.y + 16.0, 16, if sel { ACCENT } else { TEXT });
-            ui.text(m.blurb, r.x + 50.0, r.y + 30.0, 12, DIM);
+            draw_car_icon(vec2(r.x + 24.0, r.y + 18.0), c, 0.9);
+            ui.text(m.name, r.x + 46.0, r.y + 22.0, 15, if sel { ACCENT } else { TEXT });
             if hot {
-                self.hover_info = Some((m.name.to_string(), format!("{} Clique pour la lancer ; ses réglages s'affichent sous les vues.", m.blurb)));
+                self.hover_info = Some((m.name.to_string(), format!("{} Règle ici ce modèle ; il sera lancé avec ces réglages.", m.blurb)));
             }
             if hot && ui.pressed {
                 self.model = *k;
-                self.launch_car();
-                self.car_remote = true;
-                self.selected_motor = None;
+                self.selected_car = None;
             }
         }
+        let ey = top + 82.0 + 2.0 * 40.0 + 6.0;
+        ui.text(&format!("{} : réglages par défaut", self.model.model().name), 10.0, ey + 8.0, 13, DIM);
+        self.tuning_editor(ui, 0.0, ey + 16.0, PANEL_W, false);
     }
 
     /// The settings of the selected car (or of the model being launched), under the views.
@@ -2406,6 +2459,12 @@ impl Game {
         if ui.button(Rect::new(panel.x + panel.w - 30.0, panel.y + 6.0, 24.0, 22.0), "×", Icon::None, false, true, DIM) {
             self.car_remote = false;
         }
+        self.tuning_editor(ui, panel.x, panel.y + 46.0, panel.w, true);
+    }
+
+    /// The sliders and colours of a car's settings, from `y` down. `live` edits the selected car on the
+    /// track (or the model being launched); otherwise the chosen model's defaults. Returns the bottom.
+    fn tuning_editor(&mut self, ui: &mut Ui, x: f32, y0: f32, w: f32, live: bool) -> f32 {
         let rows: [(&str, f32, f32, usize); 8] = [
             ("Puissance", 0.5, 2.0, 0),
             ("Vitesse", 0.5, 2.0, 1),
@@ -2418,8 +2477,8 @@ impl Game {
         ];
         let mut changed = false;
         for (i, (label, lo, hi, which)) in rows.iter().enumerate() {
-            let y = panel.y + 46.0 + i as f32 * 23.0;
-            let mut t = *self.tuning_mut();
+            let y = y0 + i as f32 * 23.0;
+            let mut t = if live { *self.tuning_mut() } else { self.tunings[self.model_index()] };
             let v = match which {
                 0 => &mut t.power,
                 1 => &mut t.speed,
@@ -2430,36 +2489,52 @@ impl Game {
                 6 => &mut t.tough,
                 _ => &mut t.weight,
             };
-            ui.text(label, panel.x + 10.0, y + 12.0, 12, DIM);
+            ui.text(label, x + 10.0, y + 12.0, 12, DIM);
             let before = *v;
-            ui.slider(Rect::new(panel.x + 82.0, y + 2.0, panel.w - 128.0, 16.0), v, *lo, *hi, ACCENT);
-            ui.text(&format!("{:.1}", *v), panel.x + panel.w - 38.0, y + 12.0, 12, TEXT);
+            ui.slider(Rect::new(x + 82.0, y + 2.0, w - 128.0, 16.0), v, *lo, *hi, ACCENT);
+            ui.text(&format!("{:.1}", *v), x + w - 38.0, y + 12.0, 12, TEXT);
             if (*v - before).abs() > 1e-4 {
-                *self.tuning_mut() = t;
+                if live {
+                    *self.tuning_mut() = t;
+                } else {
+                    let k = self.model_index();
+                    self.tunings[k] = t;
+                }
                 changed = true;
             }
         }
-        let cy = panel.y + 46.0 + 8.0 * 23.0 + 6.0;
+        let cy = y0 + 8.0 * 23.0 + 6.0;
         for (i, c) in Tuning::COLORS.iter().enumerate() {
-            let cx = panel.x + 16.0 + i as f32 * 19.0;
+            let cx = x + 16.0 + i as f32 * 19.0;
             let r = Rect::new(cx - 9.0, cy, 18.0, 18.0);
-            let chosen = self.tuning_mut().color == Some(*c);
+            let chosen = if live { self.tuning_mut().color } else { self.tunings[self.model_index()].color } == Some(*c);
             draw_circle(cx, cy + 9.0, 7.5, Color::from_rgba(c.0, c.1, c.2, 255));
             if chosen {
                 draw_circle_lines(cx, cy + 9.0, 10.0, 2.0, WHITE);
             }
             if ui.hover(r) && ui.pressed {
-                self.tuning_mut().color = Some(*c);
+                if live {
+                    self.tuning_mut().color = Some(*c);
+                } else {
+                    let k = self.model_index();
+                    self.tunings[k].color = Some(*c);
+                }
                 changed = true;
             }
         }
-        if ui.button(Rect::new(panel.x + 8.0, cy + 26.0, panel.w - 16.0, 26.0), "Réinitialiser", Icon::Reset, false, true, ACCENT) {
-            *self.tuning_mut() = Tuning::default();
+        if ui.button(Rect::new(x + 8.0, cy + 26.0, w - 16.0, 26.0), "Réinitialiser", Icon::Reset, false, true, ACCENT) {
+            if live {
+                *self.tuning_mut() = Tuning::default();
+            } else {
+                let k = self.model_index();
+                self.tunings[k] = Tuning::default();
+            }
             changed = true;
         }
-        if changed {
+        if changed && live {
             self.sync_default_tuning();
         }
+        cy + 52.0
     }
 
     fn panel_planet(&mut self, ui: &mut Ui, top: f32) {
@@ -2541,7 +2616,7 @@ impl Game {
     /// The palette of views on the right edge: it slides out when the mouse goes there.
     fn draw_views(&mut self, ui: &mut Ui, sw: f32, sh: f32) {
         let y = TOP_H + 60.0;
-        let h = 318.0;
+        let h = 376.0;
         let tab = Rect::new(sw - VIEWS_TAB, y, VIEWS_TAB, 96.0);
         let px = sw - VIEWS_TAB - VIEWS_W * self.views_open;
         let panel = Rect::new(px, y, VIEWS_W, h);
@@ -2578,12 +2653,13 @@ impl Game {
 
         rrect(panel, 12.0, Color::new(0.09, 0.1, 0.17, 0.95));
         ui.text("Vues", panel.x + 12.0, panel.y + 22.0, 16, ACCENT);
-        let modes: [(ViewMode, &str, Icon, Color); 5] = [
+        let modes: [(ViewMode, &str, Icon, Color); 6] = [
             (ViewMode::Normal, "Normale", Icon::Sun, ACCENT),
             (ViewMode::Thermal, "Température", Icon::Thermo, RED),
             (ViewMode::Stress, "Efforts", Icon::Gauge, ACCENT),
             (ViewMode::Wind, "Vent", Icon::Wind, BLUE),
             (ViewMode::Pressure, "Pression", Icon::Gauge, GREEN),
+            (ViewMode::Humidity, "Hygrométrie", Icon::Drop, BLUE),
         ];
         for (i, (m, label, icon, col)) in modes.iter().enumerate() {
             let r = Rect::new(panel.x + 8.0, panel.y + 32.0 + i as f32 * 31.0, panel.w - 16.0, 27.0);
@@ -2592,7 +2668,7 @@ impl Game {
             }
         }
         // Legend for the chosen view.
-        let ly = panel.y + 32.0 + 5.0 * 31.0 + 8.0;
+        let ly = panel.y + 32.0 + 6.0 * 31.0 + 8.0;
         let bar = Rect::new(panel.x + 12.0, ly + 14.0, panel.w - 24.0, 12.0);
         match self.mode {
             ViewMode::Thermal => {
@@ -2635,8 +2711,22 @@ impl Game {
                 ui.text("atm", bar.x + bar.w - 20.0, ly + 10.0, 11, DIM);
                 ui.wrapped("Air : plus mince en altitude, plus dense dans les courants. Liquides : le poids de la colonne. Solides : le poids au-dessus. Traits sombres : frontières gaz / liquide / solide.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
             }
+            ViewMode::Humidity => {
+                for i in 0..40 {
+                    let f = i as f32 / 39.0;
+                    let t = f.clamp(0.0, 1.0);
+                    let stops = [(0.0f32, [186.0f32, 134.0, 66.0]), (0.35, [214.0, 196.0, 96.0]), (0.65, [90.0, 180.0, 140.0]), (1.0, [40.0, 100.0, 235.0])];
+                    let k = stops.iter().position(|s| s.0 >= t).unwrap_or(3).max(1);
+                    let ((p0, c0), (p1, c1)) = (stops[k - 1], stops[k]);
+                    let u = ((t - p0) / (p1 - p0)).clamp(0.0, 1.0);
+                    draw_rectangle(bar.x + bar.w * f * 0.975, bar.y, bar.w / 40.0 + 1.0, bar.h, Color::from_rgba((c0[0] + (c1[0] - c0[0]) * u) as u8, (c0[1] + (c1[1] - c0[1]) * u) as u8, (c0[2] + (c1[2] - c0[2]) * u) as u8, 255));
+                }
+                ui.text("sec", bar.x, bar.y + 25.0, 11, DIM);
+                ui.text("100 %", bar.x + bar.w - 28.0, bar.y + 25.0, 11, DIM);
+                ui.wrapped("Air : part de vapeur d'eau par rapport à ce que l'air peut tenir (l'air froid en tient peu). Liquides : toujours 100 %. Gris : solide sec ; la terre garde son humidité.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
+            }
             ViewMode::Normal => {
-                ui.wrapped("Touches : H température, X efforts, V vent, P pression.", bar.x, bar.y + 2.0, bar.w, 11, DIM);
+                ui.wrapped("Touches : H température, X efforts, V vent, P pression, Y hygrométrie.", bar.x, bar.y + 2.0, bar.w, 11, DIM);
             }
         }
         if let Some(r) = remote {
@@ -2916,6 +3006,14 @@ fn demo_pipes(g: &mut Game) {
     g.tool = Tool::Pipe;
 }
 
+/// A little car, `s` times its natural size, centred on `c`.
+fn draw_car_icon(c: Vec2, col: Color, s: f32) {
+    rrect(Rect::new(c.x - 17.0 * s, c.y - 2.0 * s, 34.0 * s, 10.0 * s), 3.0, col);
+    rrect(Rect::new(c.x - 11.0 * s, c.y - 10.0 * s, 18.0 * s, 10.0 * s), 3.0, col);
+    draw_circle(c.x - 10.0 * s, c.y + 9.0 * s, 5.0 * s, Color::from_rgba(26, 26, 32, 255));
+    draw_circle(c.x + 10.0 * s, c.y + 9.0 * s, 5.0 * s, Color::from_rgba(26, 26, 32, 255));
+}
+
 #[macroquad::main(window_conf)]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -2961,6 +3059,7 @@ async fn main() {
             Some("efforts") => ViewMode::Stress,
             Some("vent") => ViewMode::Wind,
             Some("pression") => ViewMode::Pressure,
+            Some("hygro") => ViewMode::Humidity,
             _ => ViewMode::Normal,
         };
         if args.iter().any(|a| a == "--palette") {
@@ -2971,6 +3070,13 @@ async fn main() {
             demo_pipes(&mut game);
             game.set_running(true);
             game.tab = Tab::Fluid;
+        }
+        if args.iter().any(|a| a == "--select") {
+            game.selection = game.blocks.first().map(|b| select::Sel::Block(b.uid));
+        }
+        if args.iter().any(|a| a == "--car") {
+            game.entry.get_or_insert((360, 300));
+            game.launch_car();
         }
         if args.iter().any(|a| a == "--plane") {
             game.planes.summon(&game.world);
