@@ -5,6 +5,7 @@
 pub mod flow;
 mod pockets;
 mod pressure;
+pub mod sleep;
 pub use pockets::boil_c;
 mod thermal;
 pub use thermal::{Season, DAY_STEPS};
@@ -298,6 +299,8 @@ pub struct World {
     /// Scratch for the pockets: what each cell is to the gas, and the weight of each liquid cell.
     cls: Vec<u8>,
     liq_w: Vec<f32>,
+    /// Sleeping zones: blocks of cells where nothing can happen are skipped (see `sleep.rs`).
+    pub zones: sleep::Zones,
     /// Walls that gave way under the pressure of a pocket this step: (x, y, pressure in atm).
     pub bursts: Vec<(i32, i32, f32)>,
 }
@@ -348,6 +351,7 @@ impl World {
             cls: vec![0; W * H],
             liq_w: vec![0.0; W * H],
             bursts: Vec::new(),
+            zones: sleep::Zones::new(),
         }
     }
 
@@ -364,6 +368,7 @@ impl World {
     pub fn clear(&mut self) {
         self.revision += 1;
         self.cells.fill(EMPTY);
+        self.zones.wake_all();
         self.reset_temps();
         self.update_season_cache();
     }
@@ -382,6 +387,7 @@ impl World {
     pub fn restore_state(&mut self, st: &State) {
         self.revision += 1;
         self.cells.copy_from_slice(&st.cells);
+        self.zones.wake_all();
         self.temp.copy_from_slice(&st.temp);
         self.clock = st.clock;
         self.falling.clear();
@@ -424,6 +430,7 @@ impl World {
         }
         for &(_, i) in found.iter().take(n) {
             self.cells[i] = EMPTY;
+            self.zones.wake(i);
         }
         true
     }
@@ -435,6 +442,7 @@ impl World {
     pub fn restore(&mut self, snap: &[Cell]) {
         self.revision += 1;
         self.cells.copy_from_slice(snap);
+        self.zones.wake_all();
     }
 
     pub fn rand(&mut self) -> u32 {
@@ -542,6 +550,7 @@ impl World {
         let frame = self.frame;
         let i = Self::idx(x, y);
         self.cells[i] = Cell { m, life, stamp: frame };
+        self.zones.wake(i);
         match m {
             Mat::Fire => self.temp[i] = thermal::FIRE_C,
             Mat::Ember => self.temp[i] = thermal::EMBER_C,
@@ -554,9 +563,12 @@ impl World {
     fn swap(&mut self, a: (i32, i32), b: (i32, i32)) {
         if !Self::inb(b.0, b.1) {
             self.cells[Self::idx(a.0, a.1)] = EMPTY;
+            self.zones.wake(Self::idx(a.0, a.1));
             return;
         }
         let (ia, ib) = (Self::idx(a.0, a.1), Self::idx(b.0, b.1));
+        self.zones.wake(ia);
+        self.zones.wake(ib);
         if self.cells[ia].m == Mat::Water {
             self.water_flow += 1;
         }
@@ -585,6 +597,10 @@ impl World {
     /// Pushes loose matter out of cells newly covered by a block.
     pub fn end_blocks(&mut self) {
         for i in 0..W * H {
+            if (self.mask[i] != 0) != (self.mask_prev[i] != 0) {
+                // A block moved here or away: what is around may move now.
+                self.zones.wake(i);
+            }
             if self.mask[i] == 0 || self.mask_prev[i] != 0 {
                 continue;
             }
@@ -601,6 +617,7 @@ impl World {
                 }
                 if self.mask[j] == 0 && self.cells[j].m == Mat::Empty {
                     self.cells[j] = Cell { stamp: self.frame, ..c };
+                    self.zones.wake(j);
                     break;
                 }
             }
@@ -934,66 +951,95 @@ impl World {
     pub fn step(&mut self) {
         self.revision += 1;
         self.frame = self.frame.wrapping_add(1);
+        self.step_cells();
+        self.after_cells();
+    }
+
+    /// Every cell of matter takes its turn, bottom row first.
+    fn step_cells(&mut self) {
         let f = self.frame;
         let ltr = f & 1 == 0;
+        self.zones.begin();
         for y in (0..H as i32).rev() {
-            for i in 0..W as i32 {
-                let x = if ltr { i } else { W as i32 - 1 - i };
-                let c = self.cells[Self::idx(x, y)];
-                if c.m == Mat::Empty || c.stamp == f {
+            let zrow = y as usize / sleep::CS * sleep::CW;
+            for zi in 0..sleep::CW {
+                let zx = if ltr { zi } else { sleep::CW - 1 - zi };
+                let zone = zrow + zx;
+                if !self.zones.awake[zone] {
                     continue;
                 }
-                match c.m {
-                    Mat::Rust => {
-                        self.step_powder(x, y);
+                let (x0, x1) = ((zx * sleep::CS) as i32, ((zx + 1) * sleep::CS).min(W) as i32);
+                for i in 0..x1 - x0 {
+                    let x = if ltr { x0 + i } else { x1 - 1 - i };
+                    let c = self.cells[Self::idx(x, y)];
+                    if c.m == Mat::Empty {
+                        continue;
                     }
-                    Mat::Sand | Mat::Mud => self.step_sediment(x, y),
-                    Mat::Dirt => self.step_dirt(x, y),
-                    Mat::Grass => self.step_grass(x, y),
-                    Mat::Snow => self.step_snow(x, y),
-                    Mat::Hail => {
-                        self.step_powder(x, y);
+                    if c.stamp == f {
+                        // Moved here this step, or a stamp left from 256 steps ago: either way
+                        // look again next step.
+                        self.zones.mark_restless(zone);
+                        continue;
                     }
-                    Mat::Shard => self.step_shard(x, y),
-                    Mat::Ash => self.step_ash(x, y),
-                    Mat::Seed => self.step_seed(x, y),
-                    Mat::Sapling => self.step_sapling(x, y),
-                    Mat::Leaf => self.step_leaf(x, y),
-                    Mat::Wood | Mat::Trunk => self.step_wood(x, y),
-                    Mat::Branch => self.step_branch(x, y),
-                    Mat::DeadLeaf => self.step_dead_leaf(x, y),
-                    Mat::Cloud => self.step_cloud(x, y),
-                    Mat::Oil => {
-                        if !self.fly(x, y) && !self.jet(x, y) && !self.seep(x, y) {
-                            self.step_oil(x, y);
+                    if self.restless(x, y, c) {
+                        self.zones.mark_restless(zone);
+                    }
+                    match c.m {
+                        Mat::Rust => {
+                            self.step_powder(x, y);
                         }
-                    }
-                    Mat::Smoke => self.step_smoke(x, y),
-                    Mat::Steel => self.step_iron(x, y, 1500),
-                    Mat::Gunpowder => self.step_gunpowder(x, y),
-                    Mat::Water => {
-                        if !self.fly(x, y) && !self.jet(x, y) && !self.seep(x, y) {
-                            self.step_water(x, y);
+                        Mat::Sand | Mat::Mud => self.step_sediment(x, y),
+                        Mat::Dirt => self.step_dirt(x, y),
+                        Mat::Grass => self.step_grass(x, y),
+                        Mat::Snow => self.step_snow(x, y),
+                        Mat::Hail => {
+                            self.step_powder(x, y);
                         }
-                    }
-                    Mat::Steam => self.step_steam(x, y),
-                    Mat::Fire => self.step_fire(x, y),
-                    Mat::Ember => self.step_ember(x, y),
-                    Mat::Lava => {
-                        if !self.seep(x, y) {
-                            self.step_hot_liquid(x, y, Mat::Stone);
+                        Mat::Shard => self.step_shard(x, y),
+                        Mat::Ash => self.step_ash(x, y),
+                        Mat::Seed => self.step_seed(x, y),
+                        Mat::Sapling => self.step_sapling(x, y),
+                        Mat::Leaf => self.step_leaf(x, y),
+                        Mat::Wood | Mat::Trunk => self.step_wood(x, y),
+                        Mat::Branch => self.step_branch(x, y),
+                        Mat::DeadLeaf => self.step_dead_leaf(x, y),
+                        Mat::Cloud => self.step_cloud(x, y),
+                        Mat::Oil => {
+                            if !self.fly(x, y) && !self.jet(x, y) && !self.seep(x, y) {
+                                self.step_oil(x, y);
+                            }
                         }
-                    }
-                    Mat::Molten => {
-                        if !self.seep(x, y) {
-                            self.step_hot_liquid(x, y, Mat::Iron);
+                        Mat::Smoke => self.step_smoke(x, y),
+                        Mat::Steel => self.step_iron(x, y, 1500),
+                        Mat::Gunpowder => self.step_gunpowder(x, y),
+                        Mat::Water => {
+                            if !self.fly(x, y) && !self.jet(x, y) && !self.seep(x, y) {
+                                self.step_water(x, y);
+                            }
                         }
+                        Mat::Steam => self.step_steam(x, y),
+                        Mat::Fire => self.step_fire(x, y),
+                        Mat::Ember => self.step_ember(x, y),
+                        Mat::Lava => {
+                            if !self.seep(x, y) {
+                                self.step_hot_liquid(x, y, Mat::Stone);
+                            }
+                        }
+                        Mat::Molten => {
+                            if !self.seep(x, y) {
+                                self.step_hot_liquid(x, y, Mat::Iron);
+                            }
+                        }
+                        Mat::Iron => self.step_iron(x, y, 300),
+                        _ => {}
                     }
-                    Mat::Iron => self.step_iron(x, y, 300),
-                    _ => {}
                 }
             }
         }
+    }
+
+    /// Everything after the cells: falling pieces, wind, pressure, heat, the clock.
+    fn after_cells(&mut self) {
         self.ticks = self.ticks.wrapping_add(1);
         if self.structures_fall && self.ticks % 8 == 0 {
             self.structure_pass();
@@ -1019,7 +1065,7 @@ impl World {
         if self.day_cycle {
             self.clock = self.clock.wrapping_add(1);
         }
-        if f % 4 == 0 {
+        if self.frame % 4 == 0 {
             self.level_water();
         }
     }
@@ -2011,12 +2057,14 @@ impl World {
         for k in order {
             let i = piece.cells[k];
             let target = i as i64 + dir as i64 * W as i64;
+            self.zones.wake(i);
             if target as usize >= W * H {
                 self.cells[i] = EMPTY;
                 gone.push(k);
                 continue;
             }
             let t = target as usize;
+            self.zones.wake(t);
             self.cells.swap(i, t);
             self.temp.swap(i, t);
             self.cells[i].stamp = self.frame;
@@ -2449,6 +2497,7 @@ impl World {
                 t.elapsed() / n
             };
             let whole = time(&mut || w.step());
+            let cells = time(&mut || w.step_cells());
             let flow = time(&mut || w.update_flow());
             let press = time(&mut || w.update_pressure());
             let push = time(&mut || w.pressure_push());
@@ -2457,6 +2506,7 @@ impl World {
             let level = time(&mut || w.level_water());
             let per = |d: Duration, every: f32| format!("{:6.2} ms/call x1/{every} = {:5.2} ms/tick", d.as_secs_f32() * 1000.0, d.as_secs_f32() * 1000.0 / every);
             eprintln!("=== {biome:?}: whole tick {:.2} ms", whole.as_secs_f32() * 1000.0);
+            eprintln!("  cells              {}  ({} of {} zones awake)", per(cells, 1.0), w.zones.awake_count(), sleep::CW * sleep::CH);
             eprintln!("  flow step+refresh  {}", per(flow, 1.0));
             eprintln!("  update_pressure    {}", per(press, 4.0));
             eprintln!("  pressure_push      {}", per(push, 1.0));

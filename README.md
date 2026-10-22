@@ -232,3 +232,7 @@ Après environ 15 s fluides, un niveau est rétabli (avec un délai de 5 minutes
 - **Eau sous pression** : la pression d'un liquide est celle du gaz sur sa surface plus son propre poids (60 cellules d'eau = 1 atm), partagée dans tout le liquide relié. Un trou dans un mur fait gicler un jet qui garde sa vitesse en tombant, plus loin pour un trou profond (Torricelli). Les vases communicants équilibrent la charge (hauteur + pression), donc une chaudière pousse son eau dans un tuyau qui monte (geyser).
 - **Moteur à vapeur** : dans la télécommande d'un moteur, « À vapeur ». Posé contre une chaudière fermée, il tourne avec sa pression (plein couple à 3 atm), use sa vapeur et la rejette par sa cheminée. Sans feu sous la chaudière, il ralentit puis s'arrête.
 - **Pas de temps fixe** : la simulation fait 60 pas par seconde (fois la vitesse), quel que soit l'écran (60 ou 144 Hz).
+
+## Zones endormies
+
+`src/world/sleep.rs` découpe le monde en zones de 32×32 cellules. Une zone où rien n'a bougé au dernier pas, et où aucune cellule ne peut changer d'elle-même (roche, sable posé, terre sèche, eau au repos sous de l'eau…), dort : la boucle des cellules la saute. Tout changement de cellule (`set`, `swap`, une pièce qui tombe, un bloc rigide qui bouge) réveille sa zone, et la voisine si la cellule est au bord. La chaleur, le vent et la pression continuent partout. Sur la campagne de `cost_of_a_tick`, une trentaine de zones sur 510 restent éveillées ; la boucle des cellules passe d'environ 0,7 ms à 0,1 ms par pas (mer : 1,8 → 0,8 ms).
