@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AWorld</title>
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #12151f; }
+    canvas#glcanvas { position: relative; z-index: 1; display: block; width: 100%; height: 100%; outline: none; }
+    #loading { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+               color: #8a93ad; font: 18px system-ui, sans-serif; pointer-events: none; z-index: 0; }
+  </style>
+</head>
+<body>
+  <canvas id="glcanvas" tabindex="1"></canvas>
+  <div id="loading">Chargement d'AWorld…</div>
+  <!-- macroquad's JS glue (WebGL, audio, input), from the same version as the game -->
+  <script src="mq_js_bundle.js"></script>
+  <script>
+    // The canvas is opaque once the game draws, which hides the loading text behind it.
+    load("aworld.wasm");
+  </script>
+</body>
+</html>

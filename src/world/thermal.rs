@@ -302,27 +302,6 @@ impl World {
         self.wind = base.signum() * (0.3 + 0.7 * base.abs());
     }
 
-    /// Where the wind carries a gas cell this step: up to a few cells along, the
-    /// farther the stronger the wind. Layers of air at different heights move at
-    /// slightly different speeds, which keeps the clouds shearing and drifting.
-    pub(super) fn wind_target(&mut self, x: i32, y: i32) -> Option<(i32, i32)> {
-        let altitude = 1.0 - y as f32 / H as f32;
-        let layer = 1.0 + 0.35 * (y as f32 * 0.045 + self.ticks as f32 * 0.0015).sin();
-        let strength = (self.wind * layer).abs() * (0.5 + altitude);
-        if (self.rand() % 100) as f32 >= strength * 95.0 {
-            return None;
-        }
-        let dir = if self.wind > 0.0 { 1 } else { -1 };
-        let reach = 1 + (strength * 2.5) as i32;
-        for k in (1..=reach).rev() {
-            let tx = (x + dir * k).rem_euclid(W as i32);
-            if self.at(tx, y) == Mat::Empty {
-                return Some((tx, y));
-            }
-        }
-        None
-    }
-
     // ----- heat flow --------------------------------------------------------
 
     /// One thermal tick: conduction, air and sun forcing, fixed heat sources,

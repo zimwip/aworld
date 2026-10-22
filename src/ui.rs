@@ -273,11 +273,15 @@ impl Ui {
         if !active && enabled {
             rrect(Rect::new(r.x + 2.0, r.y + 2.0, r.w - 4.0, r.h * 0.45), 8.0, Color::new(1.0, 1.0, 1.0, 0.05));
         }
-        let size = 16u16;
         let has_icon = icon != Icon::None;
-        let tw = if label.is_empty() { 0.0 } else { self.text_w(label, size) };
         let icon_w = if has_icon { 19.0 } else { 0.0 };
         let gap = if has_icon && !label.is_empty() { 5.0 } else { 0.0 };
+        // A long label shrinks to fit its button rather than spilling over the neighbours.
+        let mut size = 16u16;
+        while size > 10 && !label.is_empty() && icon_w + gap + self.text_w(label, size) > r.w - 8.0 {
+            size -= 1;
+        }
+        let tw = if label.is_empty() { 0.0 } else { self.text_w(label, size) };
         let total = icon_w + gap + tw;
         let x0 = r.x + (r.w - total) / 2.0;
         if has_icon {

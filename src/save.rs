@@ -1,14 +1,16 @@
 //! Saving and loading worlds: grid (run-length encoded), blocks, entry/exit.
 
+use crate::mech::{Axle, End, Gear, GearSize, Mechanism, Motor, Pivot, Rod, Slider};
 use crate::blocks::{Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, Spring, SpringKind};
 use crate::world::{Biome, Mat, World, DAY_STEPS, H, W};
 use macroquad::prelude::{vec2, Vec2};
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 use std::io::{self, Error, ErrorKind};
 use std::path::PathBuf;
 
 const MAGIC: &[u8; 4] = b"AWLD";
-const VERSION: u8 = 5;
+const VERSION: u8 = 6;
 
 pub struct Loaded {
     pub mats: Vec<Mat>,
@@ -18,6 +20,7 @@ pub struct Loaded {
     pub cables: Vec<Cable>,
     pub members: Vec<Member>,
     pub springs: Vec<Spring>,
+    pub mech: Mechanism,
     pub biome: Biome,
     pub clock: u32,
 }
@@ -30,8 +33,20 @@ pub fn slot_path(slot: usize) -> PathBuf {
     dir().join(format!("monde{}.aworld", slot + 1))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn slot_used(slot: usize) -> bool {
     slot_path(slot).exists()
+}
+
+// The web build has no files: worlds are kept in memory for as long as the page stays open.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static MEMORY: std::cell::RefCell<[Option<Vec<u8>>; 3]> = const { std::cell::RefCell::new([None, None, None]) };
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn slot_used(slot: usize) -> bool {
+    MEMORY.with(|m| m.borrow()[slot].is_some())
 }
 
 fn put_point(out: &mut Vec<u8>, p: Option<(i32, i32)>) {
@@ -41,7 +56,7 @@ fn put_point(out: &mut Vec<u8>, p: Option<(i32, i32)>) {
     out.extend(y.to_le_bytes());
 }
 
-pub fn encode(world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>, blocks: &[Block], cables: &[Cable], members: &[Member], springs: &[Spring]) -> Vec<u8> {
+pub fn encode(world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>, blocks: &[Block], cables: &[Cable], members: &[Member], springs: &[Spring], mech: &Mechanism) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend(MAGIC);
     out.push(VERSION);
@@ -106,6 +121,10 @@ pub fn encode(world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>
             out.extend((member_index(*uid).unwrap_or(0) as u16).to_le_bytes());
             out.extend(t.to_le_bytes());
         }
+        Anchor::Reel { uid, .. } => {
+            out.push(5);
+            out.extend(uid.to_le_bytes());
+        }
     };
     let saved: Vec<&Cable> = cables
         .iter()
@@ -124,6 +143,10 @@ pub fn encode(world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>
         out.extend(c.len.to_le_bytes());
         out.push(c.mat.id());
         out.extend(c.soft.to_le_bytes());
+        out.extend((c.via.len() as u16).to_le_bytes());
+        for u in &c.via {
+            out.extend(u.to_le_bytes());
+        }
     }
     out.extend((members.len() as u16).to_le_bytes());
     for m in members {
@@ -142,6 +165,78 @@ pub fn encode(world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>
         for v in [sp.rest, sp.soft, sp.p0.x, sp.p0.y, sp.p1.x, sp.p1.y] {
             out.extend(v.to_le_bytes());
         }
+    }
+    // Mechanisms: gears (with their motor), axles, rails and the rods between them.
+    out.extend((mech.gears.len() as u16).to_le_bytes());
+    for g in &mech.gears {
+        out.extend(g.uid.to_le_bytes());
+        out.push(g.size as u8);
+        put_anchor(&mut out, &g.mount);
+        out.extend(g.angle.to_le_bytes());
+        out.push(g.stripped as u8);
+        out.extend(g.wheel.and_then(index_of).map_or(0u16, |i| i as u16 + 1).to_le_bytes());
+        out.extend(g.reel.unwrap_or(0.0).to_le_bytes());
+        match g.motor {
+            Some(m) => {
+                out.push(1);
+                for v in [m.torque, m.free_speed, m.dir, m.reverse_at] {
+                    out.extend(v.to_le_bytes());
+                }
+                out.push(m.auto_reverse as u8);
+            }
+            None => out.push(0),
+        }
+    }
+    out.extend((mech.axles.len() as u16).to_le_bytes());
+    for a in &mech.axles {
+        for v in [a.uid, a.a, a.b] {
+            out.extend(v.to_le_bytes());
+        }
+    }
+    out.extend((mech.sliders.len() as u16).to_le_bytes());
+    for sl in &mech.sliders {
+        out.extend(sl.uid.to_le_bytes());
+        put_anchor(&mut out, &sl.ends.0);
+        put_anchor(&mut out, &sl.ends.1);
+        out.extend(sl.s.to_le_bytes());
+    }
+    out.extend((mech.rods.len() as u16).to_le_bytes());
+    for r in &mech.rods {
+        out.extend(r.uid.to_le_bytes());
+        for e in [&r.a, &r.b] {
+            match e {
+                End::Pin { gear, pin } => {
+                    out.push(0);
+                    out.extend(gear.to_le_bytes());
+                    out.extend(pin.x.to_le_bytes());
+                    out.extend(pin.y.to_le_bytes());
+                }
+                End::Carriage(u) => {
+                    out.push(1);
+                    out.extend(u.to_le_bytes());
+                }
+                End::Node(a) => {
+                    out.push(2);
+                    put_anchor(&mut out, a);
+                }
+            }
+        }
+        for v in [r.len, r.strength] {
+            out.extend(v.to_le_bytes());
+        }
+        out.push(r.broken as u8);
+    }
+    let pivots: Vec<&Pivot> = mech.pivots.iter().filter(|p| index_of(p.wheel).is_some()).collect();
+    out.extend((pivots.len() as u16).to_le_bytes());
+    for p in pivots {
+        out.extend((index_of(p.wheel).unwrap_or(0) as u16).to_le_bytes());
+        put_anchor(&mut out, &p.support);
+    }
+    out.extend((mech.pulleys.len() as u16).to_le_bytes());
+    for p in &mech.pulleys {
+        out.extend(p.uid.to_le_bytes());
+        put_anchor(&mut out, &p.mount);
+        out.extend(p.radius.to_le_bytes());
     }
     out
 }
@@ -187,7 +282,7 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
         return Err(bad("ce n'est pas un monde AWorld"));
     }
     let version = r.u8()?;
-    if !(1..=5).contains(&version) {
+    if !(1..=VERSION).contains(&version) {
         return Err(bad("version de fichier inconnue"));
     }
     if r.u16()? as usize != W || r.u16()? as usize != H {
@@ -235,17 +330,24 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
             }
             2 => Raw::End(r.u16()? as usize, r.u8()?),
             4 => Raw::Along(r.u16()? as usize, r.f32()?),
+            5 => Raw::Done(Anchor::Reel { uid: r.u32()?, pos: Vec2::ZERO }),
             _ => Raw::Done(Anchor::Free(vec2(r.f32()?, r.f32()?))),
         })
     };
-    let mut raw_cables: Vec<(Raw, Raw, f32, CableMat, f32)> = vec![];
+    let mut raw_cables: Vec<(Raw, Raw, f32, CableMat, f32, Vec<u32>)> = vec![];
     if version >= 2 {
         let count = r.u16()?;
         for _ in 0..count {
             let (a, b) = (anchor(&mut r)?, anchor(&mut r)?);
             let len = r.f32()?;
             let (mat, soft) = if version >= 4 { (CableMat::from_id(r.u8()?), r.f32()?) } else { (CableMat::Iron, 1.0) };
-            raw_cables.push((a, b, len, mat, soft));
+            let mut via = vec![];
+            if version >= 6 {
+                for _ in 0..r.u16()? {
+                    via.push(r.u32()?);
+                }
+            }
+            raw_cables.push((a, b, len, mat, soft, via));
         }
     }
     let mut members: Vec<Member> = vec![];
@@ -270,7 +372,91 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
             raw_springs.push((kind, a, b, vals));
         }
     }
+    enum RawEnd {
+        Pin(u32, Vec2),
+        Carriage(u32),
+        Node(Raw),
+    }
+    struct RawGear {
+        uid: u32,
+        size: GearSize,
+        mount: Raw,
+        angle: f32,
+        stripped: bool,
+        wheel: Option<u32>,
+        reel: Option<f32>,
+        motor: Option<Motor>,
+    }
+    let mut raw_gears: Vec<RawGear> = vec![];
+    let mut axles: Vec<Axle> = vec![];
+    let mut raw_sliders: Vec<(u32, Raw, Raw, f32)> = vec![];
+    let mut raw_rods: Vec<(u32, [RawEnd; 2], f32, f32, bool)> = vec![];
+    let mut raw_pivots: Vec<(usize, Raw)> = vec![];
+    let mut raw_pulleys: Vec<(u32, Raw, f32)> = vec![];
+    if version >= 6 {
+        for _ in 0..r.u16()? {
+            let uid = r.u32()?;
+            let size = *GearSize::ALL.get(r.u8()? as usize).ok_or_else(|| bad("engrenage inconnu"))?;
+            let mount = anchor(&mut r)?;
+            let angle = r.f32()?;
+            let stripped = r.u8()? != 0;
+            let wheel = match r.u16()? {
+                0 => None,
+                i => blocks.get(i as usize - 1).map(|b| b.uid),
+            };
+            let reel = Some(r.f32()?).filter(|v| *v > 0.0);
+            let motor = if r.u8()? != 0 {
+                let (torque, free_speed, dir, reverse_at) = (r.f32()?, r.f32()?, r.f32()?, r.f32()?);
+                {
+                    let mut m = Motor::new();
+                    m.torque = torque;
+                    m.free_speed = free_speed;
+                    m.dir = dir;
+                    m.reverse_at = reverse_at;
+                    m.auto_reverse = r.u8()? != 0;
+                    Some(m)
+                }
+            } else {
+                None
+            };
+            raw_gears.push(RawGear { uid, size, mount, angle, stripped, wheel, reel, motor });
+        }
+        for _ in 0..r.u16()? {
+            axles.push(Axle { uid: r.u32()?, a: r.u32()?, b: r.u32()? });
+        }
+        for _ in 0..r.u16()? {
+            let uid = r.u32()?;
+            let (a, b) = (anchor(&mut r)?, anchor(&mut r)?);
+            raw_sliders.push((uid, a, b, r.f32()?));
+        }
+        for _ in 0..r.u16()? {
+            let uid = r.u32()?;
+            let mut ends = vec![];
+            for _ in 0..2 {
+                ends.push(match r.u8()? {
+                    0 => RawEnd::Pin(r.u32()?, vec2(r.f32()?, r.f32()?)),
+                    1 => RawEnd::Carriage(r.u32()?),
+                    _ => RawEnd::Node(anchor(&mut r)?),
+                });
+            }
+            let (len, strength) = (r.f32()?, r.f32()?);
+            let broken = r.u8()? != 0;
+            let b = ends.pop().unwrap();
+            let a = ends.pop().unwrap();
+            raw_rods.push((uid, [a, b], len, strength, broken));
+        }
+        for _ in 0..r.u16()? {
+            let w = r.u16()? as usize;
+            raw_pivots.push((w, anchor(&mut r)?));
+        }
+        for _ in 0..r.u16()? {
+            let uid = r.u32()?;
+            let mount = anchor(&mut r)?;
+            raw_pulleys.push((uid, mount, r.f32()?));
+        }
+    }
     let uids: Vec<u32> = members.iter().map(|m| m.uid).collect();
+    let blocks_uids: Vec<u32> = blocks.iter().map(|b| b.uid).collect();
     let resolve = |raw: Raw, fallback: Vec2| match raw {
         Raw::Done(a) => a,
         Raw::End(i, e) => uids.get(i).map_or(Anchor::Free(fallback), |u| Anchor::End { uid: *u, end: e }),
@@ -281,14 +467,18 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
         m.b = resolve(b, m.p1);
     }
     let mut cables = vec![];
-    for (a, b, len, mat, soft) in raw_cables {
-        let (a, b) = (resolve(a, Vec2::ZERO), resolve(b, Vec2::ZERO));
-        // A cable fixed to a rod that is missing is dropped.
-        if matches!(a, Anchor::Free(_)) || matches!(b, Anchor::Free(_)) {
+    for (a, b, len, mat, soft, via) in raw_cables {
+        // A cable needs one fixed end; the other may be loose. A rod that is missing
+        // resolves to a NaN point, and such a cable is dropped.
+        let nan = Vec2::splat(f32::NAN);
+        let (a, b) = (resolve(a, nan), resolve(b, nan));
+        let lost = |x: &Anchor| matches!(x, Anchor::Free(p) if p.x.is_nan());
+        if lost(&a) || lost(&b) || (matches!(a, Anchor::Free(_)) && matches!(b, Anchor::Free(_))) {
             continue;
         }
         let mut c = Cable::new(a, b, len / 1.06).made_of(mat, soft);
         c.len = len;
+        c.via = via;
         cables.push(c);
     }
     let mut springs = vec![];
@@ -297,16 +487,79 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
         let (a, b) = (resolve(a, p0), resolve(b, p1));
         springs.push(Spring::new(kind, a, b, v[0], v[1], p0, p1));
     }
-    Ok(Loaded { mats, entry, exit, blocks, cables, members, springs, biome, clock })
+    let mut mech = Mechanism::default();
+    for g in raw_gears {
+        let mut gear = Gear::new(g.uid, g.size, Vec2::ZERO);
+        gear.mount = resolve(g.mount, Vec2::ZERO);
+        if let Anchor::Free(p) = gear.mount {
+            gear.pos = p;
+        }
+        gear.angle = g.angle;
+        gear.stripped = g.stripped;
+        gear.wheel = g.wheel;
+        gear.reel = g.reel;
+        gear.motor = g.motor;
+        mech.gears.push(gear);
+    }
+    mech.axles = axles;
+    for (uid, a, b, s) in raw_sliders {
+        let (a, b) = (resolve(a, Vec2::ZERO), resolve(b, Vec2::ZERO));
+        let mut sl = Slider::new(uid, Vec2::ZERO, vec2(1.0, 0.0));
+        sl.ends = (a, b);
+        if let (Anchor::Free(p), Anchor::Free(q)) = (a, b) {
+            sl.set_ends(p, q);
+        }
+        sl.s = s;
+        mech.sliders.push(sl);
+    }
+    for (uid, [a, b], len, strength, broken) in raw_rods {
+        let mut end = |e: RawEnd| match e {
+            RawEnd::Pin(gear, pin) => End::Pin { gear, pin },
+            RawEnd::Carriage(u) => End::Carriage(u),
+            RawEnd::Node(raw) => End::Node(resolve(raw, Vec2::ZERO)),
+        };
+        let mut rod = Rod::between(uid, end(a), end(b), len);
+        rod.strength = strength;
+        rod.broken = broken;
+        mech.rods.push(rod);
+    }
+    for (uid, mount, radius) in raw_pulleys {
+        let mount = resolve(mount, Vec2::ZERO);
+        let pos = if let Anchor::Free(p) = mount { p } else { Vec2::ZERO };
+        mech.pulleys.push(crate::mech::Pulley { uid, mount, pos, radius });
+    }
+    for (w, a) in raw_pivots {
+        if let Some(b) = blocks_uids.get(w) {
+            mech.pivots.push(Pivot { wheel: *b, support: resolve(a, Vec2::ZERO) });
+        }
+    }
+    let top = mech.gears.iter().map(|g| g.uid).chain(mech.pulleys.iter().map(|p| p.uid)).chain(mech.axles.iter().map(|a| a.uid)).chain(mech.sliders.iter().map(|s| s.uid)).chain(mech.rods.iter().map(|r| r.uid)).max().unwrap_or(0);
+    crate::mech::bump_uids(top);
+    Ok(Loaded { mats, entry, exit, blocks, cables, members, springs, mech, biome, clock })
 }
 
-pub fn save_slot(slot: usize, world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>, blocks: &[Block], cables: &[Cable], members: &[Member], springs: &[Spring]) -> io::Result<()> {
+#[cfg(not(target_arch = "wasm32"))]
+pub fn save_slot(slot: usize, world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>, blocks: &[Block], cables: &[Cable], members: &[Member], springs: &[Spring], mech: &Mechanism) -> io::Result<()> {
     fs::create_dir_all(dir())?;
-    fs::write(slot_path(slot), encode(world, entry, exit, blocks, cables, members, springs))
+    fs::write(slot_path(slot), encode(world, entry, exit, blocks, cables, members, springs, mech))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_slot(slot: usize) -> io::Result<Loaded> {
     decode(&fs::read(slot_path(slot))?)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn save_slot(slot: usize, world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>, blocks: &[Block], cables: &[Cable], members: &[Member], springs: &[Spring], mech: &Mechanism) -> io::Result<()> {
+    let bytes = encode(world, entry, exit, blocks, cables, members, springs, mech);
+    MEMORY.with(|m| m.borrow_mut()[slot] = Some(bytes));
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load_slot(slot: usize) -> io::Result<Loaded> {
+    let bytes = MEMORY.with(|m| m.borrow()[slot].clone()).ok_or_else(|| Error::new(ErrorKind::NotFound, "emplacement vide"))?;
+    decode(&bytes)
 }
 
 #[cfg(test)]
@@ -328,7 +581,7 @@ mod tests {
         let m2 = Member::new(MemberMat::Wood, Anchor::End { uid: m1.uid, end: 1 }, Anchor::Free(vec2(90.0, 40.0)), vec2(60.0, 10.0), vec2(90.0, 40.0));
         let members = vec![m1, m2];
         let sp = Spring::new(SpringKind::Elastic, Anchor::Ground(vec2(3.0, 4.0)), Anchor::End { uid: members[1].uid, end: 0 }, 40.0, 1.5, vec2(3.0, 4.0), vec2(9.0, 9.0));
-        let bytes = encode(&w, Some(e), Some(x), &blocks, &cables, &members, &[sp]);
+        let bytes = encode(&w, Some(e), Some(x), &blocks, &cables, &members, &[sp], &Mechanism::default());
         assert!(bytes.len() < W * H / 4, "RLE should compress: {}", bytes.len());
         let l = decode(&bytes).unwrap();
         assert_eq!(l.entry, Some(e));
@@ -368,7 +621,7 @@ mod tests {
         assert!(decode(b"nope").is_err());
         assert!(decode(&[]).is_err());
         let mut w = World::new();
-        let mut bytes = encode(&w, None, None, &[], &[], &[], &[]);
+        let mut bytes = encode(&w, None, None, &[], &[], &[], &[], &Mechanism::default());
         bytes.truncate(bytes.len() / 2);
         assert!(decode(&bytes).is_err());
         w.clear();

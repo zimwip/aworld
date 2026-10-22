@@ -232,6 +232,10 @@ pub struct Car {
     pub loads: Vec<(Vec2, f32)>,
     /// Glass cells the hull smashed through this step.
     pub smashed: Vec<(i32, i32)>,
+    /// Sand, mud or snow thrown up by the wheels this step: (where, velocity in cells/step).
+    pub sprays: Vec<(Vec2, Vec2)>,
+    /// 0..1: how deep the wheels have dug themselves into soft ground.
+    pub dig: f32,
     smash_grace: u32,
     /// Ticks spent nearly stopped while the engine pushes (a snag).
     stall: u32,
@@ -245,6 +249,34 @@ pub struct Car {
     progress: f32,
     grounded: u32,
     upside_down: u32,
+}
+
+/// How loose a ground material is for a wheel: 0 for rock, 1 for sand or mud.
+fn softness(m: Mat) -> f32 {
+    match m {
+        Mat::Sand | Mat::Mud | Mat::Snow | Mat::Dirt | Mat::Grass => 1.0,
+        _ => 0.0,
+    }
+}
+
+/// How soft the ground touching a wheel is (0..1): the softness of the ground cells
+/// within a cell or two of the tyre, averaged.
+fn soft_share(world: &World, c: Vec2, r: f32) -> f32 {
+    let (mut soft, mut ground) = (0.0f32, 0u32);
+    let reach = r + 2.0;
+    let ri = reach.ceil() as i32;
+    for dy in -ri..=ri {
+        for dx in -ri..=ri {
+            if (dx * dx + dy * dy) as f32 <= reach * reach {
+                let m = world.at(c.x.floor() as i32 + dx, c.y.floor() as i32 + dy);
+                if m.is_hard() && !m.is_vegetation() {
+                    ground += 1;
+                    soft += softness(m);
+                }
+            }
+        }
+    }
+    if ground == 0 { 0.0 } else { soft / ground as f32 }
 }
 
 fn rot(a: f32, v: Vec2) -> Vec2 {
@@ -323,6 +355,8 @@ impl Car {
             fate: Fate::Driving,
             loads: Vec::new(),
             smashed: Vec::new(),
+            sprays: Vec::new(),
+            dig: 0.0,
             smash_grace: 0,
             stall: 0,
             boost: 0,
@@ -379,6 +413,9 @@ impl Car {
         self.ticks += 1;
         self.loads.clear();
         self.smashed.clear();
+        self.sprays.clear();
+        let mut soft_total = 0.0f32;
+        let mut max_slip = 0.0f32;
         let mut load_total = 0.0f32;
         let m = self.kind.model();
         // A car that is already ploughing through glass keeps going.
@@ -467,8 +504,19 @@ impl Car {
                 let rc = pos - self.p;
                 let vhub = self.v + vec2(-(pos - self.p).y, (pos - self.p).x) * self.omega;
                 let slip = self.wheels[i].spin * r - vhub.dot(t);
-                let grip = m.grip * self.tuning.grip * if self.boost > 0 { 1.35 } else { 1.0 };
+                let soft = (soft_share(world, pos, r)).min(1.0);
+                soft_total += soft;
+                let grip = m.grip * self.tuning.grip * if self.boost > 0 { 1.35 } else { 1.0 } * (1.0 - 0.2 * soft) * (1.0 - 0.3 * self.dig);
                 ft = (SLIP_GAIN * slip).clamp(-grip * normal_force, grip * normal_force);
+                if soft > 0.3 {
+                    max_slip = max_slip.max(slip.abs());
+                }
+                // A spinning wheel in loose ground flings some of it up and back.
+                if soft > 0.2 && (slip.abs() > 0.8 || self.v.length() > 0.35) && (self.ticks + i as u32 * 7) % 3 == 0 && self.sprays.len() < 6 {
+                    let k = (self.ticks.wrapping_mul(2654435761u32) >> 28) as f32 / 16.0;
+                    let back = -self.dir * (0.8 + k * 1.6);
+                    self.sprays.push((pos + vec2(0.0, r * 0.4), vec2(back, -(1.0 + (1.0 - k) * 1.8))));
+                }
                 let tf = t * ft;
                 acc += tf;
                 torque += cross(rc, tf);
@@ -491,6 +539,17 @@ impl Car {
             for l in &mut self.loads {
                 l.1 /= load_total;
             }
+        }
+        let soft = (soft_total / self.wheels.len().max(1) as f32).min(1.0);
+        if soft > 0.15 {
+            // Rolling resistance in loose ground; a spinning, slow car digs itself in.
+            self.v *= 1.0 - 0.008 * soft - 0.01 * self.dig;
+            if (max_slip > 0.6 && self.v.length() < 0.45) || self.v.length() < 0.2 {
+                self.dig = (self.dig + 0.003 * soft).min(1.0);
+            }
+        }
+        if soft < 0.05 || self.v.length() > 0.3 {
+            self.dig = (self.dig - 0.02).max(0.0);
         }
         if wet {
             self.v *= 0.985;
@@ -695,6 +754,104 @@ mod tests {
             car.step(w, None);
         }
         car
+    }
+
+    /// A stretch of the road paved with sand instead of rock, at the same level.
+    fn sand_world(_depth: i32) -> World {
+        let mut w = flat_world();
+        for x in 200..400 {
+            for y in 240..250 {
+                w.set(x, y, Mat::Sand);
+            }
+        }
+        w
+    }
+
+    #[test]
+    fn sand_slows_cars_and_gets_thrown_up() {
+        for kind in ModelKind::ALL {
+            let flat = flat_world();
+            let sand = sand_world(6);
+            let (mut a, mut b) = (Car::new(kind, (40, 216)), Car::new(kind, (40, 216)));
+            let mut sprays = 0;
+            let mut dig = 0.0f32;
+            for _ in 0..500 {
+                a.step(&flat, None);
+                b.step(&sand, None);
+                sprays += b.sprays.len();
+                dig = dig.max(b.dig);
+            }
+            eprintln!("SAND {kind:?} flat x={:.0} sand x={:.0} sprays={sprays} dig={dig:.2} fate={:?}", a.p.x, b.p.x, b.fate);
+            assert!(b.p.x < a.p.x, "{kind:?} not slowed by sand");
+            assert!(sprays > 0, "{kind:?} threw nothing");
+        }
+    }
+
+    #[test]
+    fn weak_car_digs_into_soft_ground_and_recovers_on_rock() {
+        let mut w = sand_world(0);
+        for x in 400..600 {
+            for y in 240..250 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        let weak = Tuning { power: 0.02, ..Tuning::default() };
+        let mut car = Car::with_tuning(ModelKind::Truck, (205, 216), weak);
+        let mut dug = 0.0f32;
+        for _ in 0..600 {
+            car.step(&w, None);
+            dug = dug.max(car.dig);
+        }
+        assert!(dug > 0.1, "never bogged down: {dug}");
+        let mut rock = flat_world();
+        rock.set(0, 0, Mat::Empty);
+        let mut c2 = Car::with_tuning(ModelKind::Truck, (205, 216), weak);
+        c2.dig = 0.9;
+        for _ in 0..200 {
+            c2.step(&rock, None);
+        }
+        assert!(c2.dig < 0.2, "dig did not recover on rock: {}", c2.dig);
+    }
+
+    #[test]
+    fn survey_grass_country() {
+        for seed in 1..4 {
+            for kind in ModelKind::ALL {
+                let mut w = World::new_static();
+                let (e, x) = w.generate_biome(seed, crate::world::Biome::Countryside);
+                let mut car = Car::new(kind, e);
+                let mut dug = 0.0f32;
+                for t in 0..6000 {
+                    car.step(&w, Some(x));
+                    dug = dug.max(car.dig);
+                    if car.fate != Fate::Driving {
+                        eprintln!("GRASS seed {seed} {kind:?} fate {:?} t={t} x={:.0}/{} dig={dug:.2}", car.fate, car.p.x, x.0);
+                        break;
+                    }
+                }
+                if car.fate == Fate::Driving {
+                    eprintln!("GRASS seed {seed} {kind:?} still driving x={:.0}/{} dig={dug:.2}", car.p.x, x.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dirt_and_grass_are_soft_like_sand() {
+        let mut w = flat_world();
+        for x in 200..400 {
+            for y in 240..250 {
+                w.set(x, y, Mat::Dirt);
+            }
+            w.set(x, 239, Mat::Grass);
+        }
+        let mut car = Car::new(ModelKind::Buggy, (40, 216));
+        let mut sprays = 0;
+        for _ in 0..500 {
+            car.step(&w, None);
+            sprays += car.sprays.len();
+        }
+        assert!(sprays > 0);
     }
 
     #[test]

@@ -1,0 +1,3 @@
+# Newer Rust no longer lets wasm leave imports undefined; macroquad (audio, GL) takes them from its JS bundle.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--allow-undefined"]

@@ -59,3 +59,56 @@ Q/E/T tourner · Tab onglet · [ ] pinceau · ↑/↓ vitesse · 1-0 matières �
 ## Développement
 `cargo test` (≈70 tests : simulation, voitures, blocs, sauvegarde). `cargo run --release -- --demo out.png [--tab cars]
 [--biome mer|montagne] [--hour 18.5] [--season hiver] [--view thermique|efforts|vent] [--palette]` enregistre une capture.
+
+
+## Son
+
+Tout le son est synthétisé au démarrage (aucun fichier audio) : moteur (4 régimes mélangés selon la vitesse),
+vent fort, eau qui coule, feu/lave qui crépitent, explosions, chocs et objets qui tombent, verre qui casse,
+tiges/câbles/ressorts qui cèdent, sable projeté. **M** coupe/remet le son ; `--mute` démarre sans son.
+Sans carte son (ALSA/PipeWire), compiler avec `cargo build --release --no-default-features`.
+
+## Sol meuble et vent
+
+- Sable, boue, neige, terre et herbe sont meubles pour les voitures : un peu de traînée, de l'adhérence en moins,
+  du sol projeté derrière les roues, et une voiture lente qui patine peut s'enliser (elle se dégage dès qu'elle repart).
+- Le vent pousse aussi les blocs libres (surface × vent²), et les arbres se penchent et ondulent avec lui
+  (effet visuel, plus fort en haut).
+- Câbles, ressorts et tiges : le point d'ancrage s'affiche (point vert) et la souris colle au point ; près d'un
+  bord du monde, ce bord s'illumine.
+- Les liquides (eau, huile, lave) traversent les arbres au lieu d'être retenus.
+
+## Compiler et diffuser
+
+- `./build.sh` (Linux) ou `build.bat` (Windows) : l'application de bureau, `target/release/aworld`.
+- `./build.sh web` ou `build.bat web` : le paquet web dans `dist/web/` (wasm + page + petit serveur
+  `aworld-serve`). Lancer `dist/web/serve.sh` (ou `serve.bat`) puis ouvrir http://localhost:8765/ ;
+  `./build.sh web run` fait les deux. Le dossier `dist/web/site/` peut aussi être posé sur n'importe quel hébergeur statique.
+- Version web : les sauvegardes restent en mémoire tant que la page est ouverte (pas de fichiers).
+- Prérequis web : `rustup target add wasm32-unknown-unknown` (le script le tente).
+
+## Mécanique (onglet Méca)
+
+Pièces : **moteur** (petit engrenage vu de face), **engrenages** petit/moyen/grand, **axe** (relie deux engrenages
+éloignés, ou un engrenage à une roue), **coulisseau** (un rail et son chariot), **bielle** (d'un point d'accroche
+d'engrenage au chariot) et **pivot** (une roue sur un axe : poulie, tambour de treuil, roue motrice).
+
+- Les engrenages s'engrènent quand leurs centres sont à `r1 + r2` ; la pose s'aimante à cette distance (en ligne
+  droite ou en diagonale), sur le centre d'un bloc, ou s'aligne sur un autre engrenage. Les rails se redressent
+  (horizontal, vertical, diagonale) et leurs bouts s'accrochent au sol, aux blocs, aux tiges. Les points d'accroche
+  des bielles sont fixes sur l'engrenage (deux couronnes et le centre) et s'allument au survol.
+- Le calcul est dynamique : inertie, courbe couple/vitesse du moteur, rapports exacts. Un engrenage trop loin ne
+  s'engrène plus et tourne libre ; un coulisseau bute sur la roche ou le bord de son rail et le moteur cale ; une
+  bielle trop sollicitée casse, des dents trop sollicitées lâchent ; un nombre impair d'engrenages en cercle se
+  coince. Un volant d'inertie (grand engrenage) passe les points morts.
+- Option moteur : **sens inverse si surcharge** (cale, butée ou charge lourde). Clic sur un moteur posé : inverser son sens.
+- Le chariot pousse sable, eau et blocs. Un engrenage relié à une roue pivotée l'entraîne ; un câble accroché sur le bord
+  de cette roue (le câble s'accroche au bord des roues) s'enroule : c'est un **treuil**.
+- Câbles : un bout peut rester libre (le second clic dans le vide) ; l'acier est bien plus raide.
+
+## L'air qui s'écoule
+
+Le vent est un écoulement simplifié (grille grossière, fluide incompressible) : des couches d'air soufflent en sens
+opposés selon l'altitude, des rafales s'enroulent en tourbillons, l'air chaud monte au-dessus d'un feu, et
+l'écoulement contourne le relief. Nuages, vapeur et fumée le suivent, la pluie se penche avec le vent local.
+Touche **V** pour voir les flèches.

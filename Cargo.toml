@@ -2,10 +2,25 @@
 name = "aworld"
 version = "0.1.0"
 edition = "2021"
+default-run = "aworld"
+
+[[bin]]
+name = "aworld"
+path = "src/main.rs"
+
+# The little web server shipped with the web package.
+[[bin]]
+name = "aworld-serve"
+path = "src/bin/serve.rs"
 
 [dependencies]
 macroquad = { version = "0.4", default-features = false }
 rapier2d = "0.36"
+
+[features]
+default = ["sound"]
+# Needs an ALSA/PipeWire sound device at start-up; build with --no-default-features without one.
+sound = ["macroquad/audio"]
 
 [profile.dev]
 opt-level = 2

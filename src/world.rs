@@ -2,6 +2,7 @@
 //! Rigid blocks live outside the grid; they are stamped into a mask each step
 //! so particles and the car treat them as solid.
 
+pub mod flow;
 mod thermal;
 pub use thermal::{Season, DAY_STEPS};
 
@@ -215,6 +216,12 @@ pub struct World {
     pub touched: Vec<u16>,
     /// Explosions this step: (x, y, radius).
     pub blasts: Vec<(i32, i32, i32)>,
+    /// Heavy landings of falling pieces: (x, y, strength). For sound.
+    pub thuds: Vec<(i32, i32, f32)>,
+    /// How many water cells moved since it was last read. For sound.
+    pub water_flow: u32,
+    /// The air's flow: layered winds, vortices, rising warm air. Gas rides it.
+    pub flow: flow::Flow,
 }
 
 impl World {
@@ -245,6 +252,9 @@ impl World {
             mask_pass: Vec::new(),
             touched: Vec::new(),
             blasts: Vec::new(),
+            thuds: Vec::new(),
+            water_flow: 0,
+            flow: flow::Flow::new(),
         }
     }
 
@@ -285,6 +295,10 @@ impl World {
         self.touched.clear();
         self.blasts.clear();
         self.update_season_cache();
+    }
+
+    pub fn take_water_flow(&mut self) -> u32 {
+        std::mem::take(&mut self.water_flow)
     }
 
     /// How many cells of each material are on screen (indexed by `Mat as usize`).
@@ -450,6 +464,9 @@ impl World {
             return;
         }
         let (ia, ib) = (Self::idx(a.0, a.1), Self::idx(b.0, b.1));
+        if self.cells[ia].m == Mat::Water {
+            self.water_flow += 1;
+        }
         self.cells.swap(ia, ib);
         self.temp.swap(ia, ib);
         self.cells[ia].stamp = self.frame;
@@ -817,16 +834,32 @@ impl World {
                     Mat::Branch => self.step_branch(x, y),
                     Mat::DeadLeaf => self.step_dead_leaf(x, y),
                     Mat::Cloud => self.step_cloud(x, y),
-                    Mat::Oil => self.step_oil(x, y),
+                    Mat::Oil => {
+                        if !self.seep(x, y) {
+                            self.step_oil(x, y);
+                        }
+                    }
                     Mat::Smoke => self.step_smoke(x, y),
                     Mat::Steel => self.step_iron(x, y, 1500),
                     Mat::Gunpowder => self.step_gunpowder(x, y),
-                    Mat::Water => self.step_water(x, y),
+                    Mat::Water => {
+                        if !self.seep(x, y) {
+                            self.step_water(x, y);
+                        }
+                    }
                     Mat::Steam => self.step_steam(x, y),
                     Mat::Fire => self.step_fire(x, y),
                     Mat::Ember => self.step_ember(x, y),
-                    Mat::Lava => self.step_hot_liquid(x, y, Mat::Stone),
-                    Mat::Molten => self.step_hot_liquid(x, y, Mat::Iron),
+                    Mat::Lava => {
+                        if !self.seep(x, y) {
+                            self.step_hot_liquid(x, y, Mat::Stone);
+                        }
+                    }
+                    Mat::Molten => {
+                        if !self.seep(x, y) {
+                            self.step_hot_liquid(x, y, Mat::Iron);
+                        }
+                    }
                     Mat::Iron => self.step_iron(x, y, 300),
                     _ => {}
                 }
@@ -840,6 +873,7 @@ impl World {
             self.drop_structures();
         }
         self.update_wind();
+        self.update_flow();
         if self.ticks % 64 == 0 {
             self.update_season_cache();
         }
@@ -1297,6 +1331,23 @@ impl World {
         false
     }
 
+    /// Trees are porous: a liquid resting on foliage, branches or a trunk drips straight
+    /// through to the first free cell below instead of being held up.
+    fn seep(&mut self, x: i32, y: i32) -> bool {
+        if !self.at(x, y + 1).is_vegetation() {
+            return false;
+        }
+        let mut k = 2;
+        while k <= 10 && self.at(x, y + k).is_vegetation() {
+            k += 1;
+        }
+        if matches!(self.at(x, y + k).kind(), Kind::Empty | Kind::Gas) {
+            self.swap((x, y), (x, y + k));
+            return true;
+        }
+        false
+    }
+
     /// Oil is a slow, light liquid: it floats on water and burns ferociously.
     fn step_oil(&mut self, x: i32, y: i32) {
         for (nx, ny) in Self::neighbors(x, y) {
@@ -1392,8 +1443,9 @@ impl World {
         }
         let d = self.dir();
         // Falling drops are pushed along by the wind: the rain slants.
-        if self.at(x, y + 1) == Mat::Empty && self.wind.abs() > 0.15 && (self.rand() % 100) as f32 <= self.wind.abs() * 35.0 {
-            let w = if self.wind > 0.0 { 1 } else { -1 };
+        let local = self.flow.sample(x, y).0 / flow::GAIN;
+        if self.at(x, y + 1) == Mat::Empty && local.abs() > 0.15 && (self.rand() % 100) as f32 <= local.abs().min(1.0) * 35.0 {
+            let w = if local > 0.0 { 1 } else { -1 };
             if self.at(x + w, y + 1) == Mat::Empty {
                 self.swap((x, y), (x + w, y + 1));
                 return;
@@ -1713,6 +1765,10 @@ impl World {
                 if !self.piece_can_move(piece, 1) {
                     // Touched down. A hard landing bounces right away; a soft one settles.
                     if piece.vy > 1.4 {
+                        if self.thuds.len() < 8 {
+                            let c = piece.cells[0];
+                            self.thuds.push(((c % W) as i32, (c / W) as i32, piece.vy));
+                        }
                         piece.vy = -piece.vy * 0.34;
                         self.rise(piece);
                     } else {
@@ -1799,6 +1855,55 @@ impl World {
 
     /// Premultiplied RGBA of a cell; empty cells are fully transparent so the
     /// background shows through.
+    /// A wheel flings a handful of loose ground (sand, mud, snow) from `from` to `to`.
+    /// Returns whether something was actually thrown.
+    pub fn fling(&mut self, from: (i32, i32), to: (i32, i32)) -> bool {
+        if self.at(to.0, to.1) != Mat::Empty {
+            return false;
+        }
+        for dy in 0..=2 {
+            for dx in [0, -1, 1] {
+                let m = self.at(from.0 + dx, from.1 + dy);
+                if matches!(m, Mat::Sand | Mat::Mud | Mat::Snow | Mat::Dirt | Mat::Grass) {
+                    self.set(from.0 + dx, from.1 + dy, Mat::Empty);
+                    self.set(to.0, to.1, if m == Mat::Grass { Mat::Dirt } else { m });
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// A rail's carriage pushes loose matter (sand, water, gas) out of its way: the cell at
+    /// `from` jumps along `dir` to the first free cell a few cells on, or just over it.
+    pub fn shove(&mut self, from: (i32, i32), dir: (i32, i32)) -> bool {
+        if !matches!(self.raw(from.0, from.1).kind(), Kind::Powder | Kind::Liquid | Kind::Gas) {
+            return false;
+        }
+        for k in 2..=8 {
+            for lift in [0, -1, -2] {
+                let t = (from.0 + dir.0 * k, from.1 + dir.1 * k + lift);
+                if Self::inb(t.0, t.1) && self.raw(t.0, t.1) == Mat::Empty && self.mask[Self::idx(t.0, t.1)] == 0 {
+                    self.swap(from, t);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn cell_mat(&self, x: usize, y: usize) -> Mat {
+        self.cells[y * W + x].m
+    }
+
+    /// Everything but the trees, which are drawn as a separate swaying layer.
+    pub fn color_without_trees(&self, x: usize, y: usize) -> [u8; 4] {
+        if self.cells[y * W + x].m.is_vegetation() {
+            return [0, 0, 0, 0];
+        }
+        self.color(x, y)
+    }
+
     pub fn color(&self, x: usize, y: usize) -> [u8; 4] {
         let c = self.cells[y * W + x];
         if c.m == Mat::Empty {
@@ -3101,7 +3206,86 @@ mod science {
     }
 
     #[test]
-    fn flowing_water_erodes_bare_soil() {
+    fn liquids_drip_through_trees() {
+    let mut w = World::new_static();
+    for y in 0..H as i32 {
+        for x in 100..140 {
+            w.set(x, y, Mat::Empty);
+        }
+    }
+    for x in 100..140 {
+        w.set(x, 300, Mat::Stone);
+    }
+    // A canopy of leaves with a branch and a trunk stub under it.
+    for y in 150..301 {
+        w.set(99, y, Mat::Stone);
+        w.set(140, y, Mat::Stone);
+    }
+    for x in 100..140 {
+        w.set(x, 200, Mat::Leaf);
+        w.set(x, 201, Mat::Branch);
+        w.set(x, 202, Mat::Trunk);
+    }
+    for (i, m) in [Mat::Water, Mat::Oil].into_iter().enumerate() {
+        for x in 112..118 {
+            w.set(x + i as i32 * 8, 190, m);
+        }
+    }
+    for _ in 0..400 {
+        w.step();
+    }
+    let above = (100..140).flat_map(|x| (150..200).map(move |y| (x, y))).filter(|&(x, y)| matches!(w.at(x, y), Mat::Water | Mat::Oil)).count();
+    let total = (0..W as i32).flat_map(|x| (0..H as i32).map(move |y| (x, y))).filter(|&(x, y)| matches!(w.at(x, y), Mat::Water | Mat::Oil)).count();
+    let below = (100..140).flat_map(|x| (203..300).map(move |y| (x, y))).filter(|&(x, y)| matches!(w.at(x, y), Mat::Water | Mat::Oil)).count();
+    assert!(below >= 8, "liquid stayed on top of the tree: {below} below, {above} above, {total} total");
+    assert_eq!(w.at(115, 200), Mat::Leaf, "the tree itself must stay");
+}
+
+#[test]
+fn clouds_ride_opposing_winds_at_different_heights() {
+    let mut w = World::new_static();
+    w.flow.pin_opposed(0.6, 34);
+    let patch = |w: &mut World, y: i32| {
+        for dy in 0..4 {
+            for x in 400..440 {
+                w.set(x, y + dy, Mat::Cloud);
+            }
+        }
+    };
+    patch(&mut w, 100); // upper layer: towards the right
+    patch(&mut w, 400); // lower layer: towards the left
+    let mean_x = |w: &World, lo: i32, hi: i32| {
+        let xs: Vec<f32> = (lo..hi).flat_map(|y| (0..W as i32).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Cloud).map(|(x, _)| x as f32).collect();
+        (xs.iter().sum::<f32>() / xs.len().max(1) as f32, xs.len())
+    };
+    for _ in 0..150 {
+        w.step();
+    }
+    let (up, n_up) = mean_x(&w, 60, 200);
+    let (down, n_down) = mean_x(&w, 300, 480);
+    assert!(n_up > 20 && n_down > 20, "clouds should survive: {n_up} {n_down}");
+    assert!(up > 440.0, "the upper cloud drifts right: {up}");
+    assert!(down < 410.0, "the lower cloud drifts left: {down}");
+}
+
+#[test]
+fn rain_slants_with_the_local_wind() {
+    let mut w = World::new_static();
+    w.flow.pin_uniform(1.0, 0.0);
+    for x in 300..320 {
+        w.set(x, 100, Mat::Water);
+    }
+    for _ in 0..40 {
+        w.step();
+    }
+    let xs: Vec<i32> = (0..H as i32).flat_map(|y| (0..W as i32).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water && y < 300).map(|(x, _)| x).collect();
+    assert!(!xs.is_empty());
+    let mean = xs.iter().sum::<i32>() as f32 / xs.len() as f32;
+    assert!(mean > 312.0, "falling drops are pushed along: mean x {mean}");
+}
+
+#[test]
+fn flowing_water_erodes_bare_soil() {
         let mut w = World::new_static();
         floor(&mut w, 340, 100, 300);
         for x in 100..300 {

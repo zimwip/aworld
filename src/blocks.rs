@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 /// Size of one stud in cells; blocks snap to this grid.
 pub const STUD: f32 = 10.0;
 /// Cells per physics meter.
-const PX_PER_M: f32 = 16.0;
+pub const PX_PER_M: f32 = 16.0;
 const TILE: i32 = 16;
 /// Weld breaking limits (per step): force and torque impulses.
 const BREAK_FORCE: f32 = 1.3;
@@ -568,6 +568,20 @@ pub enum Anchor {
     Along { uid: u32, t: f32 },
     /// Pinned to nothing (a loose end).
     Free(Vec2),
+    /// The drum of a winch (a gear with a reel). `pos` is where the drum is now; the game keeps it
+    /// up to date, since this module knows nothing about gears.
+    Reel { uid: u32, pos: Vec2 },
+}
+
+/// How a rope's length follows its winch: `len = base_len - radius * (angle - base_angle)`.
+#[derive(Clone, Copy, Debug)]
+pub struct ReelRef {
+    pub gear: u32,
+    pub base_len: f32,
+    pub base_angle: f32,
+    pub radius: f32,
+    pub min_len: f32,
+    pub max_len: f32,
 }
 
 #[derive(Clone)]
@@ -583,6 +597,12 @@ pub struct Cable {
     pub stress: f32,
     /// Points along the cable for drawing: both anchors and every link between.
     pub pts: Vec<Vec2>,
+    /// Pulleys the rope runs over, in order (their ids), and where the rope touches each one
+    /// (filled in by the game before the rope is built).
+    pub via: Vec<u32>,
+    pub via_pts: Vec<Vec2>,
+    /// A rope fixed on a winch drum: how its length follows the drum (set when the simulation starts).
+    pub reel: Option<ReelRef>,
     pub snapped: bool,
     links: Vec<RigidBodyHandle>,
     joints: Vec<ImpulseJointHandle>,
@@ -590,7 +610,7 @@ pub struct Cable {
 
 impl Cable {
     pub fn new(a: Anchor, b: Anchor, chord: f32) -> Self {
-        Cable { a, b, len: chord * 1.06, mat: CableMat::Iron, soft: 1.0, stress: 0.0, pts: vec![], snapped: false, links: vec![], joints: vec![] }
+        Cable { a, b, len: chord * 1.06, mat: CableMat::Iron, soft: 1.0, stress: 0.0, pts: vec![], via: vec![], via_pts: vec![], reel: None, snapped: false, links: vec![], joints: vec![] }
     }
 
     pub fn made_of(mut self, mat: CableMat, soft: f32) -> Self {
@@ -603,6 +623,7 @@ impl Cable {
     pub fn fresh(&self) -> Cable {
         let mut c = Cable::new(self.a, self.b, self.len / 1.06).made_of(self.mat, self.soft);
         c.len = self.len;
+        c.via = self.via.clone();
         c
     }
 
@@ -645,6 +666,7 @@ pub fn anchor_world(anchor: &Anchor, blocks: &[Block], members: &[Member]) -> Op
         Anchor::Block { uid, local } => blocks.iter().find(|b| b.uid == *uid).map(|b| b.pos + rot(b.angle, *local)),
         Anchor::End { uid, end } => members.iter().find(|m| m.uid == *uid).map(|m| if *end == 0 { m.p0 } else { m.p1 }),
         Anchor::Along { uid, t } => members.iter().find(|m| m.uid == *uid).map(|m| m.p0 + (m.p1 - m.p0) * *t),
+        Anchor::Reel { pos, .. } => Some(*pos),
     }
 }
 
@@ -718,8 +740,8 @@ impl CableMat {
     /// Spring stiffness of each link: steel hardly stretches, rope stretches a lot.
     pub fn stiffness(self) -> f32 {
         match self {
-            CableMat::Steel => 4200.0,
-            CableMat::Iron => 2600.0,
+            CableMat::Steel => 20000.0,
+            CableMat::Iron => 8000.0,
             CableMat::Wood => 700.0,
         }
     }
@@ -764,6 +786,8 @@ impl CableMat {
 }
 
 const CABLE_SEGMENT: f32 = 8.0;
+/// Stiffness of a connecting rod to a block (newtons per metre).
+pub const ROD_STIFFNESS: f32 = 4000.0;
 
 // ---------------------------------------------------------------------------
 // Springs and elastic cords
@@ -907,6 +931,14 @@ pub struct Physics {
     welds: HashMap<ImpulseJointHandle, f32>,
     last_vel: HashMap<RigidBodyHandle, Vector>,
     impacts: Vec<u32>,
+    /// Hard knocks to any block this step: (where, how hard). For sound.
+    bumps: Vec<(Vec2, f32)>,
+    /// Where the mechanism end of each connecting rod (by rod id) is held: a body the game moves.
+    pins: HashMap<u32, (RigidBodyHandle, ImpulseJointHandle)>,
+    /// A body at each winch drum (by gear id): the end of a rope on a reel is attached to it.
+    reels: HashMap<u32, RigidBodyHandle>,
+    /// Fixed sheaves of pulleys (by pulley id): ropes bend round them.
+    pulleys: HashMap<u32, ColliderHandle>,
 }
 
 
@@ -920,7 +952,7 @@ impl Physics {
         w.gravity = Vector::new(0.0, 16.0);
         w.integration_parameters.dt = 1.0 / 60.0;
         let terrain = w.insert_body(RigidBodyBuilder::fixed());
-        Physics { w, terrain, tiles: HashMap::new(), welds: HashMap::new(), last_vel: HashMap::new(), impacts: vec![] }
+        Physics { w, terrain, tiles: HashMap::new(), welds: HashMap::new(), last_vel: HashMap::new(), impacts: vec![], bumps: vec![], pins: HashMap::new(), reels: HashMap::new(), pulleys: HashMap::new() }
     }
 
     pub fn add_block(&mut self, b: &mut Block) {
@@ -981,7 +1013,7 @@ impl Physics {
                 Anchor::Block { uid, local } => blocks.iter().find(|b| b.uid == uid).and_then(|b| Some((b.body?, v2(local)))),
                 Anchor::End { uid, end: e } => members.iter().find(|o| o.uid == uid).and_then(|o| Some((o.body?, Self::member_end_local(o, e)))),
                 Anchor::Along { uid, t } => members.iter().find(|o| o.uid == uid).and_then(|o| Some((o.body?, Vector::new((t - 0.5) * o.len() / PX_PER_M, 0.0)))),
-                Anchor::Free(_) => None,
+                Anchor::Free(_) | Anchor::Reel { .. } => None,
             };
             if let Some((tb, tl)) = target {
                 let j = RevoluteJointBuilder::new().local_anchor1(tl).local_anchor2(Self::member_end_local(&me, end)).contacts_enabled(false);
@@ -1099,6 +1131,7 @@ impl Physics {
                 Some((m.body?, Vector::new((t - 0.5) * m.len() / PX_PER_M, 0.0)))
             }
             Anchor::Free(_) => None,
+            Anchor::Reel { uid, .. } => self.reels.get(uid).map(|h| (*h, Vector::new(0.0, 0.0))),
         }
     }
 
@@ -1181,9 +1214,23 @@ impl Physics {
         let chord = (pb - pa).length();
         let sag = 0.4 * (chord * (c.len - chord).max(0.0)).sqrt();
         let mut bodies: Vec<RigidBodyHandle> = vec![];
+        // A rope that runs over pulleys starts along that path (taut, no sag).
+        let path: Vec<Vec2> = if c.via_pts.is_empty() { vec![] } else { std::iter::once(pa).chain(c.via_pts.iter().copied()).chain(std::iter::once(pb)).collect() };
+        let path_len: f32 = path.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+        let along = |u: f32| -> Vec2 {
+            let mut left = u * path_len;
+            for w in path.windows(2) {
+                let l = (w[1] - w[0]).length();
+                if left <= l || std::ptr::eq(w, path.windows(2).last().unwrap()) {
+                    return w[0] + (w[1] - w[0]) * (left / l.max(1e-3)).min(1.0);
+                }
+                left -= l;
+            }
+            pb
+        };
         for i in 1..=n {
             let u = i as f32 / (n as f32 + 1.0);
-            let p = pa + (pb - pa) * u + vec2(0.0, sag * 4.0 * u * (1.0 - u));
+            let p = if path.is_empty() { pa + (pb - pa) * u + vec2(0.0, sag * 4.0 * u * (1.0 - u)) } else { along(u) };
             let rb = RigidBodyBuilder::dynamic().translation(v2(p)).can_sleep(false).linear_damping(0.6).angular_damping(2.0);
             let col = ColliderBuilder::ball(1.4 / PX_PER_M)
                 .density(c.mat.density())
@@ -1208,16 +1255,25 @@ impl Physics {
                     Some((m.body?, Vector::new((t - 0.5) * m.len() / PX_PER_M, 0.0)))
                 }
                 Anchor::Free(_) => None,
+                Anchor::Reel { uid, .. } => this.reels.get(uid).map(|h| (*h, Vector::new(0.0, 0.0))),
             }
         };
-        let (Some((ha, la)), Some((hb, lb))) = (end_body(self, &c.a), end_body(self, &c.b)) else { return };
+        // One end may be left loose: the rope then just hangs from the other one.
+        let (ea, eb) = (end_body(self, &c.a), end_body(self, &c.b));
+        let loose = |a: &Anchor| matches!(a, Anchor::Free(_));
+        if (ea.is_none() && !loose(&c.a)) || (eb.is_none() && !loose(&c.b)) || (ea.is_none() && eb.is_none()) {
+            return;
+        }
         let rest = link_len / PX_PER_M;
         // A softer cable has weaker springs (it stretches more); damping follows the stiffness.
         let stiffness = c.mat.stiffness() / c.soft.clamp(0.3, 4.0);
         let damping = 0.27 * stiffness.sqrt();
         let mut joints = vec![];
-        let chain: Vec<(RigidBodyHandle, Vector)> =
-            std::iter::once((ha, la)).chain(bodies.iter().map(|h| (*h, Vector::new(0.0, 0.0)))).chain(std::iter::once((hb, lb))).collect();
+        let chain: Vec<(RigidBodyHandle, Vector)> = ea
+            .into_iter()
+            .chain(bodies.iter().map(|h| (*h, Vector::new(0.0, 0.0))))
+            .chain(eb)
+            .collect();
         for pair in chain.windows(2) {
             // An elastic rope: springs between the beads let it stretch a little.
             let j = SpringJointBuilder::new(rest, stiffness, damping).local_anchor1(pair[0].1).local_anchor2(pair[1].1).contacts_enabled(false);
@@ -1258,14 +1314,14 @@ impl Physics {
                 c.snapped = true;
             }
             let mut pts = vec![];
-            if let Some(p) = anchor_world(&c.a, blocks, members) {
+            if let (Some(p), false) = (anchor_world(&c.a, blocks, members), matches!(c.a, Anchor::Free(_))) {
                 pts.push(p);
             }
             for h in &c.links {
                 let t = self.w.bodies[*h].translation();
                 pts.push(vec2(t.x, t.y) * PX_PER_M);
             }
-            if let Some(p) = anchor_world(&c.b, blocks, members) {
+            if let (Some(p), false) = (anchor_world(&c.b, blocks, members), matches!(c.b, Anchor::Free(_))) {
                 pts.push(p);
             }
             c.pts = pts;
@@ -1369,6 +1425,151 @@ impl Physics {
         rb.apply_impulse_at_point(impulse, v2(point), true);
     }
 
+    /// Fixes a wheel on an axle: it can turn freely but stays where its centre is.
+    pub fn add_pivot(&mut self, blocks: &[Block], members: &[Member], wheel: u32, support: &Anchor) -> bool {
+        let Some(bw) = blocks.iter().find(|b| b.uid == wheel) else { return false };
+        let Some(hw) = bw.body else { return false };
+        let target = match support {
+            Anchor::Ground(p) | Anchor::Free(p) => Some((self.terrain, v2(*p))),
+            Anchor::Block { uid, local } => blocks.iter().find(|b| b.uid == *uid).and_then(|b| Some((b.body?, v2(*local)))),
+            Anchor::End { uid, end } => members.iter().find(|m| m.uid == *uid).and_then(|m| Some((m.body?, Self::member_end_local(m, *end)))),
+            Anchor::Along { uid, t } => members.iter().find(|m| m.uid == *uid).and_then(|m| Some((m.body?, Vector::new((t - 0.5) * m.len() / PX_PER_M, 0.0)))),
+            Anchor::Reel { .. } => None,
+        };
+        let Some((hs, local)) = target else { return false };
+        if hs == hw {
+            return false;
+        }
+        let j = RevoluteJointBuilder::new().local_anchor1(local).local_anchor2(Vector::new(0.0, 0.0)).contacts_enabled(false);
+        let h = self.w.insert_impulse_joint(hs, hw, j);
+        // An axle holds much more than a weld.
+        self.welds.insert(h, 4.0);
+        true
+    }
+
+    /// A connecting rod from a moving end of a mechanism (a gear pin, a carriage) to a block, a rod
+    /// or the ground: the end is a body the game moves; a stiff spring is the rod itself.
+    pub fn add_pin_rod(&mut self, blocks: &[Block], members: &[Member], rod: u32, pin: Vec2, node: &Anchor, len: f32) -> bool {
+        let target = match node {
+            Anchor::Ground(p) | Anchor::Free(p) => Some((self.terrain, v2(*p))),
+            Anchor::Block { uid, local } => blocks.iter().find(|b| b.uid == *uid).and_then(|b| Some((b.body?, v2(*local)))),
+            Anchor::End { uid, end } => members.iter().find(|m| m.uid == *uid).and_then(|m| Some((m.body?, Self::member_end_local(m, *end)))),
+            Anchor::Along { uid, t } => members.iter().find(|m| m.uid == *uid).and_then(|m| Some((m.body?, Vector::new((t - 0.5) * m.len() / PX_PER_M, 0.0)))),
+            Anchor::Reel { .. } => None,
+        };
+        let Some((hb, local)) = target else { return false };
+        let body = RigidBodyBuilder::kinematic_position_based().translation(v2(pin)).can_sleep(false);
+        let hp = self.w.insert_body(body);
+        let j = SpringJointBuilder::new(len / PX_PER_M, ROD_STIFFNESS, 0.3 * ROD_STIFFNESS.sqrt()).local_anchor1(Vector::new(0.0, 0.0)).local_anchor2(local).contacts_enabled(false);
+        let h = self.w.insert_impulse_joint(hp, hb, j);
+        // The rod is as strong as the mechanism's rod (the game breaks it), not like a weld.
+        self.welds.insert(h, 1e6);
+        self.pins.insert(rod, (hp, h));
+        true
+    }
+
+    /// Moves the mechanism end of a rod to `p` (it takes effect over the next step).
+    pub fn move_pin(&mut self, rod: u32, p: Vec2) {
+        if let Some((h, _)) = self.pins.get(&rod) {
+            self.w.bodies[*h].set_next_kinematic_translation(v2(p));
+        }
+    }
+
+    /// Takes a rod's spring and end body away (the rod broke or was erased).
+    pub fn remove_pin_rod(&mut self, rod: u32) {
+        if let Some((hp, hj)) = self.pins.remove(&rod) {
+            self.w.remove_impulse_joint(hj);
+            self.w.remove_body(hp);
+        }
+    }
+
+    /// The pull of a rod's spring on its mechanism end, in physics units (newtons), given where
+    /// the other end is now. Positive along the way from the pin to the other end when stretched.
+    pub fn rod_pull(pin: Vec2, other: Vec2, len: f32) -> Vec2 {
+        let d = other - pin;
+        let dist = d.length();
+        if dist < 1e-4 {
+            return Vec2::ZERO;
+        }
+        d / dist * ((dist - len) / PX_PER_M * ROD_STIFFNESS)
+    }
+
+    /// A body at a winch drum, which the end of a rope on that reel is attached to.
+    pub fn add_reel(&mut self, uid: u32, pos: Vec2) {
+        let h = self.w.insert_body(RigidBodyBuilder::kinematic_position_based().translation(v2(pos)).can_sleep(false));
+        self.reels.insert(uid, h);
+    }
+
+    pub fn move_reel(&mut self, uid: u32, pos: Vec2) {
+        if let Some(h) = self.reels.get(&uid) {
+            self.w.bodies[*h].set_next_kinematic_translation(v2(pos));
+        }
+    }
+
+    /// The fixed sheave of a pulley, on whatever it is mounted on. Only ropes touch it, and
+    /// nothing grips: the rope slides round it freely.
+    pub fn add_pulley(&mut self, blocks: &[Block], members: &[Member], uid: u32, support: &Anchor, pos: Vec2, radius: f32) {
+        let (body, local) = match support {
+            Anchor::Block { uid: b, local } => match blocks.iter().find(|x| x.uid == *b).and_then(|x| x.body) {
+                Some(h) => (h, v2(*local)),
+                None => (self.terrain, v2(pos)),
+            },
+            Anchor::End { uid: m, end } => match members.iter().find(|x| x.uid == *m).and_then(|x| x.body.map(|h| (h, x))) {
+                Some((h, x)) => (h, Self::member_end_local(x, *end)),
+                None => (self.terrain, v2(pos)),
+            },
+            _ => (self.terrain, v2(pos)),
+        };
+        let col = ColliderBuilder::ball(radius / PX_PER_M)
+            .translation(local)
+            .friction(0.0)
+            .collision_groups(InteractionGroups { memberships: Group::GROUP_1, filter: Group::GROUP_2, test_mode: InteractionTestMode::And });
+        let h = self.w.insert_collider(col, Some(body));
+        self.pulleys.insert(uid, h);
+    }
+
+    /// Reels a rope in or out: every link gets its share of the new length.
+    pub fn set_cable_length(&mut self, c: &Cable, len: f32) {
+        let links = c.joints.len();
+        if links == 0 {
+            return;
+        }
+        let rest = len / links as f32 / PX_PER_M;
+        let stiffness = c.mat.stiffness() / c.soft.clamp(0.3, 4.0);
+        let damping = 0.27 * stiffness.sqrt();
+        for h in &c.joints {
+            if let Some(j) = self.w.impulse_joints.get_mut(*h, true) {
+                j.data.set_motor_position(JointAxis::LinX, rest, stiffness, damping);
+            }
+        }
+    }
+
+    /// The tension of a rope where it leaves its first (or last) point, in newtons, from how far
+    /// its end link is stretched.
+    pub fn rope_tension(c: &Cable, at_start: bool) -> f32 {
+        let n = c.pts.len();
+        if n < 3 || c.joints.is_empty() {
+            return 0.0;
+        }
+        let (a, b) = if at_start { (c.pts[0], c.pts[1]) } else { (c.pts[n - 1], c.pts[n - 2]) };
+        let rest = c.len / c.joints.len() as f32;
+        let stiffness = c.mat.stiffness() / c.soft.clamp(0.3, 4.0);
+        ((a - b).length() - rest).max(0.0) / PX_PER_M * stiffness
+    }
+
+    /// How fast a block turns, in radians per second.
+    pub fn spin_of(&self, b: &Block) -> f32 {
+        b.body.map_or(0.0, |h| self.w.bodies[h].angvel())
+    }
+
+    /// Twists a block: `torque` (kg m² / s²) for one step.
+    pub fn twist(&mut self, b: &Block, torque: f32) {
+        if let Some(h) = b.body {
+            let dt = self.w.integration_parameters.dt;
+            self.w.bodies[h].apply_torque_impulse(torque * dt, true);
+        }
+    }
+
     /// A hammer blow: a small shove at `point`, away from it.
     pub fn knock(&mut self, b: &Block, point: Vec2, dir: Vec2) {
         let Some(h) = b.body else { return };
@@ -1403,6 +1604,9 @@ impl Physics {
             let Some(h) = b.body else { continue };
             let s = b.spec();
             let half = b.half();
+            // Wind pushes on whatever is in the open air, in proportion to the surface it offers.
+            let gust = world.wind * world.wind.abs() * (s.h.max(s.w) * s.w.min(s.h)) / (PX_PER_M * PX_PER_M) * g.abs() * 0.045 * dt;
+            self.w.bodies[h].apply_impulse(Vector::new(gust, 0.0), false);
             let reach = half.length() + 2.0;
             let (nx, ny) = (((s.w / 4.0) as i32).max(2), ((s.h / 4.0) as i32).max(2));
             let (mut wet, mut total) = (0, 0);
@@ -1443,9 +1647,24 @@ impl Physics {
         std::mem::take(&mut self.impacts)
     }
 
+    pub fn take_bumps(&mut self) -> Vec<(Vec2, f32)> {
+        std::mem::take(&mut self.bumps)
+    }
+
     fn detect_impacts(&mut self, blocks: &[Block]) {
         let vel = |this: &Physics, b: &Block| b.body.map(|h| this.w.bodies[h].linvel());
         let speeds: Vec<Option<Vector>> = blocks.iter().map(|b| vel(self, b)).collect();
+        // Any block that was moving fast and has just been stopped or knocked makes a noise.
+        for (i, b) in blocks.iter().enumerate() {
+            if let (Some(h), Some(v)) = (b.body, speeds[i]) {
+                if let Some(prev) = self.last_vel.get(&h) {
+                    let dv = ((v.x - prev.x).powi(2) + (v.y - prev.y).powi(2)).sqrt();
+                    if dv > 1.6 && self.bumps.len() < 8 {
+                        self.bumps.push((b.pos, dv));
+                    }
+                }
+            }
+        }
         for (i, g) in blocks.iter().enumerate() {
             if !g.kind.is_glass() {
                 continue;
@@ -1805,6 +2024,105 @@ mod tests {
     }
 
     #[test]
+    fn a_rope_over_a_pulley_makes_an_atwood_machine() {
+        let mut world = ground();
+        // A brick (heavy iron) on one side, a glass block (light) on the other.
+        let mut blocks = vec![Block::new(BlockKind::Cube, vec2(180.0, 220.0), 0.0), Block::new(BlockKind::Glass, vec2(220.0, 220.0), 0.0)];
+        let (heavy, light) = (blocks[0].uid, blocks[1].uid);
+        let mut phys = Physics::build(&mut blocks);
+        let (centre, r) = (vec2(200.0, 100.0), 6.0);
+        phys.add_pulley(&blocks, &[], 1, &Anchor::Free(centre), centre, r);
+        let top = vec2(centre.x, centre.y - r - 1.5);
+        let mut cable = Cable::new(Anchor::Block { uid: heavy, local: vec2(0.0, -10.0) }, Anchor::Block { uid: light, local: vec2(0.0, -4.0) }, 100.0);
+        cable.via = vec![1];
+        cable.via_pts = vec![top];
+        let len = ((vec2(180.0, 210.0) - top).length() + (vec2(220.0, 216.0) - top).length()) * 1.02;
+        cable.len = len;
+        phys.add_cable(&blocks, &[], &mut cable);
+        let (y0_heavy, y0_light) = (blocks[0].pos.y, blocks[1].pos.y);
+        let (mut near_pulley, mut heavy_down, mut light_up) = (0, 0.0f32, 0.0f32);
+        for t in 0..100 {
+            phys.step(&world, &mut blocks);
+            phys.sync_cables(&blocks, &[], std::slice::from_mut(&mut cable));
+            stamp_blocks(&mut world, &blocks);
+            if t == 40 {
+                near_pulley = cable.pts.iter().filter(|p| (**p - centre).length() < r + 4.0).count();
+            }
+            heavy_down = heavy_down.max(blocks[0].pos.y - y0_heavy);
+            light_up = light_up.max(y0_light - blocks[1].pos.y);
+        }
+        eprintln!("ATWOOD heavy +{heavy_down:.0}, light -{light_up:.0}, beads on the pulley {near_pulley}, snapped {}", cable.snapped);
+        assert!(near_pulley >= 2, "the rope wraps the pulley, not through it: {near_pulley}");
+        assert!(heavy_down > 20.0, "the heavy block goes down");
+        assert!(light_up > 20.0, "the light block is pulled up by the rope over the pulley");
+        assert!((heavy_down - light_up).abs() < 25.0, "what one side loses the other gains: {heavy_down} vs {light_up}");
+        assert!(!cable.snapped);
+    }
+
+    #[test]
+    fn reeling_a_rope_in_lifts_what_hangs_from_it() {
+        let mut world = ground();
+        let mut blocks = vec![Block::new(BlockKind::Cube, vec2(300.0, 230.0), 0.0)];
+        let cube = blocks[0].uid;
+        let mut phys = Physics::build(&mut blocks);
+        let reel = vec2(300.0, 100.0);
+        phys.add_reel(7, reel);
+        let mut cable = Cable::new(Anchor::Reel { uid: 7, pos: reel }, Anchor::Block { uid: cube, local: vec2(0.0, -10.0) }, 100.0);
+        cable.len = 120.0;
+        phys.add_cable(&blocks, &[], &mut cable);
+        for _ in 0..200 {
+            phys.step(&world, &mut blocks);
+            phys.sync_cables(&blocks, &[], std::slice::from_mut(&mut cable));
+        }
+        let hanging = blocks[0].pos.y;
+        let mut len = 120.0;
+        for _ in 0..400 {
+            len = (len - 0.25f32).max(50.0);
+            phys.set_cable_length(&cable, len);
+            phys.step(&world, &mut blocks);
+            phys.sync_cables(&blocks, &[], std::slice::from_mut(&mut cable));
+            stamp_blocks(&mut world, &blocks);
+        }
+        assert!(blocks[0].pos.y < hanging - 40.0, "winding in 70 cells of rope lifts the cube: {hanging} -> {}", blocks[0].pos.y);
+        assert!(!cable.snapped);
+        // A loaded rope pulls on its reel.
+        cable.len = len;
+        let mut pull = 0.0f32;
+        for _ in 0..60 {
+            phys.step(&world, &mut blocks);
+            phys.sync_cables(&blocks, &[], std::slice::from_mut(&mut cable));
+            pull = pull.max(Physics::rope_tension(&cable, true));
+        }
+        assert!(pull > 0.0, "a loaded rope pulls on its reel: {pull}");
+    }
+
+    #[test]
+    fn a_pivoted_wheel_winds_a_rope_and_lifts_a_weight() {
+        let mut world = ground();
+        let mut blocks = vec![Block::new(BlockKind::Wheel, vec2(200.0, 120.0), 0.0), Block::new(BlockKind::Cube, vec2(188.0, 230.0), 0.0)];
+        let (wheel, cube) = (blocks[0].uid, blocks[1].uid);
+        // Rope from the left-hand rim of the drum straight down to the cube.
+        let mut cables = vec![Cable::new(Anchor::Block { uid: wheel, local: vec2(-12.0, 0.0) }, Anchor::Block { uid: cube, local: vec2(0.0, -10.0) }, 100.0)];
+        let mut phys = Physics::build(&mut blocks);
+        assert!(phys.add_pivot(&blocks, &[], wheel, &Anchor::Free(vec2(200.0, 120.0))));
+        phys.add_cable(&blocks, &[], &mut cables[0]);
+        let start = blocks[1].pos.y;
+        for _ in 0..1500 {
+            // Wind the drum slowly, as a geared motor would.
+            let w = phys.spin_of(&blocks[0]);
+            let b = blocks[0].clone();
+            phys.twist(&b, if w < 1.2 { 900.0 } else { 0.0 });
+            phys.step(&world, &mut blocks);
+            phys.sync_cables(&blocks, &[], &mut cables);
+            stamp_blocks(&mut world, &blocks);
+        }
+        eprintln!("WINCH wheel {:?} cube y {:.1} (started {start:.1}) snapped {}", blocks[0].pos, blocks[1].pos.y, cables[0].snapped);
+        assert!((blocks[0].pos - vec2(200.0, 120.0)).length() < 1.5, "the pivot keeps the wheel in place: {:?}", blocks[0].pos);
+        assert!(!cables[0].snapped, "the rope must hold");
+        assert!(blocks[1].pos.y < start - 40.0, "the winch should have lifted the cube: y = {}", blocks[1].pos.y);
+    }
+
+    #[test]
     fn cable_holds_a_hanging_block() {
         let mut world = ground();
         let mut blocks = vec![Block::new(BlockKind::Cube, vec2(200.0, 250.0), 0.0)];
@@ -2017,6 +2335,27 @@ mod tests {
         assert!(steel.0 < iron.0 && iron.0 < rope.0, "stiffer cables hold the cube higher: steel {} iron {} rope {}", steel.0, iron.0, rope.0);
         assert!(soft_iron.0 > iron.0 + 2.0, "a softer setting stretches more: {} vs {}", soft_iron.0, iron.0);
         assert!(!steel.1 && !iron.1, "steel and iron hold a cube");
+    }
+
+    #[test]
+    fn a_cable_may_hang_from_one_end_with_the_other_loose() {
+        let world = ground();
+        let mut blocks: Vec<Block> = vec![];
+        for loose_first in [false, true] {
+            let (a, b) = (Anchor::Ground(vec2(200.0, 80.0)), Anchor::Free(vec2(260.0, 80.0)));
+            let mut cable = if loose_first { Cable::new(b, a, 60.0) } else { Cable::new(a, b, 60.0) };
+            let mut phys = Physics::build(&mut blocks);
+            phys.add_cable(&blocks, &[], &mut cable);
+            assert!(cable.has_body(), "a half-loose cable should still be built");
+            for _ in 0..600 {
+                phys.step(&world, &mut blocks);
+                phys.sync_cables(&blocks, &[], std::slice::from_mut(&mut cable));
+            }
+            let tip = if loose_first { cable.pts[0] } else { *cable.pts.last().unwrap() };
+            assert!(tip.y > 80.0 + 40.0, "the loose end should hang down, tip at {tip:?}");
+            assert!((tip.x - 200.0).abs() < 25.0, "it hangs under its fixed end: {tip:?}");
+            assert!(!cable.snapped);
+        }
     }
 
     fn spring_with_cube(kind: SpringKind, rest: f32) -> (f32, bool) {

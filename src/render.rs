@@ -116,6 +116,12 @@ pub struct Renderer {
     gas_texture: Texture2D,
     gas_material: Material,
     /// What the textures currently show, so unchanged frames cost nothing.
+    /// Trees are a layer of their own so they can sway: (x, y, height above ground, colour).
+    veg_image: Image,
+    veg_texture: Texture2D,
+    veg_cells: Vec<(u16, u16, f32, [u8; 4])>,
+    rev_veg: u64,
+    veg_tick: i64,
     rev_world: u64,
     rev_gas: u64,
     last_thermal: bool,
@@ -149,44 +155,60 @@ impl Renderer {
             },
         )
         .expect("gas shader");
-        Renderer { image, texture, material, gas_image, gas_texture, gas_material, rev_world: 0, rev_gas: 0, last_thermal: false, has_gas: false }
+        let veg_image = Image::gen_image_color(W as u16, H as u16, Color::new(0.0, 0.0, 0.0, 0.0));
+        let veg_texture = Texture2D::from_image(&veg_image);
+        veg_texture.set_filter(FilterMode::Linear);
+        Renderer { veg_image, veg_texture, veg_cells: vec![], rev_veg: u64::MAX, veg_tick: -1, image, texture, material, gas_image, gas_texture, gas_material, rev_world: 0, rev_gas: 0, last_thermal: false, has_gas: false }
     }
 
     /// Fills the texture in parallel from a per-cell colour function.
     /// Returns how many pixels are not fully transparent.
     fn fill(image: &mut Image, color: impl Fn(usize, usize) -> [u8; 4] + Sync) -> usize {
         let px = image.get_image_data_mut();
-        let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).min(8);
-        let rows = H.div_ceil(threads);
-        let color = &color;
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = px
-                .chunks_mut(rows * W)
-                .enumerate()
-                .map(|(i, chunk)| {
-                    scope.spawn(move || {
-                        let mut visible = 0;
-                        for (j, out) in chunk.iter_mut().enumerate() {
-                            let idx = i * rows * W + j;
-                            *out = color(idx % W, idx / W);
-                            visible += (out[3] != 0) as usize;
-                        }
-                        visible
+        // The web build has no threads: fill the rows one after the other.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut visible = 0;
+            for (idx, out) in px.iter_mut().enumerate() {
+                *out = color(idx % W, idx / W);
+                visible += (out[3] != 0) as usize;
+            }
+            visible
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).min(8);
+            let rows = H.div_ceil(threads);
+            let color = &color;
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = px
+                    .chunks_mut(rows * W)
+                    .enumerate()
+                    .map(|(i, chunk)| {
+                        scope.spawn(move || {
+                            let mut visible = 0;
+                            for (j, out) in chunk.iter_mut().enumerate() {
+                                let idx = i * rows * W + j;
+                                *out = color(idx % W, idx / W);
+                                visible += (out[3] != 0) as usize;
+                            }
+                            visible
+                        })
                     })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
-        })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
+            })
+        }
     }
 
-    pub fn draw_world(&mut self, world: &World, v: View, thermal: bool) {
+    pub fn draw_world(&mut self, world: &World, v: View, thermal: bool, time: f32) {
         let size = DrawTextureParams { dest_size: Some(vec2(W as f32 * v.s, H as f32 * v.s)), ..Default::default() };
         // Only rebuild the picture when the world (or the view mode) actually changed.
         if self.rev_world != world.revision || self.last_thermal != thermal {
             if thermal {
                 Self::fill(&mut self.image, |x, y| world.thermal_color(x, y));
             } else {
-                Self::fill(&mut self.image, |x, y| world.color(x, y));
+                Self::fill(&mut self.image, |x, y| world.color_without_trees(x, y));
             }
             self.texture.update(&self.image);
             self.rev_world = world.revision;
@@ -196,10 +218,52 @@ impl Renderer {
             draw_texture_ex(&self.texture, v.ox, v.oy, WHITE, size);
             return;
         }
+        self.update_trees(world, time);
         self.material.set_uniform("texel", vec2(1.0 / W as f32, 1.0 / H as f32));
         gl_use_material(&self.material);
-        draw_texture_ex(&self.texture, v.ox, v.oy, WHITE, size);
+        draw_texture_ex(&self.texture, v.ox, v.oy, WHITE, size.clone());
+        draw_texture_ex(&self.veg_texture, v.ox, v.oy, WHITE, size);
         gl_use_default_material();
+    }
+
+    /// Trees lean with the wind and wave about, more the higher the leaf or branch is
+    /// above the ground. Purely visual: the cells themselves do not move.
+    fn update_trees(&mut self, world: &World, time: f32) {
+        if self.rev_veg != world.revision {
+            self.rev_veg = world.revision;
+            self.veg_cells.clear();
+            for y in 0..H {
+                for x in 0..W {
+                    if world.cell_mat(x, y).is_vegetation() {
+                        let mut h = 0usize;
+                        while h < 90 && y + h + 1 < H && {
+                            let m = world.cell_mat(x, y + h + 1);
+                            m.is_vegetation() || !m.is_hard()
+                        } {
+                            h += 1;
+                        }
+                        self.veg_cells.push((x as u16, y as u16, h as f32, world.color(x, y)));
+                    }
+                }
+            }
+            self.veg_tick = -1;
+        }
+        let tick = (time * 12.0) as i64;
+        if tick == self.veg_tick {
+            return;
+        }
+        self.veg_tick = tick;
+        let px = self.veg_image.get_image_data_mut();
+        px.fill([0; 4]);
+        let w = world.wind;
+        for &(x, y, h, col) in &self.veg_cells {
+            let hf = (h / 40.0).powf(1.4).min(2.5);
+            let wave = (time * 1.9 + x as f32 * 0.07 + h * 0.03).sin() + 0.5 * (time * 3.3 + y as f32 * 0.11).sin();
+            let dx = (w * 1.4 + wave * (0.35 + 0.9 * w.abs())) * hf;
+            let nx = (x as i32 + dx.round() as i32).clamp(0, W as i32 - 1) as usize;
+            px[y as usize * W + nx] = col;
+        }
+        self.veg_texture.update(&self.veg_image);
     }
 
     /// Clouds and steam as soft blobs, drawn over the landscape.

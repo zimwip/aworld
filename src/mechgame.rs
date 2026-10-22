@@ -1,0 +1,1296 @@
+//! The mechanism tab: placing gears, motors, axles, rails and connecting rods, running them
+//! in the simulation, and drawing them. The physics itself lives in `mech.rs`.
+
+use super::*;
+use crate::blocks::anchor_at;
+use crate::mech::{self, Axle, End, Event, Gear, GearSize, Motor, Pivot, Rod, Slider};
+
+/// A multi-click build in progress.
+#[derive(Clone, Copy)]
+pub enum MechDraft {
+    /// First gear of an axle.
+    Axle(u32),
+    /// A wheel picked as the end of a shaft, waiting for its gear.
+    AxleWheel(u32),
+    /// First end of a rail.
+    Rail(Anchor, Vec2),
+    /// The first end of a connecting rod (a pin on a gear, a carriage, or any fixed point).
+    Crank { first: End },
+}
+
+const IRON_OR_STEEL: &[Mat] = &[Mat::Iron, Mat::Steel];
+const RAIL_MIN: f32 = 24.0;
+const RAIL_MAX: f32 = 220.0;
+const AXLE_MAX: f32 = 400.0;
+/// Wheel torque (physics units) for one unit of mechanism torque, and what a gear can always hold.
+const WHEEL_TORQUE_PER_UNIT: f32 = 60.0;
+const WHEEL_HOLD: f32 = 120.0;
+
+fn gear_cost(size: GearSize) -> u32 {
+    (size.radius() * size.radius() * 0.18).ceil() as u32
+}
+
+fn teeth(size: GearSize) -> usize {
+    match size {
+        GearSize::Small => 8,
+        GearSize::Medium => 12,
+        GearSize::Large => 16,
+    }
+}
+
+fn gear_name(size: GearSize) -> &'static str {
+    match size {
+        GearSize::Small => "Petit engrenage",
+        GearSize::Medium => "Engrenage moyen",
+        GearSize::Large => "Grand engrenage",
+    }
+}
+
+fn point_to_segment(p: Vec2, a: Vec2, b: Vec2) -> (f32, f32) {
+    let ab = b - a;
+    let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+    ((p - (a + ab * t)).length(), t)
+}
+
+/// A shaft between `a` and `b` (screen pixels). Bright dashes run along it as it turns, so that a
+/// spinning shaft is visibly spinning (the dashes slide with `phase`, in radians).
+fn draw_shaft(a: Vec2, b: Vec2, phase: f32, thickness: f32) {
+    draw_line(a.x, a.y, b.x, b.y, thickness * 1.15, Color::from_rgba(120, 124, 140, 255));
+    draw_line(a.x, a.y, b.x, b.y, thickness * 0.45, Color::from_rgba(176, 180, 196, 255));
+    let d = b - a;
+    let len = d.length();
+    if len < 1.0 {
+        return;
+    }
+    let dir = d / len;
+    let side = vec2(-dir.y, dir.x);
+    let spacing = (thickness * 2.6).max(7.0);
+    let mut t = (phase * 2.2).rem_euclid(spacing);
+    while t < len {
+        let c = a + dir * t;
+        // Slanted ticks: a barber's pole running along the shaft.
+        let (p, q) = (c - side * thickness * 0.5 - dir * thickness * 0.3, c + side * thickness * 0.5 + dir * thickness * 0.3);
+        draw_line(p.x, p.y, q.x, q.y, (thickness * 0.35).max(1.2), Color::from_rgba(244, 246, 252, 235));
+        t += spacing;
+    }
+}
+
+/// A gear with teeth, drawn from its centre in screen pixels.
+pub fn draw_gear(c: Vec2, r: f32, angle: f32, size: GearSize, tint: Color) {
+    let n = teeth(size);
+    let root = r * 0.84;
+    let w = std::f32::consts::PI / n as f32;
+    let body = Color::new(0.38 * tint.r + 0.1, 0.42 * tint.g + 0.1, 0.55 * tint.b + 0.1, tint.a);
+    let edge = Color::new((body.r + 0.2).min(1.0), (body.g + 0.2).min(1.0), (body.b + 0.2).min(1.0), tint.a);
+    for k in 0..n {
+        let a = angle + k as f32 * 2.0 * w;
+        let pts = [(a - w, root), (a - w * 0.45, r), (a + w * 0.45, r), (a + w, root)];
+        let p: Vec<Vec2> = pts.iter().map(|(t, rad)| c + vec2(t.cos(), t.sin()) * *rad).collect();
+        draw_triangle(c, p[0], p[1], edge);
+        draw_triangle(c, p[1], p[2], edge);
+        draw_triangle(c, p[2], p[3], edge);
+    }
+    draw_circle(c.x, c.y, root, body);
+    // Three spokes and a hub, so a turning gear is visibly turning.
+    for k in 0..3 {
+        let a = angle + k as f32 * std::f32::consts::TAU / 3.0;
+        let tip = c + vec2(a.cos(), a.sin()) * root * 0.86;
+        draw_line(c.x, c.y, tip.x, tip.y, (r * 0.16).max(1.5), Color::new(0.1, 0.12, 0.18, 0.55 * tint.a));
+    }
+    draw_circle(c.x, c.y, r * 0.2, Color::new(0.14, 0.16, 0.22, tint.a));
+    draw_circle(c.x, c.y, r * 0.08, Color::new(0.8, 0.82, 0.9, tint.a));
+}
+
+impl Game {
+    fn mech_pay(&mut self, units: u32, near: Vec2) -> bool {
+        if self.free_now() {
+            return true;
+        }
+        self.census = self.world.census();
+        let have = self.stock(IRON_OR_STEEL);
+        if have < units {
+            self.say(format!("Pas assez de fer ou d'acier : il en faut {units}, il y en a {have}"));
+            return false;
+        }
+        self.world.consume(IRON_OR_STEEL, units, (near.x as i32, near.y as i32));
+        true
+    }
+
+    /// What the selected mechanism tool would cost right now (for the red "missing" marks).
+    pub fn mech_cost(&self, at: Vec2) -> Option<(&'static [Mat], u32)> {
+        let units = match self.tool {
+            Tool::Gear(s) => gear_cost(s),
+            Tool::Motor => gear_cost(GearSize::Small) + 12,
+            Tool::Axle => match self.mech_draft {
+                Some(MechDraft::Axle(g)) => self.mech.gear_index(g).map_or(6, |i| ((self.mech.gears[i].pos - at).length() * 0.12).ceil().max(4.0) as u32),
+                _ => 6,
+            },
+            Tool::Rail => match self.mech_draft {
+                Some(MechDraft::Rail(_, from)) => ((at - from).length().min(RAIL_MAX) * 0.2).ceil() as u32,
+                _ => 8,
+            },
+            Tool::Crank => 6,
+            Tool::Pivot => 4,
+            _ => return None,
+        };
+        Some((IRON_OR_STEEL, units))
+    }
+
+    /// Selects the motor under `at` for the remote control. Returns whether there was one.
+    pub fn select_motor_at(&mut self, at: Vec2) -> bool {
+        match self.gear_at(at) {
+            Some(i) if self.mech.gears[i].motor.is_some() => {
+                self.selected_motor = Some(self.mech.gears[i].uid);
+                self.views_pin = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn gear_at(&self, p: Vec2) -> Option<usize> {
+        self.mech
+            .gears
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| (g.pos - p).length() <= g.size.radius() + 1.5)
+            .min_by(|a, b| (a.1.pos - p).length().total_cmp(&(b.1.pos - p).length()))
+            .map(|(i, _)| i)
+    }
+
+    /// The rail under `p` and where along it (cells from its start).
+    fn rail_at(&self, p: Vec2) -> Option<(usize, f32)> {
+        self.mech
+            .sliders
+            .iter()
+            .enumerate()
+            .filter_map(|(i, sl)| {
+                let (d, t) = point_to_segment(p, sl.origin, sl.origin + sl.dir * sl.len);
+                (d < 9.0).then_some((i, d, t * sl.len))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _, s)| (i, s))
+    }
+
+    /// Where a gear of `size` would sit for a cursor at `at`. It helps the builder: it clips onto
+    /// the teeth of a neighbour at the exact centre distance (along a straight or diagonal line
+    /// when close to one), else onto the centre of a block, else lines up with another gear.
+    pub fn gear_spot(&self, size: GearSize, at: Vec2) -> Vec2 {
+        let r = size.radius();
+        let mut best: Option<(f32, Vec2)> = None;
+        for g in &self.mech.gears {
+            if g.stripped {
+                continue;
+            }
+            let want = g.size.radius() + r;
+            let d = (at - g.pos).length();
+            if (d - want).abs() < 7.0 && best.map_or(true, |b| (d - want).abs() < b.0) {
+                let dir = if d > 1e-3 { (at - g.pos) / d } else { vec2(1.0, 0.0) };
+                best = Some(((d - want).abs(), g.pos + snap_to_axes(dir, 7.0) * want));
+            }
+        }
+        if let Some((_, c)) = best {
+            return c;
+        }
+        // On the centre of a block (a hub on a brick).
+        if let Some(b) = self.blocks.iter().find(|b| (b.pos - at).length() < 5.0) {
+            return b.pos;
+        }
+        // Lined up with the centre of another gear.
+        let mut c = at;
+        for g in &self.mech.gears {
+            if (at.y - g.pos.y).abs() < 3.0 {
+                c.y = g.pos.y;
+            }
+            if (at.x - g.pos.x).abs() < 3.0 {
+                c.x = g.pos.x;
+            }
+        }
+        c
+    }
+
+    fn gear_spot_ok(&self, size: GearSize, c: Vec2) -> bool {
+        let r = size.radius();
+        self.mech.gears.iter().all(|g| (g.pos - c).length() >= g.size.radius() + r - 1.5)
+    }
+
+    fn support_for(&self, c: Vec2) -> Anchor {
+        match node_at(&self.world, &self.blocks, &self.members, c) {
+            Some(Anchor::Ground(_)) => Anchor::Ground(c),
+            Some(a @ (Anchor::Block { .. } | Anchor::End { .. } | Anchor::Along { .. })) => a,
+            _ => Anchor::Free(c),
+        }
+    }
+
+    fn place_gear(&mut self, size: GearSize, motor: bool, at: Vec2) {
+        let c = self.gear_spot(size, at);
+        if !self.gear_spot_ok(size, c) {
+            self.say("Les engrenages se chevauchent : écarte-les ou fais-les s'engrener");
+            return;
+        }
+        let units = if motor { gear_cost(size) + 12 } else { gear_cost(size) };
+        if !self.mech_pay(units, c) {
+            return;
+        }
+        self.checkpoint();
+        let mut g = Gear::new(mech::next_uid(), size, c);
+        g.mount = self.support_for(c);
+        if motor {
+            let mut m = Motor::new();
+            m.dir = self.motor_dir;
+            m.auto_reverse = self.motor_reverse;
+            g.motor = Some(m);
+        }
+        self.mech.gears.push(g);
+    }
+
+    fn wheel_at(&self, at: Vec2) -> Option<usize> {
+        block_at(&self.blocks, at).filter(|&i| self.blocks[i].kind == BlockKind::Wheel)
+    }
+
+    /// Shaft from a gear to a wheel: the gear then drives the wheel (a drive wheel, a drum).
+    fn link_wheel(&mut self, gear: u32, wheel: u32) {
+        let Some(gi) = self.mech.gear_index(gear) else { return };
+        let pos = self.mech.gears[gi].pos;
+        if !self.mech_pay(8, pos) {
+            return;
+        }
+        self.checkpoint();
+        for g in &mut self.mech.gears {
+            if g.wheel == Some(wheel) {
+                g.wheel = None;
+            }
+        }
+        self.mech.gears[gi].wheel = Some(wheel);
+        self.say("Arbre posé : l'engrenage entraîne la roue");
+    }
+
+    fn place_axle(&mut self, at: Vec2) {
+        let gear_hit = self.gear_at(at);
+        let wheel_hit = self.wheel_at(at);
+        match self.mech_draft.take() {
+            Some(MechDraft::Axle(first)) => {
+                if let Some(i) = gear_hit {
+                    let uid = self.mech.gears[i].uid;
+                    if first == uid {
+                        return;
+                    }
+                    if self.mech.axles.iter().any(|a| (a.a == first && a.b == uid) || (a.a == uid && a.b == first)) {
+                        self.say("Ces deux engrenages ont déjà un axe");
+                        return;
+                    }
+                    let (pa, pb) = (self.mech.gears[self.mech.gear_index(first).unwrap()].pos, self.mech.gears[i].pos);
+                    let d = (pa - pb).length();
+                    if d > AXLE_MAX {
+                        self.say("Axe trop long");
+                        self.mech_draft = Some(MechDraft::Axle(first));
+                        return;
+                    }
+                    if !self.mech_pay(((d * 0.12).ceil() as u32).max(4), pb) {
+                        self.mech_draft = Some(MechDraft::Axle(first));
+                        return;
+                    }
+                    self.checkpoint();
+                    self.mech.axles.push(Axle { uid: mech::next_uid(), a: first, b: uid });
+                } else if let Some(w) = wheel_hit {
+                    let wuid = self.blocks[w].uid;
+                    self.link_wheel(first, wuid);
+                } else {
+                    self.mech_draft = Some(MechDraft::Axle(first));
+                    self.say("Clique un engrenage ou une roue pour l'autre bout");
+                }
+            }
+            Some(MechDraft::AxleWheel(w)) => {
+                if let Some(i) = gear_hit {
+                    let guid = self.mech.gears[i].uid;
+                    self.link_wheel(guid, w);
+                } else {
+                    self.mech_draft = Some(MechDraft::AxleWheel(w));
+                    self.say("Clique l'engrenage qui entraîne cette roue");
+                }
+            }
+            _ => {
+                if let Some(i) = gear_hit {
+                    self.mech_draft = Some(MechDraft::Axle(self.mech.gears[i].uid));
+                } else if let Some(w) = wheel_hit {
+                    self.mech_draft = Some(MechDraft::AxleWheel(self.blocks[w].uid));
+                } else {
+                    self.say("Clique sur un engrenage (ou une roue) pour fixer un bout de l'axe");
+                }
+            }
+        }
+    }
+
+    /// Fixes a wheel on an axle (a pulley, a drum, a drive wheel), or takes the axle off again.
+    fn place_pivot(&mut self, at: Vec2) {
+        let Some(wi) = self.wheel_at(at) else {
+            self.say("Clique sur une roue pour la fixer sur un axe");
+            return;
+        };
+        let (uid, centre) = (self.blocks[wi].uid, self.blocks[wi].pos);
+        if let Some(i) = self.mech.pivots.iter().position(|p| p.wheel == uid) {
+            self.checkpoint();
+            self.mech.pivots.remove(i);
+            self.rebuild_physics_if_running();
+            self.say("Axe retiré : la roue est libre");
+            return;
+        }
+        if !self.mech_pay(4, centre) {
+            return;
+        }
+        self.checkpoint();
+        // What holds the axle: a block under the wheel's centre, else the ground, else the air.
+        let others: Vec<Block> = self.blocks.iter().filter(|b| b.uid != uid).cloned().collect();
+        let (support, name) = match block_at(&others, centre) {
+            Some(i) => (Anchor::Block { uid: others[i].uid, local: rot_vec(-others[i].angle, centre - others[i].pos) }, "un bloc"),
+            None => match anchor_at(&self.world, &[], centre) {
+                Some(Anchor::Ground(_)) => (Anchor::Ground(centre), "le sol"),
+                _ => (Anchor::Free(centre), "l'air"),
+            },
+        };
+        self.mech.pivots.push(Pivot { wheel: uid, support });
+        self.rebuild_physics_if_running();
+        self.say(format!("Roue fixée sur un axe, tenu par {name}"));
+    }
+
+    fn rebuild_physics_if_running(&mut self) {
+        if self.running {
+            self.phys = None;
+            self.build_physics();
+        }
+    }
+
+    /// Where the second end of a rail from `from` lands for a cursor at `at`: on a support if
+    /// there is one, otherwise in the air, straightened to horizontal, vertical or diagonal.
+    pub fn rail_end(&self, from: Vec2, at: Vec2) -> (Anchor, Vec2) {
+        let anchor = self.support_for(at);
+        if !matches!(anchor, Anchor::Free(_)) {
+            if let Some(p) = anchor_world(&anchor, &self.blocks, &self.members) {
+                return (anchor, p);
+            }
+        }
+        let d = at - from;
+        let len = d.length();
+        if len < 1.0 {
+            return (Anchor::Free(at), at);
+        }
+        let dir = snap_to_axes(d / len, 6.0);
+        let len = (len / 5.0).round().max(1.0) * 5.0;
+        let p = from + dir * len;
+        (Anchor::Free(p), p)
+    }
+
+    /// The attach point of a gear nearest to `p`, or `p` itself inside the disc.
+    fn pin_spot(&self, gi: usize, p: Vec2) -> Vec2 {
+        let g = &self.mech.gears[gi];
+        let local = rot_vec(-g.angle, p - g.pos);
+        let best = attach_points(g.size).into_iter().min_by(|a, b| (*a - local).length().total_cmp(&(*b - local).length())).unwrap_or(Vec2::ZERO);
+        if (best - local).length() <= 4.5 {
+            g.pos + rot_vec(g.angle, best)
+        } else {
+            p
+        }
+    }
+
+    fn place_rail(&mut self, at: Vec2) {
+        let anchor = self.support_for(at);
+        match self.mech_draft.take() {
+            Some(MechDraft::Rail(first, from)) => {
+                let (anchor, to) = self.rail_end(from, at);
+                let len = (to - from).length();
+                if len < RAIL_MIN {
+                    self.say("Le rail est trop court : éloigne le deuxième clic");
+                    self.mech_draft = Some(MechDraft::Rail(first, from));
+                    return;
+                }
+                let (anchor, to) = if len > RAIL_MAX {
+                    let to = from + (to - from) * (RAIL_MAX / len);
+                    (self.support_for(to), to)
+                } else {
+                    (anchor, to)
+                };
+                if !self.mech_pay(((to - from).length() * 0.2).ceil() as u32, to) {
+                    self.mech_draft = Some(MechDraft::Rail(first, from));
+                    return;
+                }
+                self.checkpoint();
+                let mut sl = Slider::new(mech::next_uid(), from, to);
+                sl.ends = (first, anchor);
+                self.mech.sliders.push(sl);
+            }
+            _ => {
+                let p = anchor_world(&anchor, &self.blocks, &self.members).unwrap_or(at);
+                self.mech_draft = Some(MechDraft::Rail(anchor, p));
+            }
+        }
+    }
+
+    /// Where a rod end clicked at `at` attaches: the pin of a gear (at the nearest attach point), the
+    /// carriage of a rail, or any other node (a block, a rod end, the ground, the world border).
+    fn resolve_end(&mut self, at: Vec2) -> Option<End> {
+        if let Some(i) = self.gear_at(at) {
+            let spot = self.pin_spot(i, at);
+            let g = &self.mech.gears[i];
+            return Some(End::Pin { gear: g.uid, pin: rot_vec(-g.angle, spot - g.pos) });
+        }
+        if let Some((si, s)) = self.rail_at(at) {
+            let uid = self.mech.sliders[si].uid;
+            // A carriage that nothing holds yet goes where the rod is clicked; otherwise it stays put.
+            if !self.mech.rods.iter().any(|r| r.on_carriage(uid)) {
+                let sl = &mut self.mech.sliders[si];
+                let (lo, hi) = (sl.margin, (sl.len - sl.margin).max(sl.margin));
+                sl.s = s.clamp(lo, hi);
+            }
+            return Some(End::Carriage(uid));
+        }
+        node_at(&self.world, &self.blocks, &self.members, at).map(End::Node)
+    }
+
+    pub fn rod_end_world(&self, e: &End) -> Option<Vec2> {
+        match e {
+            End::Node(a) => anchor_world(a, &self.blocks, &self.members),
+            other => self.mech.end_point(other),
+        }
+    }
+
+    fn place_crank(&mut self, at: Vec2) {
+        match self.mech_draft.take() {
+            Some(MechDraft::Crank { first }) => {
+                let Some(second) = self.resolve_end(at) else {
+                    self.say("Clique un engrenage, un rail, un bloc, une tige ou le sol pour l'autre bout");
+                    self.mech_draft = Some(MechDraft::Crank { first });
+                    return;
+                };
+                let same = match (first, second) {
+                    (End::Pin { gear: a, .. }, End::Pin { gear: b, .. }) => a == b,
+                    (End::Carriage(a), End::Carriage(b)) => a == b,
+                    (End::Node(_), End::Node(_)) => true,
+                    _ => false,
+                };
+                if same {
+                    self.say("Une bielle relie deux choses différentes (un bloc fixe n'en relie pas un autre)");
+                    self.mech_draft = Some(MechDraft::Crank { first });
+                    return;
+                }
+                let (Some(pa), Some(pb)) = (self.rod_end_world(&first), self.rod_end_world(&second)) else { return };
+                let len = (pa - pb).length();
+                if len < 6.0 {
+                    self.say("Bielle trop courte : éloigne les deux bouts");
+                    self.mech_draft = Some(MechDraft::Crank { first });
+                    return;
+                }
+                if !self.mech_pay(6 + (len * 0.1).ceil() as u32, pb) {
+                    self.mech_draft = Some(MechDraft::Crank { first });
+                    return;
+                }
+                self.checkpoint();
+                self.mech.rods.push(Rod::between(mech::next_uid(), first, second, len));
+                self.rebuild_physics_if_running();
+            }
+            _ => match self.resolve_end(at) {
+                Some(first) => self.mech_draft = Some(MechDraft::Crank { first }),
+                None => self.say("Clique d'abord un engrenage, un rail, un bloc ou le sol pour fixer un bout"),
+            },
+        }
+    }
+
+    pub fn mech_click(&mut self, at: Vec2) {
+        match self.tool {
+            Tool::Gear(s) => self.place_gear(s, false, at),
+            Tool::Motor => {
+                if !self.select_motor_at(at) {
+                    self.place_gear(GearSize::Small, true, at);
+                    // A motor just placed is the one the remote shows.
+                    if let Some(g) = self.mech.gears.last().filter(|g| g.motor.is_some()) {
+                        self.selected_motor = Some(g.uid);
+                        self.views_pin = true;
+                    }
+                }
+            }
+            Tool::Axle => self.place_axle(at),
+            Tool::Rail => self.place_rail(at),
+            Tool::Crank => self.place_crank(at),
+            Tool::Pivot => self.place_pivot(at),
+            _ => {}
+        }
+    }
+
+    /// Removes the mechanism piece under `at`, with what hangs on it. Returns whether there was one.
+    pub fn mech_erase(&mut self, at: Vec2) -> bool {
+        if let Some(i) = self.mech.rods.iter().position(|r| {
+            let (Some(a), Some(b)) = (self.rod_end_world(&r.a), self.rod_end_world(&r.b)) else { return false };
+            point_to_segment(at, a, b).0 < 3.0
+        }) {
+            self.checkpoint();
+            self.mech.rods.remove(i);
+            return true;
+        }
+        // The shaft from a gear to its wheel.
+        let shaft = self.mech.gears.iter().position(|g| {
+            g.wheel.and_then(|w| self.blocks.iter().find(|b| b.uid == w)).map_or(false, |b| point_to_segment(at, g.pos, b.pos).0 < 3.0 && (at - g.pos).length() > g.size.radius() + 1.5 && (at - b.pos).length() > 13.0)
+        });
+        if let Some(i) = shaft {
+            self.checkpoint();
+            self.mech.gears[i].wheel = None;
+            return true;
+        }
+        if let Some(i) = self.gear_at(at) {
+            self.checkpoint();
+            self.mech.gears.remove(i);
+            self.mech.prune();
+            return true;
+        }
+        if let Some((i, _)) = self.rail_at(at) {
+            self.checkpoint();
+            self.mech.sliders.remove(i);
+            self.mech.prune();
+            return true;
+        }
+        if let Some(i) = self.mech.axles.iter().position(|a| {
+            let (Some(x), Some(y)) = (self.mech.gear_index(a.a), self.mech.gear_index(a.b)) else { return false };
+            point_to_segment(at, self.mech.gears[x].pos, self.mech.gears[y].pos).0 < 3.0
+        }) {
+            self.checkpoint();
+            self.mech.axles.remove(i);
+            return true;
+        }
+        false
+    }
+
+    // ----- simulation -------------------------------------------------------
+
+    /// One step of the mechanisms: follow the supports, feel the world around each carriage,
+    /// turn, then push whatever is in the way.
+    pub fn mech_step(&mut self) {
+        if self.mech.gears.is_empty() && self.mech.sliders.is_empty() {
+            return;
+        }
+        let (blocks, members) = (&self.blocks, &self.members);
+        self.mech.follow_mounts(|a| anchor_world(a, blocks, members));
+        self.mech_prune_wheels();
+        self.mech_feel_world();
+        self.mech_drive_wheels();
+        let node_loads = self.mech_node_rods();
+        let mut events = self.mech.step();
+        for (r, f) in node_loads {
+            if let Some(e) = self.mech.load_rod(r, f) {
+                if let (Event::RodBroke(uid), Some(p)) = (e, self.phys.as_mut()) {
+                    p.remove_pin_rod(uid);
+                }
+                events.push(e);
+            }
+        }
+        for e in events {
+            match e {
+                Event::RodBroke(uid) => {
+                    let spot = self.mech.rods.iter().find(|r| r.uid == uid).and_then(|r| self.rod_end_world(&r.b));
+                    if let Some(p) = spot {
+                        self.booms.push(Boom { pos: p, t: 0.4, color: Color::new(0.9, 0.7, 0.4, 1.0) });
+                    }
+                    self.sounds.emit(Ev::Snap);
+                    self.say("Une bielle a cassé : trop d'effort");
+                }
+                Event::TeethStripped(uid) => {
+                    if let Some(g) = self.mech.gears.iter().find(|g| g.uid == uid) {
+                        self.booms.push(Boom { pos: g.pos, t: 0.4, color: Color::new(0.8, 0.8, 0.9, 1.0) });
+                    }
+                    self.sounds.emit(Ev::Crack);
+                    self.say("Les dents d'un engrenage ont lâché : trop de couple");
+                }
+                Event::Jammed(_) => self.say("Engrenages coincés : un nombre impair d'engrenages en cercle ne tourne pas"),
+                Event::Stalled(_) => {
+                    if self.toast.is_none() {
+                        self.say("Un coulisseau est en butée : le moteur force");
+                    }
+                }
+            }
+        }
+        self.mech_push_world();
+    }
+
+    /// Rods from a gear pin or a carriage to a block, a rod or the ground: the physics holds the far end
+    /// (a stiff spring), the mechanism feels the pull as a torque or a force. Returns each rod's load.
+    fn mech_node_rods(&mut self) -> Vec<(usize, f32)> {
+        let mut loads = vec![];
+        for ri in 0..self.mech.rods.len() {
+            let rod = self.mech.rods[ri].clone();
+            if rod.broken {
+                continue;
+            }
+            let (mech_end, node) = match (rod.a, rod.b) {
+                (e, End::Node(n)) if !matches!(e, End::Node(_)) => (e, n),
+                (End::Node(n), e) if !matches!(e, End::Node(_)) => (e, n),
+                _ => continue,
+            };
+            let (Some(p), Some(q)) = (self.mech.end_point(&mech_end), anchor_world(&node, &self.blocks, &self.members)) else { continue };
+            let Some(phys) = self.phys.as_mut() else { continue };
+            phys.move_pin(rod.uid, p);
+            let pull = blocks::Physics::rod_pull(p, q, rod.len);
+            match mech_end {
+                End::Pin { gear, .. } => {
+                    if let Some(gi) = self.mech.gear_index(gear) {
+                        let r = (p - self.mech.gears[gi].pos) / blocks::PX_PER_M;
+                        self.mech.gears[gi].ext_torque += (r.x * pull.y - r.y * pull.x) / WHEEL_TORQUE_PER_UNIT;
+                    }
+                }
+                End::Carriage(u) => {
+                    if let Some(si) = self.mech.slider_index(u) {
+                        let along = pull.dot(self.mech.sliders[si].dir);
+                        self.mech.sliders[si].ext_force += along / WHEEL_TORQUE_PER_UNIT;
+                    }
+                }
+                End::Node(_) => {}
+            }
+            loads.push((ri, pull.length() / WHEEL_TORQUE_PER_UNIT));
+        }
+        loads
+    }
+
+    /// Forgets axles and shafts of wheels that no longer exist.
+    pub fn mech_prune_wheels(&mut self) {
+        let live: Vec<u32> = self.blocks.iter().filter(|b| b.kind == BlockKind::Wheel).map(|b| b.uid).collect();
+        self.mech.pivots.retain(|p| live.contains(&p.wheel));
+        for g in &mut self.mech.gears {
+            if g.wheel.map_or(false, |w| !live.contains(&w)) {
+                g.wheel = None;
+                g.ext_torque = 0.0;
+            }
+        }
+    }
+
+    /// A gear on a shaft twists its wheel towards the gear's speed, with at most the torque the
+    /// motor gets to that shaft; the wheel pushes back on the gear with the same effort.
+    fn mech_drive_wheels(&mut self) {
+        for gi in 0..self.mech.gears.len() {
+            let Some(uid) = self.mech.gears[gi].wheel else {
+                self.mech.gears[gi].ext_torque = 0.0;
+                continue;
+            };
+            let (Some(p), Some(b)) = (self.phys.as_mut(), self.blocks.iter().find(|b| b.uid == uid)) else {
+                self.mech.gears[gi].ext_torque = 0.0;
+                continue;
+            };
+            let g = &mut self.mech.gears[gi];
+            let wheel_speed = p.spin_of(b) / 60.0;
+            let effort = ((g.omega - wheel_speed) * 20.0).clamp(-1.0, 1.0);
+            // The wheel can always be held by the gear (a brake), and driven up to what the motor gives.
+            let reach = (g.shaft_torque * WHEEL_TORQUE_PER_UNIT).max(WHEEL_HOLD);
+            p.twist(b, effort * reach);
+            g.ext_torque = -effort * reach / WHEEL_TORQUE_PER_UNIT;
+        }
+    }
+
+    /// Carriage footprint advanced by `ahead` cells along its rail: (cell, is_block_cell) pairs.
+    fn carriage_cells(sl: &Slider, ahead: f32) -> Vec<(i32, i32)> {
+        let centre = sl.origin + sl.dir * (sl.s + ahead);
+        let perp = vec2(-sl.dir.y, sl.dir.x);
+        let mut out = vec![];
+        let (hx, hy) = (sl.half.x, sl.half.y);
+        let mut u = -hx;
+        while u <= hx {
+            let mut v = -hy;
+            while v <= hy {
+                let p = centre + sl.dir * u + perp * v;
+                out.push((p.x.floor() as i32, p.y.floor() as i32));
+                v += 1.0;
+            }
+            u += 1.0;
+        }
+        out
+    }
+
+    /// Tells each slider what is in its way: solid rock stops it, loose matter and blocks resist.
+    fn mech_feel_world(&mut self) {
+        for i in 0..self.mech.sliders.len() {
+            let sl = self.mech.sliders[i].clone();
+            let step = sl.v.abs().max(0.5) + 1.0;
+            let (mut lo, mut hi) = (false, false);
+            let mut force = 0.0f32;
+            for (sign, dir_blocked) in [(1.0f32, &mut hi), (-1.0, &mut lo)] {
+                let mut loose = 0u32;
+                let mut blocks_hit: Vec<usize> = vec![];
+                for (x, y) in Self::carriage_cells(&sl, sign * step) {
+                    let m = self.world.raw(x, y);
+                    match self.world.block_at_cell(x, y) {
+                        Some(id) => {
+                            if !blocks_hit.contains(&id) {
+                                blocks_hit.push(id);
+                            }
+                            continue;
+                        }
+                        None => {}
+                    }
+                    if m.is_hard() && !matches!(m.kind(), world::Kind::Powder) {
+                        *dir_blocked = true;
+                    } else if matches!(m.kind(), world::Kind::Powder | world::Kind::Liquid) {
+                        loose += 1;
+                    }
+                }
+                // What it pushes against: a little per cell of sand or water, more per block.
+                let moving_this_way = sl.v * sign > -0.05;
+                if moving_this_way {
+                    force -= sign * (loose as f32 * 0.02).min(1.5);
+                    force -= sign * blocks_hit.len() as f32 * 0.8;
+                }
+                if moving_this_way {
+                    if let Some(p) = &mut self.phys {
+                        for id in blocks_hit {
+                            if let Some(b) = self.blocks.get(id) {
+                                p.knock(b, sl.point(), sl.dir * sign * (0.25 + sl.v.abs() * 0.3));
+                            }
+                        }
+                    }
+                }
+            }
+            let slider = &mut self.mech.sliders[i];
+            slider.blocked_lo = lo;
+            slider.blocked_hi = hi;
+            slider.ext_force = force;
+        }
+    }
+
+    /// The carriage shoves sand, water and gas out of the cells it now covers.
+    fn mech_push_world(&mut self) {
+        let mut moved = 0u32;
+        for i in 0..self.mech.sliders.len() {
+            let sl = &self.mech.sliders[i];
+            if sl.v.abs() < 0.05 {
+                continue;
+            }
+            let dir = if sl.v > 0.0 { sl.dir } else { -sl.dir };
+            let d = (dir.x.round() as i32, if dir.y.abs() > 0.4 { dir.y.signum() as i32 } else { 0 });
+            let d = if d == (0, 0) { (1, 0) } else { d };
+            for (x, y) in Self::carriage_cells(sl, 0.0) {
+                if self.world.shove((x, y), d) {
+                    moved += 1;
+                }
+            }
+        }
+        if moved > 3 {
+            self.sounds.emit(Ev::Spray);
+        }
+    }
+
+    // ----- panel ------------------------------------------------------------
+
+    pub fn panel_mech(&mut self, ui: &mut Ui, top: f32) {
+        struct T {
+            tool: Tool,
+            label: &'static str,
+            text: &'static str,
+        }
+        let tools = [
+            T { tool: Tool::Motor, label: "Moteur", text: "Un petit engrenage motorisé, vu de face. Clique pour le poser (sur un bloc, le sol, ou dans le vide). Clique un moteur posé pour l'ouvrir dans la télécommande (vitesse, couple, seuil de retournement)." },
+            T { tool: Tool::Gear(GearSize::Small), label: "Petit", text: "Petit engrenage (rayon 6). Posé près d'un autre, il s'engrène : les dents collent à la bonne distance." },
+            T { tool: Tool::Gear(GearSize::Medium), label: "Moyen", text: "Engrenage moyen (rayon 10). Deux engrenages qui s'engrènent tournent en sens inverse, plus vite pour le plus petit." },
+            T { tool: Tool::Gear(GearSize::Large), label: "Grand", text: "Grand engrenage (rayon 14) : lourd, il sert de volant d'inertie et passe les points morts." },
+            T { tool: Tool::Axle, label: "Axe", text: "Deux clics sur deux engrenages : l'axe les fait tourner ensemble, à la même vitesse, même s'ils sont loin l'un de l'autre." },
+            T { tool: Tool::Rail, label: "Coulisseau", text: "Deux clics : un rail (fixé au sol, à un bloc, ou dans le vide) avec un chariot qui glisse dessus. Il pousse le sable, l'eau et les blocs." },
+            T { tool: Tool::Pivot, label: "Pivot", text: "Clique une roue pour la fixer sur un axe (sur le bloc ou le sol dessous, sinon dans l'air) : elle tourne sur place, comme une poulie ou un tambour de treuil. Re-clique pour l'enlever. Avec l'outil Axe, un engrenage peut l'entraîner : enroule un câble accroché sur son bord et c'est un treuil." },
+            T { tool: Tool::Crank, label: "Bielle", text: "Un clic sur un engrenage pose le point d'accroche, un clic sur un rail y relie la bielle. Le chariot va et vient quand l'engrenage tourne." },
+        ];
+        let free = self.free_now();
+        for (i, t) in tools.iter().enumerate() {
+            let r = Self::tile_rect(i, 3, top, 54.0);
+            if ui.hover(r) {
+                let cost = self.mech_cost_hint(t.tool);
+                self.hover_info = Some((t.label.to_string(), format!("{} {cost}", t.text)));
+            }
+            let short = !free && matches!(t.tool, Tool::Gear(_) | Tool::Motor) && self.stock(IRON_OR_STEEL) < self.mech_cost_for(t.tool);
+            let tool = t.tool;
+            if ui.tile(r, t.label, self.tool == tool, |s| {
+                let c = vec2(s.x + s.w / 2.0, s.y + s.h / 2.0);
+                match tool {
+                    Tool::Motor => {
+                        draw_rectangle(c.x - 15.0, c.y - 11.0, 30.0, 22.0, Color::from_rgba(70, 74, 92, 255));
+                        draw_gear(c + vec2(4.0, 0.0), 9.0, 0.3, GearSize::Small, WHITE);
+                        draw_circle_lines(c.x + 4.0, c.y, 13.0, 1.5, ACCENT);
+                    }
+                    Tool::Gear(size) => {
+                        let rad = match size {
+                            GearSize::Small => 9.0,
+                            GearSize::Medium => 12.0,
+                            GearSize::Large => 15.0,
+                        };
+                        draw_gear(c, rad, 0.2, size, WHITE);
+                    }
+                    Tool::Axle => {
+                        draw_line(c.x - 16.0, c.y, c.x + 16.0, c.y, 4.0, Color::from_rgba(170, 172, 186, 255));
+                        draw_circle(c.x - 16.0, c.y, 5.0, Color::from_rgba(120, 130, 160, 255));
+                        draw_circle(c.x + 16.0, c.y, 5.0, Color::from_rgba(120, 130, 160, 255));
+                    }
+                    Tool::Rail => {
+                        draw_line(c.x - 18.0, c.y, c.x + 18.0, c.y, 5.0, Color::from_rgba(70, 74, 90, 255));
+                        draw_rectangle(c.x - 5.0, c.y - 6.0, 10.0, 12.0, Color::from_rgba(214, 160, 70, 255));
+                    }
+                    Tool::Pivot => {
+                        draw_circle(c.x, c.y, 11.0, Color::from_rgba(60, 62, 74, 255));
+                        draw_circle_lines(c.x, c.y, 11.0, 2.0, Color::from_rgba(150, 154, 170, 255));
+                        draw_circle(c.x, c.y, 4.0, Color::from_rgba(214, 218, 230, 255));
+                        draw_circle(c.x, c.y, 1.6, Color::from_rgba(40, 44, 58, 255));
+                    }
+                    _ => {
+                        draw_line(c.x - 16.0, c.y - 4.0, c.x + 14.0, c.y + 5.0, 3.0, Color::from_rgba(200, 170, 120, 255));
+                        draw_circle(c.x - 16.0, c.y - 4.0, 4.5, WHITE);
+                        draw_circle(c.x + 14.0, c.y + 5.0, 4.5, WHITE);
+                    }
+                }
+            }) {
+                self.tool = tool;
+            }
+            if short {
+                Self::mark_missing(r);
+            }
+        }
+        let rows = tools.len().div_ceil(3);
+        let y = top + rows as f32 * 60.0 + 4.0;
+        let w = PANEL_W - 12.0;
+        if ui.checkbox(Rect::new(6.0, y, w, 26.0), "Moteur : inverse si surcharge", self.motor_reverse, true) {
+            self.motor_reverse = !self.motor_reverse;
+        }
+        let label = if self.motor_dir > 0.0 { "Prochain moteur : horaire" } else { "Prochain moteur : antihoraire" };
+        if ui.button(Rect::new(6.0, y + 32.0, w, 26.0), label, Icon::Rotate, false, true, BLUE) {
+            self.motor_dir = -self.motor_dir;
+        }
+        ui.wrapped(
+            "Clic droit annule un tracé. Deux engrenages proches s'engrènent. Trop d'effort : la bielle casse, les dents lâchent ; un moteur cale en butée.",
+            10.0,
+            y + 84.0,
+            PANEL_W - 20.0,
+            12,
+            DIM,
+        );
+    }
+
+    fn mech_cost_for(&self, tool: Tool) -> u32 {
+        match tool {
+            Tool::Gear(s) => gear_cost(s),
+            Tool::Motor => gear_cost(GearSize::Small) + 12,
+            _ => 6,
+        }
+    }
+
+    fn mech_cost_hint(&self, tool: Tool) -> String {
+        let have = self.stock(IRON_OR_STEEL);
+        match tool {
+            Tool::Gear(_) | Tool::Motor => format!("Coût : {} de fer ou d'acier. En stock : {have}.", self.mech_cost_for(tool)),
+            Tool::Axle => format!("Coût : 0,12 par cellule de longueur. En stock : {have}."),
+            Tool::Rail => format!("Coût : 0,2 par cellule (max {RAIL_MAX:.0}). En stock : {have}."),
+            _ => format!("Coût : 6 + 0,1 par cellule. En stock : {have}."),
+        }
+    }
+
+    // ----- drawing ----------------------------------------------------------
+
+    pub fn draw_mech(&self, view: View, ui: &Ui, inside: bool) {
+        let stress_view = self.mode == ViewMode::Stress;
+        // Rails first, then axles, then gears on top, then rods and carriages.
+        for sl in &self.mech.sliders {
+            let (a, b) = (view.to_screen(sl.origin), view.to_screen(sl.origin + sl.dir * sl.len));
+            draw_line(a.x, a.y, b.x, b.y, 6.0 * view.s, Color::from_rgba(52, 56, 70, 255));
+            draw_line(a.x, a.y, b.x, b.y, 2.4 * view.s, Color::from_rgba(120, 126, 146, 255));
+            for p in [a, b] {
+                draw_circle(p.x, p.y, 4.0 * view.s, Color::from_rgba(200, 204, 216, 255));
+                draw_circle(p.x, p.y, 1.8 * view.s, Color::from_rgba(50, 54, 68, 255));
+            }
+        }
+        for ax in &self.mech.axles {
+            if let (Some(x), Some(y)) = (self.mech.gear_index(ax.a), self.mech.gear_index(ax.b)) {
+                let (a, b) = (view.to_screen(self.mech.gears[x].pos), view.to_screen(self.mech.gears[y].pos));
+                draw_shaft(a, b, self.mech.gears[x].angle, 3.6 * view.s);
+            }
+        }
+        for g in &self.mech.gears {
+            if let Some(b) = g.wheel.and_then(|w| self.blocks.iter().find(|b| b.uid == w)) {
+                let (a, c) = (view.to_screen(g.pos), view.to_screen(b.pos));
+                draw_shaft(a, c, g.angle, 3.6 * view.s);
+            }
+        }
+        for pv in &self.mech.pivots {
+            if let Some(b) = self.blocks.iter().find(|b| b.uid == pv.wheel) {
+                let c = view.to_screen(b.pos);
+                draw_circle(c.x, c.y, 4.2 * view.s, Color::from_rgba(40, 44, 58, 255));
+                draw_circle_lines(c.x, c.y, 4.2 * view.s, 1.6, Color::from_rgba(214, 218, 230, 255));
+                draw_circle(c.x, c.y, 1.6 * view.s, Color::from_rgba(214, 218, 230, 255));
+            }
+        }
+        for g in &self.mech.gears {
+            let c = view.to_screen(g.pos);
+            let r = g.size.radius() * view.s;
+            if let Some(m) = &g.motor {
+                // Face-on motor: a housing behind the gear and an arrow for the way it turns.
+                let half = r + 3.0 * view.s;
+                draw_rectangle(c.x - half, c.y - half, half * 2.0, half * 2.0, Color::from_rgba(58, 62, 78, 255));
+                draw_rectangle_lines(c.x - half, c.y - half, half * 2.0, half * 2.0, 2.0, Color::from_rgba(150, 156, 176, 255));
+                let a0 = if m.dir > 0.0 { -0.4 } else { std::f32::consts::PI + 0.4 };
+                let tip = c + vec2(a0.cos(), a0.sin()) * (r + 1.0 * view.s);
+                draw_circle(tip.x, tip.y, 2.4 * view.s, if m.auto_reverse { GREEN } else { ACCENT });
+            }
+            let tint = if g.jammed { Color::new(1.0, 0.4, 0.4, 1.0) } else { WHITE };
+            if g.stripped {
+                draw_circle(c.x, c.y, r * 0.86, Color::from_rgba(96, 100, 116, 255));
+                draw_circle_lines(c.x, c.y, r * 0.86, 2.0, Color::from_rgba(200, 80, 70, 255));
+                draw_circle(c.x, c.y, r * 0.18, Color::from_rgba(40, 44, 58, 255));
+            } else {
+                draw_gear(c, r, g.angle, g.size, tint);
+            }
+            if g.mount_is_free() {
+                draw_circle(c.x, c.y, 1.6 * view.s, Color::from_rgba(255, 200, 80, 255));
+            }
+        }
+        for r in &self.mech.rods {
+            let (Some(pa), Some(pb)) = (self.rod_end_world(&r.a), self.rod_end_world(&r.b)) else { continue };
+            let (pin, joint) = (view.to_screen(pa), view.to_screen(pb));
+            let load = (r.force / r.strength).clamp(0.0, 1.0);
+            let col = if r.broken {
+                Color::new(0.6, 0.3, 0.3, 0.5)
+            } else if stress_view {
+                Color::new(0.3 + 0.7 * load, 1.0 - 0.8 * load, 0.3, 1.0)
+            } else {
+                Color::from_rgba(212, 176, 120, 255)
+            };
+            if r.broken {
+                // A torn rod hangs from its first end.
+                let tip = pin + vec2(0.0, r.len * 0.6 * view.s);
+                draw_line(pin.x, pin.y, tip.x, tip.y, 2.4 * view.s, col);
+            } else {
+                draw_line(pin.x, pin.y, joint.x, joint.y, 3.0 * view.s, col);
+                draw_circle(joint.x, joint.y, 3.4 * view.s, WHITE);
+                draw_circle(joint.x, joint.y, 1.4 * view.s, Color::from_rgba(60, 64, 78, 255));
+            }
+            draw_circle(pin.x, pin.y, 3.4 * view.s, WHITE);
+            draw_circle(pin.x, pin.y, 1.4 * view.s, Color::from_rgba(60, 64, 78, 255));
+        }
+        for sl in &self.mech.sliders {
+            let c = view.to_screen(sl.point());
+            let angle = sl.dir.y.atan2(sl.dir.x);
+            draw_rectangle_ex(
+                c.x,
+                c.y,
+                sl.half.x * 2.0 * view.s,
+                sl.half.y * 2.0 * view.s,
+                DrawRectangleParams { offset: vec2(0.5, 0.5), rotation: angle, color: Color::from_rgba(214, 160, 70, 255) },
+            );
+            let edge = c + vec2(angle.cos(), angle.sin()) * sl.half.x * view.s;
+            draw_circle(edge.x, edge.y, 1.2 * view.s, Color::from_rgba(255, 230, 160, 255));
+        }
+
+        // The motor the remote control shows.
+        if let Some(g) = self.selected_motor.and_then(|u| self.mech.gears.iter().find(|g| g.uid == u)) {
+            let c = view.to_screen(g.pos);
+            let half = (g.size.radius() + 5.0) * view.s;
+            draw_rectangle_lines(c.x - half, c.y - half, half * 2.0, half * 2.0, 2.5, ACCENT);
+        }
+        if stress_view {
+            self.draw_mech_efforts(view, ui);
+        }
+
+        // What the cursor is about to build.
+        if !inside {
+            return;
+        }
+        let at = view.to_world(ui.mouse);
+        match self.tool {
+            Tool::Gear(size) => self.draw_gear_ghost(view, size, at),
+            Tool::Motor => self.draw_gear_ghost(view, GearSize::Small, at),
+            Tool::Axle => {
+                if let Some(MechDraft::Axle(g)) = self.mech_draft {
+                    if let Some(i) = self.mech.gear_index(g) {
+                        let a = view.to_screen(self.mech.gears[i].pos);
+                        let hot = self.gear_at(at).is_some();
+                        draw_line(a.x, a.y, ui.mouse.x, ui.mouse.y, 3.0, if hot { GREEN } else { Color::new(1.0, 1.0, 1.0, 0.5) });
+                    }
+                } else if let Some(i) = self.gear_at(at) {
+                    let c = view.to_screen(self.mech.gears[i].pos);
+                    draw_circle_lines(c.x, c.y, (self.mech.gears[i].size.radius() + 2.0) * view.s, 2.0, GREEN);
+                } else if let Some(w) = self.wheel_at(at) {
+                    let c = view.to_screen(self.blocks[w].pos);
+                    draw_circle_lines(c.x, c.y, 14.0 * view.s, 2.0, GREEN);
+                }
+            }
+            Tool::Rail => {
+                let (spot, snapped) = match self.mech_draft {
+                    Some(MechDraft::Rail(_, from)) => {
+                        let (a, p) = self.rail_end(from, at);
+                        (p, !matches!(a, Anchor::Free(_)) || (p - at).length() > 0.5)
+                    }
+                    _ => match self.snap_point(at) {
+                        Some(p) => (p, true),
+                        None => (at, false),
+                    },
+                };
+                let s = view.to_screen(spot);
+                if let Some(MechDraft::Rail(_, from)) = self.mech_draft {
+                    let a = view.to_screen(from);
+                    let len = (spot - from).length();
+                    let ok = (RAIL_MIN..=RAIL_MAX).contains(&len);
+                    draw_line(a.x, a.y, s.x, s.y, 5.0 * view.s, Color::new(0.5, 0.55, 0.7, 0.6));
+                    ui.text(&format!("{len:.0} / {RAIL_MAX:.0}"), s.x + 10.0, s.y - 8.0, 15, if ok { WHITE } else { RED });
+                }
+                draw_circle(s.x, s.y, 3.5 * view.s, if snapped { GREEN } else { WHITE });
+                draw_circle_lines(s.x, s.y, 6.0 * view.s, 2.0, if snapped { GREEN } else { ACCENT });
+            }
+            Tool::Pivot => {
+                if let Some(w) = self.wheel_at(at) {
+                    let b = &self.blocks[w];
+                    let c = view.to_screen(b.pos);
+                    draw_circle_lines(c.x, c.y, 14.0 * view.s, 2.0, GREEN);
+                    draw_circle(c.x, c.y, 3.0 * view.s, GREEN);
+                }
+            }
+            Tool::Crank => {
+                if let Some(MechDraft::Crank { first }) = self.mech_draft {
+                    if let Some(p) = self.rod_end_world(&first) {
+                        let a = view.to_screen(p);
+                        // Where the other end would attach: a gear's attach point, a carriage, or a node.
+                        let target = if let Some(i) = self.gear_at(at) {
+                            Some(self.pin_spot(i, at))
+                        } else if let Some((si, s)) = self.rail_at(at) {
+                            let sl = &self.mech.sliders[si];
+                            let held = self.mech.rods.iter().any(|r| r.on_carriage(sl.uid));
+                            Some(if held { sl.point() } else { sl.origin + sl.dir * s })
+                        } else {
+                            self.snap_point(at)
+                        };
+                        let end = target.map(|t| view.to_screen(t)).unwrap_or(ui.mouse);
+                        draw_line(a.x, a.y, end.x, end.y, 3.0 * view.s, if target.is_some() { GREEN } else { Color::new(1.0, 1.0, 1.0, 0.5) });
+                        draw_circle(a.x, a.y, 4.0 * view.s, WHITE);
+                        if target.is_some() {
+                            draw_circle_lines(end.x, end.y, 6.0 * view.s, 2.0, GREEN);
+                        }
+                    }
+                }
+                if let Some(i) = self.gear_at(at) {
+                    // The fixed attach points of the gear, the nearest one lit.
+                    let g = &self.mech.gears[i];
+                    let c = view.to_screen(g.pos);
+                    draw_circle_lines(c.x, c.y, (g.size.radius() + 2.0) * view.s, 2.0, GREEN);
+                    let spot = self.pin_spot(i, at);
+                    for local in attach_points(g.size) {
+                        let p = view.to_screen(g.pos + rot_vec(g.angle, local));
+                        draw_circle(p.x, p.y, 1.8 * view.s, Color::new(1.0, 1.0, 1.0, 0.75));
+                    }
+                    let p = view.to_screen(spot);
+                    draw_circle(p.x, p.y, 3.6 * view.s, GREEN);
+                    draw_circle_lines(p.x, p.y, 6.0 * view.s, 2.0, WHITE);
+                } else if self.mech_draft.is_none() {
+                    if let Some(p) = self.snap_point(at) {
+                        let s = view.to_screen(p);
+                        draw_circle(s.x, s.y, 3.5 * view.s, GREEN);
+                        draw_circle_lines(s.x, s.y, 6.0 * view.s, 2.0, WHITE);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The Efforts view for mechanisms: torque on every shaft, tooth load, force in the rods and on
+    /// the carriages, and how hard each motor is pushing.
+    fn draw_mech_efforts(&self, view: View, ui: &Ui) {
+        for g in &self.mech.gears {
+            let c = view.to_screen(g.pos);
+            let r = (g.size.radius() + 1.5) * view.s;
+            // A ring coloured by how close the teeth are to stripping.
+            let load = g.tooth_load.clamp(0.0, 1.0);
+            let (cr, cg, cb) = render::stress_rgb(load);
+            draw_circle_lines(c.x, c.y, r, 3.0, Color::new(cr, cg, cb, 0.95));
+            // An arc for the torque, turning the way the shaft turns.
+            if g.torque > 0.05 {
+                let sweep = (g.torque / 40.0).clamp(0.08, 1.0) * std::f32::consts::TAU * 0.5;
+                let dir = if g.omega >= 0.0 { 1.0 } else { -1.0 };
+                let start = -std::f32::consts::FRAC_PI_2;
+                let mut prev = c + vec2(start.cos(), start.sin()) * (r + 4.0 * view.s);
+                for k in 1..=16 {
+                    let a = start + dir * sweep * k as f32 / 16.0;
+                    let p = c + vec2(a.cos(), a.sin()) * (r + 4.0 * view.s);
+                    draw_line(prev.x, prev.y, p.x, p.y, 3.0, Color::new(1.0, 0.85, 0.3, 0.9));
+                    prev = p;
+                }
+                let tip = start + dir * sweep;
+                let (t0, t1) = (c + vec2(tip.cos(), tip.sin()) * (r + 4.0 * view.s), vec2(-tip.sin(), tip.cos()) * dir);
+                draw_triangle(t0 + t1 * 5.0, t0 - t1 * 1.0 + vec2(tip.cos(), tip.sin()) * 3.0, t0 - t1 * 1.0 - vec2(tip.cos(), tip.sin()) * 3.0, Color::new(1.0, 0.85, 0.3, 0.9));
+                ui.text(&format!("C {:.0}", g.torque), c.x - 12.0, c.y + r + 18.0 * view.s.max(0.8), 12, WHITE);
+            }
+            if g.motor.is_some() {
+                ui.text(&format!("{:.0} %", g.motor_load * 100.0), c.x - 12.0, c.y - r - 12.0 * view.s.max(0.8), 12, if g.motor_load > 0.8 { RED } else { WHITE });
+            }
+        }
+        for r in &self.mech.rods {
+            if r.broken {
+                continue;
+            }
+            let (Some(a), Some(b)) = (self.rod_end_world(&r.a), self.rod_end_world(&r.b)) else { continue };
+            if r.force > 0.05 {
+                let m = view.to_screen((a + b) * 0.5);
+                ui.text(&format!("F {:.1}", r.force), m.x + 6.0, m.y - 6.0, 12, WHITE);
+            }
+        }
+        for sl in &self.mech.sliders {
+            if sl.load < 0.02 {
+                continue;
+            }
+            // The force on the carriage as an arrow along the rail, and a pressure on its face.
+            let c = view.to_screen(sl.point());
+            let dir = if sl.v >= 0.0 { sl.dir } else { -sl.dir };
+            let len = (6.0 + sl.load * 14.0).min(60.0) * view.s;
+            let tip = c + dir * (sl.half.x * view.s + len);
+            let from = c + dir * sl.half.x * view.s;
+            draw_line(from.x, from.y, tip.x, tip.y, 3.0, Color::new(1.0, 0.5, 0.2, 0.95));
+            let side = vec2(-dir.y, dir.x);
+            draw_triangle(tip + dir * 6.0, tip + side * 4.0, tip - side * 4.0, Color::new(1.0, 0.5, 0.2, 0.95));
+            let pressure = sl.load / (sl.half.y * 2.0).max(1.0);
+            ui.text(&format!("F {:.1}  p {:.2}", sl.load, pressure), c.x - 14.0, c.y - sl.half.y * view.s - 8.0, 12, WHITE);
+        }
+    }
+
+    fn draw_gear_ghost(&self, view: View, size: GearSize, at: Vec2) {
+        let c = self.gear_spot(size, at);
+        let ok = self.gear_spot_ok(size, c);
+        let tint = if ok { Color::new(0.5, 1.0, 0.6, 0.55) } else { Color::new(1.0, 0.3, 0.3, 0.55) };
+        let s = view.to_screen(c);
+        // Guide lines to the gears this one is lined up with.
+        for g in &self.mech.gears {
+            let o = view.to_screen(g.pos);
+            if (g.pos.y - c.y).abs() < 0.01 || (g.pos.x - c.x).abs() < 0.01 {
+                draw_line(o.x, o.y, s.x, s.y, 1.2, Color::new(1.0, 0.85, 0.3, 0.7));
+            }
+        }
+        draw_gear(s, size.radius() * view.s, 0.0, size, tint);
+        if (c - at).length() > 0.5 {
+            draw_circle_lines(s.x, s.y, (size.radius() + 1.5) * view.s, 2.0, GREEN);
+            draw_circle(s.x, s.y, 2.5 * view.s, GREEN);
+        }
+    }
+}
+
+/// A unit direction pulled onto the nearest of the eight compass directions when within `tol` degrees.
+fn snap_to_axes(dir: Vec2, tol_deg: f32) -> Vec2 {
+    let a = dir.y.atan2(dir.x);
+    let step = std::f32::consts::FRAC_PI_4;
+    let k = (a / step).round();
+    if (a - k * step).abs() < tol_deg.to_radians() {
+        vec2((k * step).cos(), (k * step).sin())
+    } else {
+        dir
+    }
+}
+
+/// The fixed attach points of a gear (in its own frame): two rings of eight, plus the centre.
+fn attach_points(size: GearSize) -> Vec<Vec2> {
+    let r = size.radius();
+    let mut pts = vec![Vec2::ZERO];
+    for ring in [0.45, 0.8] {
+        for k in 0..8 {
+            let a = k as f32 * std::f32::consts::FRAC_PI_4;
+            pts.push(vec2(a.cos(), a.sin()) * r * ring);
+        }
+    }
+    pts
+}
+
+pub fn rot_vec(a: f32, v: Vec2) -> Vec2 {
+    let (s, c) = a.sin_cos();
+    vec2(v.x * c - v.y * s, v.x * s + v.y * c)
+}
+
+impl Gear {
+    fn mount_is_free(&self) -> bool {
+        matches!(self.mount, Anchor::Free(_))
+    }
+}
+
+#[cfg(test)]
+impl Game {
+    pub fn pin_spot_for_test(&self, gi: usize, p: Vec2) -> Vec2 {
+        self.pin_spot(gi, p)
+    }
+
+    /// Test helper: an axle between the first two gears.
+    pub fn axle_for_test(&mut self) {
+        if self.mech.gears.len() >= 2 {
+            let (a, b) = (self.mech.gears[0].uid, self.mech.gears[1].uid);
+            self.mech.axles.push(Axle { uid: mech::next_uid(), a, b });
+        }
+    }
+}
+
+// ----- the remote control of a motor -------------------------------------------------------
+
+/// Turns per minute for a speed in radians per step (60 steps a second).
+fn rpm(rad_per_step: f32) -> f32 {
+    rad_per_step * 60.0 * 60.0 / std::f32::consts::TAU
+}
+
+impl Game {
+    /// Where the remote control goes: just under the views palette, when a motor is selected.
+    pub fn remote_rect(&self, views: Rect) -> Option<Rect> {
+        let uid = self.selected_motor?;
+        self.mech.gear_index(uid).filter(|&i| self.mech.gears[i].motor.is_some())?;
+        Some(Rect::new(views.x, views.y + views.h + 8.0, views.w, 262.0))
+    }
+
+    pub fn draw_remote(&mut self, ui: &mut Ui, panel: Rect) {
+        let Some(gi) = self.selected_motor.and_then(|u| self.mech.gear_index(u)) else { return };
+        rrect(panel, 12.0, Color::new(0.09, 0.1, 0.17, 0.95));
+        ui.text("Télécommande", panel.x + 12.0, panel.y + 22.0, 16, ACCENT);
+        let x = panel.x + 10.0;
+        let w = panel.w - 20.0;
+        let mut y = panel.y + 34.0;
+
+        let g = &self.mech.gears[gi];
+        let Some(mut m) = g.motor else { return };
+        let (omega, load, shaft) = (g.omega, g.motor_load, g.shaft_torque);
+        let before = m;
+
+        let half = (w - 6.0) / 2.0;
+        if ui.button(Rect::new(x, y, half, 26.0), if m.on { "En marche" } else { "Arrêté" }, Icon::None, m.on, true, GREEN) {
+            m.on = !m.on;
+        }
+        if ui.button(Rect::new(x + half + 6.0, y, half, 26.0), if m.dir > 0.0 { "Horaire" } else { "Antihoraire" }, Icon::Rotate, false, true, BLUE) {
+            m.dir = -m.dir;
+        }
+        y += 38.0;
+
+        ui.text("Vitesse à vide", x, y + 9.0, 13, DIM);
+        ui.text(&format!("{:.0} tr/min", rpm(m.free_speed)), x + w - 62.0, y + 9.0, 13, TEXT);
+        y += 14.0;
+        ui.slider(Rect::new(x, y, w, 18.0), &mut m.free_speed, 0.02, 0.25, ACCENT);
+        y += 26.0;
+
+        ui.text("Couple", x, y + 9.0, 13, DIM);
+        ui.text(&format!("{:.0}", m.torque), x + w - 24.0, y + 9.0, 13, TEXT);
+        y += 14.0;
+        ui.slider(Rect::new(x, y, w, 18.0), &mut m.torque, 4.0, 40.0, ACCENT);
+        y += 26.0;
+
+        if ui.checkbox(Rect::new(x, y, w, 24.0), "Retour si surcharge", m.auto_reverse, true) {
+            m.auto_reverse = !m.auto_reverse;
+        }
+        y += 30.0;
+        ui.text("Seuil retour", x, y + 9.0, 13, if m.auto_reverse { DIM } else { Color::new(0.4, 0.42, 0.5, 1.0) });
+        ui.text(&format!("{:.0} %", m.reverse_at * 100.0), x + w - 36.0, y + 9.0, 13, TEXT);
+        y += 14.0;
+        ui.slider(Rect::new(x, y, w, 18.0), &mut m.reverse_at, 0.3, 1.2, if m.auto_reverse { ACCENT } else { DIM });
+        y += 28.0;
+
+        // What it is doing right now.
+        ui.text(&format!("Rotation : {:.0} tr/min", rpm(omega.abs())), x, y + 8.0, 13, TEXT);
+        y += 16.0;
+        let bar = Rect::new(x, y, w, 10.0);
+        rrect(bar, 5.0, Color::new(0.0, 0.0, 0.0, 0.4));
+        let fill = (load / 1.2).clamp(0.0, 1.0);
+        let over = load > m.reverse_at;
+        rrect(Rect::new(bar.x, bar.y, (bar.w * fill).max(if load > 0.0 { 5.0 } else { 0.0 }), bar.h), 5.0, if over { RED } else { GREEN });
+        // The turn-back threshold as a mark on the load bar.
+        let mark = bar.x + bar.w * (m.reverse_at / 1.2).clamp(0.0, 1.0);
+        draw_line(mark, bar.y - 3.0, mark, bar.y + bar.h + 3.0, 2.0, if m.auto_reverse { WHITE } else { DIM });
+        ui.text(&format!("Charge {:.0} %   couple {:.1}", load * 100.0, shaft), x, y + 24.0, 12, DIM);
+
+        if m != before {
+            if let Some(g) = self.mech.gears.get_mut(gi) {
+                g.motor = Some(m);
+            }
+        }
+    }
+}

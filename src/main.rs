@@ -1,9 +1,12 @@
 mod backdrop;
 mod blocks;
 mod car;
+mod mech;
+mod mechgame;
 mod render;
 mod save;
 mod science;
+mod sound;
 mod ui;
 mod world;
 
@@ -12,6 +15,9 @@ use car::{collide_cars, Car, Fate, ModelKind, Tuning};
 use macroquad::prelude::*;
 use render::{cable_preview, draw_block, draw_block_shape, draw_booms, draw_cable, draw_car, draw_flag, draw_member, draw_spring, draw_spring_between, Boom, Renderer, View};
 use science::{info, mat_color, RECIPES};
+use mech::{GearSize, Mechanism};
+use mechgame::MechDraft;
+use sound::{Ev, Mix, Sounds};
 use ui::{draw_icon, rrect, Icon, Ui, ACCENT, BG, BLUE, DIM, GREEN, PANEL, RED, TEXT};
 use world::{Biome, Cell, Mat, PaintRule, Season, World, H, W};
 
@@ -27,6 +33,7 @@ enum Tab {
     Blocks,
     Cars,
     Tools,
+    Mech,
     Planet,
 }
 
@@ -52,6 +59,14 @@ enum Tool {
     Cable(CableMat),
     Spring(SpringKind),
     Beam(MemberMat),
+    Gear(GearSize),
+    Motor,
+    Axle,
+    Rail,
+    Crank,
+    Pivot,
+    Winch,
+    Pulley,
     Eraser,
     Rotate,
     Hammer,
@@ -84,6 +99,7 @@ struct Snapshot {
     cables: Vec<Cable>,
     members: Vec<Member>,
     springs: Vec<Spring>,
+    mech: Mechanism,
     cars: Vec<Car>,
     arrived: u32,
     lost: u32,
@@ -98,6 +114,10 @@ struct SpringDraft {
 }
 
 struct Game {
+    science_fresh: bool,
+    sounds: Sounds,
+    /// Fire, lava and embers on screen (for the crackle), refreshed twice a second.
+    heat_cells: u32,
     undo: Vec<Snapshot>,
     world: World,
     snap_cells: Vec<Cell>,
@@ -105,12 +125,22 @@ struct Game {
     snap_cables: Vec<Cable>,
     snap_members: Vec<Member>,
     snap_springs: Vec<Spring>,
+    mech: Mechanism,
+    snap_mech: Mechanism,
+    mech_draft: Option<MechDraft>,
+    /// How the next motor turns, and whether it reverses itself when overloaded.
+    motor_dir: f32,
+    motor_reverse: bool,
+    /// The motor shown in the remote control under the views (a gear id).
+    selected_motor: Option<u32>,
     blocks: Vec<Block>,
     cables: Vec<Cable>,
     members: Vec<Member>,
     springs: Vec<Spring>,
     spring_draft: Option<SpringDraft>,
     cable_from: Option<Anchor>,
+    /// Pulleys the cable being drawn has been threaded over so far.
+    cable_via: Vec<u32>,
     /// Cable elasticity setting (1 = as the material is, higher = stretchier).
     cable_soft: f32,
     member_from: Option<(Anchor, Vec2)>,
@@ -165,12 +195,21 @@ impl Game {
         let mut world = World::new();
         let (entry, exit) = world.generate_biome(1, Biome::Countryside);
         Game {
+            science_fresh: false,
+            sounds: Sounds::silent(),
+            heat_cells: 0,
             undo: vec![],
             snap_cells: world.snapshot(),
             snap_blocks: vec![],
             snap_cables: vec![],
             snap_members: vec![],
             snap_springs: vec![],
+            mech: Mechanism::default(),
+            snap_mech: Mechanism::default(),
+            mech_draft: None,
+            motor_dir: 1.0,
+            motor_reverse: false,
+            selected_motor: None,
             world,
             blocks: vec![],
             cables: vec![],
@@ -178,6 +217,7 @@ impl Game {
             springs: vec![],
             spring_draft: None,
             cable_from: None,
+            cable_via: vec![],
             cable_soft: 1.0,
             member_from: None,
             phys: None,
@@ -230,6 +270,7 @@ impl Game {
             cables: self.cables.iter().map(Cable::fresh).collect(),
             members: self.members.iter().map(Member::fresh).collect(),
             springs: self.springs.iter().map(Spring::fresh).collect(),
+            mech: self.mech.clone(),
             cars: self.cars.clone(),
             arrived: self.arrived,
             lost: self.lost,
@@ -249,11 +290,14 @@ impl Game {
         self.cables = s.cables;
         self.members = s.members;
         self.springs = s.springs;
+        self.mech = s.mech;
+        self.mech_draft = None;
         self.spring_draft = None;
         self.cars = s.cars;
         self.arrived = s.arrived;
         self.lost = s.lost;
         self.cable_from = None;
+        self.cable_via.clear();
         self.booms.clear();
         self.phys = None;
         if self.running {
@@ -292,6 +336,23 @@ impl Game {
             *m = m.fresh();
         }
         p.build_members(&self.blocks, &mut self.members);
+        self.mech_prune_wheels();
+        for pv in &self.mech.pivots {
+            p.add_pivot(&self.blocks, &self.members, pv.wheel, &pv.support);
+        }
+        for rod in &self.mech.rods {
+            if rod.broken {
+                continue;
+            }
+            let (mech_end, node) = match (rod.a, rod.b) {
+                (e, mech::End::Node(n)) if !matches!(e, mech::End::Node(_)) => (e, n),
+                (mech::End::Node(n), e) if !matches!(e, mech::End::Node(_)) => (e, n),
+                _ => continue,
+            };
+            if let Some(pin) = self.mech.end_point(&mech_end) {
+                p.add_pin_rod(&self.blocks, &self.members, rod.uid, pin, &node, rod.len);
+            }
+        }
         for c in &mut self.cables {
             c.reset_runtime();
             p.add_cable(&self.blocks, &self.members, c);
@@ -310,6 +371,7 @@ impl Game {
             self.snap_cables = self.cables.iter().map(Cable::fresh).collect();
             self.snap_members = self.members.iter().map(Member::fresh).collect();
             self.snap_springs = self.springs.iter().map(Spring::fresh).collect();
+            self.snap_mech = self.mech.clone();
             if self.phys.is_none() {
                 self.build_physics();
             }
@@ -323,8 +385,11 @@ impl Game {
         self.cables = self.snap_cables.iter().map(Cable::fresh).collect();
         self.members = self.snap_members.iter().map(Member::fresh).collect();
         self.springs = self.snap_springs.iter().map(Spring::fresh).collect();
+        self.mech = self.snap_mech.clone();
+        self.mech_draft = None;
         self.spring_draft = None;
         self.cable_from = None;
+        self.cable_via.clear();
         self.member_from = None;
         self.phys = None;
         self.cars.clear();
@@ -338,8 +403,12 @@ impl Game {
         self.cables.clear();
         self.members.clear();
         self.springs.clear();
+        self.mech = Mechanism::default();
+        self.snap_mech = Mechanism::default();
+        self.mech_draft = None;
         self.spring_draft = None;
         self.cable_from = None;
+        self.cable_via.clear();
         self.member_from = None;
         self.phys = None;
         self.cars.clear();
@@ -390,7 +459,7 @@ impl Game {
     }
 
     fn save(&mut self) {
-        match save::save_slot(self.slot, &self.world, self.entry, self.exit, &self.blocks, &self.cables, &self.members, &self.springs) {
+        match save::save_slot(self.slot, &self.world, self.entry, self.exit, &self.blocks, &self.cables, &self.members, &self.springs, &self.mech) {
             Ok(()) => self.say(format!("Monde sauvegardé (emplacement {})", self.slot + 1)),
             Err(e) => self.say(format!("Échec de la sauvegarde : {e}")),
         }
@@ -411,6 +480,12 @@ impl Game {
                 self.cables = l.cables;
                 self.members = l.members;
                 self.springs = l.springs;
+                self.mech = l.mech;
+                {
+                    let (blocks, members) = (&self.blocks, &self.members);
+                    self.mech.follow_mounts(|a| anchor_world(a, blocks, members));
+                }
+                self.snap_mech = self.mech.clone();
                 self.snap_blocks = self.blocks.clone();
                 self.snap_cables = self.cables.iter().map(Cable::fresh).collect();
                 self.snap_members = self.members.iter().map(Member::fresh).collect();
@@ -578,11 +653,13 @@ impl Game {
             self.blocks.push(piece);
         }
         self.refresh_mask();
+        self.sounds.emit(Ev::Clink);
         self.booms.push(Boom { pos: b.pos, t: 0.6, color: Color::new(0.7, 0.9, 1.0, 1.0) });
     }
 
     fn break_block(&mut self, i: usize) {
         let pos = self.blocks[i].pos;
+        self.sounds.emit(Ev::Clink);
         self.crumble(i, Mat::Shard, true);
         self.booms.push(Boom { pos, t: 0.55, color: Color::new(0.7, 0.9, 1.0, 1.0) });
     }
@@ -596,15 +673,50 @@ impl Game {
     }
 
     fn cable_click(&mut self, mat: CableMat, at: Vec2) {
-        let Some(anchor) = node_at(&self.world, &self.blocks, &self.members, at) else {
-            self.say("Accroche le câble sur un bloc, une tige, le sol ou le bord du monde");
+        // A pulley on the way: the rope is threaded over it.
+        if let Some(pi) = self.pulley_at(at) {
+            if self.cable_from.is_none() {
+                self.say("Fixe d'abord un bout du câble, puis clique les poulies par où il passe");
+            } else {
+                let uid = self.mech.pulleys[pi].uid;
+                if self.cable_via.last() != Some(&uid) {
+                    self.cable_via.push(uid);
+                    self.say("Le câble passe sur la poulie : clique la suivante ou l'autre bout");
+                }
+            }
             return;
+        }
+        // A winch drum is a place to fix a rope: the winch then reels it in and out.
+        let reel = self.reel_at(at).map(|gi| Anchor::Reel { uid: self.mech.gears[gi].uid, pos: self.mech.gears[gi].pos });
+        let hit = reel.or_else(|| node_at(&self.world, &self.blocks, &self.members, at));
+        // The first end must be fixed; the second may be left loose, hanging in the air.
+        let loose = hit.is_none() && self.cable_from.is_some();
+        let Some(anchor) = hit.or(loose.then_some(Anchor::Free(at))) else {
+            self.say("Accroche le câble sur un bloc, une tige, le sol, un treuil ou le bord du monde");
+            return;
+        };
+        if loose {
+            self.say("Câble à bout libre : il pend de son autre extrémité");
+        }
+        // On a wheel the rope is fixed at the rim, so that turning the wheel winds it.
+        let anchor = match anchor {
+            Anchor::Block { uid, local } => match self.blocks.iter().find(|b| b.uid == uid) {
+                Some(b) if b.kind == BlockKind::Wheel => {
+                    let dir = if local.length() > 0.5 { local.normalize() } else { vec2(-1.0, 0.0) };
+                    Anchor::Block { uid, local: dir * (b.spec().w / 2.0) }
+                }
+                _ => anchor,
+            },
+            other => other,
         };
         match self.cable_from.take() {
             None => self.cable_from = Some(anchor),
             Some(first) => {
                 let (Some(a), Some(b)) = (anchor_world(&first, &self.blocks, &self.members), anchor_world(&anchor, &self.blocks, &self.members)) else { return };
-                let chord = (b - a).length();
+                // The length is that of the whole path, over any pulleys.
+                let via_pts = self.via_contacts(a, &self.cable_via.clone(), b);
+                let path: Vec<Vec2> = std::iter::once(a).chain(via_pts.iter().copied()).chain(std::iter::once(b)).collect();
+                let chord: f32 = path.windows(2).map(|w| (w[1] - w[0]).length()).sum();
                 if chord < 10.0 {
                     self.say("Tire le câble plus loin avant de l'accrocher");
                     self.cable_from = Some(first);
@@ -626,6 +738,8 @@ impl Game {
                     self.world.consume(mat.cost_from(), units, (a.x as i32, a.y as i32));
                 }
                 let mut c = Cable::new(first, anchor, chord).made_of(mat, self.cable_soft);
+                c.via = std::mem::take(&mut self.cable_via);
+                c.via_pts = via_pts;
                 if let Some(p) = &mut self.phys {
                     p.add_cable(&self.blocks, &self.members, &mut c);
                 }
@@ -755,6 +869,44 @@ impl Game {
 
     /// Where the far end of a beam started at `p0` would land for a cursor at `at`:
     /// on a nearby node if there is one, otherwise free, never longer than the maximum.
+    /// The exact point a click at `at` would attach to (block, rod, ground or world edge).
+    fn snap_point(&self, at: Vec2) -> Option<Vec2> {
+        let a = node_at(&self.world, &self.blocks, &self.members, at)?;
+        anchor_world(&a, &self.blocks, &self.members)
+    }
+
+    /// Shows where an end will be fixed: a dot on the anchor, a thread to it from the cursor,
+    /// and the world edge lit up when the cursor is close enough to stick to it.
+    fn draw_anchor_hint(&self, ui: &Ui, view: View, at: Vec2) {
+        let (w, h) = (W as f32, H as f32);
+        let near = blocks::BORDER_REACH;
+        let lit = Color::new(1.0, 0.85, 0.3, 0.8);
+        let edge = |a: Vec2, b: Vec2| {
+            let (sa, sb) = (view.to_screen(a), view.to_screen(b));
+            draw_line(sa.x, sa.y, sb.x, sb.y, 3.0, lit);
+        };
+        if at.x < near {
+            edge(vec2(0.0, 0.0), vec2(0.0, h));
+        }
+        if at.x > w - near {
+            edge(vec2(w, 0.0), vec2(w, h));
+        }
+        if at.y < near {
+            edge(vec2(0.0, 0.0), vec2(w, 0.0));
+        }
+        if at.y > h - near {
+            edge(vec2(0.0, h), vec2(w, h));
+        }
+        let Some(p) = self.snap_point(at) else { return };
+        let (c, s) = (ui.mouse, view.to_screen(p));
+        if (c - s).length() > 3.0 {
+            draw_line(c.x, c.y, s.x, s.y, 1.5, Color::new(1.0, 1.0, 1.0, 0.7));
+        }
+        draw_circle(s.x, s.y, 5.5, Color::new(0.0, 0.0, 0.0, 0.55));
+        draw_circle(s.x, s.y, 4.0, GREEN);
+        draw_circle_lines(s.x, s.y, 8.0, 2.0, WHITE);
+    }
+
     fn beam_end(&self, p0: Vec2, at: Vec2, start: &Anchor) -> (Anchor, Vec2) {
         if let Some(a) = node_at(&self.world, &self.blocks, &self.members, at) {
             if &a != start {
@@ -889,11 +1041,16 @@ impl Game {
     // ----- input ------------------------------------------------------------
 
     fn handle_keys(&mut self) {
+        if is_key_pressed(KeyCode::M) {
+            self.sounds.toggle_mute();
+            self.say(if self.sounds.muted { "Son coupé (M)" } else { "Son activé (M)" });
+        }
         if is_key_pressed(KeyCode::Escape) {
             if self.show_science {
                 self.show_science = false;
             } else {
                 self.cable_from = None;
+                self.cable_via.clear();
                 self.member_from = None;
                 self.spring_draft = None;
             }
@@ -959,7 +1116,8 @@ impl Game {
                 Tab::Matter => Tab::Blocks,
                 Tab::Blocks => Tab::Cars,
                 Tab::Cars => Tab::Tools,
-                Tab::Tools => Tab::Planet,
+                Tab::Tools => Tab::Mech,
+                Tab::Mech => Tab::Planet,
                 Tab::Planet => Tab::Matter,
             };
         }
@@ -1005,8 +1163,10 @@ impl Game {
         let click = is_mouse_button_pressed(MouseButton::Left);
         let rclick = is_mouse_button_pressed(MouseButton::Right);
 
-        if rclick && (self.cable_from.is_some() || self.member_from.is_some() || self.spring_draft.is_some()) {
+        if rclick && (self.cable_from.is_some() || self.member_from.is_some() || self.spring_draft.is_some() || self.mech_draft.is_some()) {
+            self.mech_draft = None;
             self.cable_from = None;
+            self.cable_via.clear();
             self.member_from = None;
             self.spring_draft = None;
             return;
@@ -1015,6 +1175,9 @@ impl Game {
             if click || rclick {
                 if let Some(i) = block_at(&self.blocks, at) {
                     self.remove_block(i);
+                    return;
+                }
+                if self.mech_erase(at) {
                     return;
                 }
                 if let Some(i) = self.members.iter().position(|m| m.distance_to(at) < m.mat.thickness() / 2.0 + 3.0) {
@@ -1058,6 +1221,7 @@ impl Game {
             Tool::Cable(m) if click => self.cable_click(m, at),
             Tool::Spring(k) if click => self.spring_click(k, at),
             Tool::Beam(m) if click => self.beam_click(m, at),
+            Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Winch | Tool::Pulley if click => self.mech_click(at),
             Tool::Hammer if click => self.hammer(at),
             Tool::Rotate if click => {
                 if let Some(i) = block_at(&self.blocks, at) {
@@ -1065,6 +1229,9 @@ impl Game {
                 }
             }
             Tool::Pick if click => {
+                if self.select_motor_at(at) {
+                    return;
+                }
                 self.selected_car = self.cars.iter().find(|c| (c.p - at).length() < c.kind.model().hull_half * car::S + 10.0).map(|c| c.id);
                 if let Some(id) = self.selected_car {
                     if let Some(c) = self.cars.iter().find(|c| c.id == id) {
@@ -1102,7 +1269,7 @@ impl Game {
             self.frame_ema = 0.016;
             self.say(format!("Vitesse réduite à x{} pour rester fluide", self.speed));
         }
-        let building = matches!(self.tool, Tool::Block(_) | Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(_));
+        let building = matches!(self.tool, Tool::Block(_) | Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(_) | Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Winch | Tool::Pulley);
         if (self.tab == Tab::Blocks || building) && (self.time * 4.0) as u32 != ((self.time - dt) * 4.0) as u32 {
             self.census = self.world.census();
         }
@@ -1121,16 +1288,37 @@ impl Game {
             self.toast = None;
         }
         if !self.running {
+            let (blocks, members) = (&self.blocks, &self.members);
+            self.mech.follow_mounts(|a| anchor_world(a, blocks, members));
+            self.sounds.update(dt, &Mix::default());
             return;
         }
         for _ in 0..self.speed {
             self.sim_step();
         }
+        if (self.time * 2.0) as u32 != ((self.time - dt) * 2.0) as u32 {
+            let n = self.world.census();
+            self.heat_cells = n[Mat::Fire as usize] + n[Mat::Lava as usize] / 3 + n[Mat::Ember as usize] / 2;
+        }
+        let rpm = self
+            .cars
+            .iter()
+            .filter(|c| c.fate == Fate::Driving)
+            .map(|c| 0.12 + 0.88 * (c.v.length() / c.kind.model().top_speed).min(1.0))
+            .fold(None, |a: Option<f32>, r| Some(a.map_or(r, |a| a.max(r))));
+        let mix = Mix {
+            wind: ((self.world.wind.abs() - 0.55) / 0.45).clamp(0.0, 1.0),
+            water: (self.world.take_water_flow() as f32 / (60.0 * self.speed as f32)).sqrt().min(1.0),
+            fire: (self.heat_cells as f32 / 150.0).sqrt().min(1.0),
+            rpm,
+        };
+        self.sounds.update(dt, &mix);
     }
 
     fn sim_step(&mut self) {
         self.world.step();
         let exit = self.exit;
+        let was_driving: Vec<bool> = self.cars.iter().map(|c| c.fate == Fate::Driving).collect();
         for c in &mut self.cars {
             c.step(&self.world, exit);
         }
@@ -1139,6 +1327,22 @@ impl Game {
             for j in i + 1..self.cars.len() {
                 let (left, right) = self.cars.split_at_mut(j);
                 collide_cars(&mut left[i], &mut right[0]);
+            }
+        }
+
+        let mut flung = false;
+        for c in &self.cars {
+            for &(pos, vel) in &c.sprays {
+                let to = pos + vel * 3.5;
+                flung |= self.world.fling((pos.x as i32, pos.y as i32), (to.x as i32, to.y as i32));
+            }
+        }
+        if flung {
+            self.sounds.emit(Ev::Spray);
+        }
+        for (c, was) in self.cars.iter().zip(was_driving) {
+            if was && c.fate == Fate::Exploded {
+                self.sounds.emit(Ev::Boom(8.0));
             }
         }
 
@@ -1180,12 +1384,17 @@ impl Game {
             }
             p.step(&self.world, &mut self.blocks);
             impacts = p.take_impacts();
+            for (_, hard) in p.take_bumps() {
+                self.sounds.emit(Ev::Thud(hard));
+            }
             let broken = p.update_members(&self.world, &mut self.members);
             p.sync_cables(&self.blocks, &self.members, &mut self.cables);
             for _gone in p.sync_springs(&self.blocks, &self.members, &mut self.springs) {
+                self.sounds.emit(Ev::Snap);
                 self.booms.push(Boom { pos: self.cars.first().map_or(vec2(0.0, 0.0), |c| c.p), t: 0.9, color: Color::new(1.0, 1.0, 1.0, 1.0) });
             }
             for (spot, uid) in broken {
+                self.sounds.emit(Ev::Crack);
                 self.booms.push(Boom { pos: spot, t: 0.5, color: Color::new(0.9, 0.7, 0.4, 1.0) });
                 self.beam_broke = true;
                 self.broken_members.push(uid);
@@ -1206,6 +1415,7 @@ impl Game {
             }
             self.fix_dangling_anchors();
         }
+        self.mech_step();
         stamp_all(&mut self.world, &self.blocks, &self.members);
 
         // Flames heat wooden blocks; water rusts metal ones.
@@ -1237,6 +1447,9 @@ impl Game {
             }
         }
         // Explosions shove blocks and wreck nearby cars.
+        for (_, _, hard) in std::mem::take(&mut self.world.thuds) {
+            self.sounds.emit(Ev::Thud(hard * 0.6));
+        }
         let blasts = std::mem::take(&mut self.world.blasts);
         for (x, y, r) in blasts {
             let c = vec2(x as f32, y as f32);
@@ -1257,6 +1470,7 @@ impl Game {
                     car.fate = Fate::Exploded;
                 }
             }
+            self.sounds.emit(Ev::Boom(r as f32));
             self.booms.push(Boom { pos: c, t: 0.0, color: Color::new(1.0, 0.5, 0.1, 1.0) });
             // The pressure wave rattles the whole picture.
             self.shake = self.shake.max((r as f32 * 0.75).min(18.0));
@@ -1320,7 +1534,7 @@ impl Game {
         if !thermal {
             backdrop::draw_sky(view, self.world.biome, phase, self.world.wind, self.time, self.world.season());
         }
-        renderer.draw_world(&self.world, view, thermal);
+        renderer.draw_world(&self.world, view, thermal, self.time);
         if !thermal {
             renderer.draw_gas(&self.world, view);
         }
@@ -1340,6 +1554,9 @@ impl Game {
             let st = if self.mode == ViewMode::Stress { Some(c.stress) } else { None };
             draw_cable(&pts, view, c.snapped, true, c.mat.color(), st);
         }
+        let over_ui_now = ui.mouse.x < PANEL_W || ui.mouse.y < TOP_H || self.views_hit.contains(ui.mouse);
+        let inside_now = !over_ui_now && view.rect().contains(ui.mouse) && !self.show_science;
+        self.draw_mech(view, ui, inside_now);
         if let Some(e) = self.entry {
             draw_flag(view, e, GREEN, false);
         }
@@ -1376,8 +1593,11 @@ impl Game {
         let inside = !over_ui && view.rect().contains(ui.mouse) && !self.show_science;
         if let Some(a) = &self.cable_from {
             if let Some(p) = anchor_world(a, &self.blocks, &self.members) {
-                let end = if inside { view.to_world(ui.mouse) } else { p };
-                let ok = inside && node_at(&self.world, &self.blocks, &self.members, end).is_some();
+                let cursor = if inside { view.to_world(ui.mouse) } else { p };
+                let snapped = if inside { self.snap_point(cursor) } else { None };
+                let end = snapped.unwrap_or(cursor);
+                // A loose second end is fine, so the preview is never "refused".
+                let ok = true;
                 let pts = cable_preview(p, end, (end - p).length());
                 let rgb = if let Tool::Cable(m) = self.tool { m.color() } else { (62, 66, 78) };
                 draw_cable(&pts, view, false, ok, rgb, None);
@@ -1420,6 +1640,9 @@ impl Game {
             let label = format!("{:.0} / {:.0}", len, MEMBER_MAX_LEN);
             ui.text(&label, (sa.x + sb.x) / 2.0 + 8.0, (sa.y + sb.y) / 2.0 - 8.0, 16, WHITE);
         }
+        if inside && matches!(self.tool, Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(_)) {
+            self.draw_anchor_hint(ui, view, view.to_world(ui.mouse));
+        }
         if inside {
             let at = view.to_world(ui.mouse);
             match self.tool {
@@ -1442,13 +1665,19 @@ impl Game {
                 }
                 Tool::Beam(_) => {
                     // Green: it will be pinned there. Orange: no attachment, the rod will fall.
-                    let pinned = node_at(&self.world, &self.blocks, &self.members, at).is_some();
-                    draw_circle_lines(ui.mouse.x, ui.mouse.y, 5.0 * view.s, 2.0, if pinned { GREEN } else { ACCENT });
+                    if self.snap_point(at).is_none() {
+                        draw_circle_lines(ui.mouse.x, ui.mouse.y, 5.0 * view.s, 2.0, ACCENT);
+                    }
                 }
                 Tool::Cable(_) => {
-                    let ok = node_at(&self.world, &self.blocks, &self.members, at).is_some();
-                    let col = if ok { GREEN } else { RED };
-                    draw_circle_lines(ui.mouse.x, ui.mouse.y, 5.0 * view.s, 2.0, col);
+                    if self.snap_point(at).is_none() {
+                        // Red: nothing to fix the first end to. Orange: the second end will hang loose.
+                        let col = if self.cable_from.is_some() { ACCENT } else { RED };
+                        draw_circle_lines(ui.mouse.x, ui.mouse.y, 5.0 * view.s, 2.0, col);
+                        if self.cable_from.is_some() {
+                            ui.text("bout libre", ui.mouse.x + 10.0, ui.mouse.y + 18.0, 13, ACCENT);
+                        }
+                    }
                 }
                 Tool::Hammer => draw_circle_lines(ui.mouse.x, ui.mouse.y, 3.5 * view.s, 1.5, ACCENT),
                 Tool::Loupe => self.draw_loupe(ui, view, at),
@@ -1697,6 +1926,7 @@ impl Game {
                 B::Science => {
                     if ui.button(r, "Science", Icon::Science, self.show_science, true, BLUE) {
                         self.show_science = !self.show_science;
+                        self.science_fresh = self.show_science;
                     }
                 }
                 B::Full => {
@@ -1715,7 +1945,7 @@ impl Game {
     }
 
     fn draw_panel(&mut self, ui: &mut Ui, sh: f32) {
-        let tabs = [(Tab::Matter, "Matières"), (Tab::Blocks, "Blocs"), (Tab::Cars, "Voitures"), (Tab::Tools, "Outils"), (Tab::Planet, "Monde")];
+        let tabs = [(Tab::Matter, "Matières"), (Tab::Blocks, "Blocs"), (Tab::Cars, "Voitures"), (Tab::Tools, "Outils"), (Tab::Mech, "Méca"), (Tab::Planet, "Monde")];
         let tw = (PANEL_W - 6.0 * 4.0) / 3.0;
         for (i, (tab, label)) in tabs.iter().enumerate() {
             let r = Rect::new(6.0 + (i % 3) as f32 * (tw + 6.0), TOP_H + 8.0 + (i / 3) as f32 * 38.0, tw, 32.0);
@@ -1729,6 +1959,7 @@ impl Game {
             Tab::Blocks => self.panel_blocks(ui, top),
             Tab::Cars => self.panel_cars(ui, top),
             Tab::Tools => self.panel_tools(ui, top),
+            Tab::Mech => self.panel_mech(ui, top),
             Tab::Planet => self.panel_planet(ui, top),
         }
         let _ = sh;
@@ -1815,6 +2046,7 @@ impl Game {
                 let len = self.member_from.as_ref().map_or(60.0, |f| drafted(f.1).min(MEMBER_MAX_LEN));
                 (m.cost_from(), m.cost(len))
             }
+            Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Winch | Tool::Pulley => self.mech_cost(at)?,
             _ => return None,
         };
         let have = self.stock(from);
@@ -2127,7 +2359,7 @@ impl Game {
     /// The palette of views on the right edge: it slides out when the mouse goes there.
     fn draw_views(&mut self, ui: &mut Ui, sw: f32, sh: f32) {
         let y = TOP_H + 60.0;
-        let h = 252.0;
+        let h = 274.0;
         let tab = Rect::new(sw - VIEWS_TAB, y, VIEWS_TAB, 96.0);
         let px = sw - VIEWS_TAB - VIEWS_W * self.views_open;
         let panel = Rect::new(px, y, VIEWS_W, h);
@@ -2138,7 +2370,15 @@ impl Game {
         if (self.views_open - target).abs() < 0.01 {
             self.views_open = target;
         }
-        self.views_hit = if self.views_open > 0.02 { tab.combine_with(panel) } else { tab };
+        let remote = self.remote_rect(panel);
+        self.views_hit = if self.views_open > 0.02 {
+            match remote {
+                Some(r) => tab.combine_with(panel).combine_with(r),
+                None => tab.combine_with(panel),
+            }
+        } else {
+            tab
+        };
 
         // The tab that stays visible.
         rrect(tab, 8.0, Color::new(0.1, 0.12, 0.2, 0.92));
@@ -2190,37 +2430,43 @@ impl Game {
                 }
                 ui.text("détendu", bar.x, bar.y + 25.0, 11, DIM);
                 ui.text("casse", bar.x + bar.w - 28.0, bar.y + 25.0, 11, DIM);
-                ui.wrapped("Lance la simulation : les pièces chargées virent au rouge.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
+                ui.wrapped("Rouge = chargé. Mécanique : anneau = dents, arc = couple, F = force, % = charge moteur.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
             }
             ViewMode::Wind => {
                 let w = &self.world;
                 ui.text(&format!("{:.0} km/h {}", w.wind.abs() * 40.0, if w.wind > 0.0 { "→" } else { "←" }), bar.x, bar.y + 4.0, 14, TEXT);
-                ui.wrapped("Plus fort en altitude : il pousse nuages, vapeur et pluie.", bar.x, bar.y + 22.0, bar.w, 11, DIM);
+                ui.wrapped("Couches de vent opposées et tourbillons : ils portent nuages, vapeur, fumée et pluie, et contournent le relief.", bar.x, bar.y + 22.0, bar.w, 11, DIM);
             }
             ViewMode::Normal => {
                 ui.wrapped("Touches : H température, X efforts, V vent.", bar.x, bar.y + 2.0, bar.w, 11, DIM);
             }
         }
+        if let Some(r) = remote {
+            self.draw_remote(ui, r);
+        }
         let _ = sh;
     }
 
-    /// Arrows showing the wind: longer and stronger higher in the sky.
+    /// Arrows showing the flow of the air, vortices and opposing layers included, where it blows.
     fn draw_wind_field(&self, view: View) {
-        let r = view.rect();
-        let w = self.world.wind;
-        let (cols, rows) = (24, 12);
-        for j in 0..rows {
-            let alt = 1.0 - (j as f32 + 0.5) / rows as f32;
-            let mag = w * (0.4 + alt);
-            for i in 0..cols {
-                let sway = ((self.time * 1.5 + i as f32 * 0.7 + j as f32).sin()) * 3.0;
-                let c = vec2(r.x + r.w * (i as f32 + 0.5) / cols as f32, r.y + r.h * (j as f32 + 0.5) / rows as f32 * 0.85 + sway);
-                let len = 6.0 + 38.0 * mag.abs();
-                let dir = if mag >= 0.0 { 1.0 } else { -1.0 };
-                let (a, b) = (c - vec2(len * dir * 0.5, 0.0), c + vec2(len * dir * 0.5, 0.0));
-                let col = Color::new(1.0, 1.0, 1.0, 0.25 + 0.55 * mag.abs().min(1.0));
-                draw_line(a.x, a.y, b.x, b.y, 2.0, col);
-                draw_triangle(b, b - vec2(6.0 * dir, 4.0), b - vec2(6.0 * dir, -4.0), col);
+        let flow = &self.world.flow;
+        let step = 3;
+        for j in (1..world::flow::FH).step_by(step) {
+            for i in (0..world::flow::FW).step_by(step) {
+                if flow.is_solid(i, j) {
+                    continue;
+                }
+                let (vx, vy) = flow.at_cell(i, j);
+                let speed = (vx * vx + vy * vy).sqrt();
+                let centre = vec2((i as f32 + 0.5) * world::flow::CELL as f32, (j as f32 + 0.5) * world::flow::CELL as f32);
+                let c = view.to_screen(centre);
+                let dir = if speed > 1e-4 { vec2(vx, vy) / speed } else { vec2(1.0, 0.0) };
+                let len = (4.0 + 20.0 * speed) * view.s.max(0.8) * 1.4;
+                let (a, b) = (c - dir * len * 0.5, c + dir * len * 0.5);
+                let col = Color::new(1.0, 1.0, 1.0, (0.2 + 0.6 * (speed / 0.8)).min(0.85));
+                draw_line(a.x, a.y, b.x, b.y, 1.8, col);
+                let side = vec2(-dir.y, dir.x);
+                draw_triangle(b, b - dir * 6.0 + side * 3.6, b - dir * 6.0 - side * 3.6, col);
             }
         }
     }
@@ -2278,6 +2524,10 @@ impl Game {
                 swatch(*m, &mut cx);
             }
             ui.wrapped(rec.text, x, y + sq + 32.0, col_w - 30.0, 14, TEXT);
+        }
+        // A click outside closes it, but not the very click that opened it.
+        if std::mem::take(&mut self.science_fresh) {
+            return;
         }
         if ui.pressed && !area.contains(ui.mouse) {
             self.show_science = false;
@@ -2353,6 +2603,25 @@ fn demo_scene(g: &mut Game, biome: Biome) {
     g.launch_car();
 }
 
+/// A little mechanism for `--demo --mech`: a motor driving a gear train, a crank, a rail and an axle.
+fn demo_mech(g: &mut Game) {
+    let gx = 450.0;
+    let gy = ground_y(&g.world, 450) as f32;
+    let mut click = |g: &mut Game, tool: Tool, x: f32, y: f32| {
+        g.tool = tool;
+        g.mech_click(vec2(x, y));
+    };
+    click(g, Tool::Motor, gx - 60.0, gy - 12.0);
+    click(g, Tool::Gear(GearSize::Large), gx - 40.0, gy - 12.0 - 8.0 * 0.0);
+    click(g, Tool::Gear(GearSize::Medium), gx - 40.0 + 24.0, gy - 12.0 - 2.0);
+    click(g, Tool::Rail, gx - 20.0, gy - 70.0);
+    click(g, Tool::Rail, gx + 100.0, gy - 70.0);
+    click(g, Tool::Crank, gx - 40.0 + 24.0 + 8.0, gy - 14.0);
+    click(g, Tool::Crank, gx + 40.0, gy - 70.0);
+    g.mech_draft = None;
+    g.tool = Tool::Gear(GearSize::Medium);
+}
+
 #[macroquad::main(window_conf)]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -2363,6 +2632,10 @@ async fn main() {
     let mut ui = Ui { font, mouse: Vec2::ZERO, pressed: false };
     let mut renderer = Renderer::new();
     let mut game = Game::new();
+    #[cfg(feature = "sound")]
+    if shot.is_none() && !args.iter().any(|a| a == "--mute") {
+        game.sounds = Sounds::load().await;
+    }
     if shot.is_some() {
         let biome = match arg("--biome").as_deref() {
             Some("mer") => Biome::Sea,
@@ -2374,6 +2647,7 @@ async fn main() {
             Some("matter") => Tab::Matter,
             Some("cars") => Tab::Cars,
             Some("tools") => Tab::Tools,
+            Some("mech") => Tab::Mech,
             Some("planet") => Tab::Planet,
             _ => Tab::Blocks,
         };
@@ -2397,6 +2671,17 @@ async fn main() {
         if args.iter().any(|a| a == "--palette") {
             game.views_open = 1.0;
             game.views_pin = true;
+        }
+        if args.iter().any(|a| a == "--mech") {
+            let was = game.unlimited_sim;
+            game.unlimited_sim = true;
+            demo_mech(&mut game);
+            game.unlimited_sim = was;
+            if args.iter().any(|a| a == "--remote") {
+                game.selected_motor = game.mech.gears.iter().find(|g| g.motor.is_some()).map(|g| g.uid);
+                game.views_open = 1.0;
+                game.views_pin = true;
+            }
         }
         game.show_science = args.iter().any(|a| a == "--science");
         game.tool = if args.iter().any(|a| a == "--loupe") { Tool::Loupe } else { Tool::Block(BlockKind::Brick) };
@@ -2439,6 +2724,264 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A flat stone floor at y = 300 under a clear sky, free building, nothing else.
+    fn mech_game() -> Game {
+        let mut g = Game::new();
+        g.world = World::new_static();
+        g.empty_world();
+        for x in 0..W as i32 {
+            for y in 300..320 {
+                g.world.set(x, y, Mat::Stone);
+            }
+        }
+        g.unlimited = true;
+        g
+    }
+
+    fn click_with(g: &mut Game, tool: Tool, x: f32, y: f32) {
+        g.tool = tool;
+        g.mech_click(vec2(x, y));
+    }
+
+    /// Motor + large gear meshing + a rail with a carriage joined by a rod.
+    fn build_crank_slider(g: &mut Game) {
+        build_crank_slider_with_pin(g, 324.0);
+    }
+
+    /// `pin_x` 324 puts the pin on the side nearest the rail (the carriage starts at the far end
+    /// of its stroke), 308 on the far side (it starts at the near end and travels towards the rail).
+    fn build_crank_slider_with_pin(g: &mut Game, pin_x: f32) {
+        click_with(g, Tool::Motor, 300.0, 280.0);
+        click_with(g, Tool::Gear(GearSize::Medium), 316.0, 280.0); // 6 + 10: meshes
+        click_with(g, Tool::Rail, 330.0, 250.0);
+        click_with(g, Tool::Rail, 430.0, 250.0);
+        // Pin near the rim of the medium gear, then the rail.
+        click_with(g, Tool::Crank, pin_x, 280.0);
+        click_with(g, Tool::Crank, 380.0, 250.0);
+    }
+
+    #[test]
+    fn mechanism_tools_build_a_working_crank_slider() {
+        let mut g = mech_game();
+        build_crank_slider(&mut g);
+        assert_eq!(g.mech.gears.len(), 2, "motor + gear");
+        assert!(g.mech.gears[0].motor.is_some());
+        assert_eq!(g.mech.sliders.len(), 1);
+        assert_eq!(g.mech.rods.len(), 1, "the rod should have been attached");
+        // Placing a gear on top of another is refused.
+        click_with(&mut g, Tool::Gear(GearSize::Large), 305.0, 282.0);
+        assert_eq!(g.mech.gears.len(), 2);
+        g.set_running(true);
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for _ in 0..900 {
+            g.sim_step();
+            let s = g.mech.sliders[0].s;
+            lo = lo.min(s);
+            hi = hi.max(s);
+        }
+        assert!(hi - lo > 10.0, "the carriage should shuttle: {lo}..{hi}");
+        assert!(g.mech.gears[1].omega.abs() > 0.0, "the driven gear turns");
+        let ratio = g.mech.gears[1].omega / g.mech.gears[0].omega;
+        assert!((ratio + 0.6).abs() < 1e-3, "6/10 reduction, opposite sense: {ratio}");
+    }
+
+    #[test]
+    fn mechanisms_undo_reset_and_erase() {
+        let mut g = mech_game();
+        click_with(&mut g, Tool::Gear(GearSize::Small), 200.0, 280.0);
+        click_with(&mut g, Tool::Gear(GearSize::Small), 400.0, 280.0);
+        assert_eq!(g.mech.gears.len(), 2);
+        g.undo();
+        assert_eq!(g.mech.gears.len(), 1, "undo removes the last piece");
+        assert!(g.mech_erase(vec2(200.0, 280.0)));
+        assert!(g.mech.gears.is_empty());
+        // Running changes angles; going back restores the drawing board.
+        click_with(&mut g, Tool::Motor, 300.0, 280.0);
+        g.set_running(true);
+        for _ in 0..100 {
+            g.sim_step();
+        }
+        assert!(g.mech.gears[0].angle.abs() > 0.1);
+        g.reset();
+        assert_eq!(g.mech.gears[0].angle, 0.0);
+    }
+
+    #[test]
+    fn a_carriage_shoves_sand_out_of_its_way() {
+        let mut g = mech_game();
+        // The carriage shuttles about x 372..388 on a rail along y = 250, with sand in its way
+        // and a shelf under the sand so that it stays at the carriage's height.
+        for y in 244..258 {
+            for x in 387..392 {
+                g.world.set(x, y, Mat::Sand);
+            }
+        }
+        for x in 355..420 {
+            for y in 258..262 {
+                g.world.set(x, y, Mat::Stone);
+            }
+        }
+        build_crank_slider_with_pin(&mut g, 308.0);
+        g.mech.rods[0].strength = 1e6; // this test is about the sand, not the rod
+        g.set_running(true);
+        let sand_before = g.world.census()[Mat::Sand as usize];
+        for _ in 0..900 {
+            g.sim_step();
+        }
+        assert!(g.world.census()[Mat::Sand as usize] >= sand_before - 2, "the sand is pushed, not destroyed");
+        let moved = (244..258).flat_map(|y| (360..420).map(move |x| (x, y))).filter(|&(x, y)| g.world.raw(x, y) == Mat::Sand && !(387..392).contains(&x)).count();
+        assert!(moved > 0, "some sand should have been shoved aside");
+    }
+
+    #[test]
+    fn a_carriage_cannot_go_through_rock() {
+        let mut g = mech_game();
+        // The carriage would travel from x 380 up to about 396; the rock wall is in the way.
+        for y in 220..270 {
+            g.world.set(392, y, Mat::Stone);
+        }
+        build_crank_slider_with_pin(&mut g, 308.0);
+        g.set_running(true);
+        let mut right_edge = f32::MIN;
+        for _ in 0..1500 {
+            g.sim_step();
+            let sl = &g.mech.sliders[0];
+            right_edge = right_edge.max(sl.point().x + sl.half.x);
+        }
+        assert!(right_edge < 392.5, "the carriage must stop at the rock: right edge {right_edge}");
+    }
+
+    #[test]
+    fn the_editor_helps_to_stick_mechanism_pieces_in_the_right_place() {
+        let mut g = mech_game();
+        click_with(&mut g, Tool::Gear(GearSize::Medium), 300.0, 280.0);
+        // A small gear dropped roughly beside it clips to the exact centre distance (10 + 6)...
+        let c = g.gear_spot(GearSize::Small, vec2(318.5, 281.0));
+        assert!(((c - vec2(300.0, 280.0)).length() - 16.0).abs() < 1e-3, "mesh distance: {c:?}");
+        // ...and a nearly horizontal approach is straightened out.
+        assert!((c.y - 280.0).abs() < 1e-3, "straightened: {c:?}");
+        // Far from any gear, it only lines up with another gear's centre line.
+        let c = g.gear_spot(GearSize::Small, vec2(400.0, 281.5));
+        assert_eq!(c, vec2(400.0, 280.0));
+        // Rails straighten out in the air.
+        let (a, p) = g.rail_end(vec2(100.0, 100.0), vec2(187.0, 103.0));
+        assert!(matches!(a, Anchor::Free(_)));
+        assert!((p.y - 100.0).abs() < 1e-3 && (p.x - 185.0).abs() < 1e-3, "{p:?}");
+        // The pin of a crank jumps to the nearest attach point of the gear.
+        let gi = 0;
+        let spot = g.pin_spot_for_test(gi, vec2(300.0 + 8.2, 280.0 + 0.7));
+        assert!(((spot - vec2(308.0, 280.0)).length()) < 0.6, "attach point: {spot:?}");
+    }
+
+    #[test]
+    fn a_motor_a_shaft_and_a_pivoted_wheel_make_a_winch() {
+        let mut g = mech_game();
+        // A drum high up on a pivot in the air, a cube hanging from a rope fixed on its rim.
+        g.blocks.push(Block::new(BlockKind::Wheel, vec2(300.0, 150.0), 0.0));
+        g.blocks.push(Block::new(BlockKind::Cube, vec2(288.0, 260.0), 0.0));
+        g.refresh_mask();
+        click_with(&mut g, Tool::Pivot, 300.0, 150.0);
+        assert_eq!(g.mech.pivots.len(), 1);
+        click_with(&mut g, Tool::Motor, 360.0, 150.0);
+        click_with(&mut g, Tool::Axle, 360.0, 150.0);
+        click_with(&mut g, Tool::Axle, 300.0, 150.0);
+        assert!(g.mech.gears[0].wheel.is_some(), "the shaft links the motor to the drum");
+        g.cable_click(CableMat::Iron, vec2(289.0, 151.0));
+        g.cable_click(CableMat::Iron, vec2(288.0, 252.0));
+        assert_eq!(g.cables.len(), 1);
+        match g.cables[0].a {
+            Anchor::Block { local, .. } => assert!((local.length() - 12.0).abs() < 1e-3, "rope fixed on the rim: {local:?}"),
+            _ => panic!("rope not fixed to the drum"),
+        }
+        g.set_running(true);
+        let start = g.blocks[1].pos.y;
+        for _ in 0..1800 {
+            g.sim_step();
+        }
+        eprintln!("WINCH2 cube {start:.1} -> {:.1}, wheel {:?}, snapped {}", g.blocks[1].pos.y, g.blocks[0].pos, g.cables[0].snapped);
+        assert!((g.blocks[0].pos - vec2(300.0, 150.0)).length() < 2.0, "drum stays on its axle");
+        assert!(g.blocks[1].pos.y < start - 30.0, "the winch lifts the cube: {start} -> {}", g.blocks[1].pos.y);
+    }
+
+    #[test]
+    fn a_cable_can_be_left_loose_at_one_end_and_survives_a_save() {
+        let mut g = mech_game();
+        g.cable_click(CableMat::Wood, vec2(200.0, 300.0)); // fixed on the ground
+        g.cable_click(CableMat::Wood, vec2(260.0, 240.0)); // nothing there: loose end
+        assert_eq!(g.cables.len(), 1);
+        assert!(matches!(g.cables[0].b, Anchor::Free(_)));
+        // A first click in the air is still refused.
+        g.cable_click(CableMat::Wood, vec2(100.0, 100.0));
+        assert!(g.cable_from.is_none());
+        assert_eq!(g.cables.len(), 1);
+        let bytes = save::encode(&g.world, None, None, &g.blocks, &g.cables, &g.members, &g.springs, &g.mech);
+        let l = save::decode(&bytes).unwrap();
+        assert_eq!(l.cables.len(), 1, "the half-loose cable comes back");
+        assert!(matches!(l.cables[0].b, Anchor::Free(_)));
+    }
+
+    #[test]
+    fn a_connecting_rod_can_be_pinned_to_a_block_and_pushes_it() {
+        let mut g = mech_game();
+        g.blocks.push(Block::new(BlockKind::Cube, vec2(380.0, 290.0), 0.0));
+        g.refresh_mask();
+        click_with(&mut g, Tool::Motor, 300.0, 270.0);
+        click_with(&mut g, Tool::Gear(GearSize::Medium), 316.0, 270.0);
+        click_with(&mut g, Tool::Crank, 322.0, 266.0); // an attach point on the medium gear
+        click_with(&mut g, Tool::Crank, 372.0, 290.0); // the cube
+        assert_eq!(g.mech.rods.len(), 1, "a rod to a block is allowed");
+        assert!(matches!(g.mech.rods[0].b, mech::End::Node(Anchor::Block { .. })));
+        g.mech.rods[0].strength = 1e6;
+        g.set_running(true);
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for t in 0..900 {
+            g.sim_step();
+            if t > 120 {
+                lo = lo.min(g.blocks[0].pos.x);
+                hi = hi.max(g.blocks[0].pos.x);
+            }
+        }
+        eprintln!("BLOCKROD cube x {lo:.1}..{hi:.1}, y {:.1}, gear turned {:.1}, broken {}", g.blocks[0].pos.y, g.mech.gears[1].angle, g.mech.rods[0].broken);
+        assert!(hi - lo > 3.0, "the rod drags the block to and fro: {lo}..{hi}");
+        assert!(g.mech.gears[1].angle.abs() > 1.0, "and the gear still turns");
+    }
+
+    #[test]
+    fn pivots_and_wheel_shafts_survive_a_save() {
+        let mut g = mech_game();
+        g.blocks.push(Block::new(BlockKind::Wheel, vec2(300.0, 150.0), 0.0));
+        g.refresh_mask();
+        click_with(&mut g, Tool::Pivot, 300.0, 150.0);
+        click_with(&mut g, Tool::Motor, 360.0, 150.0);
+        click_with(&mut g, Tool::Axle, 360.0, 150.0);
+        click_with(&mut g, Tool::Axle, 300.0, 150.0);
+        let bytes = save::encode(&g.world, None, None, &g.blocks, &g.cables, &g.members, &g.springs, &g.mech);
+        let l = save::decode(&bytes).unwrap();
+        assert_eq!(l.mech.pivots.len(), 1);
+        assert_eq!(l.mech.pivots[0].wheel, l.blocks[0].uid);
+        assert_eq!(l.mech.gears[0].wheel, Some(l.blocks[0].uid));
+        // Taking the wheel away takes the axle and the shaft with it.
+        g.remove_block(0);
+        g.mech_prune_wheels();
+        assert!(g.mech.pivots.is_empty() && g.mech.gears[0].wheel.is_none());
+    }
+
+    #[test]
+    fn mechanisms_survive_save_and_load() {
+        let mut g = mech_game();
+        build_crank_slider(&mut g);
+        g.axle_for_test();
+        let bytes = save::encode(&g.world, None, None, &g.blocks, &g.cables, &g.members, &g.springs, &g.mech);
+        let l = save::decode(&bytes).unwrap();
+        assert_eq!(l.mech.gears.len(), g.mech.gears.len());
+        assert_eq!(l.mech.rods.len(), 1);
+        assert_eq!(l.mech.sliders.len(), 1);
+        assert_eq!(l.mech.axles.len(), g.mech.axles.len());
+        assert_eq!(l.mech.gears[0].motor.map(|m| m.dir), g.mech.gears[0].motor.map(|m| m.dir));
+        assert_eq!(l.mech.rods[0].len, g.mech.rods[0].len);
+        assert!(matches!(l.mech.gears[0].mount, Anchor::Ground(_) | Anchor::Free(_) | Anchor::Block { .. }));
+    }
 
     #[test]
     fn undo_puts_the_world_back_as_it_was_before_each_brick() {
