@@ -13,8 +13,8 @@ pub const STUD: f32 = 12.0;
 const PX_PER_M: f32 = 20.0;
 const TILE: i32 = 16;
 /// Weld breaking limits (per step): force and torque impulses.
-const BREAK_FORCE: f32 = 9.0;
-const BREAK_TORQUE: f32 = 14.0;
+const BREAK_FORCE: f32 = 2.8;
+const BREAK_TORQUE: f32 = 6.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockKind {
@@ -278,6 +278,10 @@ impl Physics {
         p
     }
 
+    pub fn joint_count(&self) -> usize {
+        self.w.impulse_joints().count()
+    }
+
     /// Largest (force, torque) load currently carried by a weld.
     pub fn max_joint_load(&self) -> (f32, f32) {
         self.w.impulse_joints().fold((0.0, 0.0), |(f, t): (f32, f32), (_, j)| {
@@ -503,6 +507,35 @@ mod tests {
         }
         eprintln!("peak load {peak:?}");
         eprintln!("bridge ys: {:?}", blocks.iter().map(|b| b.pos.y as i32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn overloaded_bridge_snaps() {
+        let mut world = ground();
+        for x in 200..440 {
+            for y in 300..320 {
+                world.set(x, y, Mat::Empty);
+            }
+        }
+        let mut blocks = vec![];
+        for i in 0..6 {
+            blocks.push(Block::new(BlockKind::Long, vec2(180.0 + 24.0 + 48.0 * i as f32, 294.0), 0.0));
+        }
+        for k in 0..5 {
+            for row in 0..4 {
+                blocks.push(Block::new(BlockKind::Cube, vec2(276.0 + 24.0 * k as f32, 276.0 - 24.0 * row as f32), 0.0));
+            }
+        }
+        let mut phys = Physics::build(&mut blocks);
+        let before = phys.joint_count();
+        let mut peak = (0.0f32, 0.0f32);
+        for _ in 0..400 {
+            settle(&mut world, &mut blocks, &mut phys, 1);
+            let l = phys.max_joint_load();
+            peak = (peak.0.max(l.0), peak.1.max(l.1));
+        }
+        eprintln!("overload peak {peak:?} joints {before} -> {}", phys.joint_count());
+        assert!(phys.joint_count() < before);
     }
 
     #[test]

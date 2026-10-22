@@ -115,6 +115,13 @@ impl World {
         self.cells.fill(EMPTY);
     }
 
+    /// Replace the grid with saved materials (row by row, W*H entries).
+    pub fn load_mats(&mut self, mats: &[Mat]) {
+        for (i, m) in mats.iter().enumerate().take(W * H) {
+            self.set((i % W) as i32, (i / W) as i32, *m);
+        }
+    }
+
     pub fn snapshot(&self) -> Vec<Cell> {
         self.cells.clone()
     }
@@ -346,7 +353,7 @@ impl World {
                 self.set(x as i32, y, Mat::Water);
             }
         }
-        for _ in 0..5 {
+        for _ in 0..3 {
             let x = (50 * K) + (self.rand() % (W as u32 - 100 * K as u32)) as i32;
             let base = hs[x as usize];
             if base >= sea {
@@ -656,7 +663,13 @@ impl World {
             Mat::Steam => (205 + v, 214 + v, 230 + v, 120 + flick),
             Mat::Iron => (146 + v, 156 + v, 174 + v, 255),
             Mat::Wood => (146 + v / 2 + (y as i32 % 3) * 6, 98 + v / 2, 54, 255),
-            Mat::Stone => (108 + v, 108 + v, 120 + v, 255),
+            Mat::Stone => {
+                // Darker with depth, with soft mineral patches.
+                let patch = (((x / 7) as u32).wrapping_mul(2654435761) ^ ((y / 7) as u32).wrapping_mul(40503)) >> 13 & 7;
+                let depth = 1.0 - (y as f32 / H as f32) * 0.35;
+                let base = (108 + patch as i32 * 2) as f32 * depth;
+                (base as i32 + v, base as i32 + v, (base * 1.1) as i32 + v, 255)
+            }
             Mat::Brick => (184 + v, 72 + v / 2, 56, 255),
             Mat::Rust => (156 + v, 84 + v / 2, 42, 255),
             Mat::Ash => (100 + v, 100 + v, 106 + v, 255),
