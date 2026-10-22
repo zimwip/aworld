@@ -294,6 +294,9 @@ pub struct World {
     /// Closed pockets of gas (see `pockets.rs`): for each cell its pocket id + 1 (0: not gas).
     pocket_of: Vec<u32>,
     pockets: Vec<pockets::Pocket>,
+    /// Latent heat taken in (positive) or given up (negative) by a cell of water or ice on its way
+    /// to changing state (see `thermal::latent_heat`).
+    pub latent: Vec<f32>,
     /// Absolute pressure (atm) inside each liquid cell; 1 elsewhere.
     liq_p: Vec<f32>,
     /// Scratch for the pockets: what each cell is to the gas, and the weight of each liquid cell.
@@ -348,6 +351,7 @@ impl World {
             pocket_of: vec![0; W * H],
             pockets: Vec::new(),
             liq_p: vec![1.0; W * H],
+            latent: vec![0.0; W * H],
             cls: vec![0; W * H],
             liq_w: vec![0.0; W * H],
             bursts: Vec::new(),
@@ -368,6 +372,7 @@ impl World {
     pub fn clear(&mut self) {
         self.revision += 1;
         self.cells.fill(EMPTY);
+        self.latent.fill(0.0);
         self.zones.wake_all();
         self.reset_temps();
         self.update_season_cache();
@@ -387,6 +392,7 @@ impl World {
     pub fn restore_state(&mut self, st: &State) {
         self.revision += 1;
         self.cells.copy_from_slice(&st.cells);
+        self.latent.fill(0.0);
         self.zones.wake_all();
         self.temp.copy_from_slice(&st.temp);
         self.clock = st.clock;
@@ -442,6 +448,7 @@ impl World {
     pub fn restore(&mut self, snap: &[Cell]) {
         self.revision += 1;
         self.cells.copy_from_slice(snap);
+        self.latent.fill(0.0);
         self.zones.wake_all();
     }
 
@@ -550,6 +557,7 @@ impl World {
         let frame = self.frame;
         let i = Self::idx(x, y);
         self.cells[i] = Cell { m, life, stamp: frame };
+        self.latent[i] = 0.0;
         self.zones.wake(i);
         match m {
             Mat::Fire => self.temp[i] = thermal::FIRE_C,
@@ -574,6 +582,7 @@ impl World {
         }
         self.cells.swap(ia, ib);
         self.temp.swap(ia, ib);
+        self.latent.swap(ia, ib);
         self.cells[ia].stamp = self.frame;
         self.cells[ib].stamp = self.frame;
     }
@@ -2067,6 +2076,7 @@ impl World {
             self.zones.wake(t);
             self.cells.swap(i, t);
             self.temp.swap(i, t);
+            self.latent.swap(i, t);
             self.cells[i].stamp = self.frame;
             self.cells[t].stamp = self.frame;
             piece.cells[k] = t;
@@ -3631,12 +3641,17 @@ mod science {
     fn fire_heats_water_until_it_boils() {
         let mut w = World::new_static();
         floor(&mut w, 300, 100, 140);
+        // The sides of the pot: boiling takes its time (latent heat), the water must not run off.
+        for y in 270..300 {
+            w.set(99, y, Mat::Stone);
+            w.set(140, y, Mat::Stone);
+        }
         for x in 100..140 {
             for y in 280..300 {
                 w.set(x, y, Mat::Water);
             }
         }
-        for _ in 0..600 {
+        for _ in 0..1500 {
             // A steady flame under the pot.
             for x in 110..130 {
                 if w.raw(x, 299) != Mat::Fire {

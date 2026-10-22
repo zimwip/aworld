@@ -20,7 +20,7 @@ cargo run --release
 - **Décors** (Monde → Décor) : campagne, montagne (cimes enneigées), mer. Chacun a son arrière-plan.
 - **Jour et nuit**, soleil (la chaleur forme un gradient autour de lui), lune, étoiles ; **saisons** : les feuilles
   rougissent, tombent, pourrissent en terre ; les arbres repoussent au printemps.
-- **Température** : l'air refroidit avec l'altitude ; l'eau bout à 100 °C, gèle sous -6 °C ; la roche fond vers 540 °C ;
+- **Température** : l'air refroidit avec l'altitude ; l'eau bout à 100 °C et gèle à 0 °C, avec un palier (chaleur latente) ; la roche fond vers 540 °C ;
   la lave refroidit très lentement ; le sable chauffé devient verre (et casse sous un choc thermique).
 - **Cycle de l'eau** : évaporation → vapeur → nuage (que le vent pousse) → pluie, neige ou grêle selon le froid.
   Un nuage réchauffé par le soleil garde son eau. Les gaz qui sortent d'un côté reviennent de l'autre.
@@ -236,3 +236,7 @@ Après environ 15 s fluides, un niveau est rétabli (avec un délai de 5 minutes
 ## Zones endormies
 
 `src/world/sleep.rs` découpe le monde en zones de 32×32 cellules. Une zone où rien n'a bougé au dernier pas, et où aucune cellule ne peut changer d'elle-même (roche, sable posé, terre sèche, eau au repos sous de l'eau…), dort : la boucle des cellules la saute. Tout changement de cellule (`set`, `swap`, une pièce qui tombe, un bloc rigide qui bouge) réveille sa zone, et la voisine si la cellule est au bord. La chaleur, le vent et la pression continuent partout. Sur la campagne de `cost_of_a_tick`, une trentaine de zones sur 510 restent éveillées ; la boucle des cellules passe d'environ 0,7 ms à 0,1 ms par pas (mer : 1,8 → 0,8 ms).
+
+## Chaleur latente : les paliers
+
+L'eau gèle et la glace fond à 0 °C. Pour changer d'état, une cellule doit d'abord absorber (ou céder) sa chaleur latente (`World::latent`, `thermal::latent_heat`) : 80 °C de chauffage pour fondre, comme l'eau réelle, et un tiers de la valeur réelle pour bouillir, pour qu'une casserole s'évapore dans un temps raisonnable. Pendant ce temps, sa température ne bouge pas. L'eau qui bout reste à 100 °C (plus sous pression) quelle que soit la chaleur du feu, et la glace qui fond reste à 0 °C : c'est le palier qu'on voit au collège. La chaleur absorbée sans aller jusqu'au bout est rendue si la cellule refroidit. Le soleil sur la glace ou l'eau passe d'abord par ce même compte.

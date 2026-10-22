@@ -15,8 +15,19 @@ pub const FIRE_C: f32 = 650.0;
 pub const EMBER_C: f32 = 500.0;
 pub const LAVA_C: f32 = 1100.0;
 pub const BOIL_C: f32 = 100.0;
-pub const FREEZE_C: f32 = -6.0;
-pub const MELT_C: f32 = 3.0;
+/// Water freezes and ice melts at 0 °C. What keeps it from flickering between the two is the
+/// latent heat: a cell has to give up (or take in) `LATENT_FUSION` before it changes.
+pub const FREEZE_C: f32 = 0.0;
+pub const MELT_C: f32 = 0.0;
+/// Heat (°C times heat capacity, the units of the heat flow) a cell of ice takes in to melt,
+/// and a cell of water gives up to freeze. Real water: 80 °C worth of heating.
+pub const LATENT_FUSION: f32 = 240.0;
+/// Heat a cell of boiling water takes in to become steam. Real water: about 540 °C worth;
+/// the game uses a third of it so that a pot still boils dry in a reasonable time.
+pub const LATENT_VAPOUR: f32 = 540.0;
+/// Heat capacities of water and ice (as in `props`).
+const C_WATER: f32 = 3.0;
+const C_ICE: f32 = 2.0;
 /// Lava turns to rock once it has cooled below this.
 pub const LAVA_SOLID_C: f32 = 390.0;
 pub const ROCK_MELT_C: f32 = 540.0;
@@ -100,8 +111,7 @@ fn phase(m: Mat) -> Phase {
     let none = Phase { up: None, down: None };
     match m {
         // ice <-> water <-> steam
-        Mat::Water => Phase { up: Some((BOIL_C, Mat::Steam, 1)), down: Some((FREEZE_C, Mat::Ice, 1)) },
-        Mat::Ice | Mat::Snow | Mat::Hail => Phase { up: Some((MELT_C, Mat::Water, 1)), down: None },
+        // ice <-> water <-> steam: see `latent_heat`, which also counts the heat they take in.
         // rock <-> lava
         Mat::Stone => Phase { up: Some((ROCK_MELT_C, Mat::Lava, 30)), down: None },
         Mat::Lava => Phase { up: None, down: Some((LAVA_SOLID_C, Mat::Stone, 20)) },
@@ -444,6 +454,10 @@ impl World {
                             let target = surf + 15.0 * light * absorb(m);
                             if target > self.temp[i] {
                                 self.temp[i] += (target - self.temp[i]) * 0.05 * ts;
+                                // Sunlight on ice or water goes into melting or boiling it first.
+                                if matches!(m, Mat::Water | Mat::Ice | Mat::Snow | Mat::Hail) {
+                                    self.latent_heat(i, x as i32, y as i32, m, self.temp[i]);
+                                }
                             }
                             break;
                         }
@@ -527,15 +541,72 @@ impl World {
         }
     }
 
+    /// Water, ice and snow change state only once they have taken in (or given up) their latent
+    /// heat. Meanwhile their temperature stays put at the change point: boiling water stays at
+    /// 100 °C (more under pressure) however hot the fire, melting ice stays at 0 °C. Heat that
+    /// went in and was not enough is given back if the cell cools again. Returns true when the
+    /// cell changed state.
+    fn latent_heat(&mut self, i: usize, x: i32, y: i32, m: Mat, t: f32) -> bool {
+        if m == Mat::Water {
+            // Water boils later under pressure (a pressure cooker, the deep of a lake) and earlier
+            // in a partial vacuum.
+            let boil = super::boil_c(self.liq_p[i]);
+            let stored = self.latent[i];
+            if t > boil {
+                self.latent[i] += (t - boil) * C_WATER;
+                self.temp[i] = boil;
+                if self.latent[i] >= LATENT_VAPOUR {
+                    self.set(x, y, Mat::Steam);
+                    self.temp[i] = boil + 1.0;
+                    return true;
+                }
+            } else if t < FREEZE_C {
+                self.latent[i] += (t - FREEZE_C) * C_WATER;
+                self.temp[i] = FREEZE_C;
+                if self.latent[i] <= -LATENT_FUSION {
+                    self.set(x, y, Mat::Ice);
+                    self.temp[i] = FREEZE_C;
+                    return true;
+                }
+            } else if stored > 0.0 {
+                // Half-boiled water that cools gives its heat back first.
+                let dt = (stored / C_WATER).min(boil - t);
+                self.temp[i] = t + dt;
+                self.latent[i] -= dt * C_WATER;
+            } else if stored < 0.0 {
+                // Half-frozen water that warms takes back the cold first.
+                let dt = (-stored / C_WATER).min(t - FREEZE_C);
+                self.temp[i] = t - dt;
+                self.latent[i] += dt * C_WATER;
+            }
+            return false;
+        }
+        // Ice, snow, hail.
+        if t > MELT_C {
+            self.latent[i] += (t - MELT_C) * C_ICE;
+            self.temp[i] = MELT_C;
+            if self.latent[i] >= LATENT_FUSION {
+                self.set(x, y, Mat::Water);
+                self.temp[i] = MELT_C;
+                return true;
+            }
+        } else if self.latent[i] > 0.0 && t < MELT_C {
+            let dt = (self.latent[i] / C_ICE).min(MELT_C - t);
+            self.temp[i] = t + dt;
+            self.latent[i] -= dt * C_ICE;
+        }
+        false
+    }
+
     /// Material changes driven by temperature. Transformations consume their
     /// inputs: water that boils is gone, steam that condenses is a cloud.
     fn react(&mut self, i: usize, x: i32, y: i32, m: Mat, t: f32, can_condense: bool) {
+        if matches!(m, Mat::Water | Mat::Ice | Mat::Snow | Mat::Hail) && self.latent_heat(i, x, y, m, t) {
+            return;
+        }
         // Melting, boiling, freezing, setting: one rule for every material.
         let ph = phase(m);
         if let Some((th, to, rate)) = ph.up {
-            // Water boils later under pressure (a pressure cooker, the deep of a lake) and earlier
-            // in a partial vacuum.
-            let th = if m == Mat::Water { super::boil_c(self.liq_p[i]) } else { th };
             if t >= th && self.chance_t(rate) {
                 self.set(x, y, to);
                 // The new phase takes the heat from whatever made it change: halfway
@@ -737,5 +808,94 @@ mod bench_tests {
             w.flow.step(0.5, i);
         }
         eprintln!("flow.step: {:?} per call", t.elapsed() / 100);
+    }
+}
+
+#[cfg(test)]
+mod latent_tests {
+    use super::*;
+
+    #[test]
+    fn boiling_water_stays_at_100_until_it_has_all_turned_to_steam() {
+        let mut w = World::new_static();
+        // A pot: a terracotta bottom over a fire that never goes out, water in it, open to the air.
+        // (Not iron: iron rusts in water and the pot would leak.)
+        for x in 200..230 {
+            w.set(x, 300, Mat::Terracotta);
+            for y in 285..300 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        for y in 285..301 {
+            w.set(199, y, Mat::Terracotta);
+            w.set(230, y, Mat::Terracotta);
+        }
+        let (mut hottest, mut steam_at) = (0.0f32, None);
+        for t in 0..6000 {
+            for x in 200..230 {
+                w.set(x, 301, Mat::Fire);
+            }
+            w.step();
+            for i in 0..W * H {
+                if w.cells[i].m == Mat::Water {
+                    // (Deeper down the pressure makes the boiling point a little higher.)
+                    hottest = hottest.max(w.temp[i] - super::super::boil_c(w.liq_p[i]) + 100.0);
+                }
+            }
+            if steam_at.is_none() && w.cells.iter().any(|c| c.m == Mat::Steam) {
+                steam_at = Some(t);
+            }
+        }
+        assert!(hottest < 102.0, "boiling water never gets hotter than its boiling point: {hottest}");
+        let t = steam_at.expect("it boils in the end");
+        assert!(t > 30, "but only once it has taken in the latent heat: steam after {t} steps");
+    }
+
+    #[test]
+    fn melting_ice_stays_at_0_and_water_freezes_at_0() {
+        let mut w = World::new_static();
+        w.climate_fixed = Some(20.0);
+        w.reset_temps();
+        for x in 200..220 {
+            w.set(x, 300, Mat::Stone);
+            for y in 290..300 {
+                w.set(x, y, Mat::Ice);
+                w.temp[y as usize * W + x as usize] = -5.0;
+            }
+        }
+        let mut seen_zero = false;
+        for _ in 0..3000 {
+            w.step();
+            let i = 295 * W + 210;
+            if w.cells[i].m == Mat::Ice && w.temp[i].abs() < 0.01 {
+                seen_zero = true;
+            }
+            assert!(w.cells[i].m != Mat::Ice || w.temp[i] <= 0.0 + 1e-3, "ice is never above 0 °C: {}", w.temp[i]);
+        }
+        assert!(seen_zero, "ice warming up stops at 0 °C while it melts");
+        // Water a little below freezing turns to ice (it used to need -6 °C).
+        let mut c = World::new_static();
+        c.climate_fixed = Some(-3.0);
+        c.reset_temps();
+        for y in 294..301 {
+            c.set(199, y, Mat::Stone);
+            c.set(220, y, Mat::Stone);
+        }
+        for x in 200..220 {
+            c.set(x, 300, Mat::Stone);
+            for y in 296..300 {
+                c.set(x, y, Mat::Water);
+                c.temp[y as usize * W + x as usize] = 2.0;
+            }
+        }
+        let mut froze = false;
+        for t in 0..8000 {
+            c.step();
+            if c.cells.iter().any(|m| m.m == Mat::Ice) {
+                froze = true;
+                break;
+            }
+        }
+        assert!(froze, "water at -3 °C freezes");
     }
 }
