@@ -44,6 +44,9 @@ pub struct Pocket {
     pub pressure: f32,
     /// The wall cell that would give way first, and how much excess pressure it holds.
     weakest: Option<(usize, f32)>,
+    /// Cell sides it shares with walls and with liquid.
+    wall_edge: u32,
+    liquid_edge: u32,
 }
 
 impl Pocket {
@@ -167,20 +170,30 @@ impl World {
             self.pockets.push(p);
         }
         self.stack = stack;
-        // The weakest wall of each pocket.
+        // What each pocket is held in: how much wall and how much liquid round it, and its
+        // weakest wall.
         for i in 0..W * H {
-            if self.cls[i] != 0 || self.mask[i] != 0 {
+            let c = self.cls[i];
+            if c != 0 && c != 3 {
                 continue;
             }
-            let Some(s) = wall_strength(self.cells[i].m) else { continue };
+            let strength = if c == 0 && self.mask[i] == 0 { wall_strength(self.cells[i].m) } else { None };
             let x = i % W;
             for j in [i.wrapping_sub(W), if x + 1 < W { i + 1 } else { usize::MAX }, i + W, if x > 0 { i - 1 } else { usize::MAX }] {
                 if j >= W * H {
                     continue;
                 }
                 let id = self.pocket_of[j];
-                if id != 0 {
-                    let p = &mut self.pockets[id as usize - 1];
+                if id == 0 {
+                    continue;
+                }
+                let p = &mut self.pockets[id as usize - 1];
+                if c == 3 {
+                    p.liquid_edge += 1;
+                } else {
+                    p.wall_edge += 1;
+                }
+                if let Some(s) = strength {
                     if p.weakest.map_or(true, |w| s < w.1) {
                         p.weakest = Some((i, s));
                     }
@@ -188,7 +201,10 @@ impl World {
             }
         }
         for p in &mut self.pockets {
-            p.open |= p.cells >= OPEN_POCKET;
+            // A bubble (gas held mostly by liquid) just pushes the liquid aside and rises: it is
+            // at the pressure of the open air, not shut in.
+            let bubble = p.liquid_edge * 10 > (p.liquid_edge + p.wall_edge) * 6;
+            p.open |= p.cells >= OPEN_POCKET || bubble;
             p.settle();
         }
         self.update_liquid_pressure();
@@ -633,5 +649,27 @@ mod tests {
         };
         let (with, without) = (run(true), run(false));
         assert!(with < without - 10, "the steam pushed the water up the pipe: top at {with}, {without} without steam");
+    }
+
+    #[test]
+    fn a_bubble_of_steam_under_water_is_not_a_boiler() {
+        let mut w = World::new_static();
+        // An open pot of water with a pocket of steam caught at the bottom.
+        for x in 200..240 {
+            w.set(x, 300, Mat::Stone);
+            for y in 270..300 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        for y in 265..301 {
+            w.set(199, y, Mat::Stone);
+            w.set(240, y, Mat::Stone);
+        }
+        fill(&mut w, 215, 296, 220, 299, Mat::Steam, 110.0);
+        w.update_pockets();
+        let p = w.gas_pressure(217, 298);
+        assert!(p < 1.01, "a bubble is at the pressure of the open air: {p}");
+        assert!(w.bursts.is_empty(), "and it never bursts the pot");
+        assert!(w.liquid_pressure(217, 295) < 1.6, "the water above it feels only its own weight: {}", w.liquid_pressure(217, 295));
     }
 }
