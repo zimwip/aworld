@@ -23,7 +23,7 @@ pub const OPEN_POCKET: u32 = 40_000;
 /// How many times more gas a cell of steam holds than a cell of air (boiling water swells a lot).
 pub const STEAM_N: f32 = 8.0;
 /// Pockets and liquid pressure are re-read every this many steps.
-pub const POCKETS_EVERY: u32 = 8;
+pub const POCKETS_EVERY: u32 = 16;
 /// Atmospheres per cell of water depth (the same scale as the pressure view).
 pub const ATM_PER_CELL: f32 = 1.0 / 60.0;
 /// A liquid shoots out sideways once the pressure behind a hole is worth this many cells of head.
@@ -94,64 +94,105 @@ impl World {
     /// Groups the gas into pockets and works out the pressure of every pocket and every liquid
     /// cell; then lets the weakest wall of an over-pressured pocket give way.
     pub(super) fn update_pockets(&mut self) {
+        // What each cell is to the pockets: 0 a wall, 1 gas, 2 foliage (air goes through it, but
+        // it is not volume), 3 liquid (neither: it is pushed, see `update_liquid_pressure`); and
+        // the weight of each liquid cell (atm).
+        for i in 0..W * H {
+            let m = self.cells[i].m;
+            self.cls[i] = if self.mask[i] != 0 {
+                0
+            } else if gassy(m) {
+                1
+            } else if m.is_vegetation() {
+                2
+            } else if m.kind() == Kind::Liquid {
+                3
+            } else {
+                0
+            };
+            self.liq_w[i] = if self.cls[i] == 3 { density(m) * ATM_PER_CELL } else { 0.0 };
+        }
+        // Label the connected gas a row span at a time, adding up each pocket's volume, steam and
+        // warmth on the way; the edges of the world are the open air.
         let mut stack = std::mem::take(&mut self.stack);
         self.pocket_of.fill(0);
         self.pockets.clear();
+        let through = |c: u8| c == 1 || c == 2;
         for start in 0..W * H {
-            if self.pocket_of[start] != 0 || !self.pocket_cell(start) {
+            if self.pocket_of[start] != 0 || !through(self.cls[start]) {
                 continue;
             }
             let id = self.pockets.len() as u32 + 1;
             let mut p = Pocket::default();
-            self.pocket_of[start] = id;
             stack.push(start);
             while let Some(i) = stack.pop() {
-                let (x, y) = (i % W, i / W);
-                let m = self.cells[i].m;
-                if self.mask[i] == 0 && gassy(m) {
-                    p.cells += 1;
-                    p.kelvin += self.temp[i] + 273.15;
-                    if matches!(m, Mat::Steam | Mat::Cloud) {
-                        p.steam += 1;
-                    }
+                if self.pocket_of[i] != 0 {
+                    continue;
                 }
-                if y == 0 || y == H - 1 || x == 0 || x == W - 1 {
+                let row = i - i % W;
+                let (mut a, mut b) = (i, i);
+                while a > row && self.pocket_of[a - 1] == 0 && through(self.cls[a - 1]) {
+                    a -= 1;
+                }
+                while b + 1 < row + W && self.pocket_of[b + 1] == 0 && through(self.cls[b + 1]) {
+                    b += 1;
+                }
+                if a == row || b == row + W - 1 || row == 0 || row == (H - 1) * W {
                     p.open = true;
                 }
-                for j in [i.wrapping_sub(W), i + 1, i + W, i.wrapping_sub(1)] {
-                    if j >= W * H || (j % W).abs_diff(x) > 1 {
+                for k in a..=b {
+                    self.pocket_of[k] = id;
+                    if self.cls[k] == 1 {
+                        p.cells += 1;
+                        p.kelvin += self.temp[k] + 273.15;
+                        p.steam += matches!(self.cells[k].m, Mat::Steam | Mat::Cloud) as u32;
+                    }
+                }
+                // One seed per run of free cells in the rows above and below.
+                for other in [row.wrapping_sub(W), row + W] {
+                    if other >= W * H {
                         continue;
                     }
-                    if self.pocket_of[j] == id {
-                        continue;
-                    }
-                    if self.pocket_cell(j) {
-                        if self.pocket_of[j] == 0 {
-                            self.pocket_of[j] = id;
+                    let mut open_run = false;
+                    for k in a..=b {
+                        let j = other + (k - row);
+                        let free = self.pocket_of[j] == 0 && through(self.cls[j]);
+                        if free && !open_run {
                             stack.push(j);
                         }
-                    } else if self.mask[j] == 0 {
-                        if let Some(s) = wall_strength(self.cells[j].m) {
-                            if p.weakest.map_or(true, |w| s < w.1) {
-                                p.weakest = Some((j, s));
-                            }
-                        }
+                        open_run = free;
                     }
                 }
             }
-            p.open |= p.cells >= OPEN_POCKET;
-            p.settle();
             self.pockets.push(p);
         }
         self.stack = stack;
+        // The weakest wall of each pocket.
+        for i in 0..W * H {
+            if self.cls[i] != 0 || self.mask[i] != 0 {
+                continue;
+            }
+            let Some(s) = wall_strength(self.cells[i].m) else { continue };
+            let x = i % W;
+            for j in [i.wrapping_sub(W), if x + 1 < W { i + 1 } else { usize::MAX }, i + W, if x > 0 { i - 1 } else { usize::MAX }] {
+                if j >= W * H {
+                    continue;
+                }
+                let id = self.pocket_of[j];
+                if id != 0 {
+                    let p = &mut self.pockets[id as usize - 1];
+                    if p.weakest.map_or(true, |w| s < w.1) {
+                        p.weakest = Some((i, s));
+                    }
+                }
+            }
+        }
+        for p in &mut self.pockets {
+            p.open |= p.cells >= OPEN_POCKET;
+            p.settle();
+        }
         self.update_liquid_pressure();
         self.burst_pockets();
-    }
-
-    /// Cells the pockets spread through: gas, and foliage (leaves let the air through).
-    #[inline]
-    fn pocket_cell(&self, i: usize) -> bool {
-        self.mask[i] == 0 && (gassy(self.cells[i].m) || self.cells[i].m.is_vegetation())
     }
 
     /// The pocket (index into `pockets`) a cell of gas belongs to.
@@ -181,61 +222,66 @@ impl World {
     /// liquid above, shared through the whole connected liquid (a deep arm passes its pressure
     /// to a shallow one, as in a U-tube).
     fn update_liquid_pressure(&mut self) {
-        let liquid = |w: &World, i: usize| w.mask[i] == 0 && w.cells[i].m.kind() == Kind::Liquid;
-        let weight = |w: &World, i: usize| density(w.cells[i].m) * ATM_PER_CELL;
-        // Down each column from the gas above.
-        for x in 0..W {
-            let mut above: Option<f32> = None;
-            for y in 0..H {
+        // Which rows hold liquid.
+        // (`liq_w` and `cls` are filled by `update_pockets`.)
+        let rows: Vec<bool> = (0..H).map(|y| self.cls[y * W..(y + 1) * W].contains(&3)).collect();
+        // Down each column from the gas above (row by row, all columns at once). NaN: no gas
+        // above, only walls.
+        let mut above = vec![f32::NAN; W];
+        for y in 0..H {
+            for x in 0..W {
                 let i = y * W + x;
-                if liquid(self, i) {
-                    let p = above.map_or(0.0, |a| a + weight(self, i));
+                let wt = self.liq_w[i];
+                if wt > 0.0 {
+                    let p = if above[x].is_nan() { 0.0 } else { above[x] + wt };
                     self.liq_p[i] = p;
-                    above = above.map(|_| p);
+                    if !above[x].is_nan() {
+                        above[x] = p;
+                    }
                 } else {
                     self.liq_p[i] = 1.0;
-                    above = if self.mask[i] == 0 && gassy(self.cells[i].m) { Some(self.gas_pressure(x as i32, y as i32)) } else { None };
+                    above[x] = match (self.cls[i], self.pocket_of[i]) {
+                        (1, id) if id != 0 => self.pockets[id as usize - 1].pressure,
+                        _ => f32::NAN,
+                    };
                 }
             }
         }
         // Then shared: sideways at the same depth, down and up with the weight of each cell.
+        let (p, wt) = (&mut self.liq_p, &self.liq_w);
         for _ in 0..2 {
-            for y in 0..H {
+            for y in (0..H).filter(|&y| rows[y]) {
                 let row = y * W;
-                for x in 1..W {
-                    let (i, j) = (row + x, row + x - 1);
-                    if liquid(self, i) && liquid(self, j) {
-                        self.liq_p[i] = self.liq_p[i].max(self.liq_p[j]);
+                for i in row + 1..row + W {
+                    if wt[i] > 0.0 && wt[i - 1] > 0.0 && p[i - 1] > p[i] {
+                        p[i] = p[i - 1];
                     }
                 }
-                for x in (0..W - 1).rev() {
-                    let (i, j) = (row + x, row + x + 1);
-                    if liquid(self, i) && liquid(self, j) {
-                        self.liq_p[i] = self.liq_p[i].max(self.liq_p[j]);
-                    }
-                }
-            }
-            for y in 1..H {
-                for x in 0..W {
-                    let (i, j) = (y * W + x, (y - 1) * W + x);
-                    if liquid(self, i) && liquid(self, j) {
-                        self.liq_p[i] = self.liq_p[i].max(self.liq_p[j] + weight(self, i));
+                for i in (row..row + W - 1).rev() {
+                    if wt[i] > 0.0 && wt[i + 1] > 0.0 && p[i + 1] > p[i] {
+                        p[i] = p[i + 1];
                     }
                 }
             }
-            for y in (0..H - 1).rev() {
-                for x in 0..W {
-                    let (i, j) = (y * W + x, (y + 1) * W + x);
-                    if liquid(self, i) && liquid(self, j) {
-                        self.liq_p[i] = self.liq_p[i].max(self.liq_p[j] - weight(self, j));
+            for y in (1..H).filter(|&y| rows[y] && rows[y - 1]) {
+                for i in y * W..(y + 1) * W {
+                    if wt[i] > 0.0 && wt[i - W] > 0.0 {
+                        p[i] = p[i].max(p[i - W] + wt[i]);
+                    }
+                }
+            }
+            for y in (0..H - 1).rev().filter(|&y| rows[y] && rows[y + 1]) {
+                for i in y * W..(y + 1) * W {
+                    if wt[i] > 0.0 && wt[i + W] > 0.0 {
+                        p[i] = p[i].max(p[i + W] - wt[i + W]);
                     }
                 }
             }
         }
-        // A liquid sealed off from any gas: as if at 1 atm, plus nothing (it has nowhere to go).
+        // A liquid sealed off from any gas: as if at 1 atm (it has nowhere to go anyway).
         for i in 0..W * H {
-            if self.liq_p[i] < 1.0 && liquid(self, i) {
-                self.liq_p[i] = 1.0;
+            if p[i] < 1.0 && wt[i] > 0.0 {
+                p[i] = 1.0;
             }
         }
     }
@@ -319,31 +365,36 @@ impl World {
             return false;
         }
         let rho = density(m).max(0.3);
-        let d = self.dir();
-        for dir in [d, -d] {
+        // A hole in a wall (something above the opening), not the free edge of a pool; and enough
+        // head (in cells of this liquid, less its own height) pushing through it.
+        let head = |w: &World, dir: i32| -> Option<f32> {
             let (nx, ny) = (x + dir, y);
-            // A hole in a wall (something above the opening), not the free edge of a pool.
-            if self.at(nx, ny) != Mat::Empty || matches!(self.at(nx, ny - 1).kind(), Kind::Empty | Kind::Gas | Kind::Flame) {
-                continue;
+            if w.at(nx, ny) != Mat::Empty || matches!(w.at(nx, ny - 1).kind(), Kind::Empty | Kind::Gas | Kind::Flame) {
+                return None;
             }
-            // Head (in cells of this liquid) pushing it out, less its own height.
-            let head = (p - self.gas_pressure(nx, ny)) / (rho * ATM_PER_CELL) - 1.0;
-            if head < JET_HEAD {
-                continue;
-            }
-            // Speed in cells per step: the drop keeps it while it falls (see `fly`), so it lands
-            // further from a deep hole than from a shallow one.
-            let v = (0.7 * head.sqrt()).round().clamp(1.0, 10.0) as i32;
-            let mut k = 1;
-            while k < v && self.at(x + dir * (k + 1), y) == Mat::Empty {
-                k += 1;
-            }
-            let to = Self::idx(x + dir * k, y);
-            self.swap((x, y), (x + dir * k, y));
-            self.cells[to].life = (v as u8) << 1 | (dir > 0) as u8;
-            return true;
+            // Only into gas that was already gas at the last count: a fresh hole (a bubble, a cell a
+            // pipe just took) has a pressure nobody knows yet.
+            let outside = w.pockets[w.pocket_at(nx, ny)?].pressure;
+            Some((p - outside) / (rho * ATM_PER_CELL) - 1.0).filter(|&h| h >= JET_HEAD)
+        };
+        let (right, left) = (head(self, 1), head(self, -1));
+        let (dir, head) = match (right, left) {
+            (Some(r), Some(l)) => if self.chance(2) { (1, r) } else { (-1, l) },
+            (Some(r), None) => (1, r),
+            (None, Some(l)) => (-1, l),
+            (None, None) => return false,
+        };
+        // Speed in cells per step: the drop keeps it while it falls (see `fly`), so it lands
+        // further from a deep hole than from a shallow one.
+        let v = (0.7 * head.sqrt()).round().clamp(1.0, 10.0) as i32;
+        let mut k = 1;
+        while k < v && self.at(x + dir * (k + 1), y) == Mat::Empty {
+            k += 1;
         }
-        false
+        let to = Self::idx(x + dir * k, y);
+        self.swap((x, y), (x + dir * k, y));
+        self.cells[to].life = (v as u8) << 1 | (dir > 0) as u8;
+        true
     }
 
     /// A drop shot out of a jet keeps its sideways speed while it falls: it flies in a slanting

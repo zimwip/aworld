@@ -295,6 +295,9 @@ pub struct World {
     pockets: Vec<pockets::Pocket>,
     /// Absolute pressure (atm) inside each liquid cell; 1 elsewhere.
     liq_p: Vec<f32>,
+    /// Scratch for the pockets: what each cell is to the gas, and the weight of each liquid cell.
+    cls: Vec<u8>,
+    liq_w: Vec<f32>,
     /// Walls that gave way under the pressure of a pocket this step: (x, y, pressure in atm).
     pub bursts: Vec<(i32, i32, f32)>,
 }
@@ -342,6 +345,8 @@ impl World {
             pocket_of: vec![0; W * H],
             pockets: Vec::new(),
             liq_p: vec![1.0; W * H],
+            cls: vec![0; W * H],
+            liq_w: vec![0.0; W * H],
             bursts: Vec::new(),
         }
     }
@@ -3220,7 +3225,8 @@ mod tests {
         let water_top = (0..H as i32).find(|&y| (100..200).any(|x| w.raw(x, y) == Mat::Water)).unwrap();
         assert!(oil_lowest <= water_top + 3, "oil should float on the water: lowest oil row {oil_lowest}, water surface {water_top}");
         // Set it alight: flames last far longer than a normal fire would.
-        let oil_top = (0..H as i32).find(|&y| (100..200).any(|x| w.raw(x, y) == Mat::Oil)).unwrap();
+        // (The top of the layer, not a stray drop resting on it.)
+        let oil_top = (0..H as i32).find(|&y| (100..200).filter(|&x| w.raw(x, y) == Mat::Oil).count() >= 10).unwrap();
         let ox = (100..200).find(|&x| w.raw(x, oil_top) == Mat::Oil).unwrap();
         for k in 0..8 {
             w.set(ox + k, oil_top - 1, Mat::Fire);
