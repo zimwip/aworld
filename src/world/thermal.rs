@@ -533,6 +533,9 @@ impl World {
         // Melting, boiling, freezing, setting: one rule for every material.
         let ph = phase(m);
         if let Some((th, to, rate)) = ph.up {
+            // Water boils later under pressure (a pressure cooker, the deep of a lake) and earlier
+            // in a partial vacuum.
+            let th = if m == Mat::Water { super::boil_c(self.liq_p[i]) } else { th };
             if t >= th && self.chance_t(rate) {
                 self.set(x, y, to);
                 // The new phase takes the heat from whatever made it change: halfway

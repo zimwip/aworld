@@ -3,7 +3,9 @@
 //! so particles and the car treat them as solid.
 
 pub mod flow;
+mod pockets;
 mod pressure;
+pub use pockets::boil_c;
 mod thermal;
 pub use thermal::{Season, DAY_STEPS};
 
@@ -288,6 +290,13 @@ pub struct World {
     /// 1 = the wind carries air heat in 2 x 2 blocks, 2 = the heat pass runs half as often (with
     /// doubled rates), 3 = same, and calm air next to air no longer conducts heat (it only relaxes).
     pub lod: u8,
+    /// Closed pockets of gas (see `pockets.rs`): for each cell its pocket id + 1 (0: not gas).
+    pocket_of: Vec<u32>,
+    pockets: Vec<pockets::Pocket>,
+    /// Absolute pressure (atm) inside each liquid cell; 1 elsewhere.
+    liq_p: Vec<f32>,
+    /// Walls that gave way under the pressure of a pocket this step: (x, y, pressure in atm).
+    pub bursts: Vec<(i32, i32, f32)>,
 }
 
 impl World {
@@ -330,6 +339,10 @@ impl World {
             dpd: vec![0.0; flow::FW * flow::FH],
             pressure_forces: true,
             lod: 0,
+            pocket_of: vec![0; W * H],
+            pockets: Vec::new(),
+            liq_p: vec![1.0; W * H],
+            bursts: Vec::new(),
         }
     }
 
@@ -733,8 +746,43 @@ impl World {
         if !heavy {
             return;
         }
-        // Pressure wave: loose matter near the blast is thrown outward, the closer
-        // the harder. Outer cells move first so they do not pile into inner ones.
+        self.shove_out(cx, cy, r);
+        // Under water the gas bubble lifts the surface above it into a dome and a plume of spray:
+        // the shallower the blast, the higher the water is thrown.
+        if let Some(d) = depth {
+            let strength = (1.0 - d as f32 / (3.0 * r as f32)).clamp(0.0, 1.0);
+            let half = r * 6 / 5;
+            for dx in -half..=half {
+                let x = cx + dx;
+                let Some(top) = (cy - d - 2..=cy).find(|&y| self.raw(x, y).kind() == Kind::Liquid) else { continue };
+                let shape = 1.0 - dx.abs() as f32 / half as f32;
+                let rise = (strength * r as f32 * 1.6 * shape * (0.5 + (self.rand() % 100) as f32 / 100.0)) as i32;
+                // The top few cells of the column go up, the highest first.
+                for k in 0..3 {
+                    let y = top + k;
+                    if self.raw(x, y).kind() != Kind::Liquid {
+                        break;
+                    }
+                    if let Some(up) = (1..=rise).rev().find(|&u| self.at(x, y - u) == Mat::Empty) {
+                        self.swap((x, y), (x, y - up));
+                    }
+                }
+            }
+        }
+        // A billow of smoke around the fireball.
+        for dy in -(r * 3 / 2)..=(r * 3 / 2) {
+            for dx in -(r * 3 / 2)..=(r * 3 / 2) {
+                let d2 = dx * dx + dy * dy;
+                if d2 > r * r && d2 <= (r * 3 / 2) * (r * 3 / 2) && self.chance(9) && self.at(cx + dx, cy + dy) == Mat::Empty {
+                    self.set(cx + dx, cy + dy, Mat::Smoke);
+                }
+            }
+        }
+    }
+
+    /// Pressure wave: loose matter near (cx, cy) is thrown outward, the closer the harder.
+    /// Outer cells move first so they do not pile into inner ones.
+    fn shove_out(&mut self, cx: i32, cy: i32, r: i32) {
         let reach = (r as f32 * 2.3) as i32;
         let reach2 = (reach * reach) as f32;
         let mut shoved: Vec<(f32, i32, i32)> = vec![];
@@ -770,37 +818,6 @@ impl World {
             }
             if (tx, ty) != (x, y) {
                 self.swap((x, y), (tx, ty));
-            }
-        }
-        // Under water the gas bubble lifts the surface above it into a dome and a plume of spray:
-        // the shallower the blast, the higher the water is thrown.
-        if let Some(d) = depth {
-            let strength = (1.0 - d as f32 / (3.0 * r as f32)).clamp(0.0, 1.0);
-            let half = r * 6 / 5;
-            for dx in -half..=half {
-                let x = cx + dx;
-                let Some(top) = (cy - d - 2..=cy).find(|&y| self.raw(x, y).kind() == Kind::Liquid) else { continue };
-                let shape = 1.0 - dx.abs() as f32 / half as f32;
-                let rise = (strength * r as f32 * 1.6 * shape * (0.5 + (self.rand() % 100) as f32 / 100.0)) as i32;
-                // The top few cells of the column go up, the highest first.
-                for k in 0..3 {
-                    let y = top + k;
-                    if self.raw(x, y).kind() != Kind::Liquid {
-                        break;
-                    }
-                    if let Some(up) = (1..=rise).rev().find(|&u| self.at(x, y - u) == Mat::Empty) {
-                        self.swap((x, y), (x, y - up));
-                    }
-                }
-            }
-        }
-        // A billow of smoke around the fireball.
-        for dy in -(r * 3 / 2)..=(r * 3 / 2) {
-            for dx in -(r * 3 / 2)..=(r * 3 / 2) {
-                let d2 = dx * dx + dy * dy;
-                if d2 > r * r && d2 <= (r * 3 / 2) * (r * 3 / 2) && self.chance(9) && self.at(cx + dx, cy + dy) == Mat::Empty {
-                    self.set(cx + dx, cy + dy, Mat::Smoke);
-                }
             }
         }
     }
@@ -942,7 +959,7 @@ impl World {
                     Mat::DeadLeaf => self.step_dead_leaf(x, y),
                     Mat::Cloud => self.step_cloud(x, y),
                     Mat::Oil => {
-                        if !self.seep(x, y) {
+                        if !self.fly(x, y) && !self.jet(x, y) && !self.seep(x, y) {
                             self.step_oil(x, y);
                         }
                     }
@@ -950,7 +967,7 @@ impl World {
                     Mat::Steel => self.step_iron(x, y, 1500),
                     Mat::Gunpowder => self.step_gunpowder(x, y),
                     Mat::Water => {
-                        if !self.seep(x, y) {
+                        if !self.fly(x, y) && !self.jet(x, y) && !self.seep(x, y) {
                             self.step_water(x, y);
                         }
                     }
@@ -979,6 +996,9 @@ impl World {
         if self.structures_fall && self.ticks % 2 == 0 {
             self.drop_structures();
         }
+        if self.ticks % pockets::POCKETS_EVERY == pockets::POCKETS_EVERY / 2 {
+            self.update_pockets();
+        }
         self.update_wind();
         self.update_flow();
         if self.ticks % 4 == 0 {
@@ -999,32 +1019,37 @@ impl World {
         }
     }
 
-    /// Cheap hydrostatic pressure: inside one connected body of water, a
-    /// calm surface that sits well above another one gives a cell to it.
-    /// That makes water climb back up in U-shaped tubes (communicating vessels).
+    /// Hydrostatic balance: inside one connected body of water, a calm surface whose head is well
+    /// above another one's gives cells to it. The head of a surface is its height plus the
+    /// pressure of the gas pressing on it, in cells of water (a closed boiler full of steam pushes
+    /// its water as if it stood much higher). That makes water climb back up in U-shaped tubes
+    /// (communicating vessels), and up a pipe out of a boiler under pressure.
     fn level_water(&mut self) {
         let mut seen = std::mem::take(&mut self.seen);
         let mut stack = std::mem::take(&mut self.stack);
         seen.fill(false);
+        let head = |w: &World, x: i32, y: i32| (H as i32 - y) as f32 + (w.gas_pressure(x, y - 1) - 1.0) / pockets::ATM_PER_CELL;
         for start in 0..W * H {
             if seen[start] || self.cells[start].m != Mat::Water {
                 continue;
             }
-            let mut donor: Option<(i32, i32)> = None;
-            let mut recv: Option<(i32, i32)> = None;
+            let mut donor: Option<(i32, i32, f32)> = None;
+            let mut recv: Option<(i32, i32, f32)> = None;
             seen[start] = true;
             stack.push(start);
             while let Some(i) = stack.pop() {
                 let (x, y) = ((i % W) as i32, (i / W) as i32);
-                if self.at(x, y - 1) == Mat::Empty && self.at(x, y + 1) == Mat::Water {
-                    if recv.map_or(true, |r| y > r.1) {
-                        recv = Some((x, y));
+                let above = self.at(x, y - 1);
+                if matches!(above.kind(), Kind::Empty | Kind::Gas) && self.at(x, y + 1) == Mat::Water {
+                    let h = head(self, x, y);
+                    if above == Mat::Empty && recv.map_or(true, |r| h < r.2) {
+                        recv = Some((x, y, h));
                     }
-                    if self.at(x - 1, y) != Mat::Empty
-                        && self.at(x + 1, y) != Mat::Empty
-                        && donor.map_or(true, |d| y < d.1)
+                    if !matches!(self.at(x - 1, y).kind(), Kind::Empty | Kind::Gas)
+                        && !matches!(self.at(x + 1, y).kind(), Kind::Empty | Kind::Gas)
+                        && donor.map_or(true, |d| h > d.2)
                     {
-                        donor = Some((x, y));
+                        donor = Some((x, y, h));
                     }
                 }
                 for (nx, ny) in Self::neighbors(x, y) {
@@ -1038,9 +1063,21 @@ impl World {
                 }
             }
             if let (Some(d), Some(r)) = (donor, recv) {
-                if r.1 - d.1 >= 3 {
-                    self.set(d.0, d.1, Mat::Empty);
-                    self.set(r.0, r.1 - 1, Mat::Water);
+                let gap = d.2 - r.2;
+                if gap >= 3.0 && (d.0, d.1) != (r.0, r.1) {
+                    // A big difference of head moves several cells at once (a strong push).
+                    let n = ((gap / 6.0) as i32).clamp(1, 4);
+                    for k in 0..n {
+                        let (dx, dy) = (d.0, d.1 + k);
+                        let (rx, ry) = (r.0, r.1 - 1 - k);
+                        if self.raw(dx, dy) != Mat::Water || self.at(rx, ry) != Mat::Empty {
+                            break;
+                        }
+                        let t = self.temp[Self::idx(dx, dy)];
+                        self.set(dx, dy, Mat::Empty);
+                        self.set(rx, ry, Mat::Water);
+                        self.temp[Self::idx(rx, ry)] = t;
+                    }
                 }
             }
         }
@@ -2075,6 +2112,8 @@ impl World {
         let mut weight = 0.0f32;
         // The pressure at the top of the liquid or solid column the cell below feels.
         let mut top_p: Option<f32> = None;
+        // The pressure of the closed pocket just above, if the liquid lies in one.
+        let mut pocket_top: Option<f32> = None;
         for y in 0..=until {
             let m = self.at(x as i32, y as i32);
             let air = 1.05 * (-((H - y) as f32) / 700.0).exp();
@@ -2082,24 +2121,29 @@ impl World {
             // Ideal gas, P V = n R T. With compressible air the wind solver keeps density and
             // temperature together and gives the pressure directly; otherwise the pressure follows
             // the absolute temperature at fixed volume, so warm air reads as higher pressure.
-            let p_air = match self.flow.air_pressure(x as i32, y as i32) {
+            let closed = self.pocket_at(x as i32, y as i32).map(|k| self.pockets[k]).filter(|p| !p.open);
+            let p_air = if let Some(p) = closed {
+                // A closed pocket (a boiler, a sealed room) has its own pressure.
+                air * p.pressure
+            } else { match self.flow.air_pressure(x as i32, y as i32) {
                 Some(p) => air * p.clamp(0.3, 4.0),
                 None => {
                     let kelvin = (self.temp[y * W + x] + 273.15).max(1.0) / (self.ambient_c(y as i32) + 273.15).max(1.0);
                     air * dynamic * kelvin.clamp(0.5, 3.0)
                 }
-            };
+            } };
             match m.kind() {
                 Kind::Empty | Kind::Gas | Kind::Flame => {
                     put(y, p_air);
                     weight = 0.0;
                     top_p = None;
+                    pocket_top = closed.map(|_| p_air);
                 }
                 _ => {
                     // Below the surface: the hydrostatic weight of what is above, from the still-air
                     // pressure at the top, plus the excess pressure the liquid has passed on from the
                     // air (continuous with the air above, and the same all through a connected liquid).
-                    let base = *top_p.get_or_insert(air);
+                    let base = *top_p.get_or_insert(pocket_top.unwrap_or(air));
                     weight += density(m) * PER_CELL;
                     put(y, base + weight + self.excess_pressure_at(x as f32 + 0.5, y as f32 + 0.5));
                 }
@@ -2930,7 +2974,8 @@ mod tests {
                         && (0..4).all(|k| {
                             let (x, y) = ((i % W) as i32, (i / W) as i32);
                             let (nx, ny) = [(x, y + 1), (x + 1, y), (x - 1, y), (x, y - 1)][k];
-                            !matches!(w.raw(nx, ny), Mat::Stone | Mat::Dirt | Mat::Grass | Mat::Ice | Mat::Trunk | Mat::Leaf | Mat::Branch)
+                            // Ice floating on a lake is not hanging in the air either.
+                            !matches!(w.raw(nx, ny), Mat::Stone | Mat::Dirt | Mat::Grass | Mat::Ice | Mat::Trunk | Mat::Leaf | Mat::Branch | Mat::Water)
                         })
                 })
                 .collect()

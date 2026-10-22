@@ -25,6 +25,10 @@ pub enum MechDraft {
 }
 
 const IRON_OR_STEEL: &[Mat] = &[Mat::Iron, Mat::Steel];
+/// Pressure above the air's (atm) at which a steam motor gives its full torque.
+const STEAM_FULL_ATM: f32 = 2.0;
+/// Cells of steam a steam motor uses up per radian, at full power.
+const STEAM_USE: f32 = 0.8;
 const RAIL_MIN: f32 = 24.0;
 const RAIL_MAX: f32 = 220.0;
 const AXLE_MAX: f32 = 400.0;
@@ -706,6 +710,7 @@ impl Game {
         let node_loads = self.mech_node_rods();
         self.mech_reels();
         self.pump_loads();
+        self.mech_steam();
         let mut events = self.mech.step();
         for (r, f) in node_loads {
             if let Some(e) = self.mech.load_rod(r, f) {
@@ -742,6 +747,35 @@ impl Game {
             }
         }
         self.mech_push_world();
+    }
+
+    /// Steam motors: each takes its power from the closed pocket of steam it sits in or touches (a
+    /// boiler), and uses up that steam as it turns, letting it out of its chimney. No boiler, or a
+    /// boiler gone cold: no pressure, no torque.
+    fn mech_steam(&mut self) {
+        for gi in 0..self.mech.gears.len() {
+            let g = &self.mech.gears[gi];
+            let Some(mut mo) = g.motor.filter(|m| m.steam) else { continue };
+            let (pos, r, omega) = (g.pos, g.size.radius(), g.omega);
+            let intake = self.world.steam_intake((pos.x, pos.y), r + 4.0);
+            mo.pressure = intake.map_or(1.0, |(_, p)| p);
+            mo.power = ((mo.pressure - 1.0) / STEAM_FULL_ATM).clamp(0.0, 1.5);
+            match intake {
+                Some((k, _)) if mo.on => {
+                    mo.draw += mo.power * omega.abs() * STEAM_USE;
+                    let exhaust = (pos.x.round() as i32, (pos.y - r - 5.0).round() as i32);
+                    while mo.draw >= 1.0 {
+                        mo.draw -= 1.0;
+                        if !self.world.draw_steam(k, (pos.x, pos.y), exhaust) {
+                            mo.draw = 0.0;
+                            break;
+                        }
+                    }
+                }
+                _ => mo.draw = 0.0,
+            }
+            self.mech.gears[gi].motor = Some(mo);
+        }
     }
 
     /// Rods from a gear pin or a carriage to a block, a rod or the ground: the physics holds the far end
@@ -993,7 +1027,7 @@ impl Game {
             text: &'static str,
         }
         let tools = [
-            T { tool: Tool::Motor, label: "Moteur", text: "Un petit engrenage motorisé, vu de face. Clique pour le poser (sur un bloc, le sol, ou dans le vide). Clique un moteur posé pour l'ouvrir dans la télécommande (vitesse, couple, seuil de retournement)." },
+            T { tool: Tool::Motor, label: "Moteur", text: "Un petit engrenage motorisé, vu de face. Clique pour le poser (sur un bloc, le sol, ou dans le vide). Clique un moteur posé pour l'ouvrir dans la télécommande (vitesse, couple, seuil de retournement, à vapeur). Un moteur à vapeur tourne avec la pression d'une chaudière fermée qu'il touche, et use sa vapeur." },
             T { tool: Tool::Gear(GearSize::Small), label: "Petit", text: "Petit engrenage (rayon 6). Posé près d'un autre, il s'engrène : les dents collent à la bonne distance." },
             T { tool: Tool::Gear(GearSize::Medium), label: "Moyen", text: "Engrenage moyen (rayon 10). Deux engrenages qui s'engrènent tournent en sens inverse, plus vite pour le plus petit." },
             T { tool: Tool::Gear(GearSize::Large), label: "Grand", text: "Grand engrenage (rayon 14) : lourd, il sert de volant d'inertie et passe les points morts." },
@@ -1159,10 +1193,20 @@ impl Game {
             let c = view.to_screen(g.pos);
             let r = g.size.radius() * view.s;
             if let Some(m) = &g.motor {
-                // Face-on motor: a housing behind the gear and an arrow for the way it turns.
+                // Face-on motor: a housing behind the gear and an arrow for the way it turns. A
+                // steam motor is brass, with a chimney on top.
                 let half = r + 3.0 * view.s;
-                draw_rectangle(c.x - half, c.y - half, half * 2.0, half * 2.0, Color::from_rgba(58, 62, 78, 255));
-                draw_rectangle_lines(c.x - half, c.y - half, half * 2.0, half * 2.0, 2.0, Color::from_rgba(150, 156, 176, 255));
+                let (body, edge) = if m.steam {
+                    (Color::from_rgba(120, 88, 44, 255), Color::from_rgba(214, 170, 90, 255))
+                } else {
+                    (Color::from_rgba(58, 62, 78, 255), Color::from_rgba(150, 156, 176, 255))
+                };
+                if m.steam {
+                    let cw = 3.0 * view.s;
+                    draw_rectangle(c.x - cw / 2.0, c.y - half - 4.0 * view.s, cw, 4.0 * view.s, edge);
+                }
+                draw_rectangle(c.x - half, c.y - half, half * 2.0, half * 2.0, body);
+                draw_rectangle_lines(c.x - half, c.y - half, half * 2.0, half * 2.0, 2.0, edge);
                 let a0 = if m.dir > 0.0 { -0.4 } else { std::f32::consts::PI + 0.4 };
                 let tip = c + vec2(a0.cos(), a0.sin()) * (r + 1.0 * view.s);
                 draw_circle(tip.x, tip.y, 2.4 * view.s, if m.auto_reverse { GREEN } else { ACCENT });
@@ -1490,7 +1534,7 @@ impl Game {
     pub fn remote_rect(&self, views: Rect) -> Option<Rect> {
         let uid = self.selected_motor?;
         self.mech.gear_index(uid).filter(|&i| self.mech.gears[i].motor.is_some())?;
-        Some(Rect::new(views.x, views.y + views.h + 8.0, views.w, 262.0))
+        Some(Rect::new(views.x, views.y + views.h + 8.0, views.w, 316.0))
     }
 
     pub fn draw_remote(&mut self, ui: &mut Ui, panel: Rect) {
@@ -1536,6 +1580,19 @@ impl Game {
         y += 14.0;
         ui.slider(Rect::new(x, y, w, 18.0), &mut m.reverse_at, 0.3, 1.2, if m.auto_reverse { ACCENT } else { DIM });
         y += 28.0;
+
+        if ui.checkbox(Rect::new(x, y, w, 24.0), "À vapeur (chaudière fermée)", m.steam, true) {
+            m.steam = !m.steam;
+            m.power = 1.0;
+        }
+        y += 28.0;
+        if m.steam {
+            let col = if m.pressure > 1.05 { TEXT } else { DIM };
+            ui.text(&format!("Vapeur {:.1} atm   puissance {:.0} %", m.pressure, m.power * 100.0), x, y + 8.0, 13, col);
+        } else {
+            ui.text("Pose-le contre une chaudière", x, y + 8.0, 12, DIM);
+        }
+        y += 22.0;
 
         // What it is doing right now.
         ui.text(&format!("Rotation : {:.0} tr/min", rpm(omega.abs())), x, y + 8.0, 13, TEXT);

@@ -27,6 +27,8 @@ use sound::{Ev, Mix, Sounds};
 use ui::{draw_icon, rrect, Icon, Ui, ACCENT, BG, BLUE, DIM, GREEN, PANEL, RED, TEXT};
 use world::{Biome, Cell, Mat, PaintRule, Season, World, H, W};
 
+/// Simulation steps per second at speed x1 (the rigid bodies use the same 1/60 s step).
+const STEPS_PER_SECOND: f32 = 60.0;
 const PANEL_W: f32 = 244.0;
 /// No top bar any more: the world starts at the very top.
 const TOP_H: f32 = 0.0;
@@ -235,6 +237,9 @@ struct Game {
     shake: f32,
     frame_ema: f32,
     slow_frames: u32,
+    /// Simulation steps owed to the clock: the world runs 60 steps a second (times the speed)
+    /// whatever the screen's refresh rate.
+    sim_acc: f32,
     beam_broke: bool,
     broken_members: Vec<u32>,
     /// Building does not use up the world's materials: one choice for the editing
@@ -334,6 +339,7 @@ impl Game {
             shake: 0.0,
             frame_ema: 0.016,
             slow_frames: 0,
+            sim_acc: 0.0,
             beam_broke: false,
             broken_members: vec![],
             unlimited: true,
@@ -1446,7 +1452,15 @@ impl Game {
             self.sounds.update(dt, &Mix::default());
             return;
         }
-        for _ in 0..self.speed {
+        // A fixed time step: 60 steps a second at x1, the same on a 60 Hz or a 144 Hz screen. A
+        // machine that cannot keep up catches up a little, then lets the time go (and the frame
+        // watch above simplifies the physics or lowers the speed).
+        self.sim_acc += dt * STEPS_PER_SECOND * self.speed as f32;
+        let owed = self.sim_acc.floor() as usize;
+        let max = self.speed * 2;
+        let steps = owed.min(max);
+        self.sim_acc = if owed > max { 0.0 } else { self.sim_acc - steps as f32 };
+        for _ in 0..steps {
             self.sim_step();
         }
         if (self.time * 2.0) as u32 != ((self.time - dt) * 2.0) as u32 {
@@ -1461,7 +1475,7 @@ impl Game {
             .fold(None, |a: Option<f32>, r| Some(a.map_or(r, |a| a.max(r))));
         let mix = Mix {
             wind: ((self.world.wind.abs() - 0.55) / 0.45).clamp(0.0, 1.0),
-            water: (self.world.take_water_flow() as f32 / (60.0 * self.speed as f32)).sqrt().min(1.0),
+            water: (self.world.take_water_flow() as f32 / (dt * 3600.0 * self.speed as f32).max(1.0)).sqrt().min(1.0),
             fire: (self.heat_cells as f32 / 150.0).sqrt().min(1.0),
             rpm,
         };
@@ -1628,6 +1642,10 @@ impl Game {
             self.booms.push(Boom { pos: c, t: 0.0, color: Color::new(1.0, 0.5, 0.1, 1.0) });
             // The pressure wave rattles the whole picture.
             self.shake = self.shake.max((r as f32 * 0.75).min(18.0));
+        }
+        // A wall gave way under the pressure of a closed pocket (a boiler): say how much it held.
+        if let Some(&(_, _, atm)) = std::mem::take(&mut self.world.bursts).iter().max_by(|a, b| a.2.total_cmp(&b.2)) {
+            self.say(format!("Une paroi a cédé sous la pression : {atm:.1} atm (l'air libre est à 1 atm)"));
         }
         let outside = |p: Vec2| p.y > H as f32 + 60.0 || p.x < -60.0 || p.x > W as f32 + 60.0;
         let mut gone: Vec<(usize, u8)> = vec![];
@@ -3268,6 +3286,37 @@ mod tests {
         assert!(g.mech.gears[1].omega.abs() > 0.0, "the driven gear turns");
         let ratio = g.mech.gears[1].omega / g.mech.gears[0].omega;
         assert!((ratio + 0.6).abs() < 1e-3, "6/10 reduction, opposite sense: {ratio}");
+    }
+
+    #[test]
+    fn a_steam_motor_turns_on_the_pressure_of_its_boiler_and_uses_up_the_steam() {
+        let run = |steam: bool| {
+            let mut g = mech_game();
+            // A closed stone boiler, its top half full of steam (or of plain air).
+            for x in 200..=260 {
+                for y in 200..=260 {
+                    let wall = x == 200 || x == 260 || y == 200 || y == 260;
+                    let m = if wall { Mat::Stone } else if steam && y < 215 { Mat::Steam } else { Mat::Empty };
+                    g.world.set(x, y, m);
+                }
+            }
+            click_with(&mut g, Tool::Motor, 230.0, 240.0);
+            g.mech.gears[0].motor.as_mut().unwrap().steam = true;
+            let count = |g: &Game| g.world.census()[Mat::Steam as usize];
+            let before = count(&g);
+            g.set_running(true);
+            let mut spin = 0.0f32;
+            for _ in 0..400 {
+                g.sim_step();
+                spin = spin.max(g.mech.gears[0].omega.abs());
+            }
+            (spin, before, count(&g), g.mech.gears[0].motor.unwrap().pressure)
+        };
+        let (spin, before, after, atm) = run(true);
+        assert!(atm > 1.5 && spin > 0.03, "the boiler drives the motor: {spin} rad/step at {atm} atm");
+        assert!(after < before, "the motor uses up the steam: {before} -> {after}");
+        let (idle, ..) = run(false);
+        assert!(idle < 0.005, "no steam, no torque: {idle}");
     }
 
     #[test]

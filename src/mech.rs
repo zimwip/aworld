@@ -85,11 +85,19 @@ pub struct Motor {
     /// Steps left before it may reverse again.
     pub cooldown: u32,
     overload: u32,
+    /// A steam motor: its torque comes from the pressure of the boiler it sits in (see
+    /// `Game::mech_steam`), scaled by `power` (0 with no pressure, 1 at full pressure).
+    pub steam: bool,
+    pub power: f32,
+    /// Pressure (atm) of the steam it feeds on, for the remote control.
+    pub pressure: f32,
+    /// Steam used up and not yet taken from the boiler, in cells.
+    pub draw: f32,
 }
 
 impl Motor {
     pub fn new() -> Self {
-        Motor { torque: 20.0, free_speed: 0.12, dir: 1.0, on: true, auto_reverse: false, reverse_at: 0.8, cooldown: 0, overload: 0 }
+        Motor { torque: 20.0, free_speed: 0.12, dir: 1.0, on: true, auto_reverse: false, reverse_at: 0.8, cooldown: 0, overload: 0, steam: false, power: 1.0, pressure: 1.0, draw: 0.0 }
     }
 
     pub fn reversing() -> Self {
@@ -790,7 +798,8 @@ impl Mechanism {
                 if let Some(mo) = g.motor.filter(|mo| mo.on) {
                     if ctx.comp[i] == tree.root {
                         let w = dth[i] * qd;
-                        motor_torque += mo.torque * mo.dir * (1.0 - mo.dir * w / mo.free_speed).clamp(-0.5, 1.0) * dth[i];
+                        let torque = if mo.steam { mo.torque * mo.power } else { mo.torque };
+                        motor_torque += torque * mo.dir * (1.0 - mo.dir * w / mo.free_speed).clamp(-0.5, 1.0) * dth[i];
                     }
                 }
             }

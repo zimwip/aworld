@@ -13,9 +13,9 @@ pub fn info(m: Mat) -> Info {
     let (name, state, fact) = match m {
         Mat::Empty => ("Air", "gaz", "L'air est plus froid en altitude et la nuit."),
         Mat::Sand => ("Sable", "poudre", "Chauffé à 600 °C, il fond et devient du verre."),
-        Mat::Water => ("Eau", "liquide", "Bout à 100 °C, gèle sous -6 °C. Les arbres et la terre en ont besoin."),
+        Mat::Water => ("Eau", "liquide", "Bout à 100 °C à l'air libre, plus chaud sous pression (120 °C à 2 atm : la cocotte-minute). Gèle sous -6 °C."),
         Mat::Fire => ("Feu", "flamme", "Environ 650 °C. Il brûle le bois et chauffe tout autour."),
-        Mat::Steam => ("Vapeur", "gaz", "Eau chauffée à plus de 100 °C. Elle monte, refroidit et fait des nuages."),
+        Mat::Steam => ("Vapeur", "gaz", "Eau chauffée à plus de 100 °C : elle prend bien plus de place que l'eau. Enfermée, elle pousse (chaudière, moteur à vapeur)."),
         Mat::Iron => ("Fer", "solide", "Rouille dans l'eau. Avec du carbone et de la chaleur, il devient de l'acier."),
         Mat::Wood => ("Bois", "solide", "Brûle vers 300 °C. Il reste de la cendre, c'est du carbone."),
         Mat::Stone => ("Pierre", "solide", "Fond vers 540 °C. Le gel et le dégel l'effritent en sable."),

@@ -222,3 +222,13 @@ Quand les images restent lentes, le jeu simplifie d'abord la physique (`World::l
 3. l'air calme voisin d'un air calme ne conduit plus la chaleur (il se contente de relaxer vers l'ambiant) ; une différence d'au moins 4 °C (un panache chaud) conduit toujours.
 
 Après environ 15 s fluides, un niveau est rétabli (avec un délai de 5 minutes si la simplification venait d'être imposée). Des tests vérifient que le sable fond encore en verre et qu'une pierre chaude refroidit au même rythme à chaque niveau.
+
+## Vapeur et eau sous pression
+
+`src/world/pockets.rs` regroupe le gaz en poches. Une poche qui touche le ciel, les côtés ou le fond, ou qui est très grande, est l'air libre (1 atm). Une poche fermée suit la loi des gaz parfaits (P V = n R T) : sa pression monte avec sa température absolue et avec la vapeur qu'elle contient (une cellule de vapeur compte 8 fois, car l'eau qui bout prend bien plus de place).
+
+- **Chaudière** : une boîte fermée où l'on fait bouillir de l'eau monte en pression. Sa paroi la plus faible cède quand la surpression dépasse ce qu'elle tient (glace 0,6 atm, verre 0,8, terre 2, bois 2,5, pierre 5, fer 8, acier 14) : un craquement pour une petite poche, une explosion pour une grande. Un message dit à quelle pression.
+- **Cocotte-minute** : l'eau bout plus chaud sous pression (Clausius-Clapeyron : 100 °C à 1 atm, 120 °C à 2 atm), et aussi au fond d'un lac profond.
+- **Eau sous pression** : la pression d'un liquide est celle du gaz sur sa surface plus son propre poids (60 cellules d'eau = 1 atm), partagée dans tout le liquide relié. Un trou dans un mur fait gicler un jet qui garde sa vitesse en tombant, plus loin pour un trou profond (Torricelli). Les vases communicants équilibrent la charge (hauteur + pression), donc une chaudière pousse son eau dans un tuyau qui monte (geyser).
+- **Moteur à vapeur** : dans la télécommande d'un moteur, « À vapeur ». Posé contre une chaudière fermée, il tourne avec sa pression (plein couple à 3 atm), use sa vapeur et la rejette par sa cheminée. Sans feu sous la chaudière, il ralentit puis s'arrête.
+- **Pas de temps fixe** : la simulation fait 60 pas par seconde (fois la vitesse), quel que soit l'écran (60 ou 144 Hz).

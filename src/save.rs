@@ -11,7 +11,7 @@ use std::io::{self, Error, ErrorKind};
 use std::path::PathBuf;
 
 const MAGIC: &[u8; 4] = b"AWLD";
-const VERSION: u8 = 6;
+const VERSION: u8 = 7;
 
 pub struct Loaded {
     pub mats: Vec<Mat>,
@@ -184,6 +184,7 @@ pub fn encode(world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>
                     out.extend(v.to_le_bytes());
                 }
                 out.push(m.auto_reverse as u8);
+                out.push(m.steam as u8);
             }
             None => out.push(0),
         }
@@ -453,6 +454,7 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
                     m.dir = dir;
                     m.reverse_at = reverse_at;
                     m.auto_reverse = r.u8()? != 0;
+                    m.steam = version >= 7 && r.u8()? != 0;
                     Some(m)
                 }
             } else {
