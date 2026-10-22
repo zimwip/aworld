@@ -1,5 +1,6 @@
 //! Saving and loading worlds: grid (run-length encoded), blocks, entry/exit.
 
+use crate::pipes::{Driver, Pipe, Valve};
 use crate::mech::{Axle, End, Gear, GearSize, Mechanism, Motor, Pivot, Rod, Slider};
 use crate::blocks::{Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, Spring, SpringKind};
 use crate::world::{Biome, Mat, World, DAY_STEPS, H, W};
@@ -238,6 +239,43 @@ pub fn encode(world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>
         put_anchor(&mut out, &p.mount);
         out.extend(p.radius.to_le_bytes());
     }
+    // Pipes and valves.
+    out.extend((mech.plumbing.pipes.len() as u16).to_le_bytes());
+    for p in &mech.plumbing.pipes {
+        out.extend(p.uid.to_le_bytes());
+        for v in [p.a.0, p.a.1, p.b.0, p.b.1] {
+            out.extend(v.to_le_bytes());
+        }
+        out.push(p.fluid as u8);
+    }
+    out.extend((mech.plumbing.valves.len() as u16).to_le_bytes());
+    for v in &mech.plumbing.valves {
+        out.extend(v.uid.to_le_bytes());
+        out.extend(v.pipe.to_le_bytes());
+        for f in [v.t, v.open, v.turns] {
+            out.extend(f.to_le_bytes());
+        }
+        match v.driver {
+            None => out.push(0),
+            Some(Driver::Gear(u)) => {
+                out.push(1);
+                out.extend(u.to_le_bytes());
+            }
+            Some(Driver::Slider(u)) => {
+                out.push(2);
+                out.extend(u.to_le_bytes());
+            }
+        }
+    }
+    out.extend((mech.plumbing.pumps.len() as u16).to_le_bytes());
+    for p in &mech.plumbing.pumps {
+        out.extend(p.uid.to_le_bytes());
+        out.extend(p.pipe.to_le_bytes());
+        out.extend(p.t.to_le_bytes());
+        out.extend(p.head.to_le_bytes());
+        out.push(p.on as u8);
+        out.extend(p.driver.unwrap_or(0).to_le_bytes());
+    }
     out
 }
 
@@ -392,6 +430,7 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
     let mut raw_sliders: Vec<(u32, Raw, Raw, f32)> = vec![];
     let mut raw_rods: Vec<(u32, [RawEnd; 2], f32, f32, bool)> = vec![];
     let mut raw_pivots: Vec<(usize, Raw)> = vec![];
+    let mut plumbing = crate::pipes::Plumbing::default();
     let mut raw_pulleys: Vec<(u32, Raw, f32)> = vec![];
     if version >= 6 {
         for _ in 0..r.u16()? {
@@ -454,6 +493,33 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
             let mount = anchor(&mut r)?;
             raw_pulleys.push((uid, mount, r.f32()?));
         }
+        for _ in 0..r.u16()? {
+            let uid = r.u32()?;
+            let (ax, ay, bx, by) = (r.f32()?, r.f32()?, r.f32()?, r.f32()?);
+            let mut p = Pipe::new(uid, (ax, ay), (bx, by));
+            p.fluid = Mat::from_u8(r.u8()?);
+            plumbing.pipes.push(p);
+        }
+        for _ in 0..r.u16()? {
+            let (uid, pipe) = (r.u32()?, r.u32()?);
+            let mut v = Valve::new(uid, pipe, r.f32()?);
+            v.open = r.f32()?;
+            v.turns = r.f32()?;
+            v.driver = match r.u8()? {
+                1 => Some(Driver::Gear(r.u32()?)),
+                2 => Some(Driver::Slider(r.u32()?)),
+                _ => None,
+            };
+            plumbing.valves.push(v);
+        }
+        for _ in 0..r.u16()? {
+            let (uid, pipe, t, head) = (r.u32()?, r.u32()?, r.f32()?, r.f32()?);
+            let mut pm = crate::pipes::Pump::new(uid, pipe, t);
+            pm.head = head;
+            pm.on = r.u8()? != 0;
+            pm.driver = Some(r.u32()?).filter(|u| *u != 0);
+            plumbing.pumps.push(pm);
+        }
     }
     let uids: Vec<u32> = members.iter().map(|m| m.uid).collect();
     let blocks_uids: Vec<u32> = blocks.iter().map(|b| b.uid).collect();
@@ -488,6 +554,7 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
         springs.push(Spring::new(kind, a, b, v[0], v[1], p0, p1));
     }
     let mut mech = Mechanism::default();
+    mech.plumbing = plumbing;
     for g in raw_gears {
         let mut gear = Gear::new(g.uid, g.size, Vec2::ZERO);
         gear.mount = resolve(g.mount, Vec2::ZERO);
@@ -533,7 +600,7 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
             mech.pivots.push(Pivot { wheel: *b, support: resolve(a, Vec2::ZERO) });
         }
     }
-    let top = mech.gears.iter().map(|g| g.uid).chain(mech.pulleys.iter().map(|p| p.uid)).chain(mech.axles.iter().map(|a| a.uid)).chain(mech.sliders.iter().map(|s| s.uid)).chain(mech.rods.iter().map(|r| r.uid)).max().unwrap_or(0);
+    let top = mech.gears.iter().map(|g| g.uid).chain(mech.plumbing.pipes.iter().map(|p| p.uid)).chain(mech.plumbing.valves.iter().map(|v| v.uid)).chain(mech.plumbing.pumps.iter().map(|p| p.uid)).chain(mech.pulleys.iter().map(|p| p.uid)).chain(mech.axles.iter().map(|a| a.uid)).chain(mech.sliders.iter().map(|s| s.uid)).chain(mech.rods.iter().map(|r| r.uid)).max().unwrap_or(0);
     crate::mech::bump_uids(top);
     Ok(Loaded { mats, entry, exit, blocks, cables, members, springs, mech, biome, clock })
 }

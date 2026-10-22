@@ -12,6 +12,7 @@
 //! tooth under a stalled motor, can give way).
 
 use crate::blocks::Anchor;
+use crate::pipes::Plumbing;
 use macroquad::prelude::{vec2, Vec2};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -31,7 +32,7 @@ pub fn bump_uids(above: u32) {
 /// `r_a + r_b` apart.
 const MESH_TOLERANCE: f32 = 1.5;
 /// A stop absorbs the motion over this many steps (so it is a hard shove, not infinite).
-const STOP_TICKS: f32 = 3.0;
+const STOP_TICKS: f32 = 8.0;
 /// Steps of overload before a rod or a tooth gives way.
 const FATIGUE: u32 = 3;
 
@@ -61,9 +62,9 @@ impl GearSize {
     /// The largest force the teeth carry before they strip.
     pub fn tooth_strength(self) -> f32 {
         match self {
-            GearSize::Small => 4.0,
-            GearSize::Medium => 6.0,
-            GearSize::Large => 9.0,
+            GearSize::Small => 6.0,
+            GearSize::Medium => 9.0,
+            GearSize::Large => 13.0,
         }
     }
 }
@@ -299,6 +300,8 @@ pub struct Pulley {
 
 #[derive(Clone, Default, Debug)]
 pub struct Mechanism {
+    /// Pipes and valves: part of the mechanisms so that they are saved, undone and reset with them.
+    pub plumbing: Plumbing,
     pub pulleys: Vec<Pulley>,
     pub pivots: Vec<Pivot>,
     pub gears: Vec<Gear>,

@@ -78,14 +78,29 @@ Sans carte son (ALSA/PipeWire), compiler avec `cargo build --release --no-defaul
   bord du monde, ce bord s'illumine.
 - Les liquides (eau, huile, lave) traversent les arbres au lieu d'être retenus.
 
-## Compiler et diffuser
+## Compiler, lancer, installer
 
-- `./build.sh` (Linux) ou `build.bat` (Windows) : l'application de bureau, `target/release/aworld`.
-- `./build.sh web` ou `build.bat web` : le paquet web dans `dist/web/` (wasm + page + petit serveur
-  `aworld-serve`). Lancer `dist/web/serve.sh` (ou `serve.bat`) puis ouvrir http://localhost:8765/ ;
-  `./build.sh web run` fait les deux. Le dossier `dist/web/site/` peut aussi être posé sur n'importe quel hébergeur statique.
+| | Linux | Windows |
+|---|---|---|
+| Compiler l'application | `./build.sh` | `build.bat` |
+| Compiler la version web (wasm + petit serveur) | `./build.sh web` | `build.bat web` |
+| Compiler **et lancer** l'application | `./run.sh` | `run.bat` |
+| Compiler **et servir** la version web | `./run.sh web` | `run.bat web` |
+| Installer + raccourci bureau et menu | `./install.sh` (`--uninstall` pour retirer) | `install.bat` (`install.bat uninstall`) |
+
+- `run` accepte les options du jeu (`./run.sh --mute`) ; `run web [port]` ouvre http://localhost:8765/.
+- Le paquet web est dans `dist/web/` (page + wasm + `aworld-serve`) ; `dist/web/site/` peut aussi être posé sur
+  n'importe quel hébergeur statique. Il faut `rustup` (le script installe la cible `wasm32-unknown-unknown`).
 - Version web : les sauvegardes restent en mémoire tant que la page est ouverte (pas de fichiers).
-- Prérequis web : `rustup target add wasm32-unknown-unknown` (le script le tente).
+- `install` copie le jeu dans `~/.local/share/aworld` (Linux) ou `%LOCALAPPDATA%\AWorld` (Windows), où vivent aussi
+  les mondes sauvegardés. Sous GNOME, si le raccourci du bureau reste grisé : clic droit, « Autoriser le lancement ».
+  Les scripts Windows n'ont pas pu être essayés depuis Linux.
+
+## Raccourcis
+
+Espace jouer/pause · R retour · C voiture · Z annuler · H/X/V vues · M son · F ou F11 plein écran · Tab onglet. Poteau (brique haute) dans les blocs : plus besoin de tourner les blocs.
+**Échap** recule d'un cran : page Science, tracé en cours, plein écran, puis une fenêtre « Quitter AWorld ? » qui met
+la simulation en pause ; Échap y reprend le jeu, **Entrée** quitte.
 
 ## Mécanique (onglet Méca)
 
@@ -104,6 +119,18 @@ d'engrenage au chariot) et **pivot** (une roue sur un axe : poulie, tambour de t
 - Option moteur : **sens inverse si surcharge** (cale, butée ou charge lourde). Clic sur un moteur posé : inverser son sens.
 - Le chariot pousse sable, eau et blocs. Un engrenage relié à une roue pivotée l'entraîne ; un câble accroché sur le bord
   de cette roue (le câble s'accroche au bord des roues) s'enroule : c'est un **treuil**.
+- **Treuil** (tambour à enrouleur sur un engrenage) : avec l'outil Câble, un clic sur le tambour y fixe un bout de câble ;
+  en tournant, le tambour enroule ou déroule (sens positif = enroule) et le câble tire en retour sur le moteur. Le
+  tambour a une butée en fin de câble (le moteur cale, ou repart dans l'autre sens s'il est réglé ainsi).
+- **Poulie** (une poulie sans roue, posée sur un bloc, le sol ou dans le vide) : outil Câble : premier bout, puis la
+  poulie, puis l'autre bout (plusieurs poulies à la suite possibles). Le câble glisse dessus sans frottement
+  (machine d'Atwood, palan). Une roue reste libre ; l'outil Pivot en fait un axe si on le souhaite.
+- Une bielle s'accroche à tout : engrenage, chariot, bloc, tige, sol. Sur un bloc, la bielle le tire ou le pousse
+  vraiment (l'effort revient sur le moteur). Un coulisseau accepte plusieurs bielles, et une bielle peut relier
+  deux engrenages.
+- Télécommande du moteur (sélectionne un moteur : sous les Vues) : en marche/arrêt, sens, vitesse à vide, couple,
+  seuil de retournement, et les mesures en direct (tr/min, charge). Vue Efforts : couple, charge des dents, force
+  des bielles, pression sur les chariots.
 - Câbles : un bout peut rester libre (le second clic dans le vide) ; l'acier est bien plus raide.
 
 ## L'air qui s'écoule
@@ -112,3 +139,39 @@ Le vent est un écoulement simplifié (grille grossière, fluide incompressible)
 opposés selon l'altitude, des rafales s'enroulent en tourbillons, l'air chaud monte au-dessus d'un feu, et
 l'écoulement contourne le relief. Nuages, vapeur et fumée le suivent, la pluie se penche avec le vent local.
 Touche **V** pour voir les flèches.
+
+## Fluides, pression, outils
+
+- **Onglet Fluides** : tuyaux (droits, qui s'alignent et se raccordent ; un tuyau qui finit sur le flanc d'un autre fait
+  un branchement), **vannes** (clic = ouvrir/fermer ; avec l'outil Axe, menées par un engrenage — elles s'ouvrent en N
+  tours puis le moteur cale ou repart — ou par un rail), **pompes** (poussent du 1er bout vers le 2e, clic pour inverser
+  ou arrêter ; menées par un engrenage, la poussée suit la vitesse et freine le moteur). Chaque bout libre est ouvert :
+  il aspire le liquide où il plonge ou le rejette. Le liquide suit la charge hydraulique : vases communicants, **siphon**
+  (limité par la hauteur que l'air peut soutenir, ce que la pompe dépasse), **écluse** (deux bassins et une vanne).
+- **Vue Pression** (touche P) : pression de l'air (plus mince en altitude, courants), poids des colonnes de liquide,
+  poids au-dessus des solides, frontières gaz / liquide / solide ; les tuyaux sont colorés par leur pression.
+- **Argile / terre cuite** : l'argile cuit vers 550 °C. Un feu de bois sous un creuset de terre cuite (braises couvertes :
+  plus chaudes et plus durables) chauffe le fer et la cendre jusqu'à 400 °C : acier.
+- **Pelle** : un clic remplit la bulle (si elle est vide), elle reste pleine en se déplaçant, chaque clic verse une part ;
+  clic droit verse tout. Elle garde la chaleur de ce qu'elle porte.
+- **Loupe** : le pointeur est une loupe, une vue ronde agrandie en bas à droite montre la matière sous la croix.
+- **Sélection** : entoure un élément ; glisser le déplace (les blocs se clipsent), les poignées d'une tige, d'un câble, d'un
+  tuyau ou d'un rail les retaillent ; Suppr efface ; Échap désélectionne.
+- **Briques** : se clipsent sur les plots (plus de plots en commun = tient mieux) ; une fois clipsées elles ne glissent plus
+  de côté, seulement un peu en hauteur et en basculement. Le poteau est la brique haute.
+- Le lecteur (jouer, vitesse, voiture) flotte en bas et s'efface quand la souris ne bouge plus ; les messages s'affichent en haut.
+
+## Le Béluga (pour rire)
+
+De temps en temps (rarement, un seul à la fois) un avion Béluga stylisé traverse le ciel. Il suit simplement le champ de
+vent : par temps calme il vole droit et traverse l'écran ; ce sont les tourbillons (vortex) de l'air qui le font tourner
+et faire des loopings et des culbutes. S'il touche quoi que ce soit (sol, eau, bloc, arbre…) il explose. Touche `B` : en appeler un.
+
+## Vent, saisons et palette
+
+- Onglet Monde, section Vent : trois curseurs. *Force max* plafonne la vitesse du vent, *Virages* règle la fréquence des
+  changements de direction (jamais … x3), *Calme-venteux* passe d'un temps calme (petite brise) à un temps venteux.
+- Cliquer sur la saison dans la pastille en haut à gauche de la simulation passe à la saison suivante.
+- La palette de gauche se cache comme celle de droite : elle sort quand la souris va au bord gauche. La petite poignée en
+  haut la garde dehors (et l'image se place à côté).
+- Les feuillages laissent passer l'eau : elle goutte à travers les arbres.

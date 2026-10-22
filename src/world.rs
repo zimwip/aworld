@@ -95,13 +95,16 @@ pub enum Mat {
     Oil,
     Smoke,
     Molten,
+    /// Clay: fired in a hot fire it becomes terracotta.
+    Clay,
+    Terracotta,
 }
 
 impl Mat {
-    pub const ALL: [Mat; 33] = [
+    pub const ALL: [Mat; 35] = [
         Mat::Empty, Mat::Sand, Mat::Water, Mat::Fire, Mat::Steam, Mat::Iron, Mat::Wood, Mat::Stone,
         Mat::Brick, Mat::Rust, Mat::Ash, Mat::Ember, Mat::Lava, Mat::Ice, Mat::Gunpowder, Mat::Dirt, Mat::Grass,
-        Mat::Leaf, Mat::Steel, Mat::Cloud, Mat::Seed, Mat::Sapling, Mat::Mud, Mat::Glass, Mat::Snow, Mat::Shard, Mat::DeadLeaf, Mat::Branch, Mat::Trunk, Mat::Hail, Mat::Oil, Mat::Smoke, Mat::Molten,
+        Mat::Leaf, Mat::Steel, Mat::Cloud, Mat::Seed, Mat::Sapling, Mat::Mud, Mat::Glass, Mat::Snow, Mat::Shard, Mat::DeadLeaf, Mat::Branch, Mat::Trunk, Mat::Hail, Mat::Oil, Mat::Smoke, Mat::Molten, Mat::Clay, Mat::Terracotta,
     ];
 
     pub fn from_u8(v: u8) -> Mat {
@@ -128,7 +131,7 @@ impl Mat {
             Water | Lava | Oil | Molten => Kind::Liquid,
             Steam | Cloud | Smoke => Kind::Gas,
             Fire => Kind::Flame,
-            Iron | Wood | Stone | Brick | Ember | Ice | Dirt | Grass | Leaf | Steel | Sapling | Glass | Branch | Trunk => Kind::Static,
+            Iron | Wood | Stone | Brick | Ember | Ice | Dirt | Grass | Leaf | Steel | Sapling | Glass | Branch | Trunk | Clay | Terracotta => Kind::Static,
         }
     }
 
@@ -149,6 +152,50 @@ impl Mat {
 
     pub fn hot(self) -> bool {
         matches!(self, Mat::Fire | Mat::Ember | Mat::Lava)
+    }
+}
+
+/// A pressure (atmospheres, absolute) as a colour: violet for thin air and suction, blue and green
+/// around one atmosphere, yellow, orange and red under load, white under crushing weight.
+pub fn pressure_rgb(atm: f32) -> (u8, u8, u8) {
+    const STOPS: [(f32, [f32; 3]); 8] = [
+        (0.0, [90.0, 40.0, 190.0]),
+        (0.45, [100.0, 70.0, 220.0]),
+        (0.75, [50.0, 110.0, 235.0]),
+        (1.05, [50.0, 190.0, 150.0]),
+        (1.7, [235.0, 225.0, 70.0]),
+        (3.0, [245.0, 130.0, 40.0]),
+        (6.0, [230.0, 50.0, 40.0]),
+        (12.0, [255.0, 245.0, 245.0]),
+    ];
+    let p = atm.clamp(0.0, 12.0);
+    let k = STOPS.iter().position(|s| s.0 >= p).unwrap_or(STOPS.len() - 1).max(1);
+    let ((p0, c0), (p1, c1)) = (STOPS[k - 1], STOPS[k]);
+    let f = ((p - p0) / (p1 - p0)).clamp(0.0, 1.0);
+    let m = |a: f32, b: f32| (a + (b - a) * f) as u8;
+    (m(c0[0], c1[0]), m(c0[1], c1[1]), m(c0[2], c1[2]))
+}
+
+/// Weight of a cell of this material, relative to water.
+fn density(m: Mat) -> f32 {
+    match m {
+        Mat::Water | Mat::Oil => if m == Mat::Oil { 0.8 } else { 1.0 },
+        Mat::Lava => 3.0,
+        Mat::Molten => 6.5,
+        Mat::Stone => 2.7,
+        Mat::Dirt | Mat::Sand | Mat::Mud => 1.6,
+        Mat::Clay => 1.8,
+        Mat::Terracotta => 2.0,
+        Mat::Brick => 1.2,
+        Mat::Wood | Mat::Trunk | Mat::Branch => 0.6,
+        Mat::Leaf | Mat::Sapling | Mat::Grass | Mat::Seed | Mat::DeadLeaf => 0.3,
+        Mat::Iron | Mat::Steel => 7.8,
+        Mat::Glass | Mat::Shard => 2.5,
+        Mat::Ice | Mat::Hail => 0.92,
+        Mat::Snow => 0.3,
+        Mat::Ash => 0.5,
+        Mat::Gunpowder | Mat::Rust => 1.5,
+        _ => 1.0,
     }
 }
 
@@ -199,6 +246,13 @@ pub struct World {
     pub revision: u64,
     /// Wind, -1 (left) to 1 (right).
     pub wind: f32,
+    /// The player's wind controls: strongest wind (0..1), how fast the direction keeps changing
+    /// (0 = never, 1 = usual, up to 3), and how windy the weather is (0 calm .. 1 windy).
+    pub wind_max: f32,
+    pub wind_changes: f32,
+    pub windiness: f32,
+    /// Advances with `wind_changes`; the wind's direction follows it.
+    pub wind_clock: f32,
     /// Landscape type this world was generated as (picks the backdrop).
     pub biome: Biome,
     /// Cached seasonal colours (leaf rgb, autumn amount, grass rgb).
@@ -241,6 +295,10 @@ impl World {
             climate_fixed: None,
             revision: 1,
             wind: 0.0,
+            wind_max: 1.0,
+            wind_changes: 1.0,
+            windiness: 1.0,
+            wind_clock: 0.0,
             biome: Biome::Countryside,
             leaf_rgb: (52, 140, 60),
             autumn: 0.0,
@@ -586,7 +644,8 @@ impl World {
     fn hardness(m: Mat) -> f32 {
         match m {
             Mat::Stone => 1.0,
-            Mat::Brick => 0.7,
+            Mat::Brick | Mat::Terracotta => 0.7,
+            Mat::Clay => 0.3,
             Mat::Iron | Mat::Steel => 2.4,
             Mat::Glass => 0.2,
             Mat::Ice => 0.35,
@@ -628,7 +687,7 @@ impl World {
                             // Shattered: rubble where it was rock, dust or embers otherwise.
                             let into = match m {
                                 Mat::Stone => if self.chance(2) { Mat::Sand } else { Mat::Empty },
-                                Mat::Brick | Mat::Dirt | Mat::Grass | Mat::Mud => if self.chance(2) { Mat::Mud } else { Mat::Empty },
+                                Mat::Brick | Mat::Dirt | Mat::Grass | Mat::Mud | Mat::Clay | Mat::Terracotta => if self.chance(2) { Mat::Mud } else { Mat::Empty },
                                 Mat::Wood | Mat::Trunk | Mat::Branch => if self.chance(3) { Mat::Ember } else { Mat::Empty },
                                 Mat::Glass => if self.chance(2) { Mat::Shard } else { Mat::Empty },
                                 Mat::Ice => if self.chance(2) { Mat::Snow } else { Mat::Water },
@@ -1441,6 +1500,18 @@ impl World {
                 return;
             }
         }
+        // Foliage lets water through: a drop that lands on leaves or branches trickles down to the
+        // first free cell beneath them instead of piling up on the tree.
+        if matches!(self.at(x, y + 1), Mat::Leaf | Mat::Branch | Mat::Sapling) {
+            let mut k = 1;
+            while k <= 12 * K && matches!(self.at(x, y + k), Mat::Leaf | Mat::Branch | Mat::Sapling) {
+                k += 1;
+            }
+            if matches!(self.at(x, y + k).kind(), Kind::Empty | Kind::Gas) {
+                self.swap((x, y), (x, y + k));
+                return;
+            }
+        }
         let d = self.dir();
         // Falling drops are pushed along by the wind: the rain slants.
         let local = self.flow.sample(x, y).0 / flow::GAIN;
@@ -1604,7 +1675,18 @@ impl World {
             self.set(x, y, m);
             return;
         }
-        self.cells[i].life -= 1;
+        // A coal bed that air cannot reach smoulders for much longer: that is how a covered fire
+        // (a kiln, the foot of a woodpile) keeps its heat.
+        let open = Self::neighbors(x, y).iter().filter(|&&(nx, ny)| matches!(self.at(nx, ny).kind(), Kind::Empty | Kind::Gas)).count();
+        let slow = match open {
+            0 => 6,
+            1 => 4,
+            2 => 2,
+            _ => 1,
+        };
+        if slow == 1 || self.chance(slow) {
+            self.cells[i].life -= 1;
+        }
         for (nx, ny) in Self::neighbors(x, y) {
             match self.at(nx, ny) {
                 Mat::Water => {
@@ -1892,6 +1974,68 @@ impl World {
         false
     }
 
+    /// The pressure everywhere, in atmospheres (absolute): the air thins with height and moves with the
+    /// flow, liquids add their weight with depth, and solids carry the weight of everything above them.
+    pub fn pressure_field(&self) -> Vec<f32> {
+        let mut out = vec![0.0f32; W * H];
+        for x in 0..W {
+            self.pressure_column(x, H - 1, |y, p| out[y * W + x] = p);
+        }
+        out
+    }
+
+    /// The pressure at one cell (atmospheres).
+    pub fn pressure_at_cell(&self, x: i32, y: i32) -> f32 {
+        if !Self::inb(x, y) {
+            return 0.0;
+        }
+        let mut p = 0.0;
+        self.pressure_column(x as usize, y as usize, |_, v| p = v);
+        p
+    }
+
+    /// Walks down a column to row `until`, handing each cell's pressure to `put`.
+    fn pressure_column(&self, x: usize, until: usize, mut put: impl FnMut(usize, f32)) {
+        // About one atmosphere for 60 cells of water.
+        const PER_CELL: f32 = 1.0 / 60.0;
+        let mut weight = 0.0f32;
+        // The pressure at the top of the liquid or solid column the cell below feels.
+        let mut top_p: Option<f32> = None;
+        for y in 0..=until {
+            let m = self.at(x as i32, y as i32);
+            let air = 1.05 * (-((H - y) as f32) / 700.0).exp();
+            let dynamic = 1.0 + (self.flow.pressure_at(x as i32, y as i32) * 0.08).clamp(-0.08, 0.08);
+            let p_air = air * dynamic;
+            match m.kind() {
+                Kind::Empty | Kind::Gas | Kind::Flame => {
+                    put(y, p_air);
+                    weight = 0.0;
+                    top_p = None;
+                }
+                _ => {
+                    let base = *top_p.get_or_insert(p_air);
+                    weight += density(m) * PER_CELL;
+                    put(y, base + weight);
+                }
+            }
+        }
+    }
+
+    /// The pressure view's colour of a cell, with the borders between gas, liquid and solid marked.
+    pub fn pressure_color(&self, field: &[f32], x: usize, y: usize) -> [u8; 4] {
+        let (r, g, b) = pressure_rgb(field[y * W + x]);
+        let here = self.at(x as i32, y as i32).kind();
+        let edge = [(1i32, 0i32), (0, 1)].iter().any(|&(dx, dy)| {
+            let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+            Self::inb(nx, ny) && self.at(nx, ny).kind() != here && !(matches!(here, Kind::Empty | Kind::Gas) && matches!(self.at(nx, ny).kind(), Kind::Empty | Kind::Gas))
+        });
+        if edge {
+            [(r as f32 * 0.45) as u8, (g as f32 * 0.45) as u8, (b as f32 * 0.45) as u8, 255]
+        } else {
+            [r, g, b, 255]
+        }
+    }
+
     pub fn cell_mat(&self, x: usize, y: usize) -> Mat {
         self.cells[y * W + x].m
     }
@@ -1936,6 +2080,8 @@ impl World {
                 (base as i32 + v + heat, base as i32 + v - heat / 3, (base * 1.1) as i32 + v - heat / 2, 255)
             }
             Mat::Brick => (184 + v, 72 + v / 2, 56, 255),
+            Mat::Clay => (168 + v, 124 + v / 2, 98 + v / 2, 255),
+            Mat::Terracotta => (196 + v, 98 + v / 2, 60 + v / 3, 255),
             Mat::Rust => (156 + v, 84 + v / 2, 42, 255),
             Mat::Ash => (100 + v, 100 + v, 106 + v, 255),
             Mat::Ember => (255, 110 + flick * 3, 24, 255),
@@ -2126,6 +2272,32 @@ mod tests {
             w.step();
         }
         assert!((0..10).all(|x| w.at(x, 99) != Mat::Water));
+    }
+
+    #[test]
+    fn water_trickles_through_the_foliage_of_a_tree() {
+        let mut w = World::new_static();
+        for x in 0..W as i32 {
+            w.set(x, 200, Mat::Stone);
+        }
+        for y in 100..200 {
+            w.set(3, y, Mat::Stone);
+            w.set(17, y, Mat::Stone);
+        }
+        for y in 150..160 {
+            for x in 4..17 {
+                w.set(x, y, Mat::Leaf);
+            }
+        }
+        for x in 6..14 {
+            w.set(x, 140, Mat::Water);
+        }
+        for _ in 0..400 {
+            w.step();
+        }
+        let above = (4..17).filter(|&x| (100..150).any(|y| w.at(x, y) == Mat::Water)).count();
+        let below = (4..17).filter(|&x| (160..200).any(|y| w.at(x, y) == Mat::Water)).count();
+        assert!(above == 0 && below > 0, "the water went through the leaves (above {above}, below {below})");
     }
 
     #[test]
@@ -2867,6 +3039,35 @@ mod tests {
     }
 
     #[test]
+    fn the_wind_can_be_tuned() {
+        let run = |max: f32, changes: f32, windy: f32| {
+            let mut w = World::new_static();
+            w.wind_max = max;
+            w.wind_changes = changes;
+            w.windiness = windy;
+            let (mut top, mut flips, mut last) = (0.0f32, 0, 0.0f32);
+            for _ in 0..200_000u32 {
+                w.update_wind();
+                top = top.max(w.wind.abs());
+                if w.wind * last < 0.0 {
+                    flips += 1;
+                }
+                last = w.wind;
+            }
+            (top, flips)
+        };
+        let (top_usual, flips_usual) = run(1.0, 1.0, 1.0);
+        let (top_capped, _) = run(0.4, 1.0, 1.0);
+        let (top_calm, _) = run(1.0, 1.0, 0.0);
+        let (_, flips_often) = run(1.0, 3.0, 1.0);
+        let (_, flips_never) = run(1.0, 0.0, 1.0);
+        assert!(top_capped <= 0.4001 && top_capped < top_usual, "{top_capped} {top_usual}");
+        assert!(top_calm < 0.25 && top_calm < top_usual, "calm weather is a light breeze: {top_calm}");
+        assert!(flips_often > flips_usual, "{flips_often} {flips_usual}");
+        assert_eq!(flips_never, 0, "the direction can be frozen");
+    }
+
+    #[test]
     fn there_is_always_a_breeze() {
         let mut w = World::new_static();
         let mut calmest = 1.0f32;
@@ -3282,6 +3483,83 @@ fn rain_slants_with_the_local_wind() {
     assert!(!xs.is_empty());
     let mean = xs.iter().sum::<i32>() as f32 / xs.len() as f32;
     assert!(mean > 312.0, "falling drops are pushed along: mean x {mean}");
+}
+
+/// A crucible of fired clay, a wood fire under it, iron and ash inside.
+fn crucible_world(wall: Mat) -> World {
+    let mut w = World::new_static();
+    let floor = 300;
+    for x in 0..W as i32 {
+        for y in floor..floor + 20 {
+            w.set(x, y, Mat::Stone);
+        }
+    }
+    // Wood under the bowl, 20 wide and 10 high; the bowl sits on it: base 3 thick, walls 3 thick, 16 high.
+    for x in 200..220 {
+        for y in floor - 30..floor {
+            w.set(x, y, Mat::Wood);
+        }
+    }
+    let base = floor - 30 - 3;
+    for x in 202..220 {
+        for y in base..base + 3 {
+            w.set(x, y, wall);
+        }
+    }
+    for y in base - 10..base {
+        for x in 202..205 {
+            w.set(x, y, wall);
+        }
+        for x in 217..220 {
+            w.set(x, y, wall);
+        }
+    }
+    // Wood piled around the bowl too, so that the fire wraps it.
+    for y in base - 10..base + 3 {
+        for x in (192..202).chain(220..230) {
+            w.set(x, y, Mat::Wood);
+        }
+    }
+    for y in base - 10..base + 3 {
+        for x in 192..230 {
+            if (192..202).contains(&x) || (220..230).contains(&x) {
+                continue;
+            }
+        }
+    }
+    // A little iron (three rows) with ash on top, inside the 12-wide bowl.
+    for y in base - 3..base {
+        for x in 205..217 {
+            w.set(x, y, Mat::Iron);
+        }
+    }
+    for y in base - 5..base - 3 {
+        for x in 205..217 {
+            w.set(x, y, Mat::Ash);
+        }
+    }
+    // Light the wood from below.
+    for x in 205..215 {
+        w.set(x, floor - 1, Mat::Fire);
+    }
+    w
+}
+
+#[test]
+fn a_clay_crucible_fired_by_a_wood_fire_turns_iron_and_ash_into_steel() {
+    let mut w = crucible_world(Mat::Clay);
+    let mut steel_at = None;
+    for t in 0..6000 {
+        w.step();
+        if steel_at.is_none() && (195..225).any(|x| (250..300).any(|y| w.raw(x, y) == Mat::Steel)) {
+            steel_at = Some(t);
+        }
+    }
+    let count = |m: Mat| (190..230).flat_map(|x| (240..300).map(move |y| (x, y))).filter(|&(x, y)| w.raw(x, y) == m).count();
+    assert!(count(Mat::Terracotta) > 20, "the fire fires the clay into terracotta: {}", count(Mat::Terracotta));
+    assert!(count(Mat::Steel) >= 10, "the hot iron takes carbon from the ash and becomes steel: {}", count(Mat::Steel));
+    // The crucible itself did not burn or melt away.
+    assert!(count(Mat::Terracotta) + count(Mat::Clay) > 100, "the walls hold");
 }
 
 #[test]

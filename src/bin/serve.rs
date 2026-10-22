@@ -37,10 +37,12 @@ fn resolve(root: &Path, url_path: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-fn respond(stream: &mut TcpStream, status: &str, kind: &str, body: &[u8]) {
+fn respond(stream: &mut TcpStream, status: &str, kind: &str, body: &[u8], send_body: bool) {
     let head = format!("HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n", body.len());
     let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body);
+    if send_body {
+        let _ = stream.write_all(body);
+    }
 }
 
 fn handle(mut stream: TcpStream, root: &Path) {
@@ -50,11 +52,11 @@ fn handle(mut stream: TcpStream, root: &Path) {
     let mut words = request.split_whitespace();
     let (method, target) = (words.next().unwrap_or(""), words.next().unwrap_or("/"));
     if method != "GET" && method != "HEAD" {
-        return respond(&mut stream, "405 Method Not Allowed", "text/plain", b"GET only");
+        return respond(&mut stream, "405 Method Not Allowed", "text/plain", b"GET only", true);
     }
     match resolve(root, target).and_then(|p| fs::read(&p).ok().map(|b| (p, b))) {
-        Some((path, body)) => respond(&mut stream, "200 OK", mime(&path), if method == "HEAD" { &[] } else { &body }),
-        None => respond(&mut stream, "404 Not Found", "text/plain", b"not found"),
+        Some((path, body)) => respond(&mut stream, "200 OK", mime(&path), &body, method != "HEAD"),
+        None => respond(&mut stream, "404 Not Found", "text/plain", b"not found", true),
     }
 }
 

@@ -292,6 +292,13 @@ impl Flow {
         (s(&self.vx) * CELL as f32, s(&self.vy) * CELL as f32)
     }
 
+    /// The solver's pressure at a world position (arbitrary units: it is the push that keeps the air
+    /// from piling up, large where a stream meets an obstacle).
+    pub fn pressure_at(&self, x: i32, y: i32) -> f32 {
+        let (i, j) = ((x.max(0) as usize / CELL).min(FW - 1), (y.max(0) as usize / CELL).min(FH - 1));
+        self.p[j * FW + i]
+    }
+
     /// Whole-field access for drawing and tests: velocity of flow cell `(i, j)` in world cells per step.
     pub fn at_cell(&self, i: usize, j: usize) -> (f32, f32) {
         (self.vx[j * FW + i] * CELL as f32, self.vy[j * FW + i] * CELL as f32)

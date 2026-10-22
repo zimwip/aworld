@@ -20,6 +20,8 @@ pub fn info(m: Mat) -> Info {
         Mat::Wood => ("Bois", "solide", "Brûle vers 300 °C. Il reste de la cendre, c'est du carbone."),
         Mat::Stone => ("Pierre", "solide", "Fond vers 540 °C. Le gel et le dégel l'effritent en sable."),
         Mat::Brick => ("Brique", "solide", "Brique de plastique emboîtable."),
+        Mat::Clay => ("Argile", "solide", "Terre grasse. Cuite dans un feu vers 550 °C, elle devient de la terre cuite."),
+        Mat::Terracotta => ("Terre cuite", "solide", "Argile cuite : elle tient la chaleur et ne brûle pas. Idéale pour un creuset sous un feu de bois."),
         Mat::Rust => ("Rouille", "poudre", "Fer abîmé par l'eau. Chauffée dans un feu, elle redonne du fer."),
         Mat::Ash => ("Cendre", "poudre", "Du carbone. Mélangée à du fer chaud, elle fait de l'acier ; avec l'eau, de la terre."),
         Mat::Ember => ("Braise", "solide", "Du bois qui brûle. Il devient de la cendre."),
@@ -56,8 +58,9 @@ pub struct Recipe {
 }
 
 pub const RECIPES: &[Recipe] = &[
+    Recipe { from: &[Mat::Clay, Mat::Fire], to: &[Mat::Terracotta], text: "L'argile cuite vers 550 °C devient de la terre cuite : un creuset qui tient la chaleur et ne brûle pas." },
     Recipe { from: &[Mat::Wood, Mat::Fire], to: &[Mat::Ash], text: "Le bois brûle : il reste du carbone (la cendre)." },
-    Recipe { from: &[Mat::Iron, Mat::Ash, Mat::Fire], to: &[Mat::Steel], text: "Fer + carbone + chaleur : de l'acier, plus solide." },
+    Recipe { from: &[Mat::Iron, Mat::Ash, Mat::Fire], to: &[Mat::Steel], text: "Fer + carbone + chaleur (400 °C) : de l'acier. Dans un creuset de terre cuite sous un feu de bois, avec la cendre prise à la pelle." },
     Recipe { from: &[Mat::Steel, Mat::Water], to: &[Mat::Rust], text: "L'eau rouille le fer, l'acier un peu moins vite." },
     Recipe { from: &[Mat::Rust, Mat::Fire], to: &[Mat::Iron], text: "En chauffant la rouille, on retrouve du fer." },
     Recipe { from: &[Mat::Water, Mat::Fire], to: &[Mat::Steam], text: "L'eau bout à 100 °C et devient vapeur." },
@@ -111,6 +114,8 @@ pub fn mat_color(m: Mat) -> Color {
         Mat::Cloud => (246, 248, 253),
         Mat::Ember => (255, 120, 24),
         Mat::Brick => (184, 72, 56),
+        Mat::Clay => (168, 124, 98),
+        Mat::Terracotta => (196, 98, 60),
         Mat::Empty => (30, 36, 56),
     };
     Color::from_rgba(r, g, b, 255)

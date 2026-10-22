@@ -19,7 +19,6 @@ pub enum Icon {
     Play,
     Pause,
     Reset,
-    Car,
     Rotate,
     Save,
     Load,
@@ -35,19 +34,22 @@ pub enum Icon {
     Loupe,
     Thermo,
     Science,
-    Pick,
     Sun,
     Moon,
     Undo,
     Gauge,
     Wind,
     Eye,
+    Shovel,
+    Select,
 }
 
 pub struct Ui {
     pub font: Font,
     pub mouse: Vec2,
     pub pressed: bool,
+    /// When set, buttons use this text size (so that a row of tabs reads evenly).
+    pub force_size: Option<u16>,
 }
 
 pub fn rrect(r: Rect, rad: f32, c: Color) {
@@ -148,14 +150,6 @@ pub fn draw_icon(icon: Icon, c: Vec2, s: f32, col: Color) {
             let tip = c + vec2(a.cos(), a.sin()) * s * 0.38;
             arrow_head(tip, vec2(a.sin(), -a.cos()), s * 0.45, col);
         }
-        Icon::Car => {
-            draw_rectangle(c.x - s * 0.5, c.y - s * 0.05, s, s * 0.3, col);
-            draw_rectangle(c.x - s * 0.28, c.y - s * 0.32, s * 0.5, s * 0.28, col);
-            draw_circle(c.x - s * 0.28, c.y + s * 0.3, s * 0.15, BG);
-            draw_circle(c.x + s * 0.28, c.y + s * 0.3, s * 0.15, BG);
-            draw_circle_lines(c.x - s * 0.28, c.y + s * 0.3, s * 0.15, th * 0.7, col);
-            draw_circle_lines(c.x + s * 0.28, c.y + s * 0.3, s * 0.15, th * 0.7, col);
-        }
         Icon::Save => {
             draw_rectangle(c.x - s * 0.4, c.y - s * 0.4, s * 0.8, s * 0.8, col);
             draw_rectangle(c.x - s * 0.22, c.y - s * 0.4, s * 0.44, s * 0.26, BG);
@@ -218,8 +212,21 @@ pub fn draw_icon(icon: Icon, c: Vec2, s: f32, col: Color) {
             draw_triangle(vec2(c.x - s * 0.1, c.y - s * 0.12), vec2(c.x + s * 0.1, c.y - s * 0.12), vec2(c.x + s * 0.4, c.y + s * 0.4), col);
             draw_triangle(vec2(c.x - s * 0.1, c.y - s * 0.12), vec2(c.x - s * 0.4, c.y + s * 0.4), vec2(c.x + s * 0.4, c.y + s * 0.4), col);
         }
-        Icon::Pick => {
-            draw_triangle(vec2(c.x - s * 0.3, c.y - s * 0.42), vec2(c.x - s * 0.3, c.y + s * 0.3), vec2(c.x + s * 0.3, c.y + s * 0.02), col);
+        Icon::Select => {
+            // A dashed frame with an arrow pointer.
+            for k in 0..4 {
+                let t = k as f32 * 0.22 - 0.4;
+                draw_line(c.x + s * t, c.y - s * 0.4, c.x + s * (t + 0.12), c.y - s * 0.4, th, col);
+                draw_line(c.x - s * 0.4, c.y + s * t, c.x - s * 0.4, c.y + s * (t + 0.12), th, col);
+            }
+            draw_triangle(vec2(c.x - s * 0.08, c.y - s * 0.12), vec2(c.x + s * 0.4, c.y + s * 0.16), vec2(c.x + s * 0.04, c.y + s * 0.2), col);
+            draw_triangle(vec2(c.x + s * 0.04, c.y + s * 0.2), vec2(c.x + s * 0.3, c.y + s * 0.4), vec2(c.x + s * 0.4, c.y + s * 0.16), col);
+        }
+        Icon::Shovel => {
+            // A handle with a cross-grip, and a scoop blade.
+            draw_line(c.x - s * 0.1, c.y - s * 0.46, c.x + s * 0.1, c.y + s * 0.05, th * 1.2, col);
+            draw_line(c.x - s * 0.22, c.y - s * 0.46, c.x + s * 0.04, c.y - s * 0.46, th * 1.2, col);
+            draw_triangle(vec2(c.x - s * 0.18, c.y + s * 0.02), vec2(c.x + s * 0.3, c.y + s * 0.02), vec2(c.x + s * 0.06, c.y + s * 0.46), col);
         }
         Icon::Sun => {
             draw_circle(c.x, c.y, s * 0.22, col);
@@ -264,6 +271,15 @@ impl Ui {
     }
 
     /// Big rounded button with an icon and a label; returns true on click.
+    /// The largest text size (at most 16) that fits `label` in `width` pixels.
+    pub fn fit_size(&self, label: &str, width: f32) -> u16 {
+        let mut size = 16u16;
+        while size > 10 && self.text_w(label, size) > width {
+            size -= 1;
+        }
+        size
+    }
+
     pub fn button(&mut self, r: Rect, label: &str, icon: Icon, active: bool, enabled: bool, accent: Color) -> bool {
         let hot = enabled && self.hover(r);
         let base = if active { accent } else if hot { TILE_HOT } else { TILE };
@@ -277,7 +293,7 @@ impl Ui {
         let icon_w = if has_icon { 19.0 } else { 0.0 };
         let gap = if has_icon && !label.is_empty() { 5.0 } else { 0.0 };
         // A long label shrinks to fit its button rather than spilling over the neighbours.
-        let mut size = 16u16;
+        let mut size = self.force_size.unwrap_or(16);
         while size > 10 && !label.is_empty() && icon_w + gap + self.text_w(label, size) > r.w - 8.0 {
             size -= 1;
         }

@@ -108,6 +108,14 @@ void main() {
     gl_FragColor = vec4(col * alpha, alpha);
 }";
 
+/// What the world picture shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RenderMode {
+    Normal = 0,
+    Thermal = 1,
+    Pressure = 2,
+}
+
 pub struct Renderer {
     pub image: Image,
     pub texture: Texture2D,
@@ -124,7 +132,9 @@ pub struct Renderer {
     veg_tick: i64,
     rev_world: u64,
     rev_gas: u64,
-    last_thermal: bool,
+    last_mode: u8,
+    /// The pressure of every cell, recomputed when the picture changes (pressure view only).
+    pressure: Vec<f32>,
     has_gas: bool,
 }
 
@@ -158,7 +168,7 @@ impl Renderer {
         let veg_image = Image::gen_image_color(W as u16, H as u16, Color::new(0.0, 0.0, 0.0, 0.0));
         let veg_texture = Texture2D::from_image(&veg_image);
         veg_texture.set_filter(FilterMode::Linear);
-        Renderer { veg_image, veg_texture, veg_cells: vec![], rev_veg: u64::MAX, veg_tick: -1, image, texture, material, gas_image, gas_texture, gas_material, rev_world: 0, rev_gas: 0, last_thermal: false, has_gas: false }
+        Renderer { veg_image, veg_texture, veg_cells: vec![], rev_veg: u64::MAX, veg_tick: -1, image, texture, material, gas_image, gas_texture, gas_material, rev_world: 0, rev_gas: 0, last_mode: 0, pressure: vec![], has_gas: false }
     }
 
     /// Fills the texture in parallel from a per-cell colour function.
@@ -201,20 +211,29 @@ impl Renderer {
         }
     }
 
-    pub fn draw_world(&mut self, world: &World, v: View, thermal: bool, time: f32) {
+    pub fn draw_world(&mut self, world: &World, v: View, mode: RenderMode, time: f32) {
         let size = DrawTextureParams { dest_size: Some(vec2(W as f32 * v.s, H as f32 * v.s)), ..Default::default() };
+        let id = mode as u8;
         // Only rebuild the picture when the world (or the view mode) actually changed.
-        if self.rev_world != world.revision || self.last_thermal != thermal {
-            if thermal {
-                Self::fill(&mut self.image, |x, y| world.thermal_color(x, y));
-            } else {
-                Self::fill(&mut self.image, |x, y| world.color_without_trees(x, y));
+        if self.rev_world != world.revision || self.last_mode != id {
+            match mode {
+                RenderMode::Thermal => {
+                    Self::fill(&mut self.image, |x, y| world.thermal_color(x, y));
+                }
+                RenderMode::Pressure => {
+                    self.pressure = world.pressure_field();
+                    let field = &self.pressure;
+                    Self::fill(&mut self.image, |x, y| world.pressure_color(field, x, y));
+                }
+                RenderMode::Normal => {
+                    Self::fill(&mut self.image, |x, y| world.color_without_trees(x, y));
+                }
             }
             self.texture.update(&self.image);
             self.rev_world = world.revision;
-            self.last_thermal = thermal;
+            self.last_mode = id;
         }
-        if thermal {
+        if mode != RenderMode::Normal {
             draw_texture_ex(&self.texture, v.ox, v.oy, WHITE, size);
             return;
         }
@@ -356,7 +375,7 @@ pub fn draw_block_shape(kind: BlockKind, c: Vec2, s: f32, angle: f32, tint: Opti
     rect(0.0, -h / 2.0 + inset + 1.0, w - inset * 2.0, 2.0, tintify(shade(spec.color, 1.28)));
     rect(0.0, h / 2.0 - inset - 0.8, w - inset * 2.0, 1.6, tintify(shade(spec.color, 0.8)));
     match kind {
-        BlockKind::Brick | BlockKind::Long | BlockKind::Cube => {
+        BlockKind::Brick | BlockKind::Long | BlockKind::Post | BlockKind::Cube => {
             let studs = (w / STUD).round() as i32;
             for i in 0..studs {
                 let x = -w / 2.0 + STUD / 2.0 + i as f32 * STUD;

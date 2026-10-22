@@ -24,7 +24,9 @@ pub const GLASS_C: f32 = 600.0;
 /// Metal melts only in fresh lava and sets again once it cools below this.
 pub const METAL_MELT_C: f32 = 1000.0;
 pub const METAL_SOLID_C: f32 = 850.0;
-pub const STEEL_C: f32 = 450.0;
+pub const STEEL_C: f32 = 400.0;
+/// Clay turns to terracotta once it has been this hot.
+pub const KILN_C: f32 = 550.0;
 pub const SMELT_C: f32 = 400.0;
 pub const WOOD_IGNITE_C: f32 = 300.0;
 pub const POWDER_IGNITE_C: f32 = 210.0;
@@ -49,6 +51,8 @@ fn props(m: Mat) -> (f32, f32) {
         Mat::Sand | Mat::Dirt | Mat::Mud | Mat::Grass => (0.06, 1.8),
         Mat::Wood | Mat::Trunk | Mat::Leaf | Mat::Seed | Mat::Sapling | Mat::Branch | Mat::DeadLeaf => (0.04, 1.4),
         Mat::Stone | Mat::Brick => (0.05, 6.0),
+        Mat::Clay => (0.1, 2.4),
+        Mat::Terracotta => (0.14, 3.0),
         Mat::Iron | Mat::Steel => (0.5, 2.5),
         Mat::Glass | Mat::Shard => (0.08, 3.0),
         Mat::Lava => (0.2, 400.0),
@@ -77,7 +81,7 @@ fn tables() -> &'static Tables {
                 m,
                 Mat::Water | Mat::Ice | Mat::Snow | Mat::Hail | Mat::Steam | Mat::Lava | Mat::Molten | Mat::Stone | Mat::Sand
                     | Mat::Shard | Mat::Glass | Mat::Rust | Mat::Iron | Mat::Steel | Mat::Wood | Mat::Trunk | Mat::Leaf | Mat::Branch | Mat::DeadLeaf
-                    | Mat::Grass | Mat::Seed | Mat::Sapling | Mat::Gunpowder | Mat::Oil
+                    | Mat::Grass | Mat::Seed | Mat::Sapling | Mat::Gunpowder | Mat::Oil | Mat::Clay
             );
         }
         t
@@ -292,14 +296,19 @@ impl World {
 
     // ----- wind -------------------------------------------------------------
 
-    /// Slowly changing wind, -1 (blowing left) to 1 (blowing right). It is never
-    /// dead calm: the direction changes slowly but there is always a breeze.
+    /// Slowly changing wind, -1 (blowing left) to 1 (blowing right). With the default settings it is
+    /// never dead calm: the direction changes slowly but there is always a breeze. The player can
+    /// cap its speed, make the direction change more or less often, and make the weather calmer.
     pub(super) fn update_wind(&mut self) {
-        let t = self.ticks as f32;
+        self.wind_clock += self.wind_changes;
+        let t = self.wind_clock;
         let tau = std::f32::consts::TAU;
         let base = 0.6 * (t * tau / 7200.0 + 1.3).sin() + 0.3 * (t * tau / 1900.0 + 0.4).sin() + 0.15 * (t / 300.0).sin();
         let base = base.clamp(-1.0, 1.0);
-        self.wind = base.signum() * (0.3 + 0.7 * base.abs());
+        let windy = 0.3 + 0.7 * base.abs();
+        let calm = 0.04 + 0.12 * base.abs();
+        let mag = calm + (windy - calm) * self.windiness.clamp(0.0, 1.0);
+        self.wind = base.signum() * mag * self.wind_max.clamp(0.0, 1.0);
     }
 
     // ----- heat flow --------------------------------------------------------
@@ -370,7 +379,11 @@ impl World {
                     Mat::Empty => self.temp[i] = t + (amb - t) * 0.12 * TS,
                     Mat::Steam | Mat::Cloud | Mat::Snow | Mat::Hail | Mat::Smoke => self.temp[i] = t + (amb - t) * 0.03 * TS,
                     Mat::Fire => self.temp[i] = FIRE_C,
-                    Mat::Ember => self.temp[i] = EMBER_C,
+                    // Embers a draught cannot reach glow hotter (and last longer, see `step_ember`).
+                    Mat::Ember => {
+                        let open = Self::neighbors(x as i32, y as i32).iter().filter(|&&(nx, ny)| matches!(self.at(nx, ny).kind(), super::Kind::Empty | super::Kind::Gas)).count();
+                        self.temp[i] = EMBER_C + 300.0 * (1.0 - open as f32 / 4.0);
+                    }
                     _ => {}
                 }
                 if tb.reactive[m as usize] {
@@ -477,6 +490,11 @@ impl World {
                 }
                 if worst > SHOCK_C && self.chance(6) {
                     self.shatter(x, y);
+                }
+            }
+            Mat::Clay => {
+                if t >= KILN_C && self.chance(12) {
+                    self.set(x, y, Mat::Terracotta);
                 }
             }
             Mat::Rust => {

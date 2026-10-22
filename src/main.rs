@@ -2,9 +2,15 @@ mod backdrop;
 mod blocks;
 mod car;
 mod mech;
+mod fluidgame;
+mod lens;
 mod mechgame;
+mod pipes;
+mod plane;
 mod render;
 mod save;
+mod select;
+mod shovel;
 mod science;
 mod sound;
 mod ui;
@@ -13,7 +19,7 @@ mod world;
 use blocks::{anchor_world, block_at, clip, node_at, placement_ok, snap, stamp_all, Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, Physics, Spring, SpringKind, MEMBER_MAX_LEN, SPRING_MAX_LEN};
 use car::{collide_cars, Car, Fate, ModelKind, Tuning};
 use macroquad::prelude::*;
-use render::{cable_preview, draw_block, draw_block_shape, draw_booms, draw_cable, draw_car, draw_flag, draw_member, draw_spring, draw_spring_between, Boom, Renderer, View};
+use render::{RenderMode, cable_preview, draw_block, draw_block_shape, draw_booms, draw_cable, draw_car, draw_flag, draw_member, draw_spring, draw_spring_between, Boom, Renderer, View};
 use science::{info, mat_color, RECIPES};
 use mech::{GearSize, Mechanism};
 use mechgame::MechDraft;
@@ -22,7 +28,8 @@ use ui::{draw_icon, rrect, Icon, Ui, ACCENT, BG, BLUE, DIM, GREEN, PANEL, RED, T
 use world::{Biome, Cell, Mat, PaintRule, Season, World, H, W};
 
 const PANEL_W: f32 = 244.0;
-const TOP_H: f32 = 48.0;
+/// No top bar any more: the world starts at the very top.
+const TOP_H: f32 = 0.0;
 /// Width of the sliding views palette on the right, and of its always-visible tab.
 const VIEWS_W: f32 = 176.0;
 const VIEWS_TAB: f32 = 22.0;
@@ -32,8 +39,8 @@ enum Tab {
     Matter,
     Blocks,
     Cars,
-    Tools,
     Mech,
+    Fluid,
     Planet,
 }
 
@@ -43,6 +50,7 @@ enum ViewMode {
     Thermal,
     Stress,
     Wind,
+    Pressure,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -67,25 +75,28 @@ enum Tool {
     Pivot,
     Winch,
     Pulley,
+    Pipe,
+    Valve,
+    Pump,
+    Shovel,
+    Select,
     Eraser,
-    Rotate,
     Hammer,
     Loupe,
-    Pick,
     Entry,
     Exit,
 }
 
-const MATTER: [Mat; 19] = [
+const MATTER: [Mat; 21] = [
     Mat::Sand, Mat::Water, Mat::Dirt, Mat::Grass, Mat::Seed, Mat::Wood, Mat::Stone, Mat::Iron, Mat::Steel, Mat::Glass,
-    Mat::Ash, Mat::Rust, Mat::Ice, Mat::Snow, Mat::Fire, Mat::Lava, Mat::Steam, Mat::Cloud, Mat::Gunpowder,
+    Mat::Ash, Mat::Rust, Mat::Ice, Mat::Snow, Mat::Fire, Mat::Lava, Mat::Steam, Mat::Cloud, Mat::Gunpowder, Mat::Clay, Mat::Terracotta,
 ];
 
 fn window_conf() -> Conf {
     Conf {
         window_title: "AWorld".to_owned(),
         window_width: (PANEL_W + 1280.0) as i32,
-        window_height: (TOP_H + 720.0) as i32,
+        window_height: (TOP_H + 768.0) as i32,
         window_resizable: true,
         sample_count: 4,
         ..Default::default()
@@ -139,6 +150,43 @@ struct Game {
     springs: Vec<Spring>,
     spring_draft: Option<SpringDraft>,
     cable_from: Option<Anchor>,
+    /// The rare plane that drifts across the sky, for fun.
+    planes: plane::Planes,
+    /// Where the tool strip, the corner buttons are (so that clicks on them do not paint the world).
+    tools_hit: Rect,
+    corner_hit: Rect,
+    hud_hit: Rect,
+    /// The left palette hides like the views on the right: 1 = fully out. `panel_pin` keeps it out (and
+    /// the picture beside it); `panel_hit` is where it is, so that clicks on it do not paint the world.
+    panel_open: f32,
+    panel_pin: bool,
+    panel_hit: Rect,
+    /// The car settings are shown under the views.
+    car_remote: bool,
+    /// The selection tool: what is selected and the drag in progress.
+    selection: Option<select::Sel>,
+    drag: Option<select::Drag>,
+    /// The floating player: where the mouse was, for how long it has stood still, and how far out it is.
+    last_mouse: Vec2,
+    idle: f32,
+    player_alpha: f32,
+    player_pin: bool,
+    /// The first end of the pipe being drawn.
+    pipe_from: Option<Vec2>,
+    /// Turns a gear needs to open a valve from shut, for the next link.
+    valve_turns: f32,
+    /// What the shovel carries.
+    shovel: Option<shovel::Load>,
+    /// Seconds since the shovel was filled (the bubble fills over a moment).
+    shovel_age: f32,
+    /// Seconds the shovel's button has been held (the part it will let go of grows with it).
+    shovel_charge: Option<f32>,
+    /// The "leave the game?" window is open (the simulation is paused while it is), and whether the
+    /// simulation was running before it opened.
+    quit_modal: bool,
+    quit_resume: bool,
+    /// How far the science page is scrolled, in pixels.
+    science_scroll: f32,
     /// Pulleys the cable being drawn has been threaded over so far.
     cable_via: Vec<u32>,
     /// Cable elasticity setting (1 = as the material is, higher = stretchier).
@@ -217,6 +265,28 @@ impl Game {
             springs: vec![],
             spring_draft: None,
             cable_from: None,
+            planes: plane::Planes::new(),
+            tools_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
+            corner_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
+            hud_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
+            panel_open: 1.0,
+            panel_pin: false,
+            panel_hit: Rect::new(0.0, 0.0, PANEL_W, 10000.0),
+            car_remote: false,
+            selection: None,
+            drag: None,
+            last_mouse: Vec2::ZERO,
+            idle: 0.0,
+            player_alpha: 1.0,
+            player_pin: false,
+            pipe_from: None,
+            valve_turns: 3.0,
+            shovel: None,
+            shovel_age: 0.0,
+            shovel_charge: None,
+            quit_modal: false,
+            quit_resume: false,
+            science_scroll: 0.0,
             cable_via: vec![],
             cable_soft: 1.0,
             member_from: None,
@@ -353,6 +423,7 @@ impl Game {
                 p.add_pin_rod(&self.blocks, &self.members, rod.uid, pin, &node, rod.len);
             }
         }
+        self.fluid_prepare();
         self.mech_physics_setup(&mut p);
         for i in 0..self.cables.len() {
             self.cables[i].reset_runtime();
@@ -500,13 +571,56 @@ impl Game {
         }
     }
 
+    /// Esc backs out of whatever is going on, one level at a time: the leave-the-game window, the
+    /// science page, a build in progress, full screen, and finally the window that asks to leave.
+    fn on_escape(&mut self) {
+        let drafting = self.cable_from.is_some() || self.member_from.is_some() || self.spring_draft.is_some() || self.mech_draft.is_some() || self.pipe_from.is_some();
+        if self.quit_modal {
+            self.close_quit_modal();
+        } else if self.show_science {
+            self.show_science = false;
+        } else if self.selection.is_some() {
+            self.selection = None;
+            self.drag = None;
+        } else if drafting {
+            self.cable_from = None;
+            self.cable_via.clear();
+            self.member_from = None;
+            self.spring_draft = None;
+            self.mech_draft = None;
+            self.pipe_from = None;
+        } else if self.fullscreen {
+            self.toggle_fullscreen();
+        } else {
+            self.quit_resume = self.running;
+            self.quit_modal = true;
+            self.set_running(false);
+        }
+    }
+
+    /// Enter in the leave-the-game window confirms: true when the game must close.
+    fn on_enter_in_quit_modal(&mut self) -> bool {
+        self.quit_modal
+    }
+
+    fn close_quit_modal(&mut self) {
+        self.quit_modal = false;
+        if self.quit_resume {
+            self.set_running(true);
+        }
+    }
+
+    fn quit_game() {
+        #[cfg(not(target_arch = "wasm32"))]
+        std::process::exit(0);
+        // A page cannot close itself: the web version just goes back to the game.
+        #[cfg(target_arch = "wasm32")]
+        macroquad::miniquad::window::request_quit();
+    }
+
     fn toggle_fullscreen(&mut self) {
         self.fullscreen = !self.fullscreen;
         set_fullscreen(self.fullscreen);
-    }
-
-    fn rotate_preview(&mut self, d: i32) {
-        self.rot90 = ((self.rot90 as i32 + d).rem_euclid(4)) as u8;
     }
 
     // ----- block and cable editing ------------------------------------------
@@ -583,34 +697,6 @@ impl Game {
         let mut b = self.blocks.remove(i);
         if let Some(p) = &mut self.phys {
             p.remove_block(&mut b);
-        }
-        self.refresh_mask();
-    }
-
-    fn rotate_block(&mut self, i: usize) {
-        let mut b = self.blocks[i].clone();
-        b.angle += std::f32::consts::FRAC_PI_2;
-        if !placement_ok(&self.world, &self.blocks, &b, Some(i)) {
-            self.say("Pas la place pour tourner ce bloc");
-            return;
-        }
-        let uid = b.uid;
-        if let Some(p) = &mut self.phys {
-            p.remove_block(&mut self.blocks[i]);
-            b.body = None;
-            p.add_block(&mut b);
-        }
-        self.blocks[i] = b;
-        if let Some(p) = &mut self.phys {
-            p.weld_neighbours(&self.blocks, i);
-            for c in self.cables.iter_mut().filter(|c| c.attached_to(uid)) {
-                p.remove_cable(c);
-                p.add_cable(&self.blocks, &self.members, c);
-            }
-            for sp in self.springs.iter_mut().filter(|sp| sp.attached_to(uid)) {
-                p.remove_spring(sp);
-                p.add_spring(&self.blocks, &self.members, sp);
-            }
         }
         self.refresh_mask();
     }
@@ -815,7 +901,8 @@ impl Game {
             return c.pts.clone();
         }
         match (anchor_world(&c.a, &self.blocks, &self.members), anchor_world(&c.b, &self.blocks, &self.members)) {
-            (Some(a), Some(b)) => cable_preview(a, b, c.len),
+            (Some(a), Some(b)) if c.via.is_empty() => cable_preview(a, b, c.len),
+            (Some(a), Some(b)) => std::iter::once(a).chain(self.via_contacts(a, &c.via, b)).chain(std::iter::once(b)).collect(),
             _ => vec![],
         }
     }
@@ -1044,19 +1131,23 @@ impl Game {
     // ----- input ------------------------------------------------------------
 
     fn handle_keys(&mut self) {
+        if self.quit_modal {
+            if is_key_pressed(KeyCode::Escape) {
+                self.on_escape();
+            } else if (is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter)) && self.on_enter_in_quit_modal() {
+                Self::quit_game();
+            }
+            return;
+        }
+        if is_key_pressed(KeyCode::Escape) {
+            self.on_escape();
+        }
+        if (is_key_pressed(KeyCode::Delete) || is_key_pressed(KeyCode::Backspace)) && self.tool == Tool::Select {
+            self.select_delete();
+        }
         if is_key_pressed(KeyCode::M) {
             self.sounds.toggle_mute();
             self.say(if self.sounds.muted { "Son coupé (M)" } else { "Son activé (M)" });
-        }
-        if is_key_pressed(KeyCode::Escape) {
-            if self.show_science {
-                self.show_science = false;
-            } else {
-                self.cable_from = None;
-                self.cable_via.clear();
-                self.member_from = None;
-                self.spring_draft = None;
-            }
         }
         if is_key_pressed(KeyCode::Space) {
             let run = !self.running;
@@ -1087,11 +1178,14 @@ impl Game {
         if is_key_pressed(KeyCode::V) {
             self.mode = if self.mode == ViewMode::Wind { ViewMode::Normal } else { ViewMode::Wind };
         }
-        if is_key_pressed(KeyCode::T) || is_key_pressed(KeyCode::E) {
-            self.rotate_preview(1);
+        if is_key_pressed(KeyCode::B) {
+            if self.planes.plane.is_none() {
+                self.planes.summon(&self.world);
+                self.say("Un Béluga passe dans le ciel !");
+            }
         }
-        if is_key_pressed(KeyCode::Q) {
-            self.rotate_preview(-1);
+        if is_key_pressed(KeyCode::P) {
+            self.mode = if self.mode == ViewMode::Pressure { ViewMode::Normal } else { ViewMode::Pressure };
         }
         if is_key_pressed(KeyCode::F11) || is_key_pressed(KeyCode::F) {
             self.toggle_fullscreen();
@@ -1116,12 +1210,12 @@ impl Game {
         }
         if is_key_pressed(KeyCode::Tab) {
             self.tab = match self.tab {
-                Tab::Matter => Tab::Blocks,
-                Tab::Blocks => Tab::Cars,
-                Tab::Cars => Tab::Tools,
-                Tab::Tools => Tab::Mech,
-                Tab::Mech => Tab::Planet,
                 Tab::Planet => Tab::Matter,
+                Tab::Matter => Tab::Blocks,
+                Tab::Blocks => Tab::Mech,
+                Tab::Mech => Tab::Fluid,
+                Tab::Fluid => Tab::Cars,
+                Tab::Cars => Tab::Planet,
             };
         }
         let digits = [
@@ -1137,25 +1231,27 @@ impl Game {
     }
 
     fn handle_mouse(&mut self, view: View, ui: &Ui) {
-        if self.show_science {
+        if self.show_science || self.quit_modal {
             return;
         }
-        let over_ui = ui.mouse.x < PANEL_W || ui.mouse.y < TOP_H || self.views_hit.contains(ui.mouse);
+        let over_ui = self.panel_hit.contains(ui.mouse) || self.views_hit.contains(ui.mouse) || self.tools_hit.contains(ui.mouse) || self.corner_hit.contains(ui.mouse) || self.hud_hit.contains(ui.mouse);
         let inside = !over_ui && view.rect().contains(ui.mouse);
         let wheel = mouse_wheel().1;
         if inside && wheel != 0.0 {
             let d = if wheel > 0.0 { 1 } else { -1 };
-            if matches!(self.tool, Tool::Block(_)) {
-                self.rotate_preview(d);
-            } else {
-                self.brush = (self.brush + d).clamp(0, 40);
-            }
+            self.brush = (self.brush + d).clamp(0, 40);
         }
         let left = is_mouse_button_down(MouseButton::Left);
         let right = is_mouse_button_down(MouseButton::Right);
         if !inside || (!left && !right) {
             if !left && !right {
+                // The shovel lets go where the pointer was when the button went up.
+                if let Some(at) = self.last {
+                    self.shovel_release(at);
+                }
+                self.shovel_charge = None;
                 self.last = None;
+                self.drag = None;
             }
             return;
         }
@@ -1166,12 +1262,20 @@ impl Game {
         let click = is_mouse_button_pressed(MouseButton::Left);
         let rclick = is_mouse_button_pressed(MouseButton::Right);
 
-        if rclick && (self.cable_from.is_some() || self.member_from.is_some() || self.spring_draft.is_some() || self.mech_draft.is_some()) {
+        if rclick && (self.cable_from.is_some() || self.member_from.is_some() || self.spring_draft.is_some() || self.mech_draft.is_some() || self.pipe_from.is_some()) {
             self.mech_draft = None;
+            self.pipe_from = None;
             self.cable_from = None;
             self.cable_via.clear();
             self.member_from = None;
             self.spring_draft = None;
+            return;
+        }
+        if self.tool == Tool::Shovel && right {
+            if rclick {
+                self.checkpoint();
+                self.shovel_dump(at);
+            }
             return;
         }
         if right || (left && self.tool == Tool::Eraser) {
@@ -1180,7 +1284,7 @@ impl Game {
                     self.remove_block(i);
                     return;
                 }
-                if self.mech_erase(at) {
+                if self.mech_erase(at) || self.fluid_erase(at) {
                     return;
                 }
                 if let Some(i) = self.members.iter().position(|m| m.distance_to(at) < m.mat.thickness() / 2.0 + 3.0) {
@@ -1225,26 +1329,10 @@ impl Game {
             Tool::Spring(k) if click => self.spring_click(k, at),
             Tool::Beam(m) if click => self.beam_click(m, at),
             Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Winch | Tool::Pulley if click => self.mech_click(at),
+            Tool::Pipe | Tool::Valve | Tool::Pump if click => self.fluid_click(at),
+            Tool::Shovel => self.shovel_mouse(at, click, left),
+            Tool::Select => self.select_mouse(at, click, left, is_key_down(KeyCode::LeftShift)),
             Tool::Hammer if click => self.hammer(at),
-            Tool::Rotate if click => {
-                if let Some(i) = block_at(&self.blocks, at) {
-                    self.rotate_block(i);
-                }
-            }
-            Tool::Pick if click => {
-                if self.select_motor_at(at) {
-                    return;
-                }
-                self.selected_car = self.cars.iter().find(|c| (c.p - at).length() < c.kind.model().hull_half * car::S + 10.0).map(|c| c.id);
-                if let Some(id) = self.selected_car {
-                    if let Some(c) = self.cars.iter().find(|c| c.id == id) {
-                        self.model = c.kind;
-                    }
-                    self.tab = Tab::Cars;
-                } else {
-                    self.say("Clique sur une voiture en piste");
-                }
-            }
             Tool::Entry if click => self.entry = Some(g),
             Tool::Exit if click => self.exit = Some(g),
             _ => {}
@@ -1272,9 +1360,14 @@ impl Game {
             self.frame_ema = 0.016;
             self.say(format!("Vitesse réduite à x{} pour rester fluide", self.speed));
         }
-        let building = matches!(self.tool, Tool::Block(_) | Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(_) | Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Winch | Tool::Pulley);
+        let building = matches!(self.tool, Tool::Block(_) | Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(_) | Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Winch | Tool::Pulley | Tool::Pipe | Tool::Valve | Tool::Pump);
         if (self.tab == Tab::Blocks || building) && (self.time * 4.0) as u32 != ((self.time - dt) * 4.0) as u32 {
             self.census = self.world.census();
+        }
+        self.shovel_age += dt;
+        if let Some(at) = self.planes.update(dt, &self.world) {
+            self.world.explode(at.x as i32, at.y as i32, 14);
+            self.say("Le Béluga s'est écrasé !".to_string());
         }
         for b in &mut self.booms {
             b.t += dt / 0.7;
@@ -1420,6 +1513,7 @@ impl Game {
             self.fix_dangling_anchors();
         }
         self.mech_step();
+        self.fluid_step();
         stamp_all(&mut self.world, &self.blocks, &self.members);
 
         // Flames heat wooden blocks; water rusts metal ones.
@@ -1535,12 +1629,20 @@ impl Game {
         let phase = self.world.phase();
         let day = backdrop::daylight(phase);
         let thermal = self.mode == ViewMode::Thermal;
-        if !thermal {
+        // The thermal and pressure views paint the whole picture themselves.
+        let flat = thermal || self.mode == ViewMode::Pressure;
+        let render_mode = match self.mode {
+            ViewMode::Thermal => RenderMode::Thermal,
+            ViewMode::Pressure => RenderMode::Pressure,
+            _ => RenderMode::Normal,
+        };
+        if !flat {
             backdrop::draw_sky(view, self.world.biome, phase, self.world.wind, self.time, self.world.season());
         }
-        renderer.draw_world(&self.world, view, thermal, self.time);
-        if !thermal {
+        renderer.draw_world(&self.world, view, render_mode, self.time);
+        if !flat {
             renderer.draw_gas(&self.world, view);
+            self.planes.draw(view, self.time);
         }
         let stress = if self.mode == ViewMode::Stress { self.phys.as_ref().map(|p| p.stress(&self.blocks)) } else { None };
         for b in &self.blocks {
@@ -1558,9 +1660,11 @@ impl Game {
             let st = if self.mode == ViewMode::Stress { Some(c.stress) } else { None };
             draw_cable(&pts, view, c.snapped, true, c.mat.color(), st);
         }
-        let over_ui_now = ui.mouse.x < PANEL_W || ui.mouse.y < TOP_H || self.views_hit.contains(ui.mouse);
+        let over_ui_now = self.panel_hit.contains(ui.mouse) || self.views_hit.contains(ui.mouse) || self.tools_hit.contains(ui.mouse) || self.corner_hit.contains(ui.mouse) || self.hud_hit.contains(ui.mouse);
         let inside_now = !over_ui_now && view.rect().contains(ui.mouse) && !self.show_science;
+        self.draw_pipes(view, ui, inside_now);
         self.draw_mech(view, ui, inside_now);
+        self.draw_selection(view);
         if let Some(e) = self.entry {
             draw_flag(view, e, GREEN, false);
         }
@@ -1583,9 +1687,9 @@ impl Game {
             draw_circle(head.x, head.y, 9.0, Color::from_rgba(120, 124, 140, 255));
             draw_circle_lines(s.x, s.y, 6.0 + 26.0 * t, 2.0, Color::new(1.0, 1.0, 1.0, 1.0 - t));
         }
-        if !thermal {
+        if !flat {
             backdrop::draw_night(view, day);
-        } else {
+        } else if thermal {
             self.draw_sun_on_thermal(view, ui);
         }
         if self.mode == ViewMode::Wind {
@@ -1593,7 +1697,7 @@ impl Game {
         }
 
         // Cursor preview.
-        let over_ui = ui.mouse.x < PANEL_W || ui.mouse.y < TOP_H || self.views_hit.contains(ui.mouse);
+        let over_ui = self.panel_hit.contains(ui.mouse) || self.views_hit.contains(ui.mouse) || self.tools_hit.contains(ui.mouse) || self.corner_hit.contains(ui.mouse) || self.hud_hit.contains(ui.mouse);
         let inside = !over_ui && view.rect().contains(ui.mouse) && !self.show_science;
         if let Some(a) = &self.cable_from {
             if let Some(p) = anchor_world(a, &self.blocks, &self.members) {
@@ -1661,17 +1765,22 @@ impl Game {
                     let ok = placement_ok(&self.world, &self.blocks, &cand, None) && self.missing_for_tool(at).is_none();
                     let tint = if ok { Color::new(0.3, 1.0, 0.5, 1.0) } else { Color::new(1.0, 0.1, 0.1, 1.0) };
                     draw_block_shape(k, view.to_screen(cand.pos), view.s, cand.angle, Some(tint), 0.0, 0.0, None);
+                    // The studs that would grip: lit up, and counted.
+                    let mut grip = 0;
+                    for b in &self.blocks {
+                        for p in blocks::shared_stud_points(cand.kind, cand.pos, cand.angle, b.kind, b.pos, b.angle) {
+                            let q = view.to_screen(p);
+                            draw_circle(q.x, q.y, 2.6 * view.s.max(0.9), Color::new(0.4, 1.0, 0.5, 0.95));
+                            grip += 1;
+                        }
+                    }
+                    if grip > 0 {
+                        ui.text(&format!("{grip} plot{}", if grip > 1 { "s" } else { "" }), ui.mouse.x + 16.0, ui.mouse.y - 10.0, 15, Color::new(0.5, 1.0, 0.6, 1.0));
+                    }
                 }
                 Tool::Mat(_) | Tool::Eraser => {
                     let r = (self.brush.max(if self.tool == Tool::Eraser { 2 } else { 0 }) as f32 + 0.5) * view.s;
                     draw_circle_lines(ui.mouse.x, ui.mouse.y, r, 1.5, Color::new(1.0, 1.0, 1.0, 0.9));
-                }
-                Tool::Rotate => {
-                    if let Some(i) = block_at(&self.blocks, at) {
-                        let b = &self.blocks[i];
-                        let c = view.to_screen(b.pos);
-                        draw_circle_lines(c.x, c.y, b.half().length() * view.s, 2.0, ACCENT);
-                    }
                 }
                 Tool::Beam(_) => {
                     // Green: it will be pinned there. Orange: no attachment, the rod will fall.
@@ -1689,10 +1798,18 @@ impl Game {
                         }
                     }
                 }
+                Tool::Shovel => self.draw_shovel_cursor(ui, view, at),
                 Tool::Hammer => draw_circle_lines(ui.mouse.x, ui.mouse.y, 3.5 * view.s, 1.5, ACCENT),
-                Tool::Loupe => self.draw_loupe(ui, view, at),
+                Tool::Loupe => self.draw_lens(ui, view, at),
                 _ => {}
             }
+        }
+
+        // The loupe tool is its own pointer.
+        let loupe = inside && self.tool == Tool::Loupe;
+        show_mouse(!loupe);
+        if loupe {
+            self.draw_lens_cursor(ui);
         }
 
         // Right at the cursor: building is impossible, the materials are missing.
@@ -1730,34 +1847,7 @@ impl Game {
         }
     }
 
-    fn draw_loupe(&self, ui: &Ui, view: View, at: Vec2) {
-        let (x, y) = (at.x as i32, at.y as i32);
-        let (title, body) = if let Some(i) = block_at(&self.blocks, at) {
-            let b = &self.blocks[i];
-            let s = b.spec();
-            let rust = if b.rust > 0.02 { format!(" · rouille {:.0} %", b.rust * 100.0) } else { String::new() };
-            (format!("{} (bloc){rust}", s.name), s.blurb.to_string())
-        } else {
-            let m = self.world.raw(x, y);
-            let i = info(m);
-            (format!("{} · {} · {:.0} °C", i.name, i.state, self.world.temp_c(x, y)), i.fact.to_string())
-        };
-        let w = 300.0;
-        let lines = ui.wrapped_height(&body, w - 20.0, 15);
-        let mut r = Rect::new(ui.mouse.x + 18.0, ui.mouse.y + 18.0, w, 38.0 + lines);
-        let screen = view.rect();
-        if r.x + r.w > screen.x + screen.w {
-            r.x = ui.mouse.x - r.w - 18.0;
-        }
-        if r.y + r.h > screen.y + screen.h {
-            r.y = ui.mouse.y - r.h - 18.0;
-        }
-        rrect(r, 10.0, Color::new(0.06, 0.07, 0.12, 0.94));
-        ui.text(&title, r.x + 10.0, r.y + 22.0, 17, ACCENT);
-        ui.wrapped(&body, r.x + 10.0, r.y + 42.0, w - 20.0, 15, TEXT);
-    }
-
-    fn draw_hud(&self, ui: &Ui, view: View) {
+    fn draw_hud(&mut self, ui: &Ui, view: View) {
         let r = view.rect();
         let w = &self.world;
         let night = w.sun() <= 0.0;
@@ -1773,9 +1863,23 @@ impl Game {
         );
         let tw = ui.text_w(&text, 14) + 38.0;
         let pill = Rect::new(r.x + 8.0, r.y + 8.0, tw, 26.0);
+        self.hud_hit = pill;
         rrect(pill, 13.0, Color::new(0.0, 0.0, 0.0, 0.5));
         draw_icon(if night { Icon::Moon } else { Icon::Sun }, vec2(pill.x + 16.0, pill.y + 13.0), 17.0, if night { Color::new(0.85, 0.9, 1.0, 1.0) } else { ACCENT });
         ui.text(&text, pill.x + 30.0, pill.y + 18.0, 14, WHITE);
+        // Clicking the season changes it.
+        let before = format!("{}  jour {}  ·  ", w.clock_label(), w.day_number());
+        let season_r = Rect::new(pill.x + 30.0 + ui.text_w(&before, 14) - 3.0, pill.y + 2.0, ui.text_w(w.season().name(), 14) + 6.0, 22.0);
+        if ui.hover(season_r) {
+            rrect(season_r, 8.0, Color::new(1.0, 1.0, 1.0, 0.18));
+            self.hover_info = Some(("Saison".to_string(), "Clique pour passer à la saison suivante.".to_string()));
+        }
+        if ui.pressed && !self.quit_modal && season_r.contains(ui.mouse) {
+            let all = Season::ALL;
+            let next = all[(all.iter().position(|x| *x == self.world.season()).unwrap_or(0) + 1) % all.len()];
+            self.world.set_season(next);
+            self.say(format!("Saison : {}", next.name()));
+        }
 
         let stats = format!("Arrivées {}   Perdues {}", self.arrived, self.lost);
         let sw = ui.text_w(&stats, 14) + 22.0;
@@ -1785,167 +1889,143 @@ impl Game {
 
         let (label, col) = if self.running { ("SIMULATION", RED) } else { ("CONSTRUCTION", BLUE) };
         let bw = ui.text_w(label, 14) + 32.0;
-        rrect(Rect::new(r.x + r.w - bw - 8.0, r.y + 8.0, bw, 26.0), 13.0, Color::new(0.0, 0.0, 0.0, 0.5));
-        draw_circle(r.x + r.w - bw + 6.0, r.y + 21.0, 5.0, col);
-        ui.text(label, r.x + r.w - bw + 16.0, r.y + 26.0, 14, WHITE);
+        let gap = 92.0;
+        rrect(Rect::new(r.x + r.w - bw - 8.0 - gap, r.y + 8.0, bw, 26.0), 13.0, Color::new(0.0, 0.0, 0.0, 0.5));
+        draw_circle(r.x + r.w - bw + 6.0 - gap, r.y + 21.0, 5.0, col);
+        ui.text(label, r.x + r.w - bw + 16.0 - gap, r.y + 26.0, 14, WHITE);
+    }
+
+    /// Left edge of the picture: beside the palette when it is pinned, else the whole window.
+    fn left(&self) -> f32 {
+        if self.panel_pin { PANEL_W } else { 0.0 }
+    }
+
+    /// How far the palette is pushed off to the left (0 when fully out).
+    fn panel_shift(&self) -> f32 {
+        -PANEL_W * (1.0 - self.panel_open)
     }
 
     fn draw_ui(&mut self, ui: &mut Ui, sw: f32, sh: f32) {
         self.hover_info = None;
-        draw_rectangle(0.0, 0.0, sw, TOP_H, BG);
-        draw_rectangle(0.0, TOP_H, PANEL_W, sh - TOP_H, PANEL);
-        draw_rectangle(0.0, TOP_H - 2.0, sw, 2.0, Color::new(0.0, 0.0, 0.0, 0.35));
-
-        self.draw_top_bar(ui, sw);
-        self.draw_panel(ui, sh);
-        self.draw_info_box(ui, sh);
+        // Under the leave-the-game window nothing answers a click.
+        let real_click = ui.pressed;
+        if self.quit_modal {
+            ui.pressed = false;
+        }
+        // The palette: it slides out when the mouse goes to the left edge, and tucks away again.
+        let handle_w = 16.0;
+        let edge = PANEL_W + self.panel_shift();
+        let handle = Rect::new(edge.max(0.0), TOP_H, handle_w, sh - TOP_H);
+        let hovering = (ui.mouse.x < edge.max(handle_w) && ui.mouse.y > TOP_H) || handle.contains(ui.mouse);
+        let target = if hovering || self.panel_pin { 1.0 } else { 0.0 };
+        self.panel_open += (target - self.panel_open) * (get_frame_time() * 9.0).min(1.0);
+        if (self.panel_open - target).abs() < 0.01 {
+            self.panel_open = target;
+        }
+        let shift = self.panel_shift();
+        let edge = PANEL_W + shift;
+        if self.panel_open > 0.02 {
+            let outer = (ui.mouse, ui.pressed);
+            unsafe { get_internal_gl() }.quad_gl.push_model_matrix(Mat4::from_translation(vec3(shift, 0.0, 0.0)));
+            ui.mouse.x -= shift;
+            draw_rectangle(0.0, TOP_H, PANEL_W, sh - TOP_H, PANEL);
+            self.draw_panel(ui, sh);
+            self.draw_info_box(ui, sh);
+            unsafe { get_internal_gl() }.quad_gl.pop_model_matrix();
+            ui.mouse = outer.0;
+        }
+        // The handle that stays in sight: click it to keep the palette out.
+        let handle = Rect::new(edge.max(0.0), TOP_H, handle_w, sh - TOP_H);
+        rrect(handle, 6.0, Color::new(0.1, 0.12, 0.2, if self.panel_open > 0.5 { 0.92 } else { 0.6 }));
+        ui.text_center(if self.panel_pin { "‹" } else { "›" }, handle.x + handle_w / 2.0, handle.y + handle.h / 2.0 + 7.0, 22, if self.panel_pin { ACCENT } else { TEXT });
+        if ui.pressed && handle.contains(ui.mouse) && !self.quit_modal {
+            self.panel_pin = !self.panel_pin;
+        }
+        self.panel_hit = if self.panel_open > 0.02 { Rect::new(0.0, TOP_H, edge.max(0.0) + handle_w, sh - TOP_H) } else { handle };
+        self.draw_tools_strip(ui, sh);
+        self.draw_corner_buttons(ui, sw);
         self.draw_views(ui, sw, sh);
+        self.draw_player(ui, sw, sh);
         if self.show_science {
             self.draw_science(ui, sw, sh);
+        }
+        if self.quit_modal {
+            ui.pressed = real_click;
+            self.draw_quit_modal(ui, sw, sh);
         }
 
         if let Some((msg, t)) = &self.toast {
             let a = (*t / 0.5).min(1.0);
             let w = ui.text_w(msg, 20) + 40.0;
-            let r = Rect::new(PANEL_W + (sw - PANEL_W - w) / 2.0, sh - 76.0, w, 42.0);
+            let l = self.left();
+            let r = Rect::new(l + (sw - l - w) / 2.0, TOP_H + 46.0, w, 42.0);
             rrect(r, 21.0, Color::new(0.05, 0.06, 0.1, 0.92 * a));
             ui.text(msg, r.x + 20.0, r.y + 27.0, 20, Color::new(1.0, 1.0, 1.0, a));
         }
     }
 
-    fn draw_top_bar(&mut self, ui: &mut Ui, sw: f32) {
-        #[derive(Clone, Copy, PartialEq)]
-        enum B {
-            Play,
-            Reset,
-            Undo,
-            Car,
-            Slower,
-            Faster,
-            Rotate,
-            Slot(usize),
-            Save,
-            Load,
-            World,
-            Blank,
-            Science,
-            Full,
+    /// The player: play/pause and speed, floating at the bottom of the picture like a
+    /// video player. It slides away when the mouse has not moved for a moment.
+    fn draw_player(&mut self, ui: &mut Ui, sw: f32, sh: f32) {
+        let dt = get_frame_time();
+        let moved = (ui.mouse - self.last_mouse).length() > 0.5 || is_mouse_button_down(MouseButton::Left) || is_mouse_button_down(MouseButton::Right);
+        self.last_mouse = ui.mouse;
+        if moved {
+            self.idle = 0.0;
+        } else {
+            self.idle += dt;
         }
-        let items: [(f32, B); 14] = [
-            (104.0, B::Play),
-            (100.0, B::Reset),
-            (104.0, B::Undo),
-            (108.0, B::Car),
-            (38.0, B::Slower),
-            (50.0, B::Faster),
-            (104.0, B::Rotate),
-            (32.0, B::Slot(0)),
-            (32.0, B::Slot(1)),
-            (32.0, B::Slot(2)),
-            (92.0, B::Save),
-            (100.0, B::Load),
-            (88.0, B::World),
-            (70.0, B::Blank),
-        ];
-        let tail: [(f32, B); 2] = [(98.0, B::Science), (70.0, B::Full)];
-        let all: Vec<(f32, B)> = items.iter().chain(tail.iter()).copied().collect();
+        let widths = [108.0f32, 38.0, 46.0, 38.0];
         let gap = 6.0;
-        let total: f32 = all.iter().map(|i| i.0).sum::<f32>() + gap * (all.len() as f32 + 1.0) + 40.0;
-        let k = (sw / total).min(1.0) * 0.86;
-        let mut x = 8.0;
-        let h = 32.0;
-        let y = (TOP_H - h) / 2.0 - 1.0;
-        for (w, b) in all {
-            let w = w * k;
-            let r = Rect::new(x, y, w, h);
-            x += w + gap * k;
-            if matches!(b, B::Slower) {
-                x -= gap * k * 0.5;
-            }
-            match b {
-                B::Play => {
-                    let (label, icon) = if self.running { ("Pause", Icon::Pause) } else { ("Jouer", Icon::Play) };
-                    if ui.button(r, label, icon, !self.running, true, GREEN) {
-                        let run = !self.running;
-                        self.set_running(run);
-                    }
-                }
-                B::Reset => {
-                    if ui.button(r, "Retour", Icon::Reset, false, true, ACCENT) {
-                        self.reset();
-                    }
-                }
-                B::Undo => {
-                    let label = if self.undo.is_empty() { "Annuler".to_string() } else { format!("Annuler {}", self.undo.len()) };
-                    if ui.button(r, &label, Icon::Undo, false, !self.undo.is_empty(), BLUE) {
-                        self.undo();
-                    }
-                }
-                B::Car => {
-                    if ui.button(r, "Voiture", Icon::Car, false, true, ACCENT) {
-                        self.launch_car();
-                    }
-                }
-                B::Slower => {
-                    if ui.button(r, "", Icon::Minus, false, self.speed > 1, ACCENT) {
-                        self.speed -= 1;
-                    }
-                }
-                B::Faster => {
-                    if ui.button(r, "", Icon::Plus, false, self.speed < 6, ACCENT) {
-                        self.speed += 1;
-                    }
-                    ui.text_center(&format!("x{}", self.speed), r.x + r.w + 13.0 * k, r.y + h / 2.0 + 6.0, 16, DIM);
-                    x += 26.0 * k;
-                }
-                B::Rotate => {
-                    if ui.button(r, "Tourner", Icon::Rotate, matches!(self.tool, Tool::Block(_)) && self.rot90 != 0, true, BLUE) {
-                        self.rotate_preview(1);
-                    }
-                }
-                B::Slot(i) => {
-                    let used = save::slot_used(i);
-                    if ui.button(r, &format!("{}", i + 1), Icon::None, self.slot == i, true, if used { ACCENT } else { DIM }) {
-                        self.slot = i;
-                    }
-                    if used && self.slot != i {
-                        draw_circle(r.x + r.w - 6.0, r.y + 6.0, 3.5, ACCENT);
-                    }
-                }
-                B::Save => {
-                    if ui.button(r, "Sauver", Icon::Save, false, true, ACCENT) {
-                        self.save();
-                    }
-                }
-                B::Load => {
-                    if ui.button(r, "Charger", Icon::Load, false, save::slot_used(self.slot), ACCENT) {
-                        self.load();
-                    }
-                }
-                B::World => {
-                    if ui.button(r, "Monde", Icon::World, false, true, ACCENT) {
-                        let b = Biome::ALL[(self.world.biome.id() as usize + 1) % 3];
-                        self.new_world(b);
-                    }
-                }
-                B::Blank => {
-                    if ui.button(r, "Vide", Icon::Blank, false, true, ACCENT) {
-                        self.empty_world();
-                    }
-                }
-                B::Science => {
-                    if ui.button(r, "Science", Icon::Science, self.show_science, true, BLUE) {
-                        self.show_science = !self.show_science;
-                        self.science_fresh = self.show_science;
-                    }
-                }
-                B::Full => {
-                    if ui.button(r, "Plein", Icon::Full, self.fullscreen, true, BLUE) {
-                        self.toggle_fullscreen();
-                    }
-                }
-            }
+        let pad = 12.0;
+        let total: f32 = widths.iter().sum::<f32>() + gap * (widths.len() as f32 - 1.0) + pad * 2.0;
+        let centre = self.left() + (sw - self.left()) / 2.0;
+        let rest = Rect::new(centre - total / 2.0, sh - 66.0, total, 50.0);
+        let over = rest.contains(ui.mouse);
+        let want = if self.idle < 2.5 || over || self.player_pin || self.quit_modal { 1.0 } else { 0.0 };
+        self.player_alpha += (want - self.player_alpha) * (dt * 9.0).min(1.0);
+        if (self.player_alpha - want).abs() < 0.01 {
+            self.player_alpha = want;
         }
+        if self.player_alpha < 0.02 {
+            return;
+        }
+        // It slides down out of sight.
+        let bar = Rect::new(rest.x, rest.y + (1.0 - self.player_alpha) * 90.0, rest.w, rest.h);
+        draw_rectangle(bar.x - 4.0, bar.y - 4.0, bar.w + 8.0, bar.h + 8.0, Color::new(0.0, 0.0, 0.0, 0.0));
+        rrect(Rect::new(bar.x, bar.y + 3.0, bar.w, bar.h), 25.0, Color::new(0.0, 0.0, 0.0, 0.35));
+        rrect(bar, 25.0, Color::new(0.07, 0.08, 0.15, 0.94));
+        // Buttons answer only while it is (nearly) in place.
+        let live = self.player_alpha > 0.6;
+        let was_pressed = ui.pressed;
+        if !live {
+            ui.pressed = false;
+        }
+        let h = 36.0;
+        let y = bar.y + (bar.h - h) / 2.0;
+        let mut x = bar.x + pad;
+        let mut place = |i: usize, x: &mut f32| -> Rect {
+            let r = Rect::new(*x, y, widths[i], h);
+            *x += widths[i] + gap;
+            r
+        };
+        let r = place(0, &mut x);
+        let (label, icon) = if self.running { ("Pause", Icon::Pause) } else { ("Jouer", Icon::Play) };
+        if ui.button(r, label, icon, !self.running, true, GREEN) {
+            let run = !self.running;
+            self.set_running(run);
+        }
+        let r = place(1, &mut x);
+        if ui.button(r, "", Icon::Minus, false, self.speed > 1, ACCENT) {
+            self.speed -= 1;
+        }
+        let r = place(2, &mut x);
+        ui.text_center(&format!("x{}", self.speed), r.x + r.w / 2.0, r.y + h / 2.0 + 6.0, 17, TEXT);
+        let r = place(3, &mut x);
+        if ui.button(r, "", Icon::Plus, false, self.speed < 6, ACCENT) {
+            self.speed += 1;
+        }
+        ui.pressed = was_pressed;
     }
 
     fn tile_rect(i: usize, cols: usize, top: f32, h: f32) -> Rect {
@@ -1955,24 +2035,83 @@ impl Game {
     }
 
     fn draw_panel(&mut self, ui: &mut Ui, sh: f32) {
-        let tabs = [(Tab::Matter, "Matières"), (Tab::Blocks, "Blocs"), (Tab::Cars, "Voitures"), (Tab::Tools, "Outils"), (Tab::Mech, "Méca"), (Tab::Planet, "Monde")];
+        // Two rows of tabs: the world, matter and blocks, then mechanics, fluids and cars.
+        let tabs = [(Tab::Planet, "Monde"), (Tab::Matter, "Matières"), (Tab::Blocks, "Blocs"), (Tab::Mech, "Méca"), (Tab::Fluid, "Fluides"), (Tab::Cars, "Voitures")];
         let tw = (PANEL_W - 6.0 * 4.0) / 3.0;
+        let size = tabs.iter().map(|(_, l)| ui.fit_size(l, tw - 8.0)).min().unwrap_or(16);
+        ui.force_size = Some(size);
         for (i, (tab, label)) in tabs.iter().enumerate() {
             let r = Rect::new(6.0 + (i % 3) as f32 * (tw + 6.0), TOP_H + 8.0 + (i / 3) as f32 * 38.0, tw, 32.0);
             if ui.button(r, label, Icon::None, self.tab == *tab, true, ACCENT) {
                 self.tab = *tab;
             }
         }
-        let top = TOP_H + 6.0 + 62.0 + 6.0;
+        ui.force_size = None;
+        let top = TOP_H + 6.0 + 62.0 + 14.0;
         match self.tab {
             Tab::Matter => self.panel_matter(ui, top),
             Tab::Blocks => self.panel_blocks(ui, top),
             Tab::Cars => self.panel_cars(ui, top),
-            Tab::Tools => self.panel_tools(ui, top),
             Tab::Mech => self.panel_mech(ui, top),
+            Tab::Fluid => self.panel_fluid(ui, top),
             Tab::Planet => self.panel_planet(ui, top),
         }
-        let _ = sh;
+        // Back and undo at the foot of the palette: they are about building.
+        let half = (PANEL_W - 18.0) / 2.0;
+        let y = sh - 138.0;
+        if ui.button(Rect::new(6.0, y, half, 32.0), "Retour", Icon::Reset, false, true, ACCENT) {
+            self.reset();
+        }
+        let label = if self.undo.is_empty() { "Annuler".to_string() } else { format!("Annuler {}", self.undo.len()) };
+        if ui.button(Rect::new(12.0 + half, y, half, 32.0), &label, Icon::Undo, false, !self.undo.is_empty(), BLUE) {
+            self.undo();
+        }
+    }
+
+    /// The tools, always in reach on the left edge of the picture.
+    fn draw_tools_strip(&mut self, ui: &mut Ui, sh: f32) {
+        let tools: [(Tool, &str, Icon, &str); 5] = [
+            (Tool::Select, "Sélection", Icon::Select, "Clique un élément (bloc, tige, engrenage, câble, tuyau, rail, voiture...) : il est entouré. Glisse-le pour le déplacer ; pour une tige, un câble, un tuyau ou un rail, glisse une poignée au bout pour le retailler. Suppr l'efface. Échap désélectionne. Une voiture sélectionnée affiche ses réglages."),
+            (Tool::Eraser, "Gomme", Icon::Eraser, "Efface la matière, les blocs et les câbles (clic droit aussi)."),
+            (Tool::Hammer, "Marteau", Icon::Hammer, "Tape sur le verre et la glace pour les casser, secoue les autres blocs."),
+            (Tool::Loupe, "Loupe", Icon::Loupe, "Le pointeur est une loupe : une vue ronde en bas à droite montre la matière sous la croix."),
+            (Tool::Shovel, "Pelle", Icon::Shovel, "Clique un tas (cendre, sable, eau, fer...) : la bulle se remplit. Déplace-la, elle reste pleine. Garde le clic enfoncé : plus tu attends, plus le morceau est gros (jusqu'à tout) ; relâche pour le verser. La pelle ne se remplit que si elle est vide. Clic droit : tout verser. Le pinceau règle sa taille."),
+        ];
+        let (bw, gap) = (38.0, 6.0);
+        let total = tools.len() as f32 * (bw + gap) + gap;
+        let pill = Rect::new((PANEL_W + self.panel_shift()).max(0.0) + 8.0 + 16.0, (sh - total) / 2.0, bw + 12.0, total);
+        self.tools_hit = pill;
+        rrect(pill, 14.0, Color::new(0.06, 0.07, 0.13, 0.9));
+        for (i, (t, label, icon, text)) in tools.iter().enumerate() {
+            let r = Rect::new(pill.x + 6.0, pill.y + gap + i as f32 * (bw + gap), bw, bw);
+            if ui.hover(r) {
+                self.hover_info = Some((label.to_string(), text.to_string()));
+            }
+            if ui.button(r, "", *icon, self.tool == *t, true, ACCENT) {
+                self.tool = *t;
+            }
+        }
+    }
+
+    /// Science and full screen: two small icons at the top right, above the views.
+    fn draw_corner_buttons(&mut self, ui: &mut Ui, sw: f32) {
+        let (s, gap) = (34.0, 6.0);
+        let sci = Rect::new(sw - 8.0 - s * 2.0 - gap, 10.0, s, s);
+        let full = Rect::new(sw - 8.0 - s, 10.0, s, s);
+        self.corner_hit = Rect::new(sci.x - 4.0, 4.0, s * 2.0 + gap + 12.0, s + 12.0);
+        if ui.hover(sci) {
+            self.hover_info = Some(("Science".to_string(), "Les transformations de la matière.".to_string()));
+        }
+        if ui.hover(full) {
+            self.hover_info = Some(("Plein écran".to_string(), "F ou F11 ; Échap en sort.".to_string()));
+        }
+        if ui.button(sci, "", Icon::Science, self.show_science, true, BLUE) {
+            self.show_science = !self.show_science;
+            self.science_fresh = self.show_science;
+        }
+        if ui.button(full, "", Icon::Full, self.fullscreen, true, BLUE) {
+            self.toggle_fullscreen();
+        }
     }
 
     fn panel_matter(&mut self, ui: &mut Ui, top: f32) {
@@ -2057,6 +2196,7 @@ impl Game {
                 (m.cost_from(), m.cost(len))
             }
             Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Winch | Tool::Pulley => self.mech_cost(at)?,
+            Tool::Pipe | Tool::Valve | Tool::Pump => self.fluid_cost(at)?,
             _ => return None,
         };
         let have = self.stock(from);
@@ -2213,35 +2353,23 @@ impl Game {
         ui.text("Rouge vif = pas assez : peins-en !", 10.0, y0 + 46.0 + 6.0 * 19.0 + 10.0, 12, DIM);
     }
 
-    fn panel_tools(&mut self, ui: &mut Ui, top: f32) {
-        let tools: [(Tool, &str, Icon, &str); 8] = [
-            (Tool::Eraser, "Gomme", Icon::Eraser, "Efface la matière, les blocs et les câbles (clic droit aussi)."),
-            (Tool::Rotate, "Tourner", Icon::Rotate, "Clique un bloc posé pour le pivoter d'un quart de tour."),
-            (Tool::Hammer, "Marteau", Icon::Hammer, "Tape sur le verre et la glace pour les casser, secoue les autres blocs."),
-            (Tool::Loupe, "Loupe", Icon::Loupe, "Survole le monde : nom, état, température et explication."),
-            (Tool::Pick, "Voiture", Icon::Pick, "Clique une voiture en piste pour régler ses caractéristiques."),
-            (Tool::Entry, "Entrée", Icon::Flag, "Où partent les voitures."),
-            (Tool::Exit, "Sortie", Icon::Flag, "Où elles doivent arriver."),
-            (Tool::Cable(CableMat::Iron), "Câble", Icon::Cable, "Accroche un câble entre deux points (bloc, tige, sol, bord du monde)."),
-        ];
-        for (i, (t, label, icon, text)) in tools.iter().enumerate() {
-            let r = Self::tile_rect(i, 3, top, 54.0);
-            if ui.hover(r) {
-                self.hover_info = Some((label.to_string(), text.to_string()));
-            }
-            let col = if *t == Tool::Exit { RED } else if *t == Tool::Entry { GREEN } else { TEXT };
-            if ui.tile(r, label, self.tool == *t, |s| {
-                draw_icon(*icon, vec2(s.x + s.w / 2.0, s.y + s.h / 2.0), 30.0, col);
-            }) {
-                self.tool = *t;
-            }
-        }
-    }
-
     fn panel_cars(&mut self, ui: &mut Ui, top: f32) {
+        // Where the cars start and where they must arrive.
+        ui.text("Départ et arrivée", 10.0, top + 14.0, 15, ACCENT);
+        let half = (PANEL_W - 18.0) / 2.0;
+        if ui.button(Rect::new(6.0, top + 22.0, half, 30.0), "Entrée", Icon::Flag, self.tool == Tool::Entry, true, GREEN) {
+            self.tool = if self.tool == Tool::Entry { Tool::Select } else { Tool::Entry };
+        }
+        if ui.button(Rect::new(12.0 + half, top + 22.0, half, 30.0), "Sortie", Icon::Flag, self.tool == Tool::Exit, true, RED) {
+            self.tool = if self.tool == Tool::Exit { Tool::Select } else { Tool::Exit };
+        }
+        if ui.hover(Rect::new(6.0, top + 22.0, PANEL_W - 12.0, 30.0)) {
+            self.hover_info = Some(("Entrée / Sortie".to_string(), "Choisis, puis clique dans le monde : l'entrée est le départ des voitures, la sortie l'arrivée. Reclique le bouton pour revenir à la sélection.".to_string()));
+        }
+        ui.text("Clique un modèle : la voiture part", 10.0, top + 70.0, 13, DIM);
         for (i, k) in ModelKind::ALL.iter().enumerate() {
             let m = k.model();
-            let r = Rect::new(6.0, top + i as f32 * 40.0, PANEL_W - 12.0, 36.0);
+            let r = Rect::new(6.0, top + 78.0 + i as f32 * 40.0, PANEL_W - 12.0, 36.0);
             let sel = self.model == *k;
             let hot = ui.hover(r);
             rrect(r, 10.0, if hot { ui::TILE_HOT } else { ui::TILE });
@@ -2256,22 +2384,33 @@ impl Game {
             draw_circle(r.x + 34.0, r.y + 28.0, 5.0, Color::from_rgba(26, 26, 32, 255));
             ui.text(m.name, r.x + 50.0, r.y + 16.0, 16, if sel { ACCENT } else { TEXT });
             ui.text(m.blurb, r.x + 50.0, r.y + 30.0, 12, DIM);
+            if hot {
+                self.hover_info = Some((m.name.to_string(), format!("{} Clique pour la lancer ; ses réglages s'affichent sous les vues.", m.blurb)));
+            }
             if hot && ui.pressed {
                 self.model = *k;
-                self.selected_car = None;
+                self.launch_car();
+                self.car_remote = true;
+                self.selected_motor = None;
             }
         }
+    }
 
-        let sy = top + 4.0 * 40.0 + 6.0;
+    /// The settings of the selected car (or of the model being launched), under the views.
+    fn draw_car_remote(&mut self, ui: &mut Ui, panel: Rect) {
+        rrect(panel, 12.0, Color::new(0.09, 0.1, 0.17, 0.95));
         let editing_live = self.selected_car.map_or(false, |id| self.cars.iter().any(|c| c.id == id));
         let name = self.model.model().name;
-        ui.text(&format!("Réglages · {name}"), 10.0, sy + 11.0, 15, ACCENT);
-        ui.text(if editing_live { "voiture en piste" } else { "prochaines voitures" }, 10.0, sy + 25.0, 11, DIM);
+        ui.text(&format!("Réglages · {name}"), panel.x + 10.0, panel.y + 20.0, 15, ACCENT);
+        ui.text(if editing_live { "voiture en piste" } else { "prochaines voitures" }, panel.x + 10.0, panel.y + 34.0, 11, DIM);
+        if ui.button(Rect::new(panel.x + panel.w - 30.0, panel.y + 6.0, 24.0, 22.0), "×", Icon::None, false, true, DIM) {
+            self.car_remote = false;
+        }
         let rows: [(&str, f32, f32, usize); 8] = [
             ("Puissance", 0.5, 2.0, 0),
-            ("Vitesse max", 0.5, 2.0, 1),
+            ("Vitesse", 0.5, 2.0, 1),
             ("Suspension", 0.5, 2.0, 2),
-            ("Amortisseurs", 0.5, 2.0, 3),
+            ("Amortiss.", 0.5, 2.0, 3),
             ("Adhérence", 0.6, 1.6, 4),
             ("Roues", 0.7, 1.5, 5),
             ("Solidité", 0.6, 2.0, 6),
@@ -2279,7 +2418,7 @@ impl Game {
         ];
         let mut changed = false;
         for (i, (label, lo, hi, which)) in rows.iter().enumerate() {
-            let y = sy + 32.0 + i as f32 * 25.0;
+            let y = panel.y + 46.0 + i as f32 * 23.0;
             let mut t = *self.tuning_mut();
             let v = match which {
                 0 => &mut t.power,
@@ -2291,53 +2430,72 @@ impl Game {
                 6 => &mut t.tough,
                 _ => &mut t.weight,
             };
-            let hover = ui.hover(Rect::new(0.0, y - 3.0, PANEL_W, 24.0));
-            ui.text(label, 10.0, y + 11.0, 13, if hover { TEXT } else { DIM });
+            ui.text(label, panel.x + 10.0, y + 12.0, 12, DIM);
             let before = *v;
-            ui.slider(Rect::new(98.0, y, PANEL_W - 148.0, 18.0), v, *lo, *hi, ACCENT);
-            ui.text(&format!("x{:.1}", *v), PANEL_W - 44.0, y + 11.0, 13, TEXT);
+            ui.slider(Rect::new(panel.x + 82.0, y + 2.0, panel.w - 128.0, 16.0), v, *lo, *hi, ACCENT);
+            ui.text(&format!("{:.1}", *v), panel.x + panel.w - 38.0, y + 12.0, 12, TEXT);
             if (*v - before).abs() > 1e-4 {
                 *self.tuning_mut() = t;
                 changed = true;
             }
         }
-        // Colour swatches.
-        let cy = sy + 32.0 + 8.0 * 25.0 + 2.0;
+        let cy = panel.y + 46.0 + 8.0 * 23.0 + 6.0;
         for (i, c) in Tuning::COLORS.iter().enumerate() {
-            let cx = 16.0 + i as f32 * 26.0;
-            let r = Rect::new(cx - 10.0, cy, 22.0, 22.0);
+            let cx = panel.x + 16.0 + i as f32 * 19.0;
+            let r = Rect::new(cx - 9.0, cy, 18.0, 18.0);
             let chosen = self.tuning_mut().color == Some(*c);
-            draw_circle(cx, cy + 11.0, 9.5, Color::from_rgba(c.0, c.1, c.2, 255));
+            draw_circle(cx, cy + 9.0, 7.5, Color::from_rgba(c.0, c.1, c.2, 255));
             if chosen {
-                draw_circle_lines(cx, cy + 11.0, 12.0, 2.0, WHITE);
+                draw_circle_lines(cx, cy + 9.0, 10.0, 2.0, WHITE);
             }
             if ui.hover(r) && ui.pressed {
                 self.tuning_mut().color = Some(*c);
                 changed = true;
             }
         }
-        let rr = Rect::new(8.0, cy + 28.0, PANEL_W - 16.0, 26.0);
-        if ui.button(rr, "Réinitialiser", Icon::Reset, false, true, ACCENT) {
+        if ui.button(Rect::new(panel.x + 8.0, cy + 26.0, panel.w - 16.0, 26.0), "Réinitialiser", Icon::Reset, false, true, ACCENT) {
             *self.tuning_mut() = Tuning::default();
             changed = true;
         }
         if changed {
             self.sync_default_tuning();
-            if !editing_live {
-                // nothing else to do: next cars use it
-            }
         }
     }
 
     fn panel_planet(&mut self, ui: &mut Ui, top: f32) {
-        ui.text("Décor du monde", 10.0, top + 14.0, 16, ACCENT);
+        ui.text("Nouveau monde", 10.0, top + 14.0, 16, ACCENT);
         for (i, b) in Biome::ALL.iter().enumerate() {
             let r = Rect::new(6.0, top + 22.0 + i as f32 * 32.0, PANEL_W - 12.0, 28.0);
             if ui.button(r, b.name(), Icon::World, self.world.biome == *b, true, GREEN) {
                 self.new_world(*b);
             }
         }
-        let ty = top + 22.0 + 3.0 * 32.0 + 12.0;
+        // A world with nothing in it, to build from scratch.
+        if ui.button(Rect::new(6.0, top + 22.0 + 3.0 * 32.0, PANEL_W - 12.0, 28.0), "Monde vide", Icon::Blank, false, true, ACCENT) {
+            self.empty_world();
+        }
+        // Saving: three slots, then save or load into the chosen one.
+        let sy0 = top + 22.0 + 4.0 * 32.0 + 12.0;
+        ui.text("Sauvegarde", 10.0, sy0, 16, ACCENT);
+        let slot_w = (PANEL_W - 24.0) / 3.0;
+        for i in 0..3 {
+            let used = save::slot_used(i);
+            let r = Rect::new(6.0 + i as f32 * (slot_w + 6.0), sy0 + 6.0, slot_w, 28.0);
+            if ui.button(r, &format!("{}", i + 1), Icon::None, self.slot == i, true, if used { ACCENT } else { DIM }) {
+                self.slot = i;
+            }
+            if used && self.slot != i {
+                draw_circle(r.x + r.w - 6.0, r.y + 6.0, 3.5, ACCENT);
+            }
+        }
+        let half = (PANEL_W - 18.0) / 2.0;
+        if ui.button(Rect::new(6.0, sy0 + 40.0, half, 28.0), "Sauver", Icon::Save, false, true, ACCENT) {
+            self.save();
+        }
+        if ui.button(Rect::new(12.0 + half, sy0 + 40.0, half, 28.0), "Charger", Icon::Load, false, save::slot_used(self.slot), ACCENT) {
+            self.load();
+        }
+        let ty = sy0 + 82.0;
         ui.text("Temps", 10.0, ty, 16, ACCENT);
         let half = (PANEL_W - 18.0) / 2.0;
         if ui.button(Rect::new(6.0, ty + 6.0, half, 28.0), "Midi", Icon::Sun, false, true, ACCENT) {
@@ -2360,16 +2518,30 @@ impl Game {
         }
         let iy = sy + 6.0 + 2.0 * 32.0 + 14.0;
         let w = &self.world;
-        ui.text(&format!("Air au sol : {:.0} °C", w.surface_temp_c()), 10.0, iy, 15, TEXT);
-        ui.text(&format!("Vent : {:.0} km/h {}", w.wind.abs() * 40.0, if w.wind > 0.0 { "vers la droite" } else { "vers la gauche" }), 10.0, iy + 20.0, 15, TEXT);
-        ui.text("Le soleil chauffe le jour, la nuit gèle.", 10.0, iy + 44.0, 13, DIM);
-        ui.text("Touche H : vue thermique.", 10.0, iy + 62.0, 13, DIM);
+        ui.text(&format!("Air {:.0} °C · vent {:.0} km/h {}", w.surface_temp_c(), w.wind.abs() * 40.0, if w.wind > 0.0 { "→" } else { "←" }), 10.0, iy, 14, TEXT);
+        ui.text("Vent", 10.0, iy + 22.0, 16, ACCENT);
+        let (maxv, ch, windy) = (self.world.wind_max, self.world.wind_changes, self.world.windiness);
+        let rows: [(&str, f32, f32, f32, String); 3] = [
+            ("Force max", maxv, 0.05, 1.0, format!("{:.0} km/h", maxv * 40.0)),
+            ("Virages", ch, 0.0, 3.0, if ch < 0.05 { "jamais".to_string() } else { format!("x{ch:.1}") }),
+            ("Calme-venteux", windy, 0.0, 1.0, format!("{:.0} %", windy * 100.0)),
+        ];
+        let mut vals = [maxv, ch, windy];
+        for (k, (label, _, lo, hi, shown)) in rows.iter().enumerate() {
+            let y = iy + 30.0 + k as f32 * 22.0;
+            ui.text(label, 10.0, y + 12.0, 12, TEXT);
+            ui.slider(Rect::new(96.0, y, PANEL_W - 96.0 - 74.0, 18.0), &mut vals[k], *lo, *hi, BLUE);
+            ui.text(shown, PANEL_W - 64.0, y + 13.0, 12, DIM);
+        }
+        self.world.wind_max = vals[0];
+        self.world.wind_changes = vals[1];
+        self.world.windiness = vals[2];
     }
 
     /// The palette of views on the right edge: it slides out when the mouse goes there.
     fn draw_views(&mut self, ui: &mut Ui, sw: f32, sh: f32) {
         let y = TOP_H + 60.0;
-        let h = 274.0;
+        let h = 318.0;
         let tab = Rect::new(sw - VIEWS_TAB, y, VIEWS_TAB, 96.0);
         let px = sw - VIEWS_TAB - VIEWS_W * self.views_open;
         let panel = Rect::new(px, y, VIEWS_W, h);
@@ -2381,8 +2553,10 @@ impl Game {
             self.views_open = target;
         }
         let remote = self.remote_rect(panel);
+        // The car settings take the same place as the motor's remote control.
+        let car_panel = if remote.is_none() && self.car_remote { Some(Rect::new(panel.x, panel.y + panel.h + 8.0, panel.w, 286.0)) } else { None };
         self.views_hit = if self.views_open > 0.02 {
-            match remote {
+            match remote.or(car_panel) {
                 Some(r) => tab.combine_with(panel).combine_with(r),
                 None => tab.combine_with(panel),
             }
@@ -2404,11 +2578,12 @@ impl Game {
 
         rrect(panel, 12.0, Color::new(0.09, 0.1, 0.17, 0.95));
         ui.text("Vues", panel.x + 12.0, panel.y + 22.0, 16, ACCENT);
-        let modes: [(ViewMode, &str, Icon, Color); 4] = [
+        let modes: [(ViewMode, &str, Icon, Color); 5] = [
             (ViewMode::Normal, "Normale", Icon::Sun, ACCENT),
             (ViewMode::Thermal, "Température", Icon::Thermo, RED),
             (ViewMode::Stress, "Efforts", Icon::Gauge, ACCENT),
             (ViewMode::Wind, "Vent", Icon::Wind, BLUE),
+            (ViewMode::Pressure, "Pression", Icon::Gauge, GREEN),
         ];
         for (i, (m, label, icon, col)) in modes.iter().enumerate() {
             let r = Rect::new(panel.x + 8.0, panel.y + 32.0 + i as f32 * 31.0, panel.w - 16.0, 27.0);
@@ -2417,7 +2592,7 @@ impl Game {
             }
         }
         // Legend for the chosen view.
-        let ly = panel.y + 32.0 + 4.0 * 31.0 + 8.0;
+        let ly = panel.y + 32.0 + 5.0 * 31.0 + 8.0;
         let bar = Rect::new(panel.x + 12.0, ly + 14.0, panel.w - 24.0, 12.0);
         match self.mode {
             ViewMode::Thermal => {
@@ -2447,12 +2622,27 @@ impl Game {
                 ui.text(&format!("{:.0} km/h {}", w.wind.abs() * 40.0, if w.wind > 0.0 { "→" } else { "←" }), bar.x, bar.y + 4.0, 14, TEXT);
                 ui.wrapped("Couches de vent opposées et tourbillons : ils portent nuages, vapeur, fumée et pluie, et contournent le relief.", bar.x, bar.y + 22.0, bar.w, 11, DIM);
             }
+            ViewMode::Pressure => {
+                for i in 0..40 {
+                    let atm = 0.35 + 6.0 * (i as f32 / 39.0).powf(2.0);
+                    let (r2, g2, b2) = world::pressure_rgb(atm);
+                    draw_rectangle(bar.x + bar.w * i as f32 / 40.0, bar.y, bar.w / 40.0 + 1.0, bar.h, Color::from_rgba(r2, g2, b2, 255));
+                }
+                for (atm, label) in [(0.5f32, "0,5"), (1.0, "1"), (2.0, "2"), (5.0, "5")] {
+                    let u = ((atm - 0.35) / 6.0).sqrt();
+                    ui.text(label, bar.x + bar.w * u - 4.0, bar.y + 25.0, 11, DIM);
+                }
+                ui.text("atm", bar.x + bar.w - 20.0, ly + 10.0, 11, DIM);
+                ui.wrapped("Air : plus mince en altitude, plus dense dans les courants. Liquides : le poids de la colonne. Solides : le poids au-dessus. Traits sombres : frontières gaz / liquide / solide.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
+            }
             ViewMode::Normal => {
-                ui.wrapped("Touches : H température, X efforts, V vent.", bar.x, bar.y + 2.0, bar.w, 11, DIM);
+                ui.wrapped("Touches : H température, X efforts, V vent, P pression.", bar.x, bar.y + 2.0, bar.w, 11, DIM);
             }
         }
         if let Some(r) = remote {
             self.draw_remote(ui, r);
+        } else if let Some(r) = car_panel {
+            self.draw_car_remote(ui, r);
         }
         let _ = sh;
     }
@@ -2481,6 +2671,24 @@ impl Game {
         }
     }
 
+    /// "Leave the game?": Enter or the button leaves, Esc or the other button goes back.
+    fn draw_quit_modal(&mut self, ui: &mut Ui, sw: f32, sh: f32) {
+        draw_rectangle(0.0, 0.0, sw, sh, Color::new(0.0, 0.0, 0.05, 0.62));
+        let w = 420.0;
+        let r = Rect::new((sw - w) / 2.0, sh / 2.0 - 90.0, w, 180.0);
+        rrect(r, 16.0, Color::new(0.09, 0.1, 0.17, 0.98));
+        ui::rrect_lines(r, 16.0, 2.0, ACCENT);
+        ui.text_center("Quitter AWorld ?", r.x + w / 2.0, r.y + 46.0, 26, ACCENT);
+        ui.text_center("La simulation est en pause.", r.x + w / 2.0, r.y + 76.0, 15, DIM);
+        let (bw, by) = ((w - 48.0) / 2.0, r.y + 108.0);
+        if ui.button(Rect::new(r.x + 16.0, by, bw, 44.0), "Reprendre (Échap)", Icon::Play, true, true, GREEN) {
+            self.close_quit_modal();
+        }
+        if ui.button(Rect::new(r.x + 32.0 + bw, by, bw, 44.0), "Quitter (Entrée)", Icon::None, false, true, RED) {
+            Self::quit_game();
+        }
+    }
+
     fn draw_info_box(&mut self, ui: &Ui, sh: f32) {
         let r = Rect::new(6.0, sh - 100.0, PANEL_W - 12.0, 94.0);
         rrect(r, 10.0, Color::new(0.0, 0.0, 0.0, 0.28));
@@ -2499,18 +2707,45 @@ impl Game {
     }
 
     fn draw_science(&mut self, ui: &mut Ui, sw: f32, sh: f32) {
-        draw_rectangle(PANEL_W, TOP_H, sw - PANEL_W, sh - TOP_H, Color::new(0.02, 0.03, 0.07, 0.86));
-        let area = Rect::new(PANEL_W + 30.0, TOP_H + 20.0, sw - PANEL_W - 60.0, sh - TOP_H - 40.0);
+        draw_rectangle(0.0, TOP_H, sw, sh - TOP_H, Color::new(0.02, 0.03, 0.07, 0.86));
+        let area = Rect::new(30.0, TOP_H + 20.0, sw - 60.0, sh - TOP_H - 40.0);
         ui.text("Les transformations de la matière", area.x, area.y + 28.0, 28, ACCENT);
         if ui.button(Rect::new(area.x + area.w - 110.0, area.y, 110.0, 36.0), "Fermer", Icon::None, false, true, ACCENT) {
             self.show_science = false;
         }
-        let col_w = area.w / 2.0;
+        // The page is longer than the window: it scrolls by whole rows (wheel, PageUp/PageDown, or the bar
+        // on the right), so that no row is ever cut in half.
+        let top = area.y + 52.0;
+        let view_h = (area.y + area.h - top).max(72.0);
+        let col_w = (area.w - 16.0) / 2.0;
         let per_col = RECIPES.len().div_ceil(2);
+        ui.text("Molette, PageHaut/PageBas ou barre à droite : faire défiler", area.x + 460.0, area.y + 26.0, 14, DIM);
+        let shown = ((view_h - 6.0) / 72.0).floor().max(1.0) as usize;
+        let max_row = per_col.saturating_sub(shown);
+        let content_h = per_col as f32 * 72.0;
+        let mut first = self.science_scroll.round().clamp(0.0, max_row as f32);
+        first -= mouse_wheel().1.signum() * if mouse_wheel().1 != 0.0 { 1.0 } else { 0.0 };
+        if is_key_pressed(KeyCode::PageDown) {
+            first += shown as f32 - 1.0;
+        }
+        if is_key_pressed(KeyCode::PageUp) {
+            first -= shown as f32 - 1.0;
+        }
+        let track = Rect::new(area.x + area.w - 10.0, top, 8.0, view_h);
+        if max_row > 0 && is_mouse_button_down(MouseButton::Left) && Rect::new(track.x - 8.0, track.y, track.w + 16.0, track.h).contains(ui.mouse) {
+            first = ((ui.mouse.y - track.y) / track.h * (max_row as f32 + 1.0)).floor();
+        }
+        first = first.clamp(0.0, max_row as f32);
+        self.science_scroll = first;
+        let (first, max_scroll) = (first as usize, max_row as f32);
+        let scroll = first as f32;
         for (i, rec) in RECIPES.iter().enumerate() {
             let (col, row) = (i / per_col, i % per_col);
+            if row < first || row >= first + shown {
+                continue;
+            }
             let x = area.x + col as f32 * col_w;
-            let y = area.y + 58.0 + row as f32 * 72.0;
+            let y = top + 6.0 + (row - first) as f32 * 72.0;
             let mut cx = x;
             let sq = 26.0;
             let swatch = |m: Mat, cx: &mut f32| {
@@ -2534,6 +2769,13 @@ impl Game {
                 swatch(*m, &mut cx);
             }
             ui.wrapped(rec.text, x, y + sq + 32.0, col_w - 30.0, 14, TEXT);
+        }
+        let _ = content_h;
+        if max_scroll > 0.0 {
+            rrect(track, 4.0, Color::new(1.0, 1.0, 1.0, 0.12));
+            let thumb_h = (shown as f32 / per_col as f32 * track.h).max(24.0);
+            let thumb_y = track.y + (track.h - thumb_h) * (scroll / max_scroll);
+            rrect(Rect::new(track.x, thumb_y, track.w, thumb_h), 4.0, ACCENT);
         }
         // A click outside closes it, but not the very click that opened it.
         if std::mem::take(&mut self.science_fresh) {
@@ -2632,6 +2874,48 @@ fn demo_mech(g: &mut Game) {
     g.tool = Tool::Gear(GearSize::Medium);
 }
 
+/// `--demo --pipes`: two vessels joined by a siphon, with a valve and a motor to turn it.
+fn demo_pipes(g: &mut Game) {
+    g.empty_world();
+    g.world.structures_fall = false;
+    for x in 0..W as i32 {
+        for y in 330..360 {
+            g.world.set(x, y, Mat::Stone);
+        }
+    }
+    for (x0, x1, top) in [(220, 340, 250), (520, 640, 315)] {
+        for y in 215..330 {
+            for x in x0 - 8..x0 {
+                g.world.set(x, y, Mat::Stone);
+            }
+            for x in x1..x1 + 8 {
+                g.world.set(x, y, Mat::Stone);
+            }
+        }
+        for y in top..330 {
+            for x in x0..x1 {
+                g.world.set(x, y, Mat::Water);
+            }
+        }
+    }
+    let was = g.unlimited;
+    g.unlimited = true;
+    g.tool = Tool::Pipe;
+    for (x, y) in [(300.0, 320.0), (300.0, 200.0), (580.0, 200.0), (580.0, 320.0)] {
+        g.fluid_click(vec2(x, y));
+    }
+    g.pipe_from = None;
+    g.tool = Tool::Valve;
+    g.fluid_click(vec2(440.0, 200.0));
+    g.tool = Tool::Motor;
+    g.mech_click(vec2(440.0, 150.0));
+    g.tool = Tool::Axle;
+    g.mech_click(vec2(440.0, 150.0));
+    g.mech_click(vec2(440.0, 200.0));
+    g.unlimited = was;
+    g.tool = Tool::Pipe;
+}
+
 #[macroquad::main(window_conf)]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -2639,7 +2923,7 @@ async fn main() {
     let shot = arg("--demo");
 
     let font = load_ttf_font_from_bytes(include_bytes!("../assets/font.ttf")).expect("font");
-    let mut ui = Ui { font, mouse: Vec2::ZERO, pressed: false };
+    let mut ui = Ui { font, mouse: Vec2::ZERO, pressed: false, force_size: None };
     let mut renderer = Renderer::new();
     let mut game = Game::new();
     #[cfg(feature = "sound")]
@@ -2647,6 +2931,7 @@ async fn main() {
         game.sounds = Sounds::load().await;
     }
     if shot.is_some() {
+        game.panel_pin = !std::env::args().any(|a| a == "--hide-panel");
         let biome = match arg("--biome").as_deref() {
             Some("mer") => Biome::Sea,
             Some("montagne") => Biome::Mountain,
@@ -2656,7 +2941,6 @@ async fn main() {
         game.tab = match arg("--tab").as_deref() {
             Some("matter") => Tab::Matter,
             Some("cars") => Tab::Cars,
-            Some("tools") => Tab::Tools,
             Some("mech") => Tab::Mech,
             Some("planet") => Tab::Planet,
             _ => Tab::Blocks,
@@ -2676,11 +2960,23 @@ async fn main() {
             Some("thermique") => ViewMode::Thermal,
             Some("efforts") => ViewMode::Stress,
             Some("vent") => ViewMode::Wind,
+            Some("pression") => ViewMode::Pressure,
             _ => ViewMode::Normal,
         };
         if args.iter().any(|a| a == "--palette") {
             game.views_open = 1.0;
             game.views_pin = true;
+        }
+        if args.iter().any(|a| a == "--pipes") {
+            demo_pipes(&mut game);
+            game.set_running(true);
+            game.tab = Tab::Fluid;
+        }
+        if args.iter().any(|a| a == "--plane") {
+            game.planes.summon(&game.world);
+            if let Some(p) = &mut game.planes.plane {
+                p.pos = vec2(60.0, 130.0);
+            }
         }
         if args.iter().any(|a| a == "--mech") {
             let was = game.unlimited_sim;
@@ -2694,15 +2990,26 @@ async fn main() {
             }
         }
         game.show_science = args.iter().any(|a| a == "--science");
+        game.player_pin = args.iter().any(|a| a == "--player");
         game.tool = if args.iter().any(|a| a == "--loupe") { Tool::Loupe } else { Tool::Block(BlockKind::Brick) };
     }
+    // `--mouse x,y` pins the pointer for screenshots.
+    let demo_mouse = arg("--mouse").and_then(|v| {
+        let (x, y) = v.split_once(',')?;
+        Some(vec2(x.parse().ok()?, y.parse().ok()?))
+    });
     let mut frame = 0u32;
     let mut frame_time = 0.0f32;
 
     loop {
         let (sw, sh) = (screen_width(), screen_height());
-        let view = View::fit(Rect::new(PANEL_W, TOP_H, sw - PANEL_W, sh - TOP_H));
+        let view = View::fit(Rect::new(game.left(), TOP_H, sw - game.left(), sh - TOP_H));
         ui.begin();
+        // Screenshots must not depend on where the real pointer happens to be.
+        if shot.is_some() {
+            ui.pressed = false;
+            ui.mouse = demo_mouse.unwrap_or(vec2(-1000.0, -1000.0));
+        }
         game.handle_keys();
         game.handle_mouse(view, &ui);
         game.update(get_frame_time().min(0.05));
@@ -2955,6 +3262,332 @@ mod tests {
         eprintln!("BLOCKROD cube x {lo:.1}..{hi:.1}, y {:.1}, gear turned {:.1}, broken {}", g.blocks[0].pos.y, g.mech.gears[1].angle, g.mech.rods[0].broken);
         assert!(hi - lo > 3.0, "the rod drags the block to and fro: {lo}..{hi}");
         assert!(g.mech.gears[1].angle.abs() > 1.0, "and the gear still turns");
+    }
+
+    #[test]
+    fn a_winch_reels_a_cable_in_and_stops_when_there_is_no_rope_left() {
+        let mut g = mech_game();
+        g.blocks.push(Block::new(BlockKind::Cube, vec2(316.0, 230.0), 0.0));
+        g.refresh_mask();
+        // A winch drum high up, driven by a motor beside it (meshing reverses, so turn the motor the other way).
+        click_with(&mut g, Tool::Winch, 316.0, 120.0);
+        click_with(&mut g, Tool::Motor, 300.0, 120.0);
+        g.mech.gears[1].motor.as_mut().unwrap().dir = -1.0;
+        assert!(g.mech.gears[0].reel.is_some() && g.mech.gears[1].motor.is_some());
+        g.cable_click(CableMat::Iron, vec2(316.0, 121.0)); // the drum
+        g.cable_click(CableMat::Iron, vec2(316.0, 222.0)); // the cube
+        assert_eq!(g.cables.len(), 1);
+        assert!(matches!(g.cables[0].a, Anchor::Reel { .. }), "the rope is fixed on the drum");
+        g.set_running(true);
+        let start = g.blocks[0].pos.y;
+        let start_len = g.cables[0].len;
+        let mut stalled = false;
+        for _ in 0..2500 {
+            g.sim_step();
+            stalled |= g.mech.gears[0].omega.abs() < 1e-6 && g.cables[0].len < 20.0;
+        }
+        eprintln!("WINCH3 cube {start:.0} -> {:.0}, rope {start_len:.0} -> {:.0}, drum angle {:.1}", g.blocks[0].pos.y, g.cables[0].len, g.mech.gears[0].angle);
+        assert!(g.blocks[0].pos.y < start - 60.0, "the winch hauls the cube up");
+        assert!(g.cables[0].len >= 13.9, "no more rope than there is: {}", g.cables[0].len);
+        assert!(g.cables[0].len < start_len - 60.0, "the rope was reeled in");
+        assert!(stalled, "the drum stops (the motor stalls) when the rope is all in");
+    }
+
+    #[test]
+    fn a_cable_runs_over_a_pulley_and_carries_weight_both_sides() {
+        let mut g = mech_game();
+        g.blocks.push(Block::new(BlockKind::Cube, vec2(280.0, 230.0), 0.0));
+        g.blocks.push(Block::new(BlockKind::Glass, vec2(320.0, 230.0), 0.0));
+        g.refresh_mask();
+        click_with(&mut g, Tool::Pulley, 300.0, 110.0);
+        assert_eq!(g.mech.pulleys.len(), 1);
+        g.cable_click(CableMat::Iron, vec2(280.0, 222.0)); // first block
+        g.cable_click(CableMat::Iron, vec2(300.0, 110.0)); // the pulley
+        assert_eq!(g.cable_via.len(), 1);
+        g.cable_click(CableMat::Iron, vec2(320.0, 226.0)); // second block
+        assert_eq!(g.cables.len(), 1);
+        assert_eq!(g.cables[0].via.len(), 1);
+        assert_eq!(g.cables[0].via_pts.len(), 1, "where the rope touches the pulley");
+        assert!(g.cables[0].via_pts[0].y < 110.0, "over the top of the pulley");
+        g.set_running(true);
+        let (y0, y1) = (g.blocks[0].pos.y, g.blocks[1].pos.y);
+        let (mut down, mut up) = (0.0f32, 0.0f32);
+        for _ in 0..100 {
+            g.sim_step();
+            down = down.max(g.blocks[0].pos.y - y0);
+            up = up.max(y1 - g.blocks[1].pos.y);
+        }
+        assert!(down > 15.0 && up > 10.0, "the heavy side falls, the light side rises: {down} {up}");
+        // The pulley and its rope survive a save.
+        let bytes = save::encode(&g.world, None, None, &g.blocks, &g.cables, &g.members, &g.springs, &g.mech);
+        let l = save::decode(&bytes).unwrap();
+        assert_eq!(l.mech.pulleys.len(), 1);
+        assert_eq!(l.cables[0].via, vec![l.mech.pulleys[0].uid]);
+    }
+
+    /// Two stone vessels on the floor, the left one 90 deep in water, the right one 20; a pipework from
+    /// one to the other drawn with the pipe tool, over a hump 60 cells above the left surface.
+    fn plumbed_vessels() -> Game {
+        let mut g = mech_game();
+        for (x0, x1, top) in [(100, 160, 210), (300, 360, 280)] {
+            for y in 180..300 {
+                for x in x0 - 8..x0 {
+                    g.world.set(x, y, Mat::Stone);
+                }
+                for x in x1..x1 + 8 {
+                    g.world.set(x, y, Mat::Stone);
+                }
+            }
+            for y in top..300 {
+                for x in x0..x1 {
+                    g.world.set(x, y, Mat::Water);
+                }
+            }
+        }
+        g.tool = Tool::Pipe;
+        for (x, y) in [(140.0, 290.0), (140.0, 150.0), (320.0, 150.0), (320.0, 290.0)] {
+            g.fluid_click(vec2(x, y));
+        }
+        g.pipe_from = None;
+        g
+    }
+
+    fn level(g: &Game, x: i32) -> f32 {
+        let y = (0..H as i32).find(|&y| g.world.raw(x, y) == Mat::Water).unwrap_or(H as i32);
+        H as f32 - y as f32
+    }
+
+    #[test]
+    fn pipes_drawn_with_the_tool_level_two_vessels_through_a_siphon() {
+        let mut g = plumbed_vessels();
+        assert_eq!(g.mech.plumbing.pipes.len(), 3, "three straight pipes");
+        let before = (level(&g, 130), level(&g, 330));
+        g.set_running(true);
+        for _ in 0..4000 {
+            g.sim_step();
+        }
+        let (l, r) = (level(&g, 130), level(&g, 330));
+        eprintln!("PIPES levels {before:?} -> {l} / {r}");
+        assert!(before.0 - before.1 > 50.0);
+        assert!((l - r).abs() < 6.0, "the vessels reach the same level: {l} vs {r}");
+        // Going back to the drawing board puts the water where it was.
+        g.reset();
+        assert!((level(&g, 130) - before.0).abs() < 1.0);
+    }
+
+    fn drag_from_to(g: &mut Game, from: Vec2, to: Vec2) {
+        g.tool = Tool::Select;
+        g.select_mouse(from, true, true, false);
+        let steps = 6;
+        for k in 1..=steps {
+            g.select_mouse(from + (to - from) * (k as f32 / steps as f32), false, true, false);
+        }
+        g.drag = None;
+    }
+
+    #[test]
+    fn the_selection_tool_picks_moves_resizes_and_deletes() {
+        let mut g = mech_game();
+        // A block: picked, moved (clipping onto the floor), deleted.
+        g.blocks.push(Block::new(BlockKind::Cube, vec2(200.0, 290.0), 0.0));
+        g.refresh_mask();
+        g.tool = Tool::Select;
+        g.select_mouse(vec2(200.0, 290.0), true, false, false);
+        assert!(matches!(g.selection, Some(select::Sel::Block(_))));
+        g.drag = None;
+        drag_from_to(&mut g, vec2(200.0, 290.0), vec2(300.0, 290.0));
+        assert!((g.blocks[0].pos.x - 300.0).abs() < 6.0, "the block followed the drag: {:?}", g.blocks[0].pos);
+        assert!(g.blocks[0].pos.y > 285.0, "and stayed on the floor: {:?}", g.blocks[0].pos);
+        // A pipe: its end is dragged out to make it longer.
+        g.tool = Tool::Pipe;
+        g.fluid_click(vec2(100.0, 200.0));
+        g.fluid_click(vec2(140.0, 200.0));
+        g.pipe_from = None;
+        let len_before = g.mech.plumbing.pipes[0].len();
+        drag_from_to(&mut g, vec2(141.0, 200.0), vec2(200.0, 200.0));
+        let len_after = g.mech.plumbing.pipes[0].len();
+        assert!(len_after > len_before + 30.0, "the pipe was stretched by its handle: {len_before} -> {len_after}");
+        // Moving the whole pipe by its body.
+        let a0 = g.mech.plumbing.pipes[0].a;
+        drag_from_to(&mut g, vec2(150.0, 200.0), vec2(150.0, 240.0));
+        assert!((g.mech.plumbing.pipes[0].a.1 - a0.1 - 40.0).abs() < 1.5, "the pipe moved down by 40");
+        // A gear moves, and a rod attached to it stays attached (its length is refitted).
+        click_with(&mut g, Tool::Gear(GearSize::Medium), 400.0, 250.0);
+        click_with(&mut g, Tool::Rail, 430.0, 200.0);
+        click_with(&mut g, Tool::Rail, 530.0, 200.0);
+        click_with(&mut g, Tool::Crank, 408.0, 250.0);
+        click_with(&mut g, Tool::Crank, 480.0, 200.0);
+        assert_eq!(g.mech.rods.len(), 1);
+        drag_from_to(&mut g, vec2(400.0, 250.0), vec2(400.0, 270.0));
+        let r = &g.mech.rods[0];
+        let (pa, pb) = (g.rod_end_world(&r.a).unwrap(), g.rod_end_world(&r.b).unwrap());
+        assert!(((pa - pb).length() - r.len).abs() < 0.5, "the rod still fits its two ends");
+        assert!((g.mech.gears[0].pos.y - 270.0).abs() < 2.5, "the gear moved: {:?}", g.mech.gears[0].pos);
+        // Delete, and undo brings it back.
+        g.selection = Some(select::Sel::Gear(g.mech.gears[0].uid));
+        g.select_delete();
+        assert!(g.mech.gears.is_empty() && g.mech.rods.is_empty(), "the gear and its rod are gone");
+        g.undo();
+        assert_eq!(g.mech.gears.len(), 1);
+        // Nothing is edited while the simulation runs.
+        g.set_running(true);
+        let pos = g.mech.gears[0].pos;
+        g.tool = Tool::Select;
+        g.select_mouse(pos, true, true, false);
+        g.select_mouse(pos + vec2(30.0, 0.0), false, true, false);
+        assert_eq!(g.mech.gears[0].pos, pos);
+    }
+
+    #[test]
+    fn a_pump_is_set_on_a_pipe_turned_round_stopped_and_driven_by_a_gear_and_survives_a_save() {
+        let mut g = plumbed_vessels();
+        g.tool = Tool::Pump;
+        g.fluid_click(vec2(230.0, 150.0));
+        assert_eq!(g.mech.plumbing.pumps.len(), 1);
+        assert!(g.mech.plumbing.pumps[0].on && g.mech.plumbing.pumps[0].head > 0.0);
+        g.fluid_click(vec2(230.0, 150.0));
+        assert!(g.mech.plumbing.pumps[0].head < 0.0, "turned round");
+        g.fluid_click(vec2(230.0, 150.0));
+        assert!(!g.mech.plumbing.pumps[0].on, "stopped");
+        g.fluid_click(vec2(230.0, 150.0));
+        assert!(g.mech.plumbing.pumps[0].on, "running again");
+        // A motor drives it through the axle tool.
+        click_with(&mut g, Tool::Motor, 230.0, 100.0);
+        click_with(&mut g, Tool::Axle, 230.0, 100.0);
+        click_with(&mut g, Tool::Axle, 230.0, 150.0);
+        let gear = g.mech.gears[0].uid;
+        assert_eq!(g.mech.plumbing.pumps[0].driver, Some(gear));
+        g.set_running(true);
+        for _ in 0..200 {
+            g.sim_step();
+        }
+        assert!(g.mech.plumbing.pumps[0].head.abs() > 20.0, "the lift follows the gear's speed: {}", g.mech.plumbing.pumps[0].head);
+        let bytes = save::encode(&g.world, None, None, &g.blocks, &g.cables, &g.members, &g.springs, &g.mech);
+        let l = save::decode(&bytes).unwrap();
+        assert_eq!(l.mech.plumbing.pumps.len(), 1);
+        assert_eq!(l.mech.plumbing.pumps[0].driver, Some(gear));
+    }
+
+    #[test]
+    fn a_valve_turned_by_a_motor_closes_after_its_turns_and_stalls_the_motor() {
+        let mut g = plumbed_vessels();
+        // A valve in the middle of the horizontal pipe, a motor above it, joined with the axle tool.
+        g.tool = Tool::Valve;
+        g.fluid_click(vec2(230.0, 150.0));
+        assert_eq!(g.mech.plumbing.valves.len(), 1);
+        click_with(&mut g, Tool::Motor, 230.0, 100.0);
+        g.mech.gears[0].motor.as_mut().unwrap().dir = -1.0; // closing
+        click_with(&mut g, Tool::Axle, 230.0, 100.0);
+        click_with(&mut g, Tool::Axle, 230.0, 150.0);
+        assert!(matches!(g.mech.plumbing.valves[0].driver, Some(pipes::Driver::Gear(_))), "the valve is turned by the gear");
+        g.mech.plumbing.valves[0].turns = 2.0;
+        g.set_running(true);
+        let mut min_open: f32 = 1.0;
+        let mut stalled = false;
+        for _ in 0..3000 {
+            g.sim_step();
+            min_open = min_open.min(g.mech.plumbing.valves[0].open);
+            stalled |= g.mech.gears[0].omega.abs() < 1e-6 && g.mech.plumbing.valves[0].open < 0.01;
+        }
+        assert!(min_open < 0.01, "the valve ends up shut: {min_open}");
+        assert!(stalled, "and the motor stalls against the end stop");
+        // Shut for good: the high vessel keeps most of its water.
+        assert!(level(&g, 130) > 300.0, "water stayed in the left vessel: {}", level(&g, 130));
+    }
+
+    #[test]
+    fn the_post_is_a_tall_thin_brick_standing_up() {
+        let mut g = mech_game();
+        assert!(BlockKind::PLACEABLE.contains(&BlockKind::Post), "it is in the palette");
+        let spec = BlockKind::Post.spec();
+        let long = BlockKind::Long.spec();
+        assert_eq!((spec.w, spec.h), (long.h, long.w), "the long brick, but vertical");
+        g.blocks.push(Block::new(BlockKind::Post, vec2(300.0, 270.0), 0.0));
+        assert_eq!(g.blocks.len(), 1);
+        assert_eq!(g.blocks[0].kind, BlockKind::Post);
+        assert_eq!(g.blocks[0].angle, 0.0, "no rotation is needed to stand it up");
+        let bytes = save::encode(&g.world, None, None, &g.blocks, &g.cables, &g.members, &g.springs, &g.mech);
+        let l = save::decode(&bytes).unwrap();
+        assert_eq!(l.blocks[0].kind, BlockKind::Post);
+        assert_eq!(BlockKind::from_id(BlockKind::Post.id()), Some(BlockKind::Post));
+    }
+
+    #[test]
+    fn the_shovel_scoops_a_heap_and_pours_it_elsewhere_with_its_heat() {
+        let mut g = mech_game();
+        // A hot heap of ash on the floor.
+        for x in 200..212 {
+            for y in 292..300 {
+                g.world.set(x, y, Mat::Ash);
+                g.world.temp[y as usize * W + x as usize] = 480.0;
+            }
+        }
+        let ash = |g: &Game, x0: i32, x1: i32| (0..H as i32).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| g.world.raw(x, y) == Mat::Ash).count();
+        assert_eq!(ash(&g, 190, 230), 96);
+        g.brush = 6;
+        g.tool = Tool::Shovel;
+        g.shovel_scoop(vec2(205.0, 296.0));
+        let load = g.shovel.expect("something was scooped");
+        assert_eq!(load.mat, Mat::Ash);
+        assert!(load.count >= 30 && load.count <= 96, "a scoopful: {}", load.count);
+        assert!(load.temp > 400.0, "the ash stays hot on the shovel: {}", load.temp);
+        assert_eq!(ash(&g, 190, 230), 96 - load.count as usize, "what was taken is gone from the heap");
+        // A full shovel does not fill again: a click only lets go of a part of its load.
+        let before = g.shovel.unwrap().count;
+        // A quick click lets go of a pinch; held longer, of a bigger part.
+        let quick = {
+            g.shovel_mouse(vec2(205.0, 296.0), true, false);
+            g.shovel_release(vec2(205.0, 296.0));
+            before - g.shovel.map_or(0, |l| l.count)
+        };
+        assert!(quick > 0 && quick <= 8, "a quick click pours a pinch: {quick}");
+        let mid = g.shovel.unwrap();
+        assert!(Game::shovel_portion(&mid, 0.7) > Game::shovel_portion(&mid, 0.1), "the longer it is held the bigger the part");
+        assert_eq!(Game::shovel_portion(&mid, 5.0), mid.count, "held long enough it is everything");
+        g.shovel_mouse(vec2(205.0, 296.0), true, false);
+        g.shovel_charge = Some(0.75);
+        g.shovel_release(vec2(205.0, 296.0));
+        let after = g.shovel.map_or(0, |l| l.count);
+        assert!(after < mid.count - quick, "a held click pours a bigger part: {} -> {after}", mid.count);
+        assert_eq!(ash(&g, 0, W as i32) + after as usize, 96, "what poured went back into the world; nothing was scooped again");
+        // Poured out elsewhere, all of it, nothing lost.
+        g.shovel_dump(vec2(400.0, 295.0));
+        assert!(g.shovel.is_none());
+        assert_eq!(ash(&g, 380, 420), after as usize);
+        assert_eq!(ash(&g, 0, W as i32), 96, "the matter is moved, not created or lost");
+        let hot = (380..420).flat_map(|x| (0..H as i32).map(move |y| (x, y))).filter(|&(x, y)| g.world.raw(x, y) == Mat::Ash && g.world.temp[y as usize * W + x as usize] > 400.0).count();
+        assert!(hot > 0, "the poured ash is still hot");
+        // A shovel with nothing in reach says so.
+        g.shovel_scoop(vec2(600.0, 100.0));
+        assert!(g.shovel.is_none());
+    }
+
+    #[test]
+    fn escape_backs_out_one_level_at_a_time_and_pauses_before_leaving() {
+        let mut g = mech_game();
+        g.set_running(true);
+        // A build in progress is cancelled first.
+        g.cable_from = Some(Anchor::Free(vec2(10.0, 10.0)));
+        g.on_escape();
+        assert!(g.cable_from.is_none() && !g.quit_modal && g.running);
+        // Then the full screen (not toggled for real in a test).
+        g.fullscreen = false;
+        // Then the window that asks to leave, with the simulation paused.
+        g.on_escape();
+        assert!(g.quit_modal && !g.running, "the leave window opens and pauses the game");
+        // Esc again goes back and the simulation runs again.
+        g.on_escape();
+        assert!(!g.quit_modal && g.running, "the game resumes where it was");
+        // A game that was paused stays paused after the window closes.
+        g.set_running(false);
+        g.on_escape();
+        g.on_escape();
+        assert!(!g.quit_modal && !g.running);
+        // Enter in the window confirms leaving.
+        g.on_escape();
+        assert!(g.on_enter_in_quit_modal());
+        g.on_escape();
+        assert!(!g.on_enter_in_quit_modal(), "Enter does nothing outside the window");
     }
 
     #[test]

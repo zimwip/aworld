@@ -13,6 +13,11 @@ pub enum MechDraft {
     Axle(u32),
     /// A wheel picked as the end of a shaft, waiting for its gear.
     AxleWheel(u32),
+    /// A valve picked, waiting for the gear or rail that turns it; or a rail picked, waiting for the valve.
+    AxleValve(u32),
+    AxleSlider(u32),
+    /// A pump picked, waiting for the gear that turns it.
+    AxlePump(u32),
     /// First end of a rail.
     Rail(Anchor, Vec2),
     /// The first end of a connecting rod (a pin on a gear, a carriage, or any fixed point).
@@ -27,7 +32,7 @@ const AXLE_MAX: f32 = 400.0;
 const WINCH_DRUM: f32 = 7.0;
 const PULLEY_R: f32 = 5.0;
 const REEL_SPARE: f32 = 80.0;
-const REEL_MIN: f32 = 6.0;
+const REEL_MIN: f32 = 14.0;
 /// Wheel torque (physics units) for one unit of mechanism torque, and what a gear can always hold.
 const WHEEL_TORQUE_PER_UNIT: f32 = 60.0;
 const WHEEL_HOLD: f32 = 120.0;
@@ -44,7 +49,7 @@ fn teeth(size: GearSize) -> usize {
     }
 }
 
-fn gear_name(size: GearSize) -> &'static str {
+pub(crate) fn gear_name(size: GearSize) -> &'static str {
     match size {
         GearSize::Small => "Petit engrenage",
         GearSize::Medium => "Engrenage moyen",
@@ -52,7 +57,7 @@ fn gear_name(size: GearSize) -> &'static str {
     }
 }
 
-fn point_to_segment(p: Vec2, a: Vec2, b: Vec2) -> (f32, f32) {
+pub(crate) fn point_to_segment(p: Vec2, a: Vec2, b: Vec2) -> (f32, f32) {
     let ab = b - a;
     let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
     ((p - (a + ab * t)).length(), t)
@@ -149,6 +154,7 @@ impl Game {
         match self.gear_at(at) {
             Some(i) if self.mech.gears[i].motor.is_some() => {
                 self.selected_motor = Some(self.mech.gears[i].uid);
+                self.car_remote = false;
                 self.views_pin = true;
                 true
             }
@@ -211,6 +217,10 @@ impl Game {
             .map(|(i, _)| i)
     }
 
+    pub fn rail_at_pub(&self, p: Vec2) -> Option<(usize, f32)> {
+        self.rail_at(p)
+    }
+
     /// The rail under `p` and where along it (cells from its start).
     fn rail_at(&self, p: Vec2) -> Option<(usize, f32)> {
         self.mech
@@ -265,6 +275,10 @@ impl Game {
     fn gear_spot_ok(&self, size: GearSize, c: Vec2) -> bool {
         let r = size.radius();
         self.mech.gears.iter().all(|g| (g.pos - c).length() >= g.size.radius() + r - 1.5)
+    }
+
+    pub fn support_for_pub(&self, c: Vec2) -> Anchor {
+        self.support_for(c)
     }
 
     fn support_for(&self, c: Vec2) -> Anchor {
@@ -324,7 +338,49 @@ impl Game {
     fn place_axle(&mut self, at: Vec2) {
         let gear_hit = self.gear_at(at);
         let wheel_hit = self.wheel_at(at);
+        let valve_hit = self.valve_at(at);
+        let pump_hit = self.pump_at(at);
+        let rail_hit = if gear_hit.is_none() && wheel_hit.is_none() && valve_hit.is_none() { self.rail_at(at).map(|(i, _)| i) } else { None };
         match self.mech_draft.take() {
+            Some(MechDraft::AxlePump(pm)) => {
+                if let Some(i) = gear_hit {
+                    let uid = self.mech.gears[i].uid;
+                    self.link_pump(pm, uid);
+                } else {
+                    self.mech_draft = Some(MechDraft::AxlePump(pm));
+                    self.say("Clique l'engrenage qui doit mener cette pompe");
+                }
+            }
+            Some(MechDraft::Axle(first)) if pump_hit.is_some() => {
+                let pm = self.mech.plumbing.pumps[pump_hit.unwrap()].uid;
+                self.link_pump(pm, first);
+            }
+            // A valve and the gear or rail that turns it.
+            Some(MechDraft::AxleValve(v)) => {
+                if let Some(i) = gear_hit {
+                    let uid = self.mech.gears[i].uid;
+                    self.link_valve(v, crate::pipes::Driver::Gear(uid));
+                } else if let Some(i) = rail_hit {
+                    let uid = self.mech.sliders[i].uid;
+                    self.link_valve(v, crate::pipes::Driver::Slider(uid));
+                } else {
+                    self.mech_draft = Some(MechDraft::AxleValve(v));
+                    self.say("Clique l'engrenage ou le rail qui doit tourner cette vanne");
+                }
+            }
+            Some(MechDraft::AxleSlider(s)) => {
+                if let Some(i) = valve_hit {
+                    let v = self.mech.plumbing.valves[i].uid;
+                    self.link_valve(v, crate::pipes::Driver::Slider(s));
+                } else {
+                    self.mech_draft = Some(MechDraft::AxleSlider(s));
+                    self.say("Clique la vanne que ce rail doit ouvrir");
+                }
+            }
+            Some(MechDraft::Axle(first)) if valve_hit.is_some() => {
+                let v = self.mech.plumbing.valves[valve_hit.unwrap()].uid;
+                self.link_valve(v, crate::pipes::Driver::Gear(first));
+            }
             Some(MechDraft::Axle(first)) => {
                 if let Some(i) = gear_hit {
                     let uid = self.mech.gears[i].uid;
@@ -370,6 +426,12 @@ impl Game {
                     self.mech_draft = Some(MechDraft::Axle(self.mech.gears[i].uid));
                 } else if let Some(w) = wheel_hit {
                     self.mech_draft = Some(MechDraft::AxleWheel(self.blocks[w].uid));
+                } else if let Some(i) = pump_hit {
+                    self.mech_draft = Some(MechDraft::AxlePump(self.mech.plumbing.pumps[i].uid));
+                } else if let Some(i) = valve_hit {
+                    self.mech_draft = Some(MechDraft::AxleValve(self.mech.plumbing.valves[i].uid));
+                } else if let Some(i) = rail_hit {
+                    self.mech_draft = Some(MechDraft::AxleSlider(self.mech.sliders[i].uid));
                 } else {
                     self.say("Clique sur un engrenage (ou une roue) pour fixer un bout de l'axe");
                 }
@@ -643,6 +705,7 @@ impl Game {
         self.mech_drive_wheels();
         let node_loads = self.mech_node_rods();
         self.mech_reels();
+        self.pump_loads();
         let mut events = self.mech.step();
         for (r, f) in node_loads {
             if let Some(e) = self.mech.load_rod(r, f) {
@@ -670,9 +733,10 @@ impl Game {
                     self.say("Les dents d'un engrenage ont lâché : trop de couple");
                 }
                 Event::Jammed(_) => self.say("Engrenages coincés : un nombre impair d'engrenages en cercle ne tourne pas"),
-                Event::Stalled(_) => {
+                Event::Stalled(uid) => {
                     if self.toast.is_none() {
-                        self.say("Un coulisseau est en butée : le moteur force");
+                        let rail = self.mech.sliders.iter().any(|sl| sl.uid == uid);
+                        self.say(if rail { "Un coulisseau est en butée : le moteur force" } else { "Le mécanisme est en butée (vanne, treuil...) : le moteur force" });
                     }
                 }
             }
@@ -1170,8 +1234,7 @@ impl Game {
         // The motor the remote control shows.
         if let Some(g) = self.selected_motor.and_then(|u| self.mech.gears.iter().find(|g| g.uid == u)) {
             let c = view.to_screen(g.pos);
-            let half = (g.size.radius() + 5.0) * view.s;
-            draw_rectangle_lines(c.x - half, c.y - half, half * 2.0, half * 2.0, 2.5, ACCENT);
+            draw_circle_lines(c.x, c.y, (g.size.radius() + 6.0) * view.s, 2.5, ACCENT);
         }
         if stress_view {
             self.draw_mech_efforts(view, ui);
@@ -1365,7 +1428,7 @@ impl Game {
 }
 
 /// A unit direction pulled onto the nearest of the eight compass directions when within `tol` degrees.
-fn snap_to_axes(dir: Vec2, tol_deg: f32) -> Vec2 {
+pub(crate) fn snap_to_axes(dir: Vec2, tol_deg: f32) -> Vec2 {
     let a = dir.y.atan2(dir.x);
     let step = std::f32::consts::FRAC_PI_4;
     let k = (a / step).round();

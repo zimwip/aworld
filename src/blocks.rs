@@ -28,6 +28,8 @@ pub enum BlockKind {
     Glass,
     GlassHalf,
     GlassChip,
+    /// A tall, thin brick standing up (the long one's vertical twin).
+    Post,
 }
 
 pub struct Spec {
@@ -51,7 +53,7 @@ impl BlockKind {
         let area = if s.round { std::f32::consts::PI * (s.w / 2.0).powi(2) } else { s.w * s.h };
         let units = (area * 0.25).ceil() as u32;
         let from: &'static [Mat] = match self {
-            BlockKind::Brick | BlockKind::Long => &[Mat::Dirt],
+            BlockKind::Brick | BlockKind::Long | BlockKind::Post => &[Mat::Dirt],
             BlockKind::Plank => &[Mat::Wood, Mat::Trunk, Mat::Branch],
             BlockKind::Beam | BlockKind::Wheel => &[Mat::Iron],
             BlockKind::SteelBeam => &[Mat::Steel],
@@ -62,7 +64,7 @@ impl BlockKind {
     }
 
     /// Every kind, including the smaller pieces glass breaks into.
-    pub const ALL: [BlockKind; 10] = [
+    pub const ALL: [BlockKind; 11] = [
         BlockKind::Brick,
         BlockKind::Long,
         BlockKind::Plank,
@@ -73,12 +75,14 @@ impl BlockKind {
         BlockKind::Wheel,
         BlockKind::GlassHalf,
         BlockKind::GlassChip,
+        BlockKind::Post,
     ];
 
     /// What can be picked from the palette.
-    pub const PLACEABLE: [BlockKind; 5] = [
+    pub const PLACEABLE: [BlockKind; 6] = [
         BlockKind::Brick,
         BlockKind::Long,
+        BlockKind::Post,
         BlockKind::Cube,
         BlockKind::Glass,
         BlockKind::Wheel,
@@ -101,6 +105,7 @@ impl BlockKind {
             BlockKind::Glass => 7,
             BlockKind::GlassHalf => 8,
             BlockKind::GlassChip => 9,
+            BlockKind::Post => 10,
         }
     }
 
@@ -112,6 +117,7 @@ impl BlockKind {
         match self {
             BlockKind::Brick => Spec { name: "Brique", w: 20.0, h: 10.0, mat: Mat::Brick, round: false, density: 1.0, color: (205, 62, 52), strength: 1.2, blurb: "Plastique solide" },
             BlockKind::Long => Spec { name: "Longue", w: 40.0, h: 10.0, mat: Mat::Brick, round: false, density: 1.0, color: (58, 112, 214), strength: 1.2, blurb: "Brique de 4 plots" },
+            BlockKind::Post => Spec { name: "Poteau", w: 10.0, h: 40.0, mat: Mat::Brick, round: false, density: 1.0, color: (58, 112, 214), strength: 1.2, blurb: "Haute et fine : 1 plot, 4 de haut" },
             BlockKind::Plank => Spec { name: "Planche", w: 60.0, h: 5.0, mat: Mat::Wood, round: false, density: 0.6, color: (176, 124, 72), strength: 0.25, blurb: "Bois : léger, fragile, brûle" },
             BlockKind::Beam => Spec { name: "Tige fer", w: 80.0, h: 10.0, mat: Mat::Iron, round: false, density: 1.8, color: (150, 160, 178), strength: 2.0, blurb: "Fer : rouille dans l'eau" },
             BlockKind::SteelBeam => Spec { name: "Tige acier", w: 80.0, h: 10.0, mat: Mat::Steel, round: false, density: 1.8, color: (96, 128, 186), strength: 4.0, blurb: "Acier : fer + carbone, 2x plus solide" },
@@ -283,6 +289,45 @@ pub fn snap(kind: BlockKind, rot90: u8, mouse: Vec2) -> Vec2 {
     vec2(((mouse.x - w / 2.0) / STUD).round() * STUD + w / 2.0, ((mouse.y - h / 2.0) / STUD).round() * STUD + h / 2.0)
 }
 
+/// Does this kind carry studs on top (and tubes underneath), like a Lego brick?
+pub fn has_studs(kind: BlockKind) -> bool {
+    matches!(kind, BlockKind::Brick | BlockKind::Long | BlockKind::Post | BlockKind::Cube | BlockKind::Glass | BlockKind::GlassHalf)
+}
+
+/// The studs two upright bricks share: where one sits on the other, those of the lower one that fall
+/// under the upper one (the points where they grip). Each one is a little friction element.
+pub fn shared_stud_points(ka: BlockKind, pa: Vec2, aa: f32, kb: BlockKind, pb: Vec2, ab: f32) -> Vec<Vec2> {
+    if !has_studs(ka) || !has_studs(kb) {
+        return vec![];
+    }
+    // Studs are on top: only for bricks standing upright.
+    if quarter_turns(aa) != Some(0) || quarter_turns(ab) != Some(0) {
+        return vec![];
+    }
+    let (Some(ha), Some(hb)) = (flat_half(ka, aa), flat_half(kb, ab)) else { return vec![] };
+    let mut out = vec![];
+    for (up, hu, low, hl) in [(pa, ha, pb, hb), (pb, hb, pa, ha)] {
+        // The upper brick's underside rests on the lower one's top.
+        if ((up.y + hu.y) - (low.y - hl.y)).abs() > 1.5 {
+            continue;
+        }
+        let (lo, hi) = ((up.x - hu.x).max(low.x - hl.x), (up.x + hu.x).min(low.x + hl.x));
+        let studs = ((2.0 * hl.x) / STUD).round() as i32;
+        for k in 0..studs {
+            let x = low.x - hl.x + STUD / 2.0 + k as f32 * STUD;
+            if x > lo + 0.5 && x < hi - 0.5 {
+                out.push(vec2(x, low.y - hl.y));
+            }
+        }
+    }
+    out
+}
+
+/// How many studs two blocks share.
+pub fn block_studs(a: &Block, b: &Block) -> u32 {
+    shared_stud_points(a.kind, a.pos, a.angle, b.kind, b.pos, b.angle).len() as u32
+}
+
 /// Distance (cells) within which a block is pulled onto its neighbours.
 pub const CLIP: f32 = 6.0;
 
@@ -306,7 +351,10 @@ fn flat_half(kind: BlockKind, angle: f32) -> Option<Vec2> {
 pub fn clip(blocks: &[Block], kind: BlockKind, angle: f32, pos: Vec2) -> Vec2 {
     let Some(h) = flat_half(kind, angle) else { return pos };
     let mut best: Option<(f32, Vec2)> = None;
-    let mut consider = |cost: f32, p: Vec2| {
+    let mut consider = |cost: f32, p: Vec2, other: &Block| {
+        // The more studs a spot would engage, the better it is: a brick settles where it grips most.
+        let studs = shared_stud_points(kind, p, angle, other.kind, other.pos, other.angle).len() as f32;
+        let cost = cost - 1.5 * studs.min(6.0);
         if best.map_or(true, |b| cost < b.0) {
             best = Some((cost, p));
         }
@@ -325,19 +373,19 @@ pub fn clip(blocks: &[Block], kind: BlockKind, angle: f32, pos: Vec2) -> Vec2 {
         if x_overlap {
             // On top of it.
             if (bot - bt).abs() < CLIP {
-                consider((bot - bt).abs(), vec2(stud(l, bl) + h.x, bt - h.y));
+                consider((bot - bt).abs(), vec2(stud(l, bl) + h.x, bt - h.y), b);
             }
             // Hanging below it.
             if (t - bb).abs() < CLIP {
-                consider((t - bb).abs(), vec2(stud(l, bl) + h.x, bb + h.y));
+                consider((t - bb).abs(), vec2(stud(l, bl) + h.x, bb + h.y), b);
             }
         }
         if y_overlap {
             if (r - bl).abs() < CLIP {
-                consider((r - bl).abs(), vec2(bl - h.x, stud(t, bt) + h.y));
+                consider((r - bl).abs(), vec2(bl - h.x, stud(t, bt) + h.y), b);
             }
             if (l - br).abs() < CLIP {
-                consider((l - br).abs(), vec2(br + h.x, stud(t, bt) + h.y));
+                consider((l - br).abs(), vec2(br + h.x, stud(t, bt) + h.y), b);
             }
         }
     }
@@ -786,6 +834,10 @@ impl CableMat {
 }
 
 const CABLE_SEGMENT: f32 = 8.0;
+/// How far (cells) clipped bricks can move apart or together vertically, and how far (radians) they
+/// can rock, before the clip lets go.
+const STUD_PLAY: f32 = 0.5;
+const STUD_TILT: f32 = 0.05;
 /// Stiffness of a connecting rod to a block (newtons per metre).
 pub const ROD_STIFFNESS: f32 = 4000.0;
 
@@ -1348,14 +1400,35 @@ impl Physics {
         let mid = (a.pos + b.pos) * 0.5;
         let la = rot(-a.angle, mid - a.pos) / PX_PER_M;
         let lb = rot(-b.angle, mid - b.pos) / PX_PER_M;
-        let joint = FixedJointBuilder::new()
-            .local_frame1(Pose::new(Vector::new(la.x, la.y), 0.0))
-            .local_frame2(Pose::new(Vector::new(lb.x, lb.y), a.angle - b.angle))
-            .contacts_enabled(false);
-        let h = self.w.insert_impulse_joint(ha, hb, joint);
+        let studs = block_studs(a, b);
+        let frame1 = Pose::new(Vector::new(la.x, la.y), 0.0);
+        let frame2 = Pose::new(Vector::new(lb.x, lb.y), a.angle - b.angle);
+        // Bricks that share studs are clipped: they cannot slide sideways, only come apart or go
+        // together vertically (by the height of a stud) and rock a little. Anything else (side by
+        // side, beams, planks) is welded rigidly as before.
+        let h = if studs > 0 {
+            // They come apart (positive when the first is the upper one) but cannot sink into each other.
+            let sink = 0.1 / PX_PER_M;
+            let apart = STUD_PLAY / PX_PER_M;
+            let range = if a.pos.y < b.pos.y { [-sink, apart] } else { [-apart, sink] };
+            let joint = GenericJointBuilder::new(JointAxesMask::LIN_X)
+                .local_frame1(frame1)
+                .local_frame2(frame2)
+                .limits(JointAxis::LinY, range)
+                .limits(JointAxis::AngX, [-STUD_TILT, STUD_TILT])
+                .contacts_enabled(false)
+                .build();
+            self.w.insert_impulse_joint(ha, hb, joint)
+        } else {
+            let joint = FixedJointBuilder::new().local_frame1(frame1).local_frame2(frame2).contacts_enabled(false);
+            self.w.insert_impulse_joint(ha, hb, joint)
+        };
         let q = |b: &Block| b.spec().strength * (1.0 - 0.7 * b.rust.clamp(0.0, 1.0));
         let bonus = if Self::end_to_end(a, b) { 1.5 } else { 1.0 };
-        self.welds.insert(h, q(a).min(q(b)) * bonus);
+        // Every stud they share grips a little more: the hold of a brick on another grows with the number
+        // of studs in common (side-by-side bricks, which share none, keep the plain hold).
+        let grip = 1.0 + 0.25 * block_studs(a, b) as f32;
+        self.welds.insert(h, q(a).min(q(b)) * bonus * grip);
     }
 
     /// Weld block `i` to every touching block (wheels stay free).
@@ -1794,6 +1867,9 @@ impl Physics {
                 }
             }
         }
+        // In a fixed order, so that the physics does not depend on hash-map iteration order.
+        let mut wanted: Vec<(i32, i32)> = wanted.into_iter().collect();
+        wanted.sort_unstable();
         for (tx, ty) in wanted {
             let hash = Self::tile_hash(world, tx, ty);
             if self.tiles.get(&(tx, ty)).map_or(false, |t| t.0 == hash) {
@@ -2097,6 +2173,45 @@ mod tests {
     }
 
     #[test]
+    fn clipped_bricks_do_not_slide_sideways_but_can_rise_a_little_and_rock() {
+        let world = ground();
+        // Two bricks, the upper one clipped onto the lower one by two studs.
+        let mut blocks = vec![Block::new(BlockKind::Brick, vec2(100.0, 295.0), 0.0), Block::new(BlockKind::Brick, vec2(100.0, 285.0), 0.0)];
+        assert_eq!(block_studs(&blocks[0], &blocks[1]), 2);
+        let mut phys = Physics::build(&mut blocks);
+        assert_eq!(phys.joint_count(), 1);
+        for _ in 0..60 {
+            phys.step(&world, &mut blocks);
+        }
+        let rest = blocks[1].pos;
+        // A sideways shove: the clip holds it in place.
+        let b1 = blocks[1].clone();
+        phys.knock(&b1, b1.pos, vec2(0.3, 0.0));
+        let mut drift = 0.0f32;
+        for _ in 0..90 {
+            phys.step(&world, &mut blocks);
+            drift = drift.max((blocks[1].pos.x - rest.x).abs());
+        }
+        assert!(drift < 1.0, "no sliding sideways: {drift}");
+        assert_eq!(phys.joint_count(), 1, "and it did not come off");
+        // A small pull upwards: it rises by a stud's play and settles back.
+        let b1 = blocks[1].clone();
+        phys.knock(&b1, b1.pos, vec2(0.0, -0.6));
+        let mut rise = 0.0f32;
+        for _ in 0..90 {
+            phys.step(&world, &mut blocks);
+            rise = rise.max(rest.y - blocks[1].pos.y);
+        }
+        eprintln!("CLIP drift {drift:.2} rise {rise:.2} joints {}", phys.joint_count());
+        assert!(rise > 0.2 && rise < 2.5, "it can move vertically a little: {rise}");
+        // More studs hold more than fewer.
+        let wide = [Block::new(BlockKind::Long, vec2(300.0, 295.0), 0.0), Block::new(BlockKind::Long, vec2(300.0, 285.0), 0.0)];
+        let off = [Block::new(BlockKind::Long, vec2(500.0, 295.0), 0.0), Block::new(BlockKind::Long, vec2(530.0, 285.0), 0.0)];
+        assert_eq!(block_studs(&wide[0], &wide[1]), 4);
+        assert_eq!(block_studs(&off[0], &off[1]), 1);
+    }
+
+    #[test]
     fn a_pivoted_wheel_winds_a_rope_and_lifts_a_weight() {
         let mut world = ground();
         let mut blocks = vec![Block::new(BlockKind::Wheel, vec2(200.0, 120.0), 0.0), Block::new(BlockKind::Cube, vec2(188.0, 230.0), 0.0)];
@@ -2199,13 +2314,14 @@ mod tests {
     #[test]
     fn beams_carry_loads_according_to_their_material() {
         let wood_light = hang_from_beam(MemberMat::Wood, 1);
-        let wood_heavy = hang_from_beam(MemberMat::Wood, 3);
-        let iron_heavy = hang_from_beam(MemberMat::Iron, 3);
-        let steel_heavy = hang_from_beam(MemberMat::Steel, 3);
+        // Clipped bricks give a little, which softens the shock: it takes four cubes to snap a wooden beam.
+        let wood_heavy = hang_from_beam(MemberMat::Wood, 4);
+        let iron_heavy = hang_from_beam(MemberMat::Iron, 4);
+        let steel_heavy = hang_from_beam(MemberMat::Steel, 4);
         eprintln!("BEAM wood1 {wood_light:?} wood3 {wood_heavy:?} iron3 {iron_heavy:?} steel3 {steel_heavy:?}");
         assert!(wood_light.0, "a wooden beam holds one cube");
-        assert!(!wood_heavy.0, "a wooden beam snaps under three cubes");
-        assert!(iron_heavy.0 && steel_heavy.0, "iron and steel hold three cubes");
+        assert!(!wood_heavy.0, "a wooden beam snaps under four cubes");
+        assert!(iron_heavy.0 && steel_heavy.0, "iron and steel hold four cubes");
         assert!(steel_heavy.1 < iron_heavy.1 + 0.01 || steel_heavy.1 < 1.0, "steel is less stressed than iron for the same load");
     }
 
