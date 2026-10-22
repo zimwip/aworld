@@ -3,6 +3,7 @@
 //! so particles and the car treat them as solid.
 
 pub mod flow;
+mod pressure;
 mod thermal;
 pub use thermal::{Season, DAY_STEPS};
 
@@ -276,6 +277,17 @@ pub struct World {
     pub water_flow: u32,
     /// The air's flow: layered winds, vortices, rising warm air. Gas rides it.
     pub flow: flow::Flow,
+    /// Excess pressure over the ambient one for each flow cell, in atmospheres (see `pressure.rs`).
+    dp: Vec<f32>,
+    /// Its slow average, and the quick part left when that is taken off: what pushes.
+    dp_slow: Vec<f32>,
+    dpd: Vec<f32>,
+    /// Whether the pressure pushes liquids and loose matter (for comparing in tests and demos).
+    pub pressure_forces: bool,
+    /// How much the simulation is simplified to keep the game smooth: 0 = everything exact,
+    /// 1 = the wind carries air heat in 2 x 2 blocks, 2 = the heat pass runs half as often (with
+    /// doubled rates), 3 = same, and calm air next to air no longer conducts heat (it only relaxes).
+    pub lod: u8,
 }
 
 impl World {
@@ -313,6 +325,11 @@ impl World {
             thuds: Vec::new(),
             water_flow: 0,
             flow: flow::Flow::new(),
+            dp: vec![0.0; flow::FW * flow::FH],
+            dp_slow: vec![0.0; flow::FW * flow::FH],
+            dpd: vec![0.0; flow::FW * flow::FH],
+            pressure_forces: true,
+            lod: 0,
         }
     }
 
@@ -661,10 +678,19 @@ impl World {
     /// loose outward.
     pub fn explode(&mut self, cx: i32, cy: i32, r: i32) {
         self.revision += 1;
+        self.flow.blast(cx, cy, r * 2, 0.15 + r as f32 * 0.03);
         let heavy = self.blasts.len() < 8;
         if heavy {
             self.blasts.push((cx, cy, r));
         }
+        // A blast under water: how deep it is below the surface (None in the open air).
+        let depth = {
+            let mut d = 0;
+            while d < 3 * r && self.raw(cx, cy - d).kind() == Kind::Liquid {
+                d += 1;
+            }
+            (d > 0 && matches!(self.raw(cx, cy - d).kind(), Kind::Empty | Kind::Gas)).then_some(d)
+        };
         let r2 = (r * r) as f32;
         for dy in -r..=r {
             for dx in -r..=r {
@@ -744,6 +770,28 @@ impl World {
             }
             if (tx, ty) != (x, y) {
                 self.swap((x, y), (tx, ty));
+            }
+        }
+        // Under water the gas bubble lifts the surface above it into a dome and a plume of spray:
+        // the shallower the blast, the higher the water is thrown.
+        if let Some(d) = depth {
+            let strength = (1.0 - d as f32 / (3.0 * r as f32)).clamp(0.0, 1.0);
+            let half = r * 6 / 5;
+            for dx in -half..=half {
+                let x = cx + dx;
+                let Some(top) = (cy - d - 2..=cy).find(|&y| self.raw(x, y).kind() == Kind::Liquid) else { continue };
+                let shape = 1.0 - dx.abs() as f32 / half as f32;
+                let rise = (strength * r as f32 * 1.6 * shape * (0.5 + (self.rand() % 100) as f32 / 100.0)) as i32;
+                // The top few cells of the column go up, the highest first.
+                for k in 0..3 {
+                    let y = top + k;
+                    if self.raw(x, y).kind() != Kind::Liquid {
+                        break;
+                    }
+                    if let Some(up) = (1..=rise).rev().find(|&u| self.at(x, y - u) == Mat::Empty) {
+                        self.swap((x, y), (x, y - up));
+                    }
+                }
             }
         }
         // A billow of smoke around the fireball.
@@ -933,10 +981,14 @@ impl World {
         }
         self.update_wind();
         self.update_flow();
+        if self.ticks % 4 == 0 {
+            self.update_pressure();
+        }
+        self.pressure_push();
         if self.ticks % 64 == 0 {
             self.update_season_cache();
         }
-        if self.ticks % thermal::THERMAL_EVERY == 0 {
+        if self.ticks % (thermal::THERMAL_EVERY * self.thermal_scale() as u32) == 0 {
             self.thermal_pass();
         }
         if self.day_cycle {
@@ -1981,6 +2033,28 @@ impl World {
         for x in 0..W {
             self.pressure_column(x, H - 1, |y, p| out[y * W + x] = p);
         }
+        // Liquid and rock are smoothed sideways (never across the air), so the layers of each
+        // column do not show as stripes.
+        let src = out.clone();
+        for y in 0..H {
+            let mut x = 0;
+            while x < W {
+                if matches!(self.cells[y * W + x].m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) {
+                    x += 1;
+                    continue;
+                }
+                let mut end = x;
+                while end < W && !matches!(self.cells[y * W + end].m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) {
+                    end += 1;
+                }
+                for xx in x..end {
+                    let (lo, hi) = (xx.saturating_sub(6).max(x), (xx + 6).min(end - 1));
+                    let sum: f32 = (lo..=hi).map(|q| src[y * W + q]).sum();
+                    out[y * W + xx] = sum / (hi - lo + 1) as f32;
+                }
+                x = end;
+            }
+        }
         out
     }
 
@@ -2005,7 +2079,16 @@ impl World {
             let m = self.at(x as i32, y as i32);
             let air = 1.05 * (-((H - y) as f32) / 700.0).exp();
             let dynamic = 1.0 + (self.flow.pressure_at(x as i32, y as i32) * 0.08).clamp(-0.08, 0.08);
-            let p_air = air * dynamic;
+            // Ideal gas, P V = n R T. With compressible air the wind solver keeps density and
+            // temperature together and gives the pressure directly; otherwise the pressure follows
+            // the absolute temperature at fixed volume, so warm air reads as higher pressure.
+            let p_air = match self.flow.air_pressure(x as i32, y as i32) {
+                Some(p) => air * p.clamp(0.3, 4.0),
+                None => {
+                    let kelvin = (self.temp[y * W + x] + 273.15).max(1.0) / (self.ambient_c(y as i32) + 273.15).max(1.0);
+                    air * dynamic * kelvin.clamp(0.5, 3.0)
+                }
+            };
             match m.kind() {
                 Kind::Empty | Kind::Gas | Kind::Flame => {
                     put(y, p_air);
@@ -2013,9 +2096,12 @@ impl World {
                     top_p = None;
                 }
                 _ => {
-                    let base = *top_p.get_or_insert(p_air);
+                    // Below the surface: the hydrostatic weight of what is above, from the still-air
+                    // pressure at the top, plus the excess pressure the liquid has passed on from the
+                    // air (continuous with the air above, and the same all through a connected liquid).
+                    let base = *top_p.get_or_insert(air);
                     weight += density(m) * PER_CELL;
-                    put(y, base + weight);
+                    put(y, base + weight + self.excess_pressure_at(x as f32 + 0.5, y as f32 + 0.5));
                 }
             }
         }
@@ -2085,7 +2171,9 @@ impl World {
             .map(|k| {
                 let t = if air[k] > 4.0 { temp[k] / air[k] } else { self.ambient_c(((k / bw) * B) as i32) };
                 let capacity = (0.05 * (0.07 * t).exp()).clamp(0.01, 2.0);
-                let base = 0.18 + 0.55 * (wet_b[k] * 4.0).min(1.0);
+                // The humidity the wind carries replaces the guess made from water nearby.
+                let carried = self.flow.moisture_at(((k % bw) * B + B / 2) as i32, ((k / bw) * B + B / 2) as i32);
+                let base = carried.max(0.18 + 0.55 * (wet_b[k] * 4.0).min(1.0));
                 (base + vapour_b[k] / capacity).clamp(0.0, 1.0)
             })
             .collect();
@@ -2240,6 +2328,103 @@ impl World {
 }
 
 #[cfg(test)]
+
+    #[test]
+    fn a_simplified_simulation_still_melts_sand_and_cools_a_hot_stone() {
+        for lod in 1..=3u8 {
+            // A fire on sand still makes glass.
+            let mut w = World::new_static();
+            w.lod = lod;
+            for x in 100..140 {
+                w.set(x, 300, Mat::Stone);
+                for y in 292..300 {
+                    w.set(x, y, Mat::Sand);
+                }
+            }
+            let mut glass = false;
+            for t in 0..3500 {
+                for x in 100..140 {
+                    if w.raw(x, 291) == Mat::Empty {
+                        w.set(x, 291, Mat::Fire);
+                    }
+                }
+                w.step();
+                if t % 50 == 0 {
+                    glass |= w.cells.iter().any(|c| c.m == Mat::Glass);
+                }
+            }
+            assert!(glass, "lod {lod}: sand never became glass");
+            // A hot stone cools towards the air about as fast as in the exact simulation.
+            let cool = |lod: u8| {
+                let mut w = World::new_static();
+                w.lod = lod;
+                for x in 200..210 {
+                    for y in 200..210 {
+                        w.set(x, y, Mat::Stone);
+                        w.temp[y as usize * W + x as usize] = 300.0;
+                    }
+                }
+                for _ in 0..600 {
+                    w.step();
+                }
+                w.temp[205 * W + 205]
+            };
+            let (exact, simple) = (cool(0), cool(lod));
+            assert!((exact - simple).abs() < 0.25 * (exact - 15.0).abs().max(10.0), "lod {lod}: stone at {simple} instead of {exact}");
+        }
+    }
+
+    /// Where the time goes in one simulation tick, on a real countryside with rain and a fire.
+    /// Run: `cargo test --release cost_of_a_tick -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn cost_of_a_tick() {
+        use std::time::{Duration, Instant};
+        for biome in [Biome::Countryside, Biome::Sea] {
+            let mut w = World::new();
+            w.generate_biome(7, biome);
+            for x in 300..330 {
+                for y in 150..160 {
+                    w.set(x, y, Mat::Fire);
+                }
+            }
+            for _ in 0..400 {
+                w.step();
+            }
+            let n = 200u32;
+            let time = |f: &mut dyn FnMut()| {
+                let t = Instant::now();
+                for _ in 0..n {
+                    f();
+                }
+                t.elapsed() / n
+            };
+            let whole = time(&mut || w.step());
+            let flow = time(&mut || w.update_flow());
+            let press = time(&mut || w.update_pressure());
+            let push = time(&mut || w.pressure_push());
+            let thermal = time(&mut || w.thermal_pass());
+            let carry = time(&mut || w.carry_air_heat_for_bench());
+            let level = time(&mut || w.level_water());
+            let per = |d: Duration, every: f32| format!("{:6.2} ms/call x1/{every} = {:5.2} ms/tick", d.as_secs_f32() * 1000.0, d.as_secs_f32() * 1000.0 / every);
+            eprintln!("=== {biome:?}: whole tick {:.2} ms", whole.as_secs_f32() * 1000.0);
+            eprintln!("  flow step+refresh  {}", per(flow, 1.0));
+            eprintln!("  update_pressure    {}", per(press, 4.0));
+            eprintln!("  pressure_push      {}", per(push, 1.0));
+            eprintln!("  thermal_pass       {}", per(thermal, 3.0));
+            eprintln!("  (carry_air_heat    {})", per(carry, 6.0));
+            eprintln!("  level_water        {}", per(level, 4.0));
+            for lod in 0..=3 {
+                w.lod = lod;
+                for _ in 0..30 {
+                    w.step();
+                }
+                let t = time(&mut || w.step());
+                eprintln!("  lod {lod}: whole tick {:.2} ms", t.as_secs_f32() * 1000.0);
+            }
+            w.lod = 0;
+        }
+    }
 mod tests {
     use super::*;
 

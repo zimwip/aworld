@@ -187,6 +187,12 @@ struct Game {
     /// simulation was running before it opened.
     quit_modal: bool,
     quit_resume: bool,
+    /// Which button of the leave window is selected: false = go back to the game, true = leave.
+    quit_choice: bool,
+    /// Seconds during which a simplified simulation is not restored, and how long the frames have
+    /// been fast enough to restore it.
+    lod_lock: f32,
+    fast_frames: u32,
     /// How far the science page is scrolled, in pixels.
     science_scroll: f32,
     /// Pulleys the cable being drawn has been threaded over so far.
@@ -289,6 +295,9 @@ impl Game {
             shovel_charge: None,
             quit_modal: false,
             quit_resume: false,
+            quit_choice: false,
+            lod_lock: 0.0,
+            fast_frames: 0,
             science_scroll: 0.0,
             cable_via: vec![],
             cable_soft: 1.0,
@@ -597,12 +606,18 @@ impl Game {
         } else {
             self.quit_resume = self.running;
             self.quit_modal = true;
+            self.quit_choice = false;
             self.set_running(false);
         }
     }
 
-    /// Enter in the leave-the-game window confirms: true when the game must close.
+    /// Enter in the leave-the-game window validates the selected button: true when the game must
+    /// close, false when it goes back to the game (or the window is not open).
     fn on_enter_in_quit_modal(&mut self) -> bool {
+        if self.quit_modal && !self.quit_choice {
+            self.close_quit_modal();
+            return false;
+        }
         self.quit_modal
     }
 
@@ -1135,6 +1150,13 @@ impl Game {
 
     fn handle_keys(&mut self) {
         if self.quit_modal {
+            if is_key_pressed(KeyCode::Left) {
+                self.quit_choice = false;
+            } else if is_key_pressed(KeyCode::Right) {
+                self.quit_choice = true;
+            } else if is_key_pressed(KeyCode::Tab) {
+                self.quit_choice = !self.quit_choice;
+            }
             if is_key_pressed(KeyCode::Escape) {
                 self.on_escape();
             } else if (is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter)) && self.on_enter_in_quit_modal() {
@@ -1360,11 +1382,39 @@ impl Game {
         } else {
             self.slow_frames = self.slow_frames.saturating_sub(2);
         }
-        if self.slow_frames > 60 && self.speed > 1 {
-            self.speed -= 1;
+        // First simplify the physics (cheaper approximations that keep the look of the thing), and
+        // only when that is not enough run fewer steps per frame.
+        self.lod_lock = (self.lod_lock - dt).max(0.0);
+        if self.slow_frames > 60 {
             self.slow_frames = 0;
             self.frame_ema = 0.016;
-            self.say(format!("Vitesse réduite à x{} pour rester fluide", self.speed));
+            self.fast_frames = 0;
+            if self.world.lod < 3 {
+                self.world.lod += 1;
+                // A simplification that has to come back straight away: do not try to undo it for a while.
+                self.lod_lock = 300.0;
+                self.say(match self.world.lod {
+                    1 => "Simplification 1/3 : la chaleur de l'air est calculée par blocs de 2×2",
+                    2 => "Simplification 2/3 : la chaleur est calculée une fois sur deux (vitesses compensées)",
+                    _ => "Simplification 3/3 : l'air calme ne conduit plus la chaleur",
+                }
+                .to_string());
+            } else if self.speed > 1 {
+                self.speed -= 1;
+                self.say(format!("Vitesse réduite à x{} pour rester fluide", self.speed));
+            }
+        }
+        // Long smooth stretches bring the exact simulation back, one level at a time.
+        if self.running && self.world.lod > 0 && self.frame_ema < 0.011 && self.lod_lock <= 0.0 {
+            self.fast_frames += 1;
+            if self.fast_frames > 900 {
+                self.fast_frames = 0;
+                self.world.lod -= 1;
+                self.frame_ema = 0.016;
+                self.say(if self.world.lod == 0 { "Simulation exacte rétablie".to_string() } else { format!("Simplification allégée : niveau {}/3", self.world.lod) });
+            }
+        } else {
+            self.fast_frames = 0;
         }
         let building = matches!(self.tool, Tool::Block(_) | Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(_) | Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Winch | Tool::Pulley | Tool::Pipe | Tool::Valve | Tool::Pump);
         if (self.tab == Tab::Blocks || building) && (self.time * 4.0) as u32 != ((self.time - dt) * 4.0) as u32 {
@@ -2611,6 +2661,10 @@ impl Game {
         self.world.wind_max = vals[0];
         self.world.wind_changes = vals[1];
         self.world.windiness = vals[2];
+        let cr = Rect::new(10.0, iy + 30.0 + 3.0 * 22.0 + 2.0, PANEL_W - 20.0, 24.0);
+        if ui.checkbox(cr, "Air compressible (P V = n R T)", self.world.flow.compress, true) {
+            self.world.flow.compress = !self.world.flow.compress;
+        }
     }
 
     /// The palette of views on the right edge: it slides out when the mouse goes there.
@@ -2761,7 +2815,7 @@ impl Game {
         }
     }
 
-    /// "Leave the game?": Enter or the button leaves, Esc or the other button goes back.
+    /// "Leave the game?": left and right pick a button, Enter validates it, Esc goes back.
     fn draw_quit_modal(&mut self, ui: &mut Ui, sw: f32, sh: f32) {
         draw_rectangle(0.0, 0.0, sw, sh, Color::new(0.0, 0.0, 0.05, 0.62));
         let w = 420.0;
@@ -2769,12 +2823,12 @@ impl Game {
         rrect(r, 16.0, Color::new(0.09, 0.1, 0.17, 0.98));
         ui::rrect_lines(r, 16.0, 2.0, ACCENT);
         ui.text_center("Quitter AWorld ?", r.x + w / 2.0, r.y + 46.0, 26, ACCENT);
-        ui.text_center("La simulation est en pause.", r.x + w / 2.0, r.y + 76.0, 15, DIM);
+        ui.text_center("La simulation est en pause. ← → choisir · Entrée valider", r.x + w / 2.0, r.y + 76.0, 14, DIM);
         let (bw, by) = ((w - 48.0) / 2.0, r.y + 108.0);
-        if ui.button(Rect::new(r.x + 16.0, by, bw, 44.0), "Reprendre (Échap)", Icon::Play, true, true, GREEN) {
+        if ui.button(Rect::new(r.x + 16.0, by, bw, 44.0), "Reprendre (Échap)", Icon::Play, !self.quit_choice, true, GREEN) {
             self.close_quit_modal();
         }
-        if ui.button(Rect::new(r.x + 32.0 + bw, by, bw, 44.0), "Quitter (Entrée)", Icon::None, false, true, RED) {
+        if ui.button(Rect::new(r.x + 32.0 + bw, by, bw, 44.0), "Quitter", Icon::None, self.quit_choice, true, RED) {
             Self::quit_game();
         }
     }
@@ -3119,6 +3173,13 @@ async fn main() {
         game.handle_keys();
         game.handle_mouse(view, &ui);
         game.update(get_frame_time().min(0.05));
+        // `--boom`: an explosion 25 cells under the water surface at x (default 360), shortly before the shot.
+        if shot.is_some() && frame == 357 && args.iter().any(|a| a == "--boom") {
+            let x = arg("--boom").and_then(|v| v.parse().ok()).unwrap_or(360);
+            if let Some(top) = (0..H as i32).find(|&y| game.world.at(x, y) == Mat::Water) {
+                game.world.explode(x, top + 25, 18);
+            }
+        }
 
         clear_background(BG);
         // Explosions shake the picture of the world (input keeps using the steady view).
@@ -3669,6 +3730,32 @@ mod tests {
     }
 
     #[test]
+    fn slow_frames_simplify_the_physics_before_slowing_the_game_and_smooth_ones_restore_it() {
+        let mut g = mech_game();
+        g.set_running(true);
+        g.speed = 3;
+        let mut said = vec![];
+        for _ in 0..400 {
+            g.update(0.05);
+            if let Some((m, t)) = &g.toast {
+                if *t > 1.5 && said.last() != Some(m) {
+                    said.push(m.clone());
+                }
+            }
+        }
+        assert_eq!(g.world.lod, 3, "all the simplifications come first");
+        assert!(g.speed < 3, "then the speed drops");
+        assert!(said.iter().any(|m| m.contains("Simplification 1/3")) && said.iter().any(|m| m.contains("3/3")), "each one is announced: {said:?}");
+        // A long smooth stretch brings the exact simulation back, a level at a time.
+        g.lod_lock = 0.0;
+        for _ in 0..4000 {
+            g.update(0.004);
+            g.lod_lock = 0.0;
+        }
+        assert_eq!(g.world.lod, 0, "the exact physics is back");
+    }
+
+    #[test]
     fn escape_backs_out_one_level_at_a_time_and_pauses_before_leaving() {
         let mut g = mech_game();
         g.set_running(true);
@@ -3689,9 +3776,12 @@ mod tests {
         g.on_escape();
         g.on_escape();
         assert!(!g.quit_modal && !g.running);
-        // Enter in the window confirms leaving.
+        // Enter validates the selected button: "Reprendre" (the default) goes back, "Quitter" leaves.
         g.on_escape();
-        assert!(g.on_enter_in_quit_modal());
+        assert!(!g.on_enter_in_quit_modal() && !g.quit_modal, "Enter on the default button goes back");
+        g.on_escape();
+        g.quit_choice = true;
+        assert!(g.on_enter_in_quit_modal() && g.quit_modal, "Enter on Quitter leaves");
         g.on_escape();
         assert!(!g.on_enter_in_quit_modal(), "Enter does nothing outside the window");
     }

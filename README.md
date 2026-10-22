@@ -190,3 +190,35 @@ toujours à 100 %, la terre montre son humidité, les solides secs sont en gris.
 - « Matériaux illimités » (Édition / Simulation) est dans les palettes Matières et Blocs, modifiable à tout moment.
 - La punaise à droite de Annuler épingle la palette (la poignée du bord gauche fait la même chose).
 - Le monde remplit toute la fenêtre : un peu de ciel est recadré en haut si la fenêtre n'est pas en 16:9.
+
+## Air compressible (gaz parfait)
+
+Le vent (`src/world/flow.rs`) est un air faiblement compressible : chaque case grossière a une densité `rho` et une température relative `theta` (T/T_ambiante, en kelvin). La pression est `P = rho · theta` (PV = nRT), le vent est poussé par `-∇P`, et le transport de masse (flux amont) change la densité. L'air plus chaud que son voisinage (1 − 1/theta) monte ; une explosion comprime l'air et lance une onde de pression ; une pièce fermée chauffée garde sa surpression un moment. La case « Air compressible » (onglet Monde, section Vent) rebascule sur l'ancien solveur incompressible.
+
+- Le vent transporte aussi la chaleur de l'air libre (advection bilinéaire) et refroidit/réchauffe les solides et liquides au contact (convection, proportionnelle à la vitesse).
+- L'humidité de l'air est un champ transporté par le vent : alimenté par l'eau, la boue, les nuages et la vapeur, il sèche lentement. La vue Hygrométrie l'utilise.
+- La vue Pression lit la pression de l'air compressible (plus l'hydrostatique des liquides).
+- Tout tourne sur CPU ; le GPU ne sert qu'à l'affichage.
+
+## La pression pousse (liquides, matière meuble, blocs)
+
+`src/world/pressure.rs` calcule l'excès de pression (en atm) de chaque case du vent. L'air donne sa valeur au solveur de vent, et un liquide la transmet à toute sa masse connectée (Pascal : relaxation depuis l'air au-dessus), sans saut à l'interface. Le poids propre du liquide n'y est pas compté, la gravité et la poussée d'Archimède l'équilibrent déjà.
+
+- **Liquides et matière meuble** (sable, cendres, neige, poudre…) en bordure d'un gradient glissent vers la basse pression, d'autant plus vite qu'ils sont légers. Un seuil ignore la brise ordinaire, et un seuil plus haut protège le sable que chauffe un feu.
+- **Blocs** : le gradient pousse chaque bloc, sur le même principe (une onde de choc pousse, une dépression attire).
+- Seule la partie qui varie vite pousse (onde de choc, houle de pression) : la surpression stable d'un panache chaud est retirée par une moyenne lente.
+- La vue Pression montre ce champ : hydrostatique des liquides et solides + excès transmis par l'air, lissé latéralement dans les liquides et la roche.
+
+Une explosion sous l'eau lève maintenant un panache : plus elle est peu profonde, plus l'eau de la surface au-dessus est projetée haut (rien si elle est très profonde, la surface se soulève seulement). `--demo out.png --biome mer --boom [x]` déclenche une explosion sous la surface juste avant la capture.
+
+## Garder le jeu fluide : niveaux de simplification
+
+`cargo test --release cost_of_a_tick -- --ignored --nocapture` mesure le coût d'un pas de simulation (campagne : environ 3,4 ms, mer : environ 4,5 ms). La chaleur est le poste le plus lourd : la passe thermique coûte environ 6 ms tous les 3 pas (réactions et relaxation de l'air 2,7 ms, conduction 1,8 ms, transport de la chaleur par le vent jusqu'à 4 ms une passe sur deux), le vent 0,35 ms, la pression moins de 0,1 ms, le reste est l'automate de matière.
+
+Quand les images restent lentes, le jeu simplifie d'abord la physique (`World::lod`), puis seulement après réduit la vitesse. Chaque niveau remplace un calcul par une approximation et une notification l'annonce :
+
+1. la chaleur de l'air est transportée par blocs de 2×2 cellules ;
+2. la passe thermique tourne une fois sur deux, toutes ses vitesses (conduction, relaxation, probabilités de réaction) sont doublées pour garder le même rythme ;
+3. l'air calme voisin d'un air calme ne conduit plus la chaleur (il se contente de relaxer vers l'ambiant) ; une différence d'au moins 4 °C (un panache chaud) conduit toujours.
+
+Après environ 15 s fluides, un niveau est rétabli (avec un délai de 5 minutes si la simplification venait d'être imposée). Des tests vérifient que le sable fond encore en verre et qu'une pierre chaude refroidit au même rythme à chaque niveau.

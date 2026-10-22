@@ -35,6 +35,20 @@ pub struct Flow {
     solid: Vec<bool>,
     /// How much warmer than the air each flow cell is (drives the rising of warm air).
     heat: Vec<f32>,
+    /// Absolute temperature of each flow cell over the ambient one (T / T_ambient, kelvin).
+    theta: Vec<f32>,
+    /// Air density relative to the ambient air (1 = undisturbed); P V = n R T makes the pressure rho * theta.
+    rho: Vec<f32>,
+    /// Absolute pressure relative to the ambient one (rho * theta).
+    pr: Vec<f32>,
+    scratch: Vec<f32>,
+    /// Relative humidity of the air, carried by the wind (0..1).
+    moist: Vec<f32>,
+    /// Fraction of each cell that is water or damp ground (feeds `moist`).
+    wet: Vec<f32>,
+    /// Compressible air (default): density, pressure and temperature are coupled by the ideal gas
+    /// law and the wind is pushed by pressure gradients. Off: the older incompressible solver.
+    pub compress: bool,
     vortices: Vec<Vortex>,
     rng: u32,
     /// Tests can pin the field.
@@ -58,6 +72,13 @@ impl Flow {
             div: vec![0.0; n],
             solid: vec![false; n],
             heat: vec![0.0; n],
+            theta: vec![1.0; n],
+            rho: vec![1.0; n],
+            pr: vec![1.0; n],
+            scratch: vec![0.0; n],
+            moist: vec![0.2; n],
+            wet: vec![0.0; n],
+            compress: true,
             vortices: vec![],
             rng: 0x9e37_79b9,
             frozen: false,
@@ -111,6 +132,86 @@ impl Flow {
                     }
                 }
                 self.heat[j * FW + i] = sum / n.max(1) as f32;
+                let amb = ambient[(j * CELL + CELL / 2).min(H - 1)] + 273.15;
+                let k = j * FW + i;
+                let theta = ((amb + self.heat[k]) / amb.max(1.0)).clamp(0.5, 3.0);
+                // Heating in the open air makes the air expand at once (sound crosses a room in no
+                // time, here it would take many steps), so most of the expansion happens right away
+                // and only a tenth is left as overpressure; a closed room still keeps some.
+                if !self.solid[k] {
+                    self.rho[k] = (self.rho[k] * (self.theta[k] / theta).powf(0.9)).clamp(0.2, 4.0);
+                }
+                self.theta[k] = theta;
+            }
+        }
+    }
+
+    /// How much of each flow cell is open water, mud or cloud: the air there is fed with moisture.
+    pub fn refresh_wet(&mut self, cells: &[Cell], is_wet: impl Fn(&Cell) -> bool) {
+        for j in 0..FH {
+            for i in 0..FW {
+                let (mut n, mut wet) = (0, 0);
+                for dy in (0..CELL).step_by(2) {
+                    let y = j * CELL + dy;
+                    if y >= H {
+                        break;
+                    }
+                    for dx in (0..CELL).step_by(2) {
+                        n += 1;
+                        wet += is_wet(&cells[y * W + i * CELL + dx]) as u32;
+                    }
+                }
+                self.wet[j * FW + i] = wet as f32 / n.max(1) as f32;
+            }
+        }
+    }
+
+    /// Relative humidity of the air at a world position (0..1), as carried by the wind.
+    pub fn moisture_at(&self, x: i32, y: i32) -> f32 {
+        let (i, j) = ((x.max(0) as usize / CELL).min(FW - 1), (y.max(0) as usize / CELL).min(FH - 1));
+        self.moist[j * FW + i]
+    }
+
+    /// Absolute air pressure relative to the ambient one at a world position, when the air is
+    /// compressible.
+    pub fn air_pressure(&self, x: i32, y: i32) -> Option<f32> {
+        if !self.compress {
+            return None;
+        }
+        // Bilinear between the centres of the flow cells, so the picture has no visible blocks.
+        let fx = (x as f32 + 0.5) / CELL as f32 - 0.5;
+        let fy = ((y as f32 + 0.5) / CELL as f32 - 0.5).clamp(0.0, FH as f32 - 1.001);
+        let (i0, j0) = (fx.floor(), fy.floor());
+        let (tx, ty) = (fx - i0, fy - j0);
+        let (i0, j0) = (i0 as i32, j0 as i32);
+        let a = self.pr[at(i0, j0)] * (1.0 - tx) + self.pr[at(i0 + 1, j0)] * tx;
+        let b = self.pr[at(i0, j0 + 1)] * (1.0 - tx) + self.pr[at(i0 + 1, j0 + 1)] * tx;
+        Some(a * (1.0 - ty) + b * ty)
+    }
+
+    /// Excess air pressure of one flow cell over the ambient one, in atmospheres.
+    pub fn excess_at_cell(&self, i: usize, j: usize) -> f32 {
+        if self.compress { self.pr[j * FW + i] - 1.0 } else { 0.0 }
+    }
+
+    /// A blast: compresses the air around `(x, y)` (world cells) within `r` world cells by up to `amount`.
+    pub fn blast(&mut self, x: i32, y: i32, r: i32, amount: f32) {
+        let reach = (r / CELL as i32 + 1).max(1);
+        let (ci, cj) = (x / CELL as i32, y / CELL as i32);
+        for dj in -reach..=reach {
+            let j = cj + dj;
+            if j < 0 || j >= FH as i32 {
+                continue;
+            }
+            for di in -reach..=reach {
+                let k = at(ci + di, j);
+                if self.solid[k] {
+                    continue;
+                }
+                let d = ((di * di + dj * dj) as f32).sqrt() * CELL as f32 / r.max(1) as f32;
+                if d < 1.5 {
+                    self.rho[k] = (self.rho[k] + amount * (-d * d * 1.5).exp()).min(3.5);
+                }
             }
         }
     }
@@ -180,11 +281,18 @@ impl Flow {
                     continue;
                 }
                 self.vx[k] += (target - self.vx[k]) * 0.012;
-                self.vy[k] -= (self.heat[k] / 12.0).clamp(-1.0, 3.0) * 0.012;
+                if !self.compress {
+                    self.vy[k] -= (self.heat[k] / 12.0).clamp(-1.0, 3.0) * 0.012;
+                }
             }
         }
         self.advect();
-        self.project(24);
+        if self.compress {
+            self.compress_step();
+        } else {
+            self.project(24);
+        }
+        self.carry_moisture();
         let damp = 0.997;
         for k in 0..FW * FH {
             if self.solid[k] {
@@ -196,6 +304,106 @@ impl Flow {
                 // Keep numerical accidents from running away.
                 self.vx[k] = self.vx[k].clamp(-0.6, 0.6);
                 self.vy[k] = self.vy[k].clamp(-0.6, 0.6);
+            }
+        }
+    }
+
+    /// Compressible air: the pressure `rho * theta` (ideal gas, P V = n R T) pushes the wind from high
+    /// to low, the wind moves the air and so changes its density, and air lighter than its
+    /// surroundings (warmer, so thinner at the same pressure: 1 - 1/theta) floats up. Hot air at first expands, a closed room keeps its pressure for a while.
+    fn compress_step(&mut self) {
+        const C2: f32 = 0.12; // squared speed of sound, coarse cells² per step²
+        const BUOYANCY: f32 = 0.3;
+        for k in 0..FW * FH {
+            self.pr[k] = if self.solid[k] { 1.0 } else { self.rho[k] * self.theta[k] };
+        }
+        for j in 0..FH as i32 {
+            for i in 0..FW as i32 {
+                let k = at(i, j);
+                if self.solid[k] {
+                    continue;
+                }
+                let pc = self.pr[k];
+                let p = |di: i32, dj: i32| if self.solid_at(i + di, j + dj) { pc } else { self.pr[at(i + di, j + dj)] };
+                let (gx, gy) = (0.5 * (p(1, 0) - p(-1, 0)), 0.5 * (p(0, 1) - p(0, -1)));
+                let inv = 1.0 / self.rho[k].max(0.3);
+                self.vx[k] -= C2 * gx * inv;
+                self.vy[k] -= C2 * gy * inv + BUOYANCY * (1.0 - 1.0 / self.theta[k]).clamp(-0.1, 0.15);
+            }
+        }
+        // Continuity, in flux form with upwind density: mass is moved, not created.
+        self.scratch.copy_from_slice(&self.rho);
+        for j in 0..FH as i32 {
+            for i in 0..FW as i32 {
+                let k = at(i, j);
+                if self.solid[k] {
+                    continue;
+                }
+                if !self.solid_at(i + 1, j) {
+                    let e = at(i + 1, j);
+                    let vf = (0.5 * (self.vx[k] + self.vx[e])).clamp(-0.4, 0.4);
+                    let fl = vf * if vf > 0.0 { self.rho[k] } else { self.rho[e] };
+                    self.scratch[k] -= fl;
+                    self.scratch[e] += fl;
+                }
+                if !self.solid_at(i, j + 1) {
+                    let s = at(i, j + 1);
+                    let vf = (0.5 * (self.vy[k] + self.vy[s])).clamp(-0.4, 0.4);
+                    let fl = vf * if vf > 0.0 { self.rho[k] } else { self.rho[s] };
+                    self.scratch[k] -= fl;
+                    self.scratch[s] += fl;
+                }
+            }
+        }
+        // A little diffusion keeps the waves stable; the open atmosphere slowly relaxes the pressure.
+        for j in 0..FH as i32 {
+            for i in 0..FW as i32 {
+                let k = at(i, j);
+                if self.solid[k] {
+                    self.rho[k] = 1.0;
+                    continue;
+                }
+                let (mut sum, mut n) = (0.0, 0.0);
+                for (di, dj) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    if !self.solid_at(i + di, j + dj) {
+                        sum += self.scratch[at(i + di, j + dj)];
+                        n += 1.0;
+                    }
+                }
+                let mut r = self.scratch[k];
+                if n > 0.0 {
+                    r += (sum / n - r) * 0.05;
+                }
+                r += (1.0 / self.theta[k] - r) * 0.003;
+                self.rho[k] = r.clamp(0.2, 4.0);
+            }
+        }
+    }
+
+    /// Moisture rides the wind, is fed by water and damp air, and dries out slowly.
+    fn carry_moisture(&mut self) {
+        self.scratch.copy_from_slice(&self.moist);
+        for j in 0..FH as i32 {
+            for i in 0..FW as i32 {
+                let k = at(i, j);
+                if self.solid[k] {
+                    continue;
+                }
+                let x = i as f32 - self.vx[k] * 2.0;
+                let y = (j as f32 - self.vy[k] * 2.0).clamp(0.0, FH as f32 - 1.001);
+                let (i0, j0) = (x.floor(), y.floor());
+                let (fx, fy) = (x - i0, y - j0);
+                let (i0, j0) = (i0 as i32, j0 as i32);
+                let m = |ii: i32, jj: i32| {
+                    let q = at(ii, jj);
+                    if self.solid[q] { self.scratch[k] } else { self.scratch[q] }
+                };
+                let a = m(i0, j0) * (1.0 - fx) + m(i0 + 1, j0) * fx;
+                let b = m(i0, j0 + 1) * (1.0 - fx) + m(i0 + 1, j0 + 1) * fx;
+                let mut v = a * (1.0 - fy) + b * fy;
+                v += (1.0 - v) * (self.wet[k] * 4.0).min(1.0) * 0.05;
+                v += (0.18 - v) * 0.004;
+                self.moist[k] = v.clamp(0.0, 1.0);
             }
         }
     }
@@ -331,6 +539,11 @@ impl Flow {
     }
 
     #[cfg(test)]
+    pub fn set_wet(&mut self, i: usize, j: usize, w: f32) {
+        self.wet[j * FW + i] = w;
+    }
+
+    #[cfg(test)]
     pub fn set_solid(&mut self, i: usize, j: usize, s: bool) {
         self.solid[j * FW + i] = s;
     }
@@ -338,6 +551,7 @@ impl Flow {
     #[cfg(test)]
     pub fn set_heat(&mut self, i: usize, j: usize, h: f32) {
         self.heat[j * FW + i] = h;
+        self.theta[j * FW + i] = 1.0 + h / 288.0;
     }
 
     #[cfg(test)]
@@ -382,6 +596,7 @@ impl World {
         if t % 4 == 1 {
             let ambient: Vec<f32> = (0..H as i32).map(|y| self.ambient_c(y)).collect();
             self.flow.refresh_heat(&self.temp, &ambient);
+            self.flow.refresh_wet(&self.cells, |c| matches!(c.m, super::Mat::Water | super::Mat::Mud | super::Mat::Cloud | super::Mat::Steam));
         }
         if t % 2 == 0 {
             let wind = self.wind;
@@ -509,6 +724,71 @@ mod tests {
         }
         assert!(peak > start * 0.1, "the vortex should not vanish at once: {peak} vs {start}");
         assert!(peak < start * 3.0, "and it must not blow up: {peak} vs {start} (row {j_at})");
+    }
+
+    #[test]
+    fn a_blast_sends_a_pressure_wave_that_dies_away() {
+        let mut f = Flow::new();
+        f.blast(480, 270, 28, 0.8);
+        let peak_at = |f: &Flow, di: usize| (f.rho[33 * FW + 60 + di] * f.theta[33 * FW + 60 + di]).max(f.rho[33 * FW + 60 - di] * f.theta[33 * FW + 60 - di]);
+        assert!(peak_at(&f, 0) > 1.4, "compressed at the centre: {}", peak_at(&f, 0));
+        run(&mut f, 0.0, 14);
+        // The front has left the centre and reached cells further out.
+        assert!(peak_at(&f, 0) < 1.3, "the centre relaxed: {}", peak_at(&f, 0));
+        let out = (6..14).map(|d| peak_at(&f, d)).fold(0.0f32, f32::max);
+        assert!(out > 1.01, "a wave runs outward: {out}");
+        run(&mut f, 0.0, 600);
+        let worst = (0..FW * FH).map(|k| (f.pr[k] - 1.0).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 0.05, "and it settles: {worst}");
+    }
+
+    #[test]
+    fn a_sealed_room_keeps_its_pressure_when_heated() {
+        let mut open = Flow::new();
+        let mut shut = Flow::new();
+        for j in 30..40 {
+            for i in 50..60 {
+                if j == 30 || j == 39 || i == 50 || i == 59 {
+                    shut.set_solid(i, j, true);
+                }
+            }
+        }
+        for f in [&mut open, &mut shut] {
+            for j in 32..38 {
+                for i in 52..58 {
+                    f.set_heat(i, j, 150.0);
+                }
+            }
+        }
+        // Mean pressure inside the room over a while (sound rings in it for a bit).
+        let mean = |f: &Flow| (31..39).flat_map(|j| (51..59).map(move |i| (i, j))).map(|(i, j)| f.pr[j * FW + i]).sum::<f32>() / 64.0;
+        let (mut o, mut s) = (0.0, 0.0);
+        for t in 0..90 {
+            open.step(0.0, t);
+            shut.step(0.0, t);
+            if t >= 60 {
+                o += mean(&open) / 30.0;
+                s += mean(&shut) / 30.0;
+            }
+        }
+        assert!(s > 1.03 && s > o + 0.04, "a closed room is over-pressured, an open one is not: {s} vs {o}");
+    }
+
+    #[test]
+    fn the_wind_carries_moisture_downwind() {
+        let mut f = Flow::new();
+        f.pin_uniform(0.4, 0.0);
+        f.frozen = false;
+        for t in 0..400 {
+            f.vx.fill(0.05);
+            f.vy.fill(0.0);
+            f.set_wet(30, 20, 1.0);
+            f.carry_moisture();
+            let _ = t;
+        }
+        let down = f.moist[20 * FW + 34];
+        let up = f.moist[20 * FW + 26];
+        assert!(down > 0.4 && down > up + 0.2, "damp air is blown downwind: {down} vs {up}");
     }
 
     #[test]

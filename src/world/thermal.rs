@@ -313,9 +313,27 @@ impl World {
 
     // ----- heat flow --------------------------------------------------------
 
+    /// How many times longer a thermal pass covers when the simulation is simplified.
+    pub(super) fn thermal_scale(&self) -> f32 {
+        match self.lod {
+            0 | 1 => 1.0,
+            _ => 2.0,
+        }
+    }
+
+    /// `chance(n)` for a thermal rate: with a simplified (less frequent) pass the odds are scaled up.
+    fn chance_t(&mut self, n: u32) -> bool {
+        let n = (n as f32 / self.thermal_scale()).round().max(1.0) as u32;
+        self.chance(n)
+    }
+
     /// One thermal tick: conduction, air and sun forcing, fixed heat sources,
     /// and every material reaction that depends on temperature.
     pub(super) fn thermal_pass(&mut self) {
+        // When the game has to save time the pass runs half as often (see `lod`): each run then
+        // covers twice the time, so every rate is doubled to keep the same speed of change.
+        let scale = self.thermal_scale();
+        let ts = TS * scale;
         self.thermal_flip = !self.thermal_flip;
         let horizontal = self.thermal_flip;
 
@@ -341,6 +359,11 @@ impl World {
                     continue;
                 }
                 let (mi, mj) = (self.cells[i].m as usize, self.cells[j].m as usize);
+                // Simplified: air next to air only exchanges heat where there is a real difference
+                // (a hot plume); the rest of the sky just relaxes towards its surroundings below.
+                if self.lod >= 3 && mi == Mat::Empty as usize && mj == Mat::Empty as usize && d.abs() < 4.0 {
+                    continue;
+                }
                 // Flames and embers pour heat into whatever touches them.
                 let k = if mi == Mat::Fire as usize || mi == Mat::Ember as usize || mj == Mat::Fire as usize || mj == Mat::Ember as usize {
                     0.25
@@ -350,10 +373,16 @@ impl World {
                 } else {
                     tb.k[mi].min(tb.k[mj])
                 };
-                let flux = d * k * TS;
+                // (Capped so that a longer covered time can never overshoot and oscillate.)
+                let flux = d * (k * ts).min(0.9);
                 self.temp[i] = ti + flux * tb.inv_c[mi];
                 self.temp[j] = tj - flux * tb.inv_c[mj];
             }
+        }
+
+        // Every other pass, with twice the reach: the wind is slow next to the thermal clock.
+        if horizontal {
+            self.carry_air_heat();
         }
 
         // The sun radiates: the air and the ground are warmest near it and the
@@ -376,8 +405,8 @@ impl World {
                 let t = self.temp[i];
                 let amb = if fixed { base } else { base + 12.0 * sun * gx[x] * gy[y] };
                 match m {
-                    Mat::Empty => self.temp[i] = t + (amb - t) * 0.12 * TS,
-                    Mat::Steam | Mat::Cloud | Mat::Snow | Mat::Hail | Mat::Smoke => self.temp[i] = t + (amb - t) * 0.03 * TS,
+                    Mat::Empty => self.temp[i] = t + (amb - t) * 0.12 * ts,
+                    Mat::Steam | Mat::Cloud | Mat::Snow | Mat::Hail | Mat::Smoke => self.temp[i] = t + (amb - t) * 0.03 * ts,
                     Mat::Fire => self.temp[i] = FIRE_C,
                     // Embers a draught cannot reach glow hotter (and last longer, see `step_ember`).
                     Mat::Ember => {
@@ -406,7 +435,7 @@ impl World {
                         Mat::Cloud | Mat::Steam => {
                             let target = surf + 12.0 * light * 0.5;
                             if target > self.temp[i] {
-                                self.temp[i] += (target - self.temp[i]) * 0.04 * TS;
+                                self.temp[i] += (target - self.temp[i]) * 0.04 * ts;
                             }
                             light *= 0.8;
                         }
@@ -414,12 +443,85 @@ impl World {
                         _ => {
                             let target = surf + 15.0 * light * absorb(m);
                             if target > self.temp[i] {
-                                self.temp[i] += (target - self.temp[i]) * 0.05 * TS;
+                                self.temp[i] += (target - self.temp[i]) * 0.05 * ts;
                             }
                             break;
                         }
                     }
                     y += 1;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn carry_air_heat_for_bench(&mut self) {
+        self.carry_air_heat();
+    }
+
+    /// The wind carries warmth: every free air cell takes (bilinearly) the temperature of the air
+    /// upwind of it, so a hot plume is blown sideways and a cold front sweeps across the map. Gas
+    /// cells (steam, smoke, clouds) already carry their own temperature when the flow moves them.
+    /// Wind also strips heat from whatever it blows over (convection): the faster, the quicker.
+    /// With `lod >= 1` it works on blocks of 2 x 2 cells.
+    fn carry_air_heat(&mut self) {
+        let old = self.temp.clone();
+        let reach = 2.0 * THERMAL_EVERY as f32 * self.thermal_scale();
+        let stride = if self.lod >= 1 { 2 } else { 1 };
+        let tb = tables();
+        let cell = super::flow::CELL;
+        let (fw, fh) = (super::flow::FW, super::flow::FH);
+        for bj in 0..fh {
+            for bi in 0..fw {
+                // One wind per block of the flow grid: it is as fine as the wind itself, and the
+                // upwind offset is the same for the whole block.
+                let (vx, vy) = self.flow.at_cell(bi, bj);
+                let speed = vx.abs() + vy.abs();
+                if speed < 0.05 {
+                    continue;
+                }
+                let (ox, oy) = (-vx * reach, -vy * reach);
+                let (ix, iy) = (ox.floor(), oy.floor());
+                let (tx, ty) = (ox - ix, oy - iy);
+                let (ix, iy) = (ix as i32, iy as i32);
+                let gust = speed.min(1.5) * 0.02;
+                for y in (bj * cell..((bj + 1) * cell).min(H)).step_by(stride) {
+                    let sy0 = (y as i32 + iy).clamp(0, H as i32 - 2) as usize;
+                    for x in (bi * cell..(bi + 1) * cell).step_by(stride) {
+                        let i = y * W + x;
+                        if self.cells[i].m != Mat::Empty {
+                            continue;
+                        }
+                        let sx0 = (x as i32 + ix).rem_euclid(W as i32 - 1) as usize;
+                        // Free air is read as it is; anything else counts as the cell's own temperature.
+                        let air = |j: usize| if self.cells[j].m == Mat::Empty { old[j] } else { old[i] };
+                        let top = air(sy0 * W + sx0) * (1.0 - tx) + air(sy0 * W + sx0 + 1) * tx;
+                        let bot = air((sy0 + 1) * W + sx0) * (1.0 - tx) + air((sy0 + 1) * W + sx0 + 1) * tx;
+                        let upwind = top * (1.0 - ty) + bot * ty;
+                        self.temp[i] = old[i] + (upwind - old[i]) * 0.7;
+                        if stride == 2 {
+                            // Simplified: the other three cells of the 2 x 2 block follow.
+                            let t = self.temp[i];
+                            for j in [i + 1, i + W, i + W + 1] {
+                                if j < W * H && self.cells[j].m == Mat::Empty {
+                                    self.temp[j] = t;
+                                }
+                            }
+                        }
+                        // Convection: the moving air also cools or warms the solid or liquid beside it.
+                        for j in [i + 1, i.wrapping_sub(1), i + W, i.wrapping_sub(W)] {
+                            if j >= W * H {
+                                continue;
+                            }
+                            let m = self.cells[j].m;
+                            if m == Mat::Empty || matches!(m.kind(), super::Kind::Gas | super::Kind::Flame) || matches!(m, Mat::Fire | Mat::Ember | Mat::Lava) {
+                                continue;
+                            }
+                            let flux = (self.temp[i] - self.temp[j]) * gust;
+                            self.temp[j] += flux * tb.inv_c[m as usize];
+                            self.temp[i] -= flux * tb.inv_c[Mat::Empty as usize].min(1.0);
+                        }
+                    }
                 }
             }
         }
@@ -431,7 +533,7 @@ impl World {
         // Melting, boiling, freezing, setting: one rule for every material.
         let ph = phase(m);
         if let Some((th, to, rate)) = ph.up {
-            if t >= th && self.chance(rate) {
+            if t >= th && self.chance_t(rate) {
                 self.set(x, y, to);
                 // The new phase takes the heat from whatever made it change: halfway
                 // between the threshold and its hottest neighbour. That is how fresh
@@ -447,7 +549,7 @@ impl World {
             }
         }
         if let Some((th, to, rate)) = ph.down {
-            if t <= th && self.chance(rate) {
+            if t <= th && self.chance_t(rate) {
                 self.set(x, y, to);
                 self.temp[i] = t.max(th);
                 return;
@@ -459,19 +561,19 @@ impl World {
                 if m == Mat::Snow && t < -2.0 {
                     // Deep, cold snow is pressed into ice (the way a glacier forms).
                     let above = (1..=3).filter(|d| matches!(self.raw(x, y - d), Mat::Snow | Mat::Ice | Mat::Hail)).count();
-                    if (above >= 2 && self.chance(500)) || (t < -12.0 && above >= 1 && self.chance(4000)) {
+                    if (above >= 2 && self.chance_t(500)) || (t < -12.0 && above >= 1 && self.chance_t(4000)) {
                         self.set(x, y, Mat::Ice);
                     }
                 }
             }
             Mat::Steam => {
-                if t <= 45.0 && can_condense && self.chance(8) {
+                if t <= 45.0 && can_condense && self.chance_t(8) {
                     self.set(x, y, Mat::Cloud);
                 }
             }
             Mat::Lava => {}
             Mat::Stone => {
-                if t > -8.0 && t < 6.0 && self.chance(20_000) {
+                if t > -8.0 && t < 6.0 && self.chance_t(20_000) {
                     // Frost weathering: water in the cracks freezes and thaws, rock crumbles to sand.
                     let wet = Self::neighbors(x, y).iter().any(|&(nx, ny)| matches!(self.raw(nx, ny), Mat::Water | Mat::Ice));
                     if wet {
@@ -488,22 +590,22 @@ impl World {
                         worst = worst.max((self.temp[Self::idx(nx, ny)] - t).abs());
                     }
                 }
-                if worst > SHOCK_C && self.chance(6) {
+                if worst > SHOCK_C && self.chance_t(6) {
                     self.shatter(x, y);
                 }
             }
             Mat::Clay => {
-                if t >= KILN_C && self.chance(12) {
+                if t >= KILN_C && self.chance_t(12) {
                     self.set(x, y, Mat::Terracotta);
                 }
             }
             Mat::Rust => {
-                if t >= SMELT_C && self.chance(15) {
+                if t >= SMELT_C && self.chance_t(15) {
                     self.set(x, y, Mat::Iron);
                 }
             }
             Mat::Iron => {
-                if t >= STEEL_C && self.chance(10) {
+                if t >= STEEL_C && self.chance_t(10) {
                     if let Some((ax, ay)) = self.find_near(x, y, 3, Mat::Ash) {
                         self.set(ax, ay, Mat::Empty);
                         self.set(x, y, Mat::Steel);
@@ -511,17 +613,17 @@ impl World {
                 }
             }
             Mat::Wood | Mat::Trunk | Mat::Leaf | Mat::Branch | Mat::DeadLeaf => {
-                if t >= WOOD_IGNITE_C && self.chance(10) {
+                if t >= WOOD_IGNITE_C && self.chance_t(10) {
                     self.set(x, y, Mat::Ember);
                 }
             }
             Mat::Grass | Mat::Seed | Mat::Sapling => {
-                if t >= WOOD_IGNITE_C - 40.0 && self.chance(10) {
+                if t >= WOOD_IGNITE_C - 40.0 && self.chance_t(10) {
                     self.set(x, y, Mat::Fire);
                 }
             }
             Mat::Oil => {
-                if t >= OIL_IGNITE_C && self.chance(3) {
+                if t >= OIL_IGNITE_C && self.chance_t(3) {
                     self.ignite_oil(x, y);
                 }
             }
@@ -578,5 +680,59 @@ impl World {
             _ => return [0, 0, 0, 0],
         };
         [(r * a / 255) as u8, (g * a / 255) as u8, (b * a / 255) as u8, a as u8]
+    }
+}
+
+#[cfg(test)]
+mod carry_tests {
+    use super::*;
+
+    #[test]
+    fn the_wind_blows_warmth_downwind() {
+        let mut w = World::new_static();
+        w.climate_fixed = Some(10.0);
+        w.reset_temps();
+        w.flow.pin_uniform(0.25, 0.0);
+        let (x0, y) = (300usize, 100usize);
+        for dx in 0..12 {
+            for dy in 0..12 {
+                w.temp[(y + dy) * W + x0 + dx] = 80.0;
+            }
+        }
+        let mean = |w: &World, x: usize| (0..12).map(|dy| w.temp[(y + dy) * W + x]).sum::<f32>() / 12.0;
+        let mut passed = 0.0f32;
+        for _ in 0..40 {
+            w.carry_air_heat();
+            passed = passed.max(mean(&w, x0 + 30));
+        }
+        assert!(passed > 20.0, "the warm patch travelled downwind past x0+30: {passed}");
+        assert!(mean(&w, x0 - 30) < 11.0, "nothing upwind: {}", mean(&w, x0 - 30));
+    }
+}
+
+#[cfg(test)]
+mod bench_tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn bench_air_heat() {
+        let mut w = World::new_static();
+        w.flow.pin_uniform(0.5, 0.2);
+        let t = std::time::Instant::now();
+        for _ in 0..30 {
+            w.carry_air_heat();
+        }
+        eprintln!("carry_air_heat: {:?} per call", t.elapsed() / 30);
+        let t = std::time::Instant::now();
+        for _ in 0..30 {
+            w.thermal_pass();
+        }
+        eprintln!("thermal_pass total: {:?} per call", t.elapsed() / 30);
+        let t = std::time::Instant::now();
+        for i in 0..100 {
+            w.flow.step(0.5, i);
+        }
+        eprintln!("flow.step: {:?} per call", t.elapsed() / 100);
     }
 }

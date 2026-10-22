@@ -1680,6 +1680,13 @@ impl Physics {
             // Wind pushes on whatever is in the open air, in proportion to the surface it offers.
             let gust = world.wind * world.wind.abs() * (s.h.max(s.w) * s.w.min(s.h)) / (PX_PER_M * PX_PER_M) * g.abs() * 0.045 * dt;
             self.w.bodies[h].apply_impulse(Vector::new(gust, 0.0), false);
+            // A difference of pressure across the block pushes it from high to low (a blast wave,
+            // a surge of water). The still weight of the liquid is the buoyancy below.
+            let (gx, gy) = world.pressure_gradient(b.pos.x, b.pos.y);
+            if gx * gx + gy * gy > 0.004 * 0.004 {
+                let k = -600.0 * (s.w * s.h) / (PX_PER_M * PX_PER_M) * dt;
+                self.w.bodies[h].apply_impulse(Vector::new(gx * k, gy * k), true);
+            }
             let reach = half.length() + 2.0;
             let (nx, ny) = (((s.w / 4.0) as i32).max(2), ((s.h / 4.0) as i32).max(2));
             let (mut wet, mut total) = (0, 0);
@@ -2344,6 +2351,69 @@ mod tests {
         }
         assert_eq!(members.len(), 2, "an unloaded truss must not collapse");
         assert!((members[0].p1 - apex).length() < 6.0, "apex moved to {:?}", members[0].p1);
+    }
+
+    #[test]
+    fn a_pressure_wave_shoves_a_block_away_from_the_blast() {
+        let mut world = World::new_static();
+        let mut blocks = vec![Block::new(BlockKind::Plank, vec2(450.0, 200.0), 0.0)];
+        let mut phys = Physics::build(&mut blocks);
+        let x0 = blocks[0].pos.x;
+        // Only the air blast: no explosion shove, just the pressure wave on the left.
+        world.flow.blast(380, 200, 60, 1.5);
+        let mut calm = vec![Block::new(BlockKind::Plank, vec2(450.0, 200.0), 0.0)];
+        let mut calm_phys = Physics::build(&mut calm);
+        let calm_world = World::new_static();
+        for _ in 0..90 {
+            phys.step(&world, &mut blocks);
+            world.step();
+            calm_phys.step(&calm_world, &mut calm);
+        }
+        let (pushed, still) = (blocks[0].pos.x - x0, calm[0].pos.x - x0);
+        assert!(pushed > still + 3.0, "the wave carries the block away from the blast: {pushed} vs {still}");
+    }
+
+    #[test]
+    fn an_underwater_explosion_shoves_a_floating_plank() {
+        let run = |boom: bool| {
+            let mut world = World::new_static();
+            for x in 100..300 {
+                world.set(x, 320, Mat::Stone);
+            }
+            for y in 230..320 {
+                world.set(99, y, Mat::Stone);
+                world.set(300, y, Mat::Stone);
+            }
+            for x in 100..300 {
+                for y in 270..320 {
+                    world.set(x, y, Mat::Water);
+                }
+            }
+            let mut blocks = vec![Block::new(BlockKind::Plank, vec2(190.0, 262.0), 0.0)];
+            let mut phys = Physics::build(&mut blocks);
+            // Let it settle on the water first.
+            for _ in 0..150 {
+                phys.step(&world, &mut blocks);
+                stamp_blocks(&mut world, &blocks);
+                world.step();
+            }
+            let start = blocks[0].pos;
+            if boom {
+                world.explode(150, 295, 16);
+            }
+            let mut top = start.y;
+            for _ in 0..150 {
+                phys.step(&world, &mut blocks);
+                stamp_blocks(&mut world, &blocks);
+                world.step();
+                top = top.min(blocks[0].pos.y);
+            }
+            (blocks[0].pos - start, start.y - top)
+        };
+        let (calm, _) = run(false);
+        let (blasted, lift) = run(true);
+        eprintln!("calm drift {calm:?}, blasted displacement {blasted:?}, highest lift {lift}");
+        assert!(blasted.length() > calm.length() + 4.0 || lift > 4.0, "the blast moves the plank: {blasted:?} vs {calm:?}, lift {lift}");
     }
 
     #[test]
