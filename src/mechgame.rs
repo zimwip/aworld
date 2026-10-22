@@ -3,7 +3,8 @@
 
 use super::*;
 use crate::blocks::anchor_at;
-use crate::mech::{self, Axle, End, Event, Gear, GearSize, Motor, Pivot, Rod, Slider};
+use crate::blocks::{Physics, ReelRef, PX_PER_M};
+use crate::mech::{self, Axle, End, Event, Gear, GearSize, Motor, Pivot, Pulley, Rod, Slider};
 
 /// A multi-click build in progress.
 #[derive(Clone, Copy)]
@@ -22,6 +23,11 @@ const IRON_OR_STEEL: &[Mat] = &[Mat::Iron, Mat::Steel];
 const RAIL_MIN: f32 = 24.0;
 const RAIL_MAX: f32 = 220.0;
 const AXLE_MAX: f32 = 400.0;
+/// Radius of a winch drum and of a pulley sheave, in cells; rope a winch can hold beyond what it has.
+const WINCH_DRUM: f32 = 7.0;
+const PULLEY_R: f32 = 5.0;
+const REEL_SPARE: f32 = 80.0;
+const REEL_MIN: f32 = 6.0;
 /// Wheel torque (physics units) for one unit of mechanism torque, and what a gear can always hold.
 const WHEEL_TORQUE_PER_UNIT: f32 = 60.0;
 const WHEEL_HOLD: f32 = 120.0;
@@ -131,6 +137,8 @@ impl Game {
             },
             Tool::Crank => 6,
             Tool::Pivot => 4,
+            Tool::Winch => gear_cost(GearSize::Medium) + 10,
+            Tool::Pulley => 4,
             _ => return None,
         };
         Some((IRON_OR_STEEL, units))
@@ -146,6 +154,51 @@ impl Game {
             }
             _ => false,
         }
+    }
+
+    pub fn reel_at(&self, p: Vec2) -> Option<usize> {
+        self.gear_at(p).filter(|&i| self.mech.gears[i].reel.is_some())
+    }
+
+    pub fn pulley_at(&self, p: Vec2) -> Option<usize> {
+        self.mech
+            .pulleys
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| (u.pos - p).length() <= u.radius + 2.5)
+            .min_by(|a, b| (a.1.pos - p).length().total_cmp(&(b.1.pos - p).length()))
+            .map(|(i, _)| i)
+    }
+
+    /// Where a rope from `a` to `b` touches each pulley it runs over: on the far side from the
+    /// bend (a rope hanging from two points runs over the top of a pulley).
+    pub fn via_contacts(&self, a: Vec2, via: &[u32], b: Vec2) -> Vec<Vec2> {
+        let pulleys: Vec<&Pulley> = via.iter().filter_map(|u| self.mech.pulleys.iter().find(|p| p.uid == *u)).collect();
+        let mut out = vec![];
+        for (i, u) in pulleys.iter().enumerate() {
+            let prev = if i == 0 { a } else { pulleys[i - 1].pos };
+            let next = if i + 1 == pulleys.len() { b } else { pulleys[i + 1].pos };
+            let bis = (prev - u.pos).normalize_or_zero() + (next - u.pos).normalize_or_zero();
+            let off = if bis.length() < 0.25 { vec2(0.0, -1.0) } else { -bis.normalize() };
+            out.push(u.pos + off * (u.radius + 1.5));
+        }
+        out
+    }
+
+    fn place_pulley(&mut self, at: Vec2) {
+        let c = self.snap_point(at).filter(|_| matches!(node_at(&self.world, &self.blocks, &self.members, at), Some(Anchor::Block { .. }))).unwrap_or(at);
+        if self.mech.pulleys.iter().any(|p| (p.pos - c).length() < p.radius + PULLEY_R) {
+            self.say("Les poulies se chevauchent");
+            return;
+        }
+        if !self.mech_pay(4, c) {
+            return;
+        }
+        self.checkpoint();
+        let mount = self.support_for(c);
+        self.mech.pulleys.push(Pulley { uid: mech::next_uid(), mount, pos: c, radius: PULLEY_R });
+        self.rebuild_physics_if_running();
+        self.say("Poulie posée : clique-la avec l'outil câble, entre deux bouts, pour y passer le câble");
     }
 
     pub fn gear_at(&self, p: Vec2) -> Option<usize> {
@@ -222,19 +275,22 @@ impl Game {
         }
     }
 
-    fn place_gear(&mut self, size: GearSize, motor: bool, at: Vec2) {
+    fn place_gear(&mut self, size: GearSize, motor: bool, reel: bool, at: Vec2) {
         let c = self.gear_spot(size, at);
         if !self.gear_spot_ok(size, c) {
             self.say("Les engrenages se chevauchent : écarte-les ou fais-les s'engrener");
             return;
         }
-        let units = if motor { gear_cost(size) + 12 } else { gear_cost(size) };
+        let units = gear_cost(size) + if motor { 12 } else { 0 } + if reel { 10 } else { 0 };
         if !self.mech_pay(units, c) {
             return;
         }
         self.checkpoint();
         let mut g = Gear::new(mech::next_uid(), size, c);
         g.mount = self.support_for(c);
+        if reel {
+            g.reel = Some(WINCH_DRUM);
+        }
         if motor {
             let mut m = Motor::new();
             m.dir = self.motor_dir;
@@ -496,10 +552,10 @@ impl Game {
 
     pub fn mech_click(&mut self, at: Vec2) {
         match self.tool {
-            Tool::Gear(s) => self.place_gear(s, false, at),
+            Tool::Gear(s) => self.place_gear(s, false, false, at),
             Tool::Motor => {
                 if !self.select_motor_at(at) {
-                    self.place_gear(GearSize::Small, true, at);
+                    self.place_gear(GearSize::Small, true, false, at);
                     // A motor just placed is the one the remote shows.
                     if let Some(g) = self.mech.gears.last().filter(|g| g.motor.is_some()) {
                         self.selected_motor = Some(g.uid);
@@ -511,6 +567,8 @@ impl Game {
             Tool::Rail => self.place_rail(at),
             Tool::Crank => self.place_crank(at),
             Tool::Pivot => self.place_pivot(at),
+            Tool::Winch => self.place_gear(GearSize::Medium, false, true, at),
+            Tool::Pulley => self.place_pulley(at),
             _ => {}
         }
     }
@@ -525,6 +583,15 @@ impl Game {
             self.mech.rods.remove(i);
             return true;
         }
+        if let Some(i) = self.pulley_at(at) {
+            self.checkpoint();
+            let uid = self.mech.pulleys.remove(i).uid;
+            for c in &mut self.cables {
+                c.via.retain(|u| *u != uid);
+            }
+            self.rebuild_physics_if_running();
+            return true;
+        }
         // The shaft from a gear to its wheel.
         let shaft = self.mech.gears.iter().position(|g| {
             g.wheel.and_then(|w| self.blocks.iter().find(|b| b.uid == w)).map_or(false, |b| point_to_segment(at, g.pos, b.pos).0 < 3.0 && (at - g.pos).length() > g.size.radius() + 1.5 && (at - b.pos).length() > 13.0)
@@ -536,8 +603,12 @@ impl Game {
         }
         if let Some(i) = self.gear_at(at) {
             self.checkpoint();
-            self.mech.gears.remove(i);
+            let reel = self.mech.gears.remove(i).reel.is_some();
             self.mech.prune();
+            if reel {
+                self.refresh_reel_anchors();
+                self.rebuild_physics_if_running();
+            }
             return true;
         }
         if let Some((i, _)) = self.rail_at(at) {
@@ -571,6 +642,7 @@ impl Game {
         self.mech_feel_world();
         self.mech_drive_wheels();
         let node_loads = self.mech_node_rods();
+        self.mech_reels();
         let mut events = self.mech.step();
         for (r, f) in node_loads {
             if let Some(e) = self.mech.load_rod(r, f) {
@@ -644,6 +716,83 @@ impl Game {
             loads.push((ri, pull.length() / WHEEL_TORQUE_PER_UNIT));
         }
         loads
+    }
+
+    /// Keeps the positions stored in rope ends on winch drums up to date; a rope whose winch is gone
+    /// is left hanging loose.
+    pub fn refresh_reel_anchors(&mut self) {
+        let gears = &self.mech.gears;
+        for c in &mut self.cables {
+            for a in [&mut c.a, &mut c.b] {
+                if let Anchor::Reel { uid, pos } = a {
+                    match gears.iter().find(|g| g.uid == *uid && g.reel.is_some()) {
+                        Some(g) => *pos = g.pos,
+                        None => *a = Anchor::Free(*pos),
+                    }
+                }
+            }
+        }
+        // Pulleys that no longer exist drop out of the ropes that ran over them.
+        let live: Vec<u32> = self.mech.pulleys.iter().map(|p| p.uid).collect();
+        for c in &mut self.cables {
+            c.via.retain(|u| live.contains(u));
+        }
+    }
+
+    /// Before a rope is built: where it touches its pulleys, and how its length follows its winch.
+    pub fn mech_prepare_cable(&mut self, i: usize) {
+        self.refresh_reel_anchors();
+        let (a, b) = (self.cables[i].a, self.cables[i].b);
+        if let (Some(pa), Some(pb)) = (anchor_world(&a, &self.blocks, &self.members), anchor_world(&b, &self.blocks, &self.members)) {
+            let via = self.cables[i].via.clone();
+            self.cables[i].via_pts = self.via_contacts(pa, &via, pb);
+        }
+        self.cables[i].reel = None;
+        for end in [a, b] {
+            if let Anchor::Reel { uid, .. } = end {
+                if let Some(gi) = self.mech.gear_index(uid) {
+                    let r = self.mech.gears[gi].reel.unwrap_or(WINCH_DRUM);
+                    let len = self.cables[i].len;
+                    let th0 = self.mech.gears[gi].angle;
+                    let (min_len, max_len) = (REEL_MIN.min(len), len + REEL_SPARE);
+                    self.cables[i].reel = Some(ReelRef { gear: uid, base_len: len, base_angle: th0, radius: r, min_len, max_len });
+                    // The drum can turn only as far as there is rope: an end stop with unlimited torque.
+                    self.mech.gears[gi].limit = Some((th0 + (len - max_len) / r, th0 + (len - min_len) / r));
+                }
+            }
+        }
+    }
+
+    /// Winches: the rope pays out or reels in as the drum turns, and pulls back on the drum.
+    fn mech_reels(&mut self) {
+        let Some(phys) = self.phys.as_mut() else { return };
+        for g in &self.mech.gears {
+            if g.reel.is_some() {
+                phys.move_reel(g.uid, g.pos);
+            }
+        }
+        for c in &mut self.cables {
+            let Some(r) = c.reel else { continue };
+            let Some(gi) = self.mech.gear_index(r.gear) else { continue };
+            let len = (r.base_len - r.radius * (self.mech.gears[gi].angle - r.base_angle)).clamp(r.min_len, r.max_len);
+            phys.set_cable_length(c, len);
+            c.len = len;
+            let at_start = matches!(c.a, Anchor::Reel { .. });
+            let pull = Physics::rope_tension(c, at_start);
+            self.mech.gears[gi].ext_torque -= pull * (r.radius / PX_PER_M) / WHEEL_TORQUE_PER_UNIT;
+        }
+    }
+
+    /// Winch drums and pulley sheaves go into the physics before any rope is built.
+    pub fn mech_physics_setup(&self, p: &mut Physics) {
+        for g in &self.mech.gears {
+            if g.reel.is_some() {
+                p.add_reel(g.uid, g.pos);
+            }
+        }
+        for pu in &self.mech.pulleys {
+            p.add_pulley(&self.blocks, &self.members, pu.uid, &pu.mount, pu.pos, pu.radius);
+        }
     }
 
     /// Forgets axles and shafts of wheels that no longer exist.
@@ -787,6 +936,8 @@ impl Game {
             T { tool: Tool::Axle, label: "Axe", text: "Deux clics sur deux engrenages : l'axe les fait tourner ensemble, à la même vitesse, même s'ils sont loin l'un de l'autre." },
             T { tool: Tool::Rail, label: "Coulisseau", text: "Deux clics : un rail (fixé au sol, à un bloc, ou dans le vide) avec un chariot qui glisse dessus. Il pousse le sable, l'eau et les blocs." },
             T { tool: Tool::Pivot, label: "Pivot", text: "Clique une roue pour la fixer sur un axe (sur le bloc ou le sol dessous, sinon dans l'air) : elle tourne sur place, comme une poulie ou un tambour de treuil. Re-clique pour l'enlever. Avec l'outil Axe, un engrenage peut l'entraîner : enroule un câble accroché sur son bord et c'est un treuil." },
+            T { tool: Tool::Winch, label: "Treuil", text: "Un tambour à enrouleur sur un engrenage. Avec l'outil Câble, accroche un bout de câble sur le tambour : en tournant, il enroule ou déroule le câble. Quand il n'y a plus de câble le tambour bute (le moteur cale ou repart dans l'autre sens)." },
+            T { tool: Tool::Pulley, label: "Poulie", text: "Une poulie fixée sur un bloc, le sol ou dans le vide, sans roue. Avec l'outil Câble : un bout, puis la poulie, puis l'autre bout. Le câble glisse dessus sans frottement." },
             T { tool: Tool::Crank, label: "Bielle", text: "Un clic sur un engrenage pose le point d'accroche, un clic sur un rail y relie la bielle. Le chariot va et vient quand l'engrenage tourne." },
         ];
         let free = self.free_now();
@@ -796,7 +947,7 @@ impl Game {
                 let cost = self.mech_cost_hint(t.tool);
                 self.hover_info = Some((t.label.to_string(), format!("{} {cost}", t.text)));
             }
-            let short = !free && matches!(t.tool, Tool::Gear(_) | Tool::Motor) && self.stock(IRON_OR_STEEL) < self.mech_cost_for(t.tool);
+            let short = !free && matches!(t.tool, Tool::Gear(_) | Tool::Motor | Tool::Winch) && self.stock(IRON_OR_STEEL) < self.mech_cost_for(t.tool);
             let tool = t.tool;
             if ui.tile(r, t.label, self.tool == tool, |s| {
                 let c = vec2(s.x + s.w / 2.0, s.y + s.h / 2.0);
@@ -822,6 +973,20 @@ impl Game {
                     Tool::Rail => {
                         draw_line(c.x - 18.0, c.y, c.x + 18.0, c.y, 5.0, Color::from_rgba(70, 74, 90, 255));
                         draw_rectangle(c.x - 5.0, c.y - 6.0, 10.0, 12.0, Color::from_rgba(214, 160, 70, 255));
+                    }
+                    Tool::Winch => {
+                        draw_circle(c.x, c.y, 13.0, Color::from_rgba(120, 88, 56, 255));
+                        for k in 0..3 {
+                            draw_circle_lines(c.x, c.y, 6.0 + 2.5 * k as f32, 1.5, Color::from_rgba(176, 140, 88, 255));
+                        }
+                        draw_circle_lines(c.x, c.y, 13.0, 2.0, Color::from_rgba(214, 218, 230, 255));
+                        draw_circle(c.x, c.y, 2.5, Color::from_rgba(40, 44, 58, 255));
+                    }
+                    Tool::Pulley => {
+                        draw_circle(c.x, c.y, 10.0, Color::from_rgba(150, 156, 176, 255));
+                        draw_circle(c.x, c.y, 7.5, Color::from_rgba(96, 102, 124, 255));
+                        draw_circle(c.x, c.y, 2.6, Color::from_rgba(214, 218, 230, 255));
+                        draw_line(c.x - 16.0, c.y - 9.0, c.x - 2.0, c.y - 10.0, 2.0, Color::from_rgba(176, 140, 88, 255));
                     }
                     Tool::Pivot => {
                         draw_circle(c.x, c.y, 11.0, Color::from_rgba(60, 62, 74, 255));
@@ -866,6 +1031,7 @@ impl Game {
         match tool {
             Tool::Gear(s) => gear_cost(s),
             Tool::Motor => gear_cost(GearSize::Small) + 12,
+            Tool::Winch => gear_cost(GearSize::Medium) + 10,
             _ => 6,
         }
     }
@@ -873,7 +1039,7 @@ impl Game {
     fn mech_cost_hint(&self, tool: Tool) -> String {
         let have = self.stock(IRON_OR_STEEL);
         match tool {
-            Tool::Gear(_) | Tool::Motor => format!("Coût : {} de fer ou d'acier. En stock : {have}.", self.mech_cost_for(tool)),
+            Tool::Gear(_) | Tool::Motor | Tool::Winch => format!("Coût : {} de fer ou d'acier. En stock : {have}.", self.mech_cost_for(tool)),
             Tool::Axle => format!("Coût : 0,12 par cellule de longueur. En stock : {have}."),
             Tool::Rail => format!("Coût : 0,2 par cellule (max {RAIL_MAX:.0}). En stock : {have}."),
             _ => format!("Coût : 6 + 0,1 par cellule. En stock : {have}."),
@@ -914,6 +1080,17 @@ impl Game {
                 draw_circle(c.x, c.y, 1.6 * view.s, Color::from_rgba(214, 218, 230, 255));
             }
         }
+        for pu in &self.mech.pulleys {
+            let c = view.to_screen(pu.pos);
+            let r = pu.radius * view.s;
+            // A bracket to its support, the sheave with its groove, the hub.
+            draw_rectangle(c.x - r * 0.45, c.y - r * 0.45, r * 0.9, r * 1.9, Color::from_rgba(70, 74, 90, 255));
+            draw_circle(c.x, c.y, r, Color::from_rgba(150, 156, 176, 255));
+            draw_circle(c.x, c.y, r * 0.8, Color::from_rgba(96, 102, 124, 255));
+            draw_circle_lines(c.x, c.y, r * 0.9, 1.4, Color::from_rgba(214, 218, 230, 255));
+            draw_circle(c.x, c.y, r * 0.28, Color::from_rgba(214, 218, 230, 255));
+            draw_circle(c.x, c.y, r * 0.12, Color::from_rgba(40, 44, 58, 255));
+        }
         for g in &self.mech.gears {
             let c = view.to_screen(g.pos);
             let r = g.size.radius() * view.s;
@@ -933,6 +1110,21 @@ impl Game {
                 draw_circle(c.x, c.y, r * 0.18, Color::from_rgba(40, 44, 58, 255));
             } else {
                 draw_gear(c, r, g.angle, g.size, tint);
+            }
+            if let Some(drum) = g.reel {
+                // The drum of a winch: rope wound round it, flanges that turn with the gear.
+                let rd = drum * view.s;
+                draw_circle(c.x, c.y, rd, Color::from_rgba(120, 88, 56, 255));
+                for k in 0..3 {
+                    draw_circle_lines(c.x, c.y, rd * (0.55 + 0.2 * k as f32), 1.6, Color::from_rgba(176, 140, 88, 255));
+                }
+                draw_circle_lines(c.x, c.y, rd, 2.2, Color::from_rgba(214, 218, 230, 255));
+                for k in 0..4 {
+                    let a = g.angle + k as f32 * std::f32::consts::FRAC_PI_2;
+                    let tip = c + vec2(a.cos(), a.sin()) * rd;
+                    draw_line(c.x, c.y, tip.x, tip.y, 2.0, Color::from_rgba(214, 218, 230, 255));
+                }
+                draw_circle(c.x, c.y, rd * 0.18, Color::from_rgba(40, 44, 58, 255));
             }
             if g.mount_is_free() {
                 draw_circle(c.x, c.y, 1.6 * view.s, Color::from_rgba(255, 200, 80, 255));
@@ -993,6 +1185,14 @@ impl Game {
         match self.tool {
             Tool::Gear(size) => self.draw_gear_ghost(view, size, at),
             Tool::Motor => self.draw_gear_ghost(view, GearSize::Small, at),
+            Tool::Winch => self.draw_gear_ghost(view, GearSize::Medium, at),
+            Tool::Pulley => {
+                let spot = self.snap_point(at).unwrap_or(at);
+                let s = view.to_screen(spot);
+                let free = !self.mech.pulleys.iter().any(|p| (p.pos - spot).length() < p.radius + PULLEY_R);
+                draw_circle(s.x, s.y, PULLEY_R * view.s, if free { Color::new(0.5, 1.0, 0.6, 0.6) } else { Color::new(1.0, 0.3, 0.3, 0.6) });
+                draw_circle_lines(s.x, s.y, PULLEY_R * view.s + 2.0, 2.0, GREEN);
+            }
             Tool::Axle => {
                 if let Some(MechDraft::Axle(g)) = self.mech_draft {
                     if let Some(i) = self.mech.gear_index(g) {

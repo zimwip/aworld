@@ -353,9 +353,11 @@ impl Game {
                 p.add_pin_rod(&self.blocks, &self.members, rod.uid, pin, &node, rod.len);
             }
         }
-        for c in &mut self.cables {
-            c.reset_runtime();
-            p.add_cable(&self.blocks, &self.members, c);
+        self.mech_physics_setup(&mut p);
+        for i in 0..self.cables.len() {
+            self.cables[i].reset_runtime();
+            self.mech_prepare_cable(i);
+            p.add_cable(&self.blocks, &self.members, &mut self.cables[i]);
         }
         for sp in &mut self.springs {
             *sp = sp.fresh();
@@ -485,6 +487,7 @@ impl Game {
                     let (blocks, members) = (&self.blocks, &self.members);
                     self.mech.follow_mounts(|a| anchor_world(a, blocks, members));
                 }
+                self.refresh_reel_anchors();
                 self.snap_mech = self.mech.clone();
                 self.snap_blocks = self.blocks.clone();
                 self.snap_cables = self.cables.iter().map(Cable::fresh).collect();
@@ -1290,6 +1293,7 @@ impl Game {
         if !self.running {
             let (blocks, members) = (&self.blocks, &self.members);
             self.mech.follow_mounts(|a| anchor_world(a, blocks, members));
+            self.refresh_reel_anchors();
             self.sounds.update(dt, &Mix::default());
             return;
         }
@@ -1596,11 +1600,17 @@ impl Game {
                 let cursor = if inside { view.to_world(ui.mouse) } else { p };
                 let snapped = if inside { self.snap_point(cursor) } else { None };
                 let end = snapped.unwrap_or(cursor);
-                // A loose second end is fine, so the preview is never "refused".
-                let ok = true;
-                let pts = cable_preview(p, end, (end - p).length());
                 let rgb = if let Tool::Cable(m) = self.tool { m.color() } else { (62, 66, 78) };
-                draw_cable(&pts, view, false, ok, rgb, None);
+                if self.cable_via.is_empty() {
+                    // A loose second end is fine, so the preview is never "refused".
+                    let pts = cable_preview(p, end, (end - p).length());
+                    draw_cable(&pts, view, false, true, rgb, None);
+                } else {
+                    // Straight between the pulleys the rope runs over.
+                    let via = self.via_contacts(p, &self.cable_via, end);
+                    let path: Vec<Vec2> = std::iter::once(p).chain(via).chain(std::iter::once(end)).collect();
+                    draw_cable(&path, view, false, true, rgb, None);
+                }
             }
         }
         if let (Tool::Spring(kind), Some(d)) = (self.tool, self.spring_draft.as_ref()) {
