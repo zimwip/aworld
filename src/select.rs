@@ -510,6 +510,10 @@ fn outline(pts: &[Vec2], col: Color) {
     for k in 0..pts.len() {
         let (a, b) = (pts[k], pts[(k + 1) % pts.len()]);
         draw_line(a.x, a.y, b.x, b.y, 2.4, col);
+        // Round joints, so a curve made of many short segments reads as one line.
+        if pts.len() > 8 {
+            draw_circle(a.x, a.y, 1.2, col);
+        }
     }
 }
 
@@ -519,20 +523,90 @@ fn outline_circle(c: Vec2, r: f32, col: Color) {
     draw_circle_lines(c.x, c.y, r, 2.4, col);
 }
 
-/// A car's outline: its body and each of its wheels.
+/// A car's outline: one smooth line around the body and the wheels together, like a blob drawn
+/// round it, rather than a ring round every wheel.
 pub fn outline_car(c: &car::Car, view: View, col: Color) {
     let m = c.kind.model();
     let (hl, top, bot) = (m.hull_half, m.hull_top, m.hull_bottom);
     let slab_top = top * 0.3;
     let p = |lx: f32, ly: f32| view.to_screen(c.p + sel_rot(c.angle, vec2(lx * c.dir, ly) * car::S));
-    let body = [p(-hl - 1.0, bot + 1.0), p(hl + 1.0, bot + 1.0), p(hl + 1.0, slab_top - 1.0), p(hl * 0.5, top - 1.5), p(-hl * 0.7, top - 1.5), p(-hl - 1.0, slab_top - 1.0)];
-    outline(&body, col);
+    let mut pts = vec![p(-hl - 1.0, bot + 1.0), p(hl + 1.0, bot + 1.0), p(hl + 1.0, slab_top - 1.0), p(hl * 0.5, top - 1.5), p(-hl * 0.7, top - 1.5), p(-hl - 1.0, slab_top - 1.0)];
     for (i, w) in c.wheels.iter().enumerate() {
-        outline_circle(view.to_screen(w.pos), (c.wheel_r(i) + 1.0) * view.s, col);
+        let (centre, r) = (view.to_screen(w.pos), (c.wheel_r(i) + 1.5) * view.s);
+        pts.extend((0..16).map(|k| centre + Vec2::from_angle(k as f32 * std::f32::consts::TAU / 16.0) * r));
     }
+    outline(&blob(&pts), col);
+}
+
+/// A smooth closed line around a set of points: their convex hull with its corners rounded off.
+pub fn blob(pts: &[Vec2]) -> Vec<Vec2> {
+    let mut hull = convex_hull(pts);
+    // Chaikin's corner cutting, twice: every corner becomes a soft curve.
+    for _ in 0..2 {
+        let n = hull.len();
+        if n < 3 {
+            break;
+        }
+        hull = (0..n).flat_map(|k| {
+            let (a, b) = (hull[k], hull[(k + 1) % n]);
+            [a.lerp(b, 0.25), a.lerp(b, 0.75)]
+        }).collect();
+    }
+    hull
+}
+
+/// The convex hull of a set of points, counter-clockwise on screen (Andrew's monotone chain).
+fn convex_hull(pts: &[Vec2]) -> Vec<Vec2> {
+    let mut p = pts.to_vec();
+    p.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    p.dedup();
+    if p.len() < 3 {
+        return p;
+    }
+    let cross = |o: Vec2, a: Vec2, b: Vec2| (a - o).perp_dot(b - o);
+    let mut lower: Vec<Vec2> = vec![];
+    for &q in &p {
+        while lower.len() >= 2 && cross(lower[lower.len() - 2], lower[lower.len() - 1], q) <= 0.0 {
+            lower.pop();
+        }
+        lower.push(q);
+    }
+    let mut upper: Vec<Vec2> = vec![];
+    for &q in p.iter().rev() {
+        while upper.len() >= 2 && cross(upper[upper.len() - 2], upper[upper.len() - 1], q) <= 0.0 {
+            upper.pop();
+        }
+        upper.push(q);
+    }
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    lower
 }
 
 #[allow(dead_code)]
 fn _unused(_: Vec2) -> Vec2 {
     snap_to_axes(vec2(1.0, 0.0), 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_blob_wraps_a_body_and_its_wheels_in_one_smooth_line() {
+        // A body and two wheels hanging under it, as on a car.
+        let mut pts = vec![vec2(0.0, 0.0), vec2(40.0, 0.0), vec2(40.0, 12.0), vec2(0.0, 12.0)];
+        for c in [vec2(6.0, 14.0), vec2(34.0, 14.0)] {
+            pts.extend((0..16).map(|k| c + Vec2::from_angle(k as f32 * std::f32::consts::TAU / 16.0) * 5.0));
+        }
+        let b = blob(&pts);
+        assert!(b.len() > 20, "a smooth curve: {} points", b.len());
+        // Convex all the way round: every turn goes the same way.
+        let turns: Vec<f32> = (0..b.len()).map(|k| (b[(k + 1) % b.len()] - b[k]).perp_dot(b[(k + 2) % b.len()] - b[(k + 1) % b.len()])).collect();
+        assert!(turns.iter().all(|&t| t >= -1e-3) || turns.iter().all(|&t| t <= 1e-3), "one convex loop");
+        // It hugs the shape: nothing far outside the points' bounds, and it reaches round the wheels.
+        assert!(b.iter().all(|p| p.x > -6.0 && p.x < 46.0 && p.y > -1.0 && p.y < 20.0));
+        assert!(b.iter().any(|p| p.y > 17.0), "the line goes under the wheels");
+    }
 }
