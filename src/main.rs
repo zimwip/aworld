@@ -33,7 +33,7 @@ use mech::{GearSize, Mechanism};
 use mechgame::MechDraft;
 use sound::{Ev, Mix, Sounds};
 use ui::{draw_icon, rrect, Drawer, Icon, Ui, ACCENT, BG, BLUE, DIM, GREEN, PANEL, RED, TEXT, TILE, TILE_HOT};
-use world::{Biome, Cell, Mat, PaintRule, Season, World, H, W};
+use world::{Biome, Mat, Matter, PaintRule, Season, World, H, W};
 
 /// Simulation steps per second at speed x1 (the rigid bodies use the same 1/60 s step).
 const STEPS_PER_SECOND: f32 = 60.0;
@@ -144,7 +144,7 @@ struct Game {
     heat_cells: u32,
     undo: Vec<Snapshot>,
     world: World,
-    snap_cells: Vec<Cell>,
+    snap_cells: Matter,
     snap_blocks: Vec<Block>,
     snap_cables: Vec<Cable>,
     snap_members: Vec<Member>,

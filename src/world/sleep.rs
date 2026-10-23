@@ -106,7 +106,7 @@ impl World {
         let sinks_into = |m: Mat| matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Liquid);
         match c.m {
             Mat::Empty | Mat::Stone | Mat::Brick | Mat::Glass | Mat::Ice | Mat::Clay | Mat::Terracotta => false,
-            Mat::Dirt => self.soil_restless(x, y, c.life),
+            Mat::Dirt => self.soil_restless(x, y),
             // Grass can always change: it grows, dries, wilts or is smothered.
             Mat::Grass => true,
             Mat::Sand | Mat::Rust | Mat::Hail | Mat::Snow | Mat::Gunpowder | Mat::Ash | Mat::Charcoal | Mat::Saltpeter => {
@@ -141,7 +141,7 @@ impl World {
                 wet || (sealed && cover >= 2)
             }
             Mat::Water => {
-                c.life >= 2
+                self.jet[Self::idx(x, y)] >= 2
                     || free(self.at(x, y - 1))
                     || self.soil_drinks((x, y + 1))
                     || self.soil_drinks((x - 1, y))
