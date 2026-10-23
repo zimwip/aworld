@@ -276,6 +276,8 @@ pub struct World {
     thermal_flip: bool,
     /// Tests (and calm sandboxes) can pin the air temperature everywhere.
     pub climate_fixed: Option<f32>,
+    /// The energy budget of the world: the sun in, the sky out to space (see `thermal.rs`).
+    pub climate: thermal::Climate,
     /// Bumped whenever the picture could have changed: lets the renderer skip work.
     pub revision: u64,
     /// Wind, -1 (left) to 1 (right).
@@ -358,6 +360,7 @@ impl World {
             day_cycle: true,
             thermal_flip: false,
             climate_fixed: None,
+            climate: thermal::Climate::default(),
             revision: 1,
             wind: 0.0,
             wind_max: 1.0,

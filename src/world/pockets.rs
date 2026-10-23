@@ -236,6 +236,15 @@ impl World {
         self.pocket_at(x, y).and_then(|k| self.pockets.get(k)).is_some_and(|p| !p.open)
     }
 
+    /// For each pocket (by its number in `pocket_of`, 0 being none), the mean temperature (°C) of
+    /// its gas if it is shut in for good (no gap, no cracks), NaN otherwise. Shut-in warmth cannot
+    /// mix with the open sky: it only stirs round its pocket and passes through the walls.
+    pub(super) fn shut_in_means(&self) -> Vec<f32> {
+        std::iter::once(f32::NAN)
+            .chain(self.pockets.iter().map(|p| if !p.open && !p.leaky && p.cells > 0 { p.kelvin / p.cells as f32 - 273.15 } else { f32::NAN }))
+            .collect()
+    }
+
     /// Whether the gas at a cell is shut in with too little oxygen left for a flame: a closed
     /// pocket that is half smoke or more.
     pub fn stale(&self, x: i32, y: i32) -> bool {
