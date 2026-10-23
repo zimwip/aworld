@@ -170,6 +170,8 @@ struct Game {
     tools_hit: Rect,
     corner_hit: Rect,
     hud_hit: Rect,
+    /// The world's settings (sun, escape to space) and its energy budget, under the day pill.
+    climate_menu: bool,
     launch_hit: Rect,
     /// The left palette hides like the views on the right: 1 = fully out. `panel_pin` keeps it out (and
     /// the picture beside it); `panel_hit` is where it is, so that clicks on it do not paint the world.
@@ -307,6 +309,7 @@ impl Game {
             tools_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             corner_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             hud_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
+            climate_menu: false,
             launch_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             panel_open: 1.0,
             panel_pin: false,
@@ -2072,6 +2075,11 @@ impl Game {
             let next = all[(all.iter().position(|x| *x == self.world.season()).unwrap_or(0) + 1) % all.len()];
             self.world.set_season(next);
             self.say(format!("Saison : {}", next.name()));
+        } else if ui.pressed && !self.quit_modal && pill.contains(ui.mouse) {
+            // Anywhere else on the pill opens (or closes) the world's settings.
+            self.climate_menu = !self.climate_menu;
+        } else if ui.hover(pill) {
+            self.hover_info = Some(("Le monde".to_string(), "Clique pour régler le soleil et voir le bilan d'énergie.".to_string()));
         }
 
         let stats = format!("Arrivées {}   Perdues {}", self.arrived, self.lost);
@@ -2086,6 +2094,67 @@ impl Game {
         rrect(Rect::new(r.x + r.w - bw - 8.0 - gap, r.y + 8.0, bw, 26.0), 13.0, Color::new(0.0, 0.0, 0.0, 0.5));
         draw_circle(r.x + r.w - bw + 6.0 - gap, r.y + 21.0, 5.0, col);
         ui.text(label, r.x + r.w - bw + 16.0 - gap, r.y + 26.0, 14, WHITE);
+    }
+
+    /// Under the day pill: where the world's energy comes from and goes, how much it holds over the
+    /// last day, and the settings of the sun and of the escape to space.
+    fn draw_climate_menu(&mut self, ui: &mut Ui) {
+        let pill = self.hud_hit;
+        let r = Rect::new(pill.x, pill.y + pill.h + 6.0, 340.0, 332.0);
+        self.hud_hit = Rect::new(pill.x, pill.y, pill.w.max(r.w), r.y + r.h - pill.y);
+        rrect(r, 14.0, Color::new(0.06, 0.07, 0.13, 0.94));
+        let (x, w) = (r.x + 14.0, r.w - 28.0);
+        let c = &self.world.climate;
+        ui.text("Bilan d'énergie (par heure)", x, r.y + 24.0, 16, ACCENT);
+        // Where the energy comes from and where it goes: one bar each, on the same scale.
+        let flows = [("Soleil → monde", c.rates[0], ACCENT), ("Monde → espace", -c.rates[1], BLUE), ("Feux → monde", c.rates[2], RED)];
+        let top = flows.iter().map(|f| f.1.abs()).fold(1.0f32, f32::max);
+        for (k, (label, v, col)) in flows.iter().enumerate() {
+            let y = r.y + 36.0 + k as f32 * 22.0;
+            ui.text(label, x, y + 13.0, 13, TEXT);
+            let bx = x + 118.0;
+            let bw = (w - 118.0 - 64.0) * (v.abs() / top);
+            rrect(Rect::new(bx, y + 4.0, bw.max(2.0), 11.0), 4.0, *col);
+            ui.text(&format!("{:+.0} k", v / 1000.0), x + w - 58.0, y + 13.0, 13, DIM);
+        }
+        // The heat the world holds over the last day: flat when the budget balances.
+        let gy = r.y + 112.0;
+        let g = Rect::new(x, gy, w, 58.0);
+        rrect(g, 6.0, Color::new(0.0, 0.0, 0.0, 0.35));
+        ui.text("Chaleur du monde, dernières 24 h", x + 6.0, gy + 14.0, 12, DIM);
+        let h: Vec<f32> = c.history.iter().copied().collect();
+        if h.len() >= 2 {
+            let (lo, hi) = h.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+            let span = (hi - lo).max(hi.abs() * 0.02).max(1.0);
+            let mid = 0.5 * (hi + lo);
+            let pt = |i: usize, v: f32| vec2(g.x + 4.0 + (g.w - 8.0) * i as f32 / (96 - 1) as f32, g.y + g.h * 0.6 - (v - mid) / span * (g.h * 0.7));
+            for i in 1..h.len() {
+                let (a, b) = (pt(i - 1, h[i - 1]), pt(i, h[i]));
+                draw_line(a.x, a.y, b.x, b.y, 2.0, GREEN);
+            }
+        }
+        let dev = c.sky_dev;
+        let sky = if dev.abs() < 0.5 { "Ciel : comme d'habitude".to_string() } else { format!("Ciel : {:+.1} °C par rapport à d'habitude", dev) };
+        ui.text(&sky, x, gy + g.h + 18.0, 13, TEXT);
+
+        // The settings.
+        let sy = gy + g.h + 34.0;
+        ui.text("Réglages", x, sy + 6.0, 16, ACCENT);
+        let mut vals = [c.sun_gain, c.space_gain, c.greenhouse];
+        let rows: [(&str, f32, f32, Color); 3] = [("Soleil", 0.0, 2.0, ACCENT), ("Sortie vers l'espace", 0.5, 1.5, BLUE), ("Nuages et fumée gardent", 0.0, 1.0, GREEN)];
+        for (k, (label, lo, hi, col)) in rows.iter().enumerate() {
+            let y = sy + 16.0 + k as f32 * 24.0;
+            ui.text(label, x, y + 13.0, 12, TEXT);
+            ui.slider(Rect::new(x + 150.0, y, w - 150.0 - 60.0, 18.0), &mut vals[k], *lo, *hi, *col);
+            ui.text(&format!("{:.0} %", vals[k] * 100.0), x + w - 40.0, y + 13.0, 12, DIM);
+        }
+        let c = &mut self.world.climate;
+        (c.sun_gain, c.space_gain, c.greenhouse) = (vals[0], vals[1], vals[2]);
+        let neutral = (c.sun_gain - 1.0).abs() < 0.01 && (c.space_gain - 1.0).abs() < 0.01 && (c.greenhouse - 1.0).abs() < 0.01;
+        if ui.button(Rect::new(x, r.y + r.h - 36.0, w, 26.0), "Revenir au neutre", Icon::None, neutral, !neutral, GREEN) {
+            c.reset_settings();
+            self.say("Le soleil et le ciel reprennent leur cycle habituel".to_string());
+        }
     }
 
     /// Left edge of the picture: beside the palette when it is pinned, else the whole window.
@@ -2169,6 +2238,9 @@ impl Game {
         self.draw_launch_bar(ui, sw);
         self.draw_views(ui, sw, sh);
         self.draw_player(ui, sw, sh);
+        if self.climate_menu {
+            self.draw_climate_menu(ui);
+        }
         if self.show_science {
             self.draw_science(ui, sw, sh);
         }
@@ -3392,6 +3464,7 @@ async fn main() {
             }
         }
         game.show_science = args.iter().any(|a| a == "--science");
+        game.climate_menu = args.iter().any(|a| a == "--climate");
         game.player_pin = args.iter().any(|a| a == "--player");
         game.tool = if args.iter().any(|a| a == "--loupe") { Tool::Loupe } else { Tool::Block(BlockKind::Brick) };
         // `--states N` opens the states of the palette's matter N (1 is water).
