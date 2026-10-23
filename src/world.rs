@@ -476,6 +476,9 @@ pub struct World {
     /// Load on each anchored solid cell, as a share of what it can bear (0..255 for 0..2). For the
     /// stress view.
     pub strain: Vec<u8>,
+    /// A fingerprint of the anchored cells when their sections were last checked: they are only
+    /// checked again once something changed.
+    strain_key: u64,
     ticks: u32,
     /// Temperature in °C of every cell (air included).
     pub temp: Vec<f32>,
@@ -585,6 +588,7 @@ impl World {
             slabs: Vec::new(),
             level: vec![u32::MAX; W * H],
             strain: vec![0; W * H],
+            strain_key: 0,
             ticks: 0,
             temp: vec![15.0; W * H],
             clock: DAY_STEPS / 5,

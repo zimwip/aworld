@@ -1952,6 +1952,7 @@ impl Game {
             ViewMode::Pressure => RenderMode::Pressure,
             ViewMode::Humidity => RenderMode::Humidity,
             ViewMode::Electric => RenderMode::Electric,
+            ViewMode::Stress => RenderMode::Stress,
             _ => RenderMode::Normal,
         };
         if !flat {
@@ -3240,7 +3241,7 @@ impl Game {
                 }
                 ui.text("détendu", bar.x, bar.y + 25.0, 11, DIM);
                 ui.text("casse", bar.x + bar.w - 28.0, bar.y + 25.0, 11, DIM);
-                ui.wrapped("Rouge = chargé. Mécanique : anneau = dents, arc = couple, F = force, % = charge moteur.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
+                ui.wrapped("Rouge = chargé. Solides : part de la résistance de la section qui porte le reste (au-delà, elle casse). Mécanique : anneau = dents, arc = couple, F = force, % = charge moteur.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
             }
             ViewMode::Wind => {
                 let w = &self.world;
@@ -3685,6 +3686,32 @@ fn demo_lava(g: &mut Game) {
     }
 }
 
+/// `--demo --topple`: a long stroke of ice painted from the ground up into the sky, leaning far
+/// out, as a player draws it.
+fn demo_topple(g: &mut Game) {
+    g.empty_world();
+    // Fields of earth over the rock, and a pond in a hollow.
+    for x in 0..W as i32 {
+        let top = 330 + ((x as f32 * 0.013).sin() * 8.0) as i32;
+        let bed = if (380..540).contains(&x) { top + (40.0 * (std::f32::consts::PI * (x - 380) as f32 / 160.0).sin()) as i32 } else { top };
+        for y in top..H as i32 {
+            let m = if y > 380 + (x * 7 % 5) { Mat::Stone } else if y < bed { Mat::Water } else if y == top { Mat::Grass } else { Mat::Dirt };
+            g.world.set(x, y, m);
+        }
+    }
+    let ground = |w: &World, x: i32| (0..H as i32).find(|&y| w.at(x, y).is_hard()).unwrap_or(H as i32);
+    let foot = (440, ground(&g.world, 440) - 2);
+    let stroke: [(i32, i32); 5] = [foot, (520, 140), (545, 122), (600, 150), (720, 134)];
+    for seg in stroke.windows(2) {
+        let (a, b) = (seg[0], seg[1]);
+        let n = (b.0 - a.0).abs().max((b.1 - a.1).abs()).max(1);
+        for k in 0..=n {
+            g.world.paint(a.0 + (b.0 - a.0) * k / n, a.1 + (b.1 - a.1) * k / n, 4, Mat::Ice);
+        }
+    }
+    g.set_running(true);
+}
+
 fn demo_bridge(g: &mut Game) {
     g.empty_world();
     for x in 0..W as i32 {
@@ -3887,6 +3914,9 @@ async fn main() {
         if args.iter().any(|a| a == "--crater") {
             demo_crater(&mut game, args.iter().any(|a| a == "--dynamite"));
         }
+        if args.iter().any(|a| a == "--topple") {
+            demo_topple(&mut game);
+        }
         if args.iter().any(|a| a == "--siphon") {
             demo_siphon(&mut game);
         }
@@ -4061,7 +4091,7 @@ async fn main() {
         frame += 1;
         frame_time += get_frame_time();
         if let Some(path) = &shot {
-            if frame == 360 {
+            if frame == arg("--frames").and_then(|v| v.parse().ok()).unwrap_or(360) {
                 eprintln!("average frame time: {:.1} ms", frame_time * 1000.0 / frame as f32);
                 get_screen_data().export_png(path);
                 std::process::exit(0);

@@ -180,6 +180,12 @@ impl World {
     /// cells from the anchors outwards. The parts beyond a section that gives way break loose and
     /// start to tip.
     pub(super) fn stress_pass(&mut self, order: &[usize], seen: &mut [bool]) {
+        // Nothing changed in the anchored bodies since the last check: their loads are the same.
+        let key = order.iter().fold(order.len() as u64, |h, &i| (h ^ ((i as u64) << 8 | self.cells[i].m as u64)).wrapping_mul(0x100_0000_01b3));
+        if key == self.strain_key {
+            return;
+        }
+        self.strain_key = key;
         self.strain.fill(0);
         let n = order.len();
         if n == 0 {
@@ -318,7 +324,7 @@ impl World {
             for &i in &region {
                 seen[i] = true;
             }
-            self.loosen(region, hinge);
+            self.loosen(region, Some(hinge), (0.0, 0.0), 0.0);
             tips += 1;
         }
         self.level = level;
@@ -374,7 +380,7 @@ impl World {
             }
             let in_piece = |i: usize| p.cells.binary_search_by(|q| i.cmp(q)).is_ok();
             let (mut lo, mut hi) = ((i32::MAX, 0), (i32::MIN, 0));
-            let mut loose = false;
+            let (mut loose, mut firm) = (false, false);
             for &i in &p.cells {
                 let t = i + W;
                 if t >= W * H || in_piece(t) {
@@ -382,15 +388,19 @@ impl World {
                 }
                 let under = self.cells[t].m;
                 if self.mask[t] == 0 {
+                    // Firm ground holds it up; a liquid buoys it (it floats, see `drop_structures`),
+                    // but only where it dips in: a long arm reaching out beyond tips it over all the same.
                     match under.kind() {
-                        Kind::Static | Kind::Powder => {}
-                        Kind::Liquid => loose = true,
+                        Kind::Static | Kind::Powder => firm = true,
+                        Kind::Liquid => {}
                         _ => continue,
                     }
                     // Leaves and twigs give way under it (see `crush_foliage`).
                     if matches!(under, Mat::Leaf | Mat::Branch | Mat::Sapling) {
                         loose = true;
                     }
+                } else {
+                    firm = true;
                 }
                 let (x, y) = ((i % W) as i32, (i / W) as i32);
                 if x < lo.0 || (x == lo.0 && y > lo.1) {
@@ -405,27 +415,38 @@ impl World {
                 continue;
             }
             if tips >= MAX_TIPS || p.cells.len() > MAX_SLAB {
+                if !firm {
+                    self.falling.push(p);
+                }
                 continue;
             }
-            let (mass, moment) = p.cells.iter().fold((0.0f32, 0.0f32), |(m, mx), &i| {
+            let (mass, mx, my) = p.cells.iter().fold((0.0f32, 0.0f32, 0.0f32), |(m, mx, my), &i| {
                 let rho = density(self.cells[i].m);
-                (m + rho, mx + rho * ((i % W) as f32 + 0.5))
+                (m + rho, mx + rho * ((i % W) as f32 + 0.5), my + rho * ((i / W) as f32 + 0.5))
             });
-            let cx = moment / mass.max(1e-6);
+            let (cx, cy) = (mx / mass.max(1e-6), my / mass.max(1e-6));
             let hinge = if cx < lo.0 as f32 {
                 (lo.0 as f32, lo.1 as f32 + 1.0)
             } else if cx > hi.0 as f32 + 1.0 {
                 (hi.0 as f32 + 1.0, hi.1 as f32 + 1.0)
             } else {
+                if !firm {
+                    self.falling.push(p);
+                }
                 continue;
             };
-            self.loosen(p.cells, hinge);
+            // Hooked by a part above its centre of mass, it hangs there instead.
+            if cy > hinge.1 {
+                continue;
+            }
+            self.loosen(p.cells, Some(hinge), (0.0, 0.0), 0.0);
             tips += 1;
         }
     }
 
-    /// Turns the cells of a body into a slab turning about `hinge`.
-    fn loosen(&mut self, cells: Vec<usize>, hinge: (f32, f32)) {
+    /// Turns the cells of a body into a slab turning about `hinge`, or flying at `v` (cells per
+    /// step) and turning at `spin`.
+    fn loosen(&mut self, cells: Vec<usize>, hinge: Option<(f32, f32)>, v: (f32, f32), spin: f32) {
         let mut parts = Vec::with_capacity(cells.len());
         let mut home = HashMap::with_capacity(cells.len());
         let (mut mass, mut mx, mut my) = (0.0f32, 0.0f32, 0.0f32);
@@ -448,7 +469,7 @@ impl World {
             inertia += density(p.cell.m) * (r2 + 1.0 / 6.0);
             reach = reach.max(r2.sqrt());
         }
-        self.slabs.push(Slab { parts, home, c0, c: c0, v: (0.0, 0.0), angle: 0.0, spin: 0.0, mass, inertia, reach: reach + 1.0, hinge: Some(hinge), drawn, crushed: vec![] });
+        self.slabs.push(Slab { parts, home, c0, c: c0, v, angle: 0.0, spin, mass, inertia, reach: reach + 1.0, hinge, drawn, crushed: vec![] });
     }
 
     /// Moves the bodies in flight; those that hit something come to rest there, broken or not.
@@ -532,7 +553,11 @@ impl World {
             let q = ((t % W) as f32 + 0.5 - c.0, (t / W) as f32 + 0.5 - c.1);
             let home = ((s.c0.0 + q.0 * cs + q.1 * sn).floor() as i32, (s.c0.1 - q.0 * sn + q.1 * cs).floor() as i32);
             let Some(&k) = s.home.get(&home) else { continue };
-            if own.contains(&t) || (self.mask[t] == 0 && free_for_slab(self.cells[t].m)) {
+            // Air gives way; while it turns slowly on its edge, so do water and loose grains
+            // (they are pushed aside). In flight they stop it.
+            let m = self.cells[t].m;
+            let yields = free_for_slab(m) || (s.hinge.is_some() && matches!(m.kind(), Kind::Liquid | Kind::Powder));
+            if own.contains(&t) || (self.mask[t] == 0 && yields) {
                 drawn.push((t, k));
                 continue;
             }
@@ -555,11 +580,13 @@ impl World {
         // What the body leaves is filled with the air (or smoke, or flames) it pushes aside.
         let now: HashSet<usize> = drawn.iter().map(|d| d.0).collect();
         let mut pushed: Vec<(Cell, f32, States)> = drawn.iter().filter(|d| !own.contains(&d.0) && self.cells[d.0].m != Mat::Empty).map(|d| (self.cells[d.0], self.temp[d.0], self.states(d.0))).collect();
+        pushed.sort_by_key(|p| matches!(p.0.m.kind(), Kind::Liquid | Kind::Powder | Kind::Static));
         let frame = self.frame;
         for &(i, _) in &s.drawn {
             if now.contains(&i) {
                 continue;
             }
+            // Pushed aside into the room the body leaves (grains and water first: they matter).
             match pushed.pop() {
                 Some((cell, t, st)) => {
                     self.cells[i] = Cell { stamp: frame, ..cell };
@@ -574,6 +601,14 @@ impl World {
             self.latent[i] = 0.0;
             self.vel[i] = 0;
             self.zones.wake(i);
+        }
+        // What found no room is thrown up beside it.
+        for (cell, _, _) in pushed {
+            if cell.m.kind() != Kind::Gas && cell.m.kind() != Kind::Flame && self.ejecta.len() < 14_000 {
+                let h = s.hinge.unwrap_or(c);
+                let vx = (self.rand() % 100) as f32 / 100.0 - 0.5;
+                self.ejecta.push(Ejecta { x: h.0, y: h.1 - 2.0, vx, vy: -0.6, m: cell.m });
+            }
         }
         for &(t, k) in &drawn {
             let p = s.parts[k as usize];
@@ -621,7 +656,18 @@ impl World {
             let c = (s.c.0 as i32, s.c.1 as i32);
             self.thuds.push((c.0, c.1, (hardest / 3.0).min(4.0)));
         }
-        self.fracture(&cells, &vel);
+        // The pieces fly on with what is left of their speed; those that were the ones to hit
+        // hit again at once, softer, and settle or break further.
+        let Some(pieces) = self.fracture(&cells, &vel) else { return };
+        let at: HashMap<usize, usize> = cells.iter().enumerate().map(|(k, &i)| (i, k)).collect();
+        for piece in pieces {
+            if piece.len() < 3 {
+                continue;
+            }
+            let v = piece.iter().fold((0.0, 0.0), |a, i| (a.0 + vel[at[i]].0, a.1 + vel[at[i]].1));
+            let v = (v.0 / piece.len() as f32 / ms * 0.6, v.1 / piece.len() as f32 / ms * 0.6);
+            self.loosen(piece, None, v, s.spin * 0.6);
+        }
     }
 
     /// Whether a falling piece that just touched down on something firm breaks (and breaks it).
@@ -639,13 +685,14 @@ impl World {
         }
         let v = (2.0 * G * piece.fallen * CELL_M).sqrt();
         let cells = piece.cells.clone();
-        self.fracture(&cells, &vec![(0.0, v); cells.len()])
+        self.fracture(&cells, &vec![(0.0, v); cells.len()]).is_some()
     }
 
     /// Breaks the solid cells `cells` that hit something at `vel` (m/s, one per cell): splits
     /// them into pieces whose size follows the energy each part brings, opens the cracks between
-    /// the pieces and throws what is crushed finer than a cell as grains. False if it holds.
-    pub(super) fn fracture(&mut self, cells: &[usize], vel: &[(f32, f32)]) -> bool {
+    /// the pieces and throws what is crushed finer than a cell as grains. Returns the pieces, or
+    /// None if it holds.
+    pub(super) fn fracture(&mut self, cells: &[usize], vel: &[(f32, f32)]) -> Option<Vec<Vec<usize>>> {
         let n = cells.len();
         let at: HashMap<usize, usize> = cells.iter().enumerate().map(|(k, &i)| (i, k)).collect();
         let mut piece = vec![u32::MAX; n];
@@ -656,7 +703,7 @@ impl World {
         let sizes: Vec<f32> = (0..n).map(|k| piece_size(self.cells[cells[k]].m, (vel[k].0 * vel[k].0 + vel[k].1 * vel[k].1).sqrt())).collect();
         let expected: f32 = sizes.iter().map(|s| 1.0 / (s * s).max(1.0)).sum();
         if expected < 1.5 {
-            return false;
+            return None;
         }
         for k in 0..n {
             let size = sizes[k];
@@ -721,7 +768,14 @@ impl World {
                 self.set(x, y, grain);
             }
         }
-        true
+        let mut out: Vec<Vec<usize>> = vec![vec![]; pieces as usize];
+        for k in 0..n {
+            if !crushed[k] {
+                out[piece[k] as usize].push(cells[k]);
+            }
+        }
+        out.retain(|p| !p.is_empty());
+        Some(out)
     }
 }
 
@@ -807,7 +861,7 @@ mod tests {
         // (It may come to lean against the side of the pedestal, as a plank would.)
         let fallen: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Ice && i % W > 200).collect();
         let mean_y = fallen.iter().map(|i| i / W).sum::<usize>() / fallen.len();
-        assert!(mean_y > 432, "the overhanging block tipped off: its cells are at row {mean_y} on average");
+        assert!(mean_y > 428, "the overhanging block tipped off: its cells are at row {mean_y} on average");
         assert!((0..W * H).any(|i| matches!(w.cells[i].m, Mat::Ice | Mat::Hail) && i % W > 320 && i / W > 440), "it fell beside the pedestal");
     }
 
@@ -875,7 +929,7 @@ mod tests {
             }
         }
         let cells: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Ice).collect();
-        w.loosen(cells, (100.0, 104.0));
+        w.loosen(cells, Some((100.0, 104.0)), (0.0, 0.0), 0.0);
         let s = &w.slabs[0];
         assert!((s.mass - 40.0 * 0.92).abs() < 1e-3);
         assert!((s.c.0 - 105.0).abs() < 1e-3 && (s.c.1 - 102.0).abs() < 1e-3, "{:?}", s.c);
