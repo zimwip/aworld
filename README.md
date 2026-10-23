@@ -255,6 +255,19 @@ Le vent (`src/world/flow.rs`) est un air faiblement compressible : chaque case g
 
 Une explosion sous l'eau lève maintenant un panache : plus elle est peu profonde, plus l'eau de la surface au-dessus est projetée haut (rien si elle est très profonde, la surface se soulève seulement). `--demo out.png --biome mer --boom [x]` déclenche une explosion sous la surface juste avant la capture.
 
+## Liquides sous pression : vases communicants, siphons
+
+Case par case, un liquide ne fait que tomber et s'étaler, comme des grains qui ne s'entassent pas : il ne peut pas remonter. Ce qui en fait un liquide, c'est qu'il transmet sa pression. `src/world/hydro.rs` applique une seule règle à tous les liquides (eau, huile, lave, métal fondu), paramétrée par leur densité et leur fluidité :
+
+- Tous les 2 pas, les masses connectées de chaque liquide sont retrouvées. Dans une masse, le liquide passe des endroits où sa charge (hauteur + pression du gaz qui appuie dessus) est la plus haute vers ceux où elle est la plus basse, quelques cases à la fois, d'autant plus vite que l'écart est grand (Torricelli : en racine carrée). Une surface ne donne que si elle est calme (fermée d'une rive à l'autre). L'eau remonte dans un tube en U, deux vases reliés par le fond s'égalisent, une chaudière sous pression pousse son eau dans un tuyau.
+- **Embouchures** : le liquide au bas d'un tuyau plein (ou d'un trou étroit, 8 cases au plus) est tenu par la pression derrière lui, comme une paille bouchée du doigt : la colonne ne se casse pas. Si l'embouchure est sous la surface, le liquide s'y écoule (en jet, plusieurs cases d'un coup quand la charge est grande). Un tuyau qui passe par-dessus un rebord fait donc un **siphon** : amorcé (plein), il vide le réservoir jusqu'à son embouchure, puis l'air entre et il s'arrête. Vide, il ne fait rien.
+- **Limite de l'air** : l'air ne peut pousser l'eau qu'à environ 10 m (60 cases, `ATM_PER_CELL`) au-dessus de la surface : un siphon dont le sommet est plus haut se désamorce. Plus le liquide est dense, plus cette hauteur est faible (environ 20 cases pour la lave).
+- Un filet qui tombe dans l'air (de l'air à côté) ne transmet pas la pression : une cascade ne pompe pas le lac dans le bassin sous elle.
+- **Fluidité** : eau 1, huile 0,6, métal fondu 0,3, lave 0,12. La lave s’égalise environ huit fois plus lentement que l’eau, et fige si le tuyau est froid.
+- Coût : seules les masses qui touchent une zone éveillée sont parcourues (environ 0,05 ms par pas en campagne, 0,35 ms sur la mer).
+
+`--demo out.png --siphon --advance 900` montre deux vases d'eau, un siphon et un tube en U d'huile après 900 pas.
+
 ## Garder le jeu fluide : niveaux de simplification
 
 `cargo test --release cost_of_a_tick -- --ignored --nocapture` mesure le coût d'un pas de simulation (campagne : environ 3,4 ms, mer : environ 4,5 ms). La chaleur est le poste le plus lourd : la passe thermique coûte environ 6 ms tous les 3 pas (réactions et relaxation de l'air 2,7 ms, conduction 1,8 ms, transport de la chaleur par le vent jusqu'à 4 ms une passe sur deux), le vent 0,35 ms, la pression moins de 0,1 ms, le reste est l'automate de matière.

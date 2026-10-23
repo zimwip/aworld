@@ -3402,6 +3402,50 @@ fn demo_scene(g: &mut Game, biome: Biome) {
 /// `--demo --bridge`: a gap in a flat floor, crossed by a steel deck held up by a small truss.
 /// `--tunnel`: two sand dunes on bedrock, both dug through. The left one with the eraser (the sand
 /// pours back in), the right one with the tunnel tool (the vault holds), then the world runs.
+/// Liquids under pressure: two vessels of water joined at the bottom, a siphon draining a tank
+/// over a crest into a basin, and a U-tube of oil.
+fn demo_siphon(g: &mut Game) {
+    g.empty_world();
+    let rect = |g: &mut Game, x0: i32, y0: i32, x1: i32, y1: i32, m: Mat| {
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                g.world.set(x, y, m);
+            }
+        }
+    };
+    rect(g, 0, 470, W as i32 - 1, H as i32 - 1, Mat::Stone);
+    // Two vessels, the left one full.
+    rect(g, 60, 300, 260, 469, Mat::Stone);
+    rect(g, 70, 300, 120, 460, Mat::Empty);
+    rect(g, 200, 300, 250, 460, Mat::Empty);
+    rect(g, 121, 452, 199, 460, Mat::Empty);
+    rect(g, 70, 340, 120, 460, Mat::Water);
+    // A siphon: an open tank on a pedestal, a full pipe over its rim down into a basin below.
+    rect(g, 330, 250, 480, 360, Mat::Stone);
+    rect(g, 340, 250, 440, 350, Mat::Empty);
+    rect(g, 340, 275, 440, 350, Mat::Water);
+    rect(g, 330, 361, 345, 469, Mat::Stone);
+    rect(g, 425, 238, 425, 300, Mat::Stone);
+    rect(g, 430, 244, 430, 300, Mat::Stone);
+    rect(g, 425, 239, 530, 239, Mat::Stone);
+    rect(g, 431, 244, 525, 244, Mat::Stone);
+    rect(g, 525, 244, 525, 440, Mat::Stone);
+    rect(g, 530, 239, 530, 440, Mat::Stone);
+    rect(g, 482, 245, 486, 469, Mat::Stone);
+    rect(g, 426, 240, 429, 300, Mat::Water);
+    rect(g, 426, 240, 529, 243, Mat::Water);
+    rect(g, 526, 244, 529, 440, Mat::Water);
+    rect(g, 490, 410, 490, 469, Mat::Stone);
+    rect(g, 600, 410, 600, 469, Mat::Stone);
+    // A U-tube of oil, filled on the left.
+    rect(g, 680, 300, 880, 469, Mat::Stone);
+    rect(g, 690, 300, 730, 460, Mat::Empty);
+    rect(g, 830, 300, 870, 460, Mat::Empty);
+    rect(g, 731, 452, 829, 460, Mat::Empty);
+    rect(g, 690, 360, 730, 460, Mat::Oil);
+    g.set_running(true);
+}
+
 fn demo_tunnel(g: &mut Game) {
     g.empty_world();
     let floor = 420;
@@ -3615,6 +3659,13 @@ async fn main() {
         }
         if args.iter().any(|a| a == "--tunnel") {
             demo_tunnel(&mut game);
+        }
+        if args.iter().any(|a| a == "--siphon") {
+            demo_siphon(&mut game);
+        }
+        // `--advance n`: the world runs n steps before the first frame.
+        for _ in 0..arg("--advance").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) {
+            game.world.step();
         }
     }
     // `--mouse x,y` pins the pointer for screenshots.
