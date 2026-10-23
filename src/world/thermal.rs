@@ -954,18 +954,25 @@ impl World {
         let (fw, fh) = (super::flow::FW, super::flow::FH);
         for bj in 0..fh {
             for bi in 0..fw {
-                // One wind per block of the flow grid: it is as fine as the wind itself, and the
-                // upwind offset is the same for the whole block.
                 let (vx, vy) = self.flow.at_cell(bi, bj);
                 let speed = vx.abs() + vy.abs();
                 if speed < 0.05 {
                     continue;
                 }
+                let gust = speed.min(1.5) * 0.02;
+                // The wind at the four corners of the block. Where it is about the same, one upwind
+                // offset serves the whole block; where it changes across the block or blows hard
+                // (an updraft over lava, a fire), each cell reads its own wind and the air it
+                // swept on its way (see `carry_fine`).
+                let (x0, y0) = ((bi * cell) as i32, (bj * cell) as i32);
+                let corner = |dx: i32, dy: i32| self.flow.sample(x0 + dx, y0 + dy);
+                let c = [corner(0, 0), corner(cell as i32, 0), corner(0, cell as i32), corner(cell as i32, cell as i32)];
+                let spread = c.iter().map(|w| (w.0 - c[0].0).abs() + (w.1 - c[0].1).abs()).fold(0.0f32, f32::max);
+                let fine = spread * reach > 2.0 || (vx.abs().max(vy.abs()) * reach) > 10.0;
                 let (ox, oy) = (-vx * reach, -vy * reach);
                 let (ix, iy) = (ox.floor(), oy.floor());
                 let (tx, ty) = (ox - ix, oy - iy);
                 let (ix, iy) = (ix as i32, iy as i32);
-                let gust = speed.min(1.5) * 0.02;
                 for y in (bj * cell..((bj + 1) * cell).min(H)).step_by(stride) {
                     let sy0 = (y as i32 + iy).clamp(0, H as i32 - 2) as usize;
                     for x in (bi * cell..(bi + 1) * cell).step_by(stride) {
@@ -973,12 +980,21 @@ impl World {
                         if self.cells[i].m != Mat::Empty {
                             continue;
                         }
-                        let sx0 = (x as i32 + ix).rem_euclid(W as i32 - 1) as usize;
-                        // Free air is read as it is; anything else counts as the cell's own temperature.
-                        let air = |j: usize| if self.cells[j].m == Mat::Empty { old[j] } else { old[i] };
-                        let top = air(sy0 * W + sx0) * (1.0 - tx) + air(sy0 * W + sx0 + 1) * tx;
-                        let bot = air((sy0 + 1) * W + sx0) * (1.0 - tx) + air((sy0 + 1) * W + sx0 + 1) * tx;
-                        let upwind = top * (1.0 - ty) + bot * ty;
+                        let upwind = if fine {
+                            let (u, v) = ((x as i32 - x0) as f32 / cell as f32, (y as i32 - y0) as f32 / cell as f32);
+                            let lerp = |k: usize| -> f32 {
+                                let g = |w: (f32, f32)| if k == 0 { w.0 } else { w.1 };
+                                (g(c[0]) * (1.0 - u) + g(c[1]) * u) * (1.0 - v) + (g(c[2]) * (1.0 - u) + g(c[3]) * u) * v
+                            };
+                            Self::carry_fine(&self.cells, &old, i, x, y, -lerp(0) * reach, -lerp(1) * reach)
+                        } else {
+                            let sx0 = (x as i32 + ix).rem_euclid(W as i32 - 1) as usize;
+                            // Free air is read as it is; anything else counts as the cell's own temperature.
+                            let air = |j: usize| if self.cells[j].m == Mat::Empty { old[j] } else { old[i] };
+                            let top = air(sy0 * W + sx0) * (1.0 - tx) + air(sy0 * W + sx0 + 1) * tx;
+                            let bot = air((sy0 + 1) * W + sx0) * (1.0 - tx) + air((sy0 + 1) * W + sx0 + 1) * tx;
+                            top * (1.0 - ty) + bot * ty
+                        };
                         self.temp[i] = old[i] + (upwind - old[i]) * 0.7;
                         if stride == 2 {
                             // Simplified: the other three cells of the 2 x 2 block follow.
@@ -1006,6 +1022,49 @@ impl World {
                 }
             }
         }
+    }
+
+    /// The air that reaches cell `i` (at `x`, `y`) from `(ox, oy)` upwind, averaged along the way.
+    /// Reading only the far point made what a hot surface gave off rise in jumps, drawn as stacked
+    /// bands; the air that swept past on the way counts too, and the bands blur into a plume. The
+    /// way stops at the first thing that is not free air: the air came from just this side of it.
+    fn carry_fine(cells: &[Cell], old: &[f32], i: usize, x: usize, y: usize, ox: f32, oy: f32) -> f32 {
+        // The far end, bilinear, so slow air still moves by less than a cell.
+        let (px, py) = (x as f32 + ox, y as f32 + oy);
+        let (fx, fy) = (px.floor(), py.floor());
+        let (tx, ty) = (px - fx, py - fy);
+        let sx0 = (fx as i32).rem_euclid(W as i32 - 1) as usize;
+        let sy0 = (fy as i32).clamp(0, H as i32 - 2) as usize;
+        let corners = [sy0 * W + sx0, sy0 * W + sx0 + 1, (sy0 + 1) * W + sx0, (sy0 + 1) * W + sx0 + 1];
+        let open = corners.iter().all(|&j| cells[j].m == Mat::Empty);
+        let far = if open {
+            let top = old[corners[0]] * (1.0 - tx) + old[corners[1]] * tx;
+            let bot = old[corners[2]] * (1.0 - tx) + old[corners[3]] * tx;
+            top * (1.0 - ty) + bot * ty
+        } else {
+            old[i]
+        };
+        // Most of the sky: the air upwind is as warm as here, nothing to blend.
+        if open && (far - old[i]).abs() < 1.5 {
+            return far;
+        }
+        // Every cell of the way (fewer, and the rows that happen to land on the hot layer show).
+        let n = (ox.abs().max(oy.abs()).ceil() as usize).clamp(1, 32);
+        let (mut sum, mut count) = (0.0, 0.0);
+        for k in 1..n {
+            let f = k as f32 / n as f32;
+            let j = ((y as f32 + oy * f).round() as i32).clamp(0, H as i32 - 1) as usize * W + ((x as f32 + ox * f).round() as i32).rem_euclid(W as i32) as usize;
+            if cells[j].m != Mat::Empty {
+                return if count > 0.0 { sum / count } else { old[i] };
+            }
+            sum += old[j];
+            count += 1.0;
+        }
+        if open {
+            sum += far;
+            count += 1.0;
+        }
+        if count > 0.0 { sum / count } else { old[i] }
     }
 
     /// A matter changes state only once it has taken in (or given up) its latent heat: ice and
@@ -1351,6 +1410,35 @@ mod carry_tests {
         }
         assert!(passed > 20.0, "the warm patch travelled downwind past x0+30: {passed}");
         assert!(mean(&w, x0 - 30) < 11.0, "nothing upwind: {}", mean(&w, x0 - 30));
+    }
+}
+
+#[cfg(test)]
+mod plume_tests {
+    use super::*;
+
+    /// A strong updraft over a hot floor: the warm air rises as one smooth plume, not as stacked
+    /// bands (each carry used to lift the heat given off since the last one in a single jump).
+    #[test]
+    fn a_plume_over_a_hot_floor_rises_without_bands() {
+        let mut w = World::new_static();
+        w.climate_fixed = Some(10.0);
+        w.reset_temps();
+        w.flow.pin_uniform(0.0, -4.5);
+        let floor = 400;
+        for x in 0..W {
+            w.set(x as i32, floor as i32, Mat::Lava);
+        }
+        for _ in 0..80 {
+            for x in 0..W {
+                w.temp[floor * W + x] = 1000.0;
+            }
+            w.thermal_pass();
+        }
+        // Up the column: the temperature should only fall, give or take a little.
+        let col: Vec<f32> = (300..floor).rev().map(|y| (0..W).map(|x| w.temp[y * W + x]).sum::<f32>() / W as f32).collect();
+        let bumps = col.windows(2).filter(|p| p[1] > p[0] + 3.0).count();
+        assert_eq!(bumps, 0, "the plume rises in bands: {:?}", col.iter().map(|t| t.round()).collect::<Vec<_>>());
     }
 }
 

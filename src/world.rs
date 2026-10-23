@@ -2410,7 +2410,7 @@ impl World {
             2 => 2,
             _ => 1,
         };
-        let slow = if coal { slow * 8 } else { slow };
+        let slow = if coal { slow * 12 } else { slow };
         if slow == 1 || self.chance(slow) {
             self.cells[i].life -= 1;
         }
