@@ -64,6 +64,7 @@ pub fn conductivity(m: Mat) -> f32 {
         Mat::Iron | Mat::Steel | Mat::Molten | Mat::MoltenSteel => 1.0,
         Mat::Water | Mat::Mud => 0.6,
         Mat::Trunk | Mat::Branch | Mat::Leaf | Mat::Wood => 0.4,
+        Mat::Charcoal | Mat::Ember => 0.5,
         Mat::Dirt | Mat::Grass | Mat::Clay => 0.2,
         _ => 0.0,
     }
@@ -200,7 +201,7 @@ impl World {
             }
             let target = self.lightning_target(x0, base, 90);
             self.discharge_around(qx, qy, 5);
-            self.lightning_bolt((x0 as f32, base as f32), target, best.min(3.0) / 3.0, true);
+            self.lightning_bolt((x0 as f32, base as f32), None, target, best.min(3.0) / 3.0, true);
         } else {
             // Inside the cloud: to the strongest charge of the other sign near it.
             let (mut other, mut ok) = (at, 0.0f32);
@@ -222,7 +223,7 @@ impl World {
             self.discharge_around(qx, qy, 4);
             self.discharge_around(other % QW, other / QW, 4);
             let (a, b) = if oy < y0 as f32 { ((ox, oy), (x0 as f32, y0 as f32)) } else { ((x0 as f32, y0 as f32), (ox, oy)) };
-            self.lightning_bolt(a, (b.0 as i32, b.1 as i32), best.min(3.0) / 3.0 * 0.6, false);
+            self.lightning_bolt(a, None, (b.0 as i32, b.1 as i32), best.min(3.0) / 3.0 * 0.6, false);
         }
     }
 
@@ -270,33 +271,68 @@ impl World {
     }
 
     /// Lightning from the sky where the player clicked: from the cloud above (or the top of the
-    /// sky) down to the first thing in the column under the pointer. A bolt comes from the sky,
-    /// so a click deep in the ground strikes the surface above it, not a point inside the rock.
+    /// sky) down to the pointer. It cannot go through the ground: under the surface it strikes the
+    /// surface above. Released in the open air, it does not stop there: it jumps on, like a bolt,
+    /// to the nearest place where it can reach the ground.
     pub fn strike(&mut self, x: i32, y: i32) {
         let x = x.clamp(0, W as i32 - 1);
-        let _ = y;
-        let hit = self.first_hit(x, 0).unwrap_or(H as i32 - 1);
+        let y = y.clamp(0, H as i32 - 1);
+        let surface = self.first_hit(x, 0).unwrap_or(H as i32 - 1);
+        let aim = y.min(surface);
         // From the base of the cloud above (the first cloud from the top, down through it), or
-        // else from the top of the picture. A wisp of cloud just above the ground does not count.
-        let mut top = (0..hit).find(|&yy| self.raw(x, yy) == Mat::Cloud).unwrap_or(0);
-        while top + 1 < hit && self.raw(x, top + 1) == Mat::Cloud {
+        // else from the top of the picture. A wisp of cloud just above the pointer does not count.
+        let mut top = (0..aim).find(|&yy| self.raw(x, yy) == Mat::Cloud).unwrap_or(0);
+        while top + 1 < aim && self.raw(x, top + 1) == Mat::Cloud {
             top += 1;
         }
-        if hit - top < 60 {
+        if aim - top < 60 {
             top = 0;
         }
         let start = ((x as f32 + self.storm_rng.f() * 30.0).clamp(0.0, W as f32 - 1.0), top as f32);
-        self.lightning_bolt(start, (x, hit), 1.0, true);
+        if y < surface {
+            let target = self.nearest_ground(x, y, 60);
+            self.lightning_bolt(start, Some((x as f32, y as f32)), target, 1.0, true);
+        } else {
+            self.lightning_bolt(start, None, (x, surface), 1.0, true);
+        }
     }
 
-    /// Builds a bolt from `a` down to `b`, heats its channel and, if it reached the ground,
-    /// strikes what is there.
-    fn lightning_bolt(&mut self, a: (f32, f32), b: (i32, i32), power: f32, ground: bool) {
+    /// Where a bolt left hanging in the air at (x, y) goes on to: the nearest thing under it
+    /// within `reach` columns, conductors first.
+    fn nearest_ground(&mut self, x0: i32, y0: i32, reach: i32) -> (i32, i32) {
+        let mut best = (x0, self.first_hit(x0, y0).unwrap_or(H as i32 - 1));
+        let mut score = f32::MIN;
+        for x in ((x0 - reach).max(0)..=(x0 + reach).min(W as i32 - 1)).step_by(2) {
+            if let Some(y) = self.first_hit(x, y0) {
+                let d = (((x - x0) * (x - x0) + (y - y0) * (y - y0)) as f32).sqrt();
+                let s = -d - 0.5 * (x - x0).abs() as f32 + 30.0 * conductivity(self.raw(x, y)) + self.storm_rng.f() * 2.0;
+                if s > score {
+                    score = s;
+                    best = (x, y);
+                }
+            }
+        }
+        best
+    }
+
+    /// Builds a bolt from `a` down to `b` (by way of `via`), heats its whole channel and, if it
+    /// reached the ground, strikes what is there and sends the current into the ground.
+    fn lightning_bolt(&mut self, a: (f32, f32), via: Option<(f32, f32)>, b: (i32, i32), power: f32, ground: bool) {
         let mut rng = self.storm_rng.clone();
         let end = (b.0 as f32, b.1 as f32);
         let len = ((end.0 - a.0).powi(2) + (end.1 - a.1).powi(2)).sqrt();
         let depth = (len.max(8.0).log2() as u32).clamp(3, 8);
-        let path = jagged(a, end, depth, 0.32, &mut rng);
+        let mut path = match via {
+            Some(v) => {
+                let first = ((v.0 - a.0).powi(2) + (v.1 - a.1).powi(2)).sqrt();
+                let second = ((end.0 - v.0).powi(2) + (end.1 - v.1).powi(2)).sqrt();
+                let mut p = jagged(a, v, (first.max(8.0).log2() as u32).clamp(3, 8), 0.32, &mut rng);
+                p.extend(jagged(v, end, (second.max(8.0).log2() as u32).clamp(2, 7), 0.4, &mut rng).into_iter().skip(1));
+                p
+            }
+            None => jagged(a, end, depth, 0.32, &mut rng),
+        };
+        path.dedup();
         // Branches: forks from the upper part of the channel that die out in the air.
         let mut branches = vec![];
         let forks = 2 + rng.next() % 5;
@@ -311,22 +347,34 @@ impl World {
             branches.push(jagged(p, q, depth.saturating_sub(2).max(2), 0.4, &mut rng));
         }
         self.storm_rng = rng;
-        // The channel: the air in it is heated in an instant (the heat haze and the glow follow).
+        // The whole channel is heated in an instant: the air in it to thousands of degrees (the
+        // heat haze and the glow follow), and whatever it goes through is scorched and set alight.
         for w in path.windows(2) {
             let (p, q) = (w[0], w[1]);
             let n = ((q.0 - p.0).abs().max((q.1 - p.1).abs()).ceil() as i32).max(1);
             for s in 0..=n {
                 let f = s as f32 / n as f32;
                 let (x, y) = ((p.0 + (q.0 - p.0) * f) as i32, (p.1 + (q.1 - p.1) * f) as i32);
-                if Self::inb(x, y) && self.raw(x, y) == Mat::Empty {
-                    let i = Self::idx(x, y);
-                    self.temp[i] = self.temp[i].max(CHANNEL_C * power.max(0.4));
-                    self.zones.wake(i);
+                if !Self::inb(x, y) {
+                    continue;
                 }
+                let i = Self::idx(x, y);
+                match self.raw(x, y).kind() {
+                    Kind::Empty => self.temp[i] = self.temp[i].max(CHANNEL_C * power.max(0.4)),
+                    Kind::Gas | Kind::Flame => {}
+                    _ if ground => {
+                        self.temp[i] += 500.0 * power.max(0.5);
+                        self.lightning_burn(x, y, true);
+                    }
+                    _ => {}
+                }
+                self.zones.wake(i);
             }
         }
         if ground {
             self.lightning_hit(b.0, b.1, power);
+            let current = self.ground_current(b.0, b.1, power);
+            branches.extend(current);
         }
         self.revision += 1;
         self.bolts.push(Bolt { path, branches, ground, power });
@@ -351,46 +399,7 @@ impl World {
                 let m = self.cells[i].m;
                 self.temp[i] += 900.0 * near * power.max(0.5) * if m == Mat::Empty { 1.0 } else { 0.6 };
                 self.zones.wake(i);
-                if m.is_wooden() || matches!(m, Mat::Grass | Mat::DeadLeaf | Mat::Sapling) {
-                    if self.storm_rng.next() % 3 != 0 {
-                        self.set(cx, cy, if m == Mat::Grass || m == Mat::DeadLeaf { Mat::Fire } else { Mat::Ember });
-                    }
-                } else if m == Mat::Gunpowder {
-                    self.temp[i] = self.temp[i].max(1000.0);
-                }
-            }
-        }
-        // Sand fuses into a tube of glass along the path of the current into the ground.
-        if matches!(m0, Mat::Sand) {
-            let deep = 4 + (power * 10.0) as i32;
-            let mut xx = x;
-            for k in 0..deep {
-                if !Self::inb(xx, y + k) || self.raw(xx, y + k) != Mat::Sand {
-                    break;
-                }
-                self.set(xx, y + k, Mat::Glass);
-                if self.storm_rng.next() % 3 == 0 {
-                    xx += if self.storm_rng.next() % 2 == 0 { 1 } else { -1 };
-                }
-            }
-        }
-        // Metal carries the current: everything of it that touches is heated.
-        if matches!(m0, Mat::Iron | Mat::Steel) {
-            let mut seen = std::collections::HashSet::new();
-            let mut stack = vec![(x, y)];
-            seen.insert((x, y));
-            while let Some((cx, cy)) = stack.pop() {
-                let i = Self::idx(cx, cy);
-                self.temp[i] += 250.0 * power.max(0.5);
-                self.zones.wake(i);
-                if seen.len() > 1500 {
-                    continue;
-                }
-                for (nx, ny) in Self::neighbors(cx, cy) {
-                    if Self::inb(nx, ny) && matches!(self.raw(nx, ny), Mat::Iron | Mat::Steel) && seen.insert((nx, ny)) {
-                        stack.push((nx, ny));
-                    }
-                }
+                self.lightning_burn(cx, cy, d2 <= 2);
             }
         }
         // Water: a puff of steam where it was struck.
@@ -402,6 +411,125 @@ impl World {
                 }
             }
         }
+    }
+}
+
+impl World {
+    /// What the heat of lightning does to the cell (x, y): wood, grass and leaves catch fire,
+    /// charcoal starts to glow, oil flares up, powder and dynamite are brought to the point of
+    /// going off. `sure`: right in the channel, it always catches; a little off it, mostly.
+    fn lightning_burn(&mut self, x: i32, y: i32, sure: bool) {
+        let m = self.raw(x, y);
+        let catches = sure || self.storm_rng.next() % 3 != 0;
+        let i = Self::idx(x, y);
+        if m.is_wooden() || matches!(m, Mat::Grass | Mat::DeadLeaf | Mat::Sapling) {
+            if catches {
+                self.set(x, y, if m == Mat::Grass || m == Mat::DeadLeaf { Mat::Fire } else { Mat::Ember });
+            }
+        } else if m == Mat::Charcoal {
+            if catches {
+                self.set(x, y, Mat::Ember);
+                self.fuel[i] = Fuel { left: 30 + (self.storm_rng.next() % 26) as u8, carbon: true };
+            }
+        } else if m == Mat::Oil {
+            self.ignite_oil(x, y);
+        } else if matches!(m, Mat::Gunpowder | Mat::Dynamite) {
+            self.temp[i] = self.temp[i].max(1000.0);
+        }
+    }
+
+    /// The current of a bolt that struck (x, y) goes into the ground. Struck on something that
+    /// does not conduct (stone, glass, brick), it first jumps across to the nearest thing that does.
+    /// Then it runs down, always into the neighbour that conducts best, heating what it goes
+    /// through (the worse the conductor, the hotter): sand fuses into a tube of glass (a
+    /// fulgurite), wood and charcoal catch fire. Metal it touches carries it all along, heating
+    /// up. Returns the lines it drew, for the picture: the jump, then the path in the ground.
+    fn ground_current(&mut self, x: i32, y: i32, power: f32) -> Vec<Vec<(f32, f32)>> {
+        let mut lines = vec![];
+        if !Self::inb(x, y) {
+            return lines;
+        }
+        let (mut cx, mut cy) = (x, y);
+        if conductivity(self.raw(x, y)) == 0.0 {
+            let mut best: Option<(i32, i32)> = None;
+            let mut bd = i32::MAX;
+            for dy in -20i32..=20 {
+                for dx in -20i32..=20 {
+                    let (nx, ny) = (x + dx, y + dy);
+                    let d = dx * dx + dy * dy;
+                    if d < bd && d <= 400 && Self::inb(nx, ny) && conductivity(self.raw(nx, ny)) > 0.0 {
+                        bd = d;
+                        best = Some((nx, ny));
+                    }
+                }
+            }
+            if let Some((nx, ny)) = best {
+                let mut rng = self.storm_rng.clone();
+                lines.push(jagged((x as f32, y as f32), (nx as f32, ny as f32), 3, 0.4, &mut rng));
+                self.storm_rng = rng;
+                (cx, cy) = (nx, ny);
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        seen.insert((cx, cy));
+        let mut trail = vec![(cx as f32, cy as f32)];
+        let mut metal = vec![];
+        let deep = 12 + (power * 28.0) as i32;
+        for _ in 0..deep {
+            let here = self.raw(cx, cy);
+            let k = conductivity(here);
+            let i = Self::idx(cx, cy);
+            self.temp[i] += 350.0 * power.max(0.5) * (1.2 - k);
+            self.zones.wake(i);
+            match here {
+                Mat::Sand => self.set(cx, cy, Mat::Glass),
+                Mat::Iron | Mat::Steel => metal.push((cx, cy)),
+                _ => self.lightning_burn(cx, cy, true),
+            }
+            // Down first, then to the sides: every solid or liquid conducts a little at the
+            // voltage of lightning, conductors much better.
+            let mut next = None;
+            let mut ns = f32::MIN;
+            for (dx, dy, bias) in [(0, 1, 0.6), (-1, 1, 0.45), (1, 1, 0.45), (-1, 0, 0.0), (1, 0, 0.0)] {
+                let (nx, ny) = (cx + dx, cy + dy);
+                if !Self::inb(nx, ny) || seen.contains(&(nx, ny)) {
+                    continue;
+                }
+                let m = self.raw(nx, ny);
+                if matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) {
+                    continue;
+                }
+                let s = conductivity(m) + bias + 0.15 * (self.storm_rng.f() * 0.5 + 0.5);
+                if s > ns {
+                    ns = s;
+                    next = Some((nx, ny));
+                }
+            }
+            let Some(n) = next else { break };
+            seen.insert(n);
+            (cx, cy) = n;
+            trail.push((cx as f32, cy as f32));
+        }
+        if trail.len() > 1 {
+            lines.push(trail);
+        }
+        // Metal carries the current: everything of it that touches is heated.
+        let mut stack = metal;
+        let mut done: std::collections::HashSet<(i32, i32)> = stack.iter().copied().collect();
+        while let Some((mx, my)) = stack.pop() {
+            let i = Self::idx(mx, my);
+            self.temp[i] += 250.0 * power.max(0.5);
+            self.zones.wake(i);
+            if done.len() > 1500 {
+                continue;
+            }
+            for (nx, ny) in Self::neighbors(mx, my) {
+                if Self::inb(nx, ny) && matches!(self.raw(nx, ny), Mat::Iron | Mat::Steel) && done.insert((nx, ny)) {
+                    stack.push((nx, ny));
+                }
+            }
+        }
+        lines
     }
 }
 
@@ -518,13 +646,63 @@ mod tests {
     }
 
     #[test]
-    fn a_click_deep_in_the_ground_strikes_the_surface_above_it() {
+    fn lightning_lights_charcoal_and_its_current_goes_into_the_ground() {
         let mut w = World::new_static();
         ground(&mut w, 420);
-        w.strike(300, 500);
+        for x in 300..340 {
+            for y in 400..420 {
+                w.set(x, y, Mat::Charcoal);
+            }
+        }
+        w.strike(320, 410);
+        assert!((395..425).any(|y| (315..326).any(|x| w.raw(x, y) == Mat::Ember)), "the charcoal glows");
+        // The current went on down into the ground and drew its path there.
+        let b = &w.bolts[0];
+        let deepest = b.branches.iter().flatten().map(|p| p.1).fold(0.0f32, f32::max);
+        assert!(deepest > 425.0, "the current runs down into the ground: {deepest}");
+    }
+
+    #[test]
+    fn clicked_under_ground_it_strikes_the_surface_above() {
+        let mut w = World::new_static();
+        ground(&mut w, 400);
+        for x in 480..500 {
+            w.set(x, 400, Mat::Dirt);
+        }
+        w.strike(490, 470);
         let end = w.bolts[0].path.last().unwrap();
-        assert_eq!((end.0 as i32, end.1 as i32), (300, 420), "lightning comes from the sky: it stops at the ground");
-        assert!((440..H as i32).all(|y| w.raw(300, y) == Mat::Stone), "and leaves the rock below whole");
+        assert_eq!((end.0 as i32, end.1 as i32), (490, 400), "lightning does not go through rock");
+    }
+
+    #[test]
+    fn released_in_the_air_it_jumps_on_to_the_nearest_conductor() {
+        let mut w = World::new_static();
+        ground(&mut w, 420);
+        // An iron post a little to the side of the pointer.
+        for y in 380..420 {
+            w.set(530, y, Mat::Iron);
+        }
+        w.strike(500, 340);
+        let b = &w.bolts[0];
+        assert!(b.path.iter().any(|p| (p.0 - 500.0).abs() < 1.0 && (p.1 - 340.0).abs() < 1.0), "it goes through the pointer");
+        let end = b.path.last().unwrap();
+        assert_eq!((end.0 as i32, end.1 as i32), (530, 380), "then on to the top of the iron post");
+        assert!(w.temp_c(530, 418) > 100.0, "and the current runs down the post: {}", w.temp_c(530, 418));
+    }
+
+    #[test]
+    fn struck_on_bare_rock_the_current_jumps_to_wet_ground_nearby() {
+        let mut w = World::new_static();
+        ground(&mut w, 420);
+        for x in 610..640 {
+            for y in 420..440 {
+                w.set(x, y, Mat::Mud);
+            }
+        }
+        w.strike(600, 425);
+        let b = &w.bolts[0];
+        let reached = b.branches.iter().flatten().any(|p| p.0 >= 609.0);
+        assert!(reached, "the current looks for the mud");
     }
 
     #[test]
