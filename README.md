@@ -355,3 +355,15 @@ Le nouvel outil **Capteur** (barre d'outils à gauche, icône thermomètre) pose
 - **Air chaud** : au-dessus d'un feu ou de la lave, l'air chaud fait onduler ce qu'on voit à travers (comme au-dessus d'une route en été).
 - **Aube et crépuscule** : quand le soleil est bas, le ciel passe à l'orange près de l'horizon, au rose au-dessus et au violet en haut, avec un halo doré du côté où il se lève ou se couche. Le ciel ne s'éteint pas d'un coup : la lueur reste un moment après le coucher. Les nuages sont éclairés par en dessous et sur la face tournée vers le soleil, en or près de lui et en rose plus loin, leur sommet dans une ombre lavande.
 - Une petite carte de lumière (une case pour 6×6 cellules) suffit : tout reste fluide.
+
+## Explosions et cratères
+
+`src/world/blast.rs` fait le bilan d'énergie d'une explosion, avec la même règle pour tous les matériaux.
+
+- **Toute la charge part ensemble** : les grains de poudre qui se touchent brûlent dans le même instant, l'explosion a l'énergie de toute la charge (3 MJ/kg de poudre noire, dont 1 % travaille sur le sol ; le reste chauffe le gaz, fait de la lumière et du bruit). Une longue traînée fine part par morceaux, comme une mèche.
+- **Arracher une case coûte** `V · (σ + ½ ρ (v² + 2 g h))` : `σ` la résistance du matériau (MPa, la cohésion pour un sol), `ρ` sa densité, `v` la vitesse à laquelle il faut le lancer pour sortir du trou et `h` la hauteur dont il faut le lever. Le sable ne coûte que son poids et son lancer, la terre un peu plus, la roche bien plus, l'acier tient presque. Un nouveau matériau n'a besoin que de sa densité et de sa résistance.
+- **La ligne de moindre résistance** : l'énergie part en rayons depuis le centre, et un rayon qui atteint l'air libre à travers peu de sol en reçoit davantage. Ceux qui percent projettent ce qu'ils ont arraché avec l'énergie qui leur reste ; ceux qui s'épuisent sous terre écrasent seulement le sol (une cavité cachée, le « camouflet »).
+- **Les éjecta volent** (balistique, gravité), retombent et roulent comme du sable : ils font le bourrelet autour du cratère. La terre qui tombe dans l'eau devient de la boue.
+- Le gaz de la charge (environ 280 L par kg) monte la densité de l'air autour : l'onde de pression du vent compressible pousse ensuite les blocs, le sable et l'eau. Le rayon du feu, du souffle et de la secousse grandit avec la racine de la quantité de poudre.
+
+`--demo out.png --crater n` enterre une grosse charge de poudre sous une prairie et l'allume `n` images avant la capture.
