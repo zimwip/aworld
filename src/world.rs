@@ -8,7 +8,8 @@ mod pressure;
 pub mod sleep;
 pub use pockets::boil_c;
 mod thermal;
-pub use thermal::{Season, DAY_STEPS};
+pub use thermal::{air_pressure_atm, Season, DAY_STEPS};
+use thermal::adiabatic_cooling_c;
 
 /// How the brush treats what is already there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -64,9 +65,11 @@ pub const K: i32 = 3;
 pub const TUNNEL_LINING: i32 = 3;
 /// Above this row the air is cold: steam condenses into clouds.
 const COLD_Y: i32 = (H as i32) * 3 / 10;
-/// The top of the weather (the tropopause): above this row the air gets warmer again with height
-/// (an inversion), so rising steam and clouds stop under it and spread out sideways, the way a
-/// storm cloud flattens into an anvil. They never climb into the space above it.
+/// The top of the weather (the tropopause, about 13 km up on the logarithmic altitude scale of
+/// `thermal::altitude_m`): above this row the air gets warmer again with height (an inversion).
+/// Rising steam and clouds cool as they climb, so past it they are soon colder and denser than
+/// the air around them: they stop under it and spread out sideways, the way a storm cloud
+/// flattens into an anvil.
 pub const CEILING_Y: i32 = (H as i32) / 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -758,6 +761,11 @@ impl World {
         self.temp.swap(ia, ib);
         self.latent.swap(ia, ib);
         self.vel.swap(ia, ib);
+        if a.1 != b.1 {
+            // Vapour and clouds cool as they rise into thinner air, and warm as they sink.
+            self.temp[ib] -= adiabatic_cooling_c(self.cells[ib].m, a.1, b.1);
+            self.temp[ia] -= adiabatic_cooling_c(self.cells[ia].m, b.1, a.1);
+        }
         self.cells[ia].stamp = self.frame;
         self.cells[ib].stamp = self.frame;
     }
@@ -1937,8 +1945,10 @@ impl World {
                 return true;
             }
         }
-        // Gas that got above the top of the weather (painted there, blown up) sinks back under it.
-        if !self.gas_may_rise_to(x, y, y) && self.chance(3) {
+        // Above the top of the weather, vapour or cloud that cannot rise any more (painted there,
+        // or an updraft that overshot) settles back down: its ice crystals slowly fall out of the
+        // thin air, and it ends up spread under the tropopause.
+        if y < CEILING_Y && !self.gas_may_rise_to(x, y, y - 1) && self.chance(3) {
             let d = self.dir();
             for dx in [0, d, -d] {
                 let t = (self.edge_x(x, y, x + dx), y + 1);
@@ -1996,10 +2006,17 @@ impl World {
         false
     }
 
-    /// Whether the gas at (x, y) may rise into row `to`: steam and clouds not past the top of
-    /// the weather. (Smoke is left free: it thins out in the open air by itself.)
+    /// Whether the gas at (x, y) may rise into row `to`. Under the top of the weather steam and
+    /// clouds rise freely; above it, in the warm thin air of the stratosphere, only if, once
+    /// cooled by the climb, they would still be warmer (lighter) than the air there, which they
+    /// soon are not. (Smoke is left free: it thins out in the open air by itself.)
     pub(super) fn gas_may_rise_to(&self, x: i32, y: i32, to: i32) -> bool {
-        to >= CEILING_Y || !matches!(self.raw(x, y), Mat::Steam | Mat::Cloud)
+        if to >= CEILING_Y || !Self::inb(x, y) || !matches!(self.raw(x, y), Mat::Steam | Mat::Cloud) {
+            return true;
+        }
+        // The air it would rise into (open air there, else the usual air of that height).
+        let air = if Self::inb(x, to) && self.raw(x, to) == Mat::Empty { self.temp[Self::idx(x, to)] } else { self.ambient_c(to) };
+        self.temp[Self::idx(x, y)] - adiabatic_cooling_c(self.raw(x, y), y, to) > air + 0.5
     }
 
     /// Where the gas at (x, y) moving to column `to` ends up. Vapour and clouds blown past the
@@ -2261,6 +2278,8 @@ impl World {
         self.set(x, y, Mat::Steam);
         self.temp[Self::idx(x, y)] = t;
         let mut left = VAPOUR_PER_WATER - 1;
+        // (Not upward where the vapour could not rise: a drop evaporating above the top of the
+        // weather would otherwise ratchet its water up a row each time.)
         'out: for r in 1..=2 {
             for dy in -r..=r {
                 for dx in -r..=r {
@@ -2271,7 +2290,7 @@ impl World {
                         break 'out;
                     }
                     let (nx, ny) = (x + dx, y + dy);
-                    if Self::inb(nx, ny) && self.at(nx, ny) == Mat::Empty {
+                    if Self::inb(nx, ny) && self.at(nx, ny) == Mat::Empty && (dy >= 0 || self.gas_may_rise_to(x, y, ny)) {
                         self.set(nx, ny, Mat::Steam);
                         self.temp[Self::idx(nx, ny)] = t;
                         left -= 1;
@@ -3622,7 +3641,7 @@ mod tests {
             w.set(519, y, Mat::Stone);
         }
         for x in 340..480 {
-            for y in 60..60 + rows {
+            for y in 80..80 + rows {
                 w.set(x, y, Mat::Cloud);
             }
         }
@@ -4463,9 +4482,12 @@ mod tests {
 
     #[test]
     fn clouds_and_steam_stop_under_the_top_of_the_weather() {
-        let mut w = World::new_static();
+        let mut w = World::new();
+        w.structures_fall = false;
+        w.clear();
         w.flow.pin_uniform(0.0, -2.0);
-        // Hot steam low down, a warm cloud high up, and a puff of cloud painted above the ceiling.
+        // Hot steam low down, a very warm cloud high up, and a puff of cloud painted in the
+        // stratosphere. (A real atmosphere: the air cools up to the tropopause, then warms.)
         for x in 300..340 {
             for y in 250..260 {
                 w.set(x, y, Mat::Steam);
@@ -4477,15 +4499,17 @@ mod tests {
             }
             w.set(x + 400, 10, Mat::Cloud);
         }
-        let mut got_up = false;
+        // A strong updraft may push the top of a storm cloud a little past the tropopause (an
+        // overshooting top), but cooling as it climbs it is soon heavier than the warm air there.
+        let mut highest = H;
         for _ in 0..800 {
             w.step();
-            got_up |= (0..W * H).any(|i| matches!(w.cells[i].m, Mat::Steam | Mat::Cloud) && ((i / W) as i32) < CEILING_Y - 2 && (i % W) < 640);
+            highest = (0..W * H).filter(|&i| matches!(w.cells[i].m, Mat::Steam | Mat::Cloud) && (i % W) < 640).map(|i| i / W).min().unwrap_or(H).min(highest);
         }
-        assert!(!got_up, "rising steam or cloud went up past the top of the weather");
+        assert!(highest as i32 >= CEILING_Y - 20, "rising cloud overshot up to row {highest}");
         let gas: Vec<usize> = (0..W * H).filter(|&i| matches!(w.cells[i].m, Mat::Steam | Mat::Cloud)).collect();
         assert!(!gas.is_empty());
-        assert!(gas.iter().all(|&i| (i / W) as i32 >= CEILING_Y - 2), "gas above the ceiling sank back under it");
+        assert!(gas.iter().all(|&i| (i / W) as i32 >= CEILING_Y - 12), "gas above the tropopause settled back down to it");
         let near_top = gas.iter().filter(|&&i| ((i / W) as i32) < CEILING_Y + 12).count();
         assert!(near_top * 3 > gas.len(), "the rising gas gathers in a layer under the ceiling: {near_top} of {}", gas.len());
     }
