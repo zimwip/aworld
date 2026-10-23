@@ -578,7 +578,6 @@ impl Game {
         }
         if self.cars.len() < 8 {
             let car = Car::with_tuning(self.model, e, self.tunings[self.model_index()]);
-            self.selected_car = Some(car.id);
             self.cars.push(car);
         }
         self.set_running(true);
@@ -3436,6 +3435,15 @@ mod tests {
         }
         g.unlimited = true;
         g
+    }
+
+    #[test]
+    fn a_new_car_is_not_selected_until_clicked() {
+        let mut g = mech_game();
+        g.entry = Some((100, 290));
+        g.launch_car();
+        assert_eq!(g.cars.len(), 1);
+        assert_eq!(g.selected_car, None, "a car only gets selected when the player clicks it");
     }
 
     fn click_with(g: &mut Game, tool: Tool, x: f32, y: f32) {
