@@ -504,6 +504,7 @@ impl World {
         // and grass above each hole slide down one cell, highest hole first so stacked holes close
         // from the top. The grass stays on top of the earth that carries it.
         taken.sort_unstable();
+        let mut columns = vec![];
         for i in taken {
             let (x, y) = ((i % W) as i32, (i / W) as i32);
             let mut top = y;
@@ -512,6 +513,28 @@ impl World {
             }
             for yy in (top + 1..=y).rev() {
                 self.swap((x, yy - 1), (x, yy));
+            }
+            columns.push(x);
+        }
+        // Grass lives on earth: where all the earth under a turf was taken, the turf goes too.
+        columns.sort_unstable();
+        columns.dedup();
+        for x in columns {
+            let mut y = H as i32 - 1;
+            while y >= 0 {
+                if self.cells[Self::idx(x, y)].m != Mat::Grass {
+                    y -= 1;
+                    continue;
+                }
+                let bottom = y;
+                while y >= 0 && self.cells[Self::idx(x, y)].m == Mat::Grass {
+                    y -= 1;
+                }
+                if self.at(x, bottom + 1) != Mat::Dirt {
+                    for yy in y + 1..=bottom {
+                        self.set(x, yy, Mat::Empty);
+                    }
+                }
             }
         }
         true
@@ -3160,6 +3183,26 @@ mod tests {
         // The surface dipped where the earth was taken.
         assert!((0..H as i32).find(|&y| w.raw(200, y) == Mat::Grass).unwrap() > 300, "the ground should sink");
         assert_eq!(w.raw(20, 300), Mat::Grass, "far away the ground is untouched");
+    }
+
+    #[test]
+    fn grass_goes_with_the_last_of_its_earth() {
+        let mut w = World::new_static();
+        for x in 100..140 {
+            for y in 320..330 {
+                w.set(x, y, Mat::Stone);
+            }
+            for y in 316..320 {
+                w.set(x, y, Mat::Dirt);
+            }
+            for y in 313..316 {
+                w.set(x, y, Mat::Grass);
+            }
+        }
+        // Every bit of earth is taken: nothing is left to carry the turf.
+        assert!(w.consume(&[Mat::Dirt], 40 * 4, (120, 300)));
+        assert!(w.cells.iter().all(|c| c.m != Mat::Grass), "grass without earth should be gone");
+        assert!((100..140).all(|x| w.raw(x, 320) == Mat::Stone), "the rock stays");
     }
 
     #[test]
