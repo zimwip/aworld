@@ -174,7 +174,7 @@ fn props(m: Mat) -> (f32, f32) {
         Mat::Wood | Mat::Trunk | Mat::Leaf | Mat::Seed | Mat::Sapling | Mat::Branch | Mat::DeadLeaf => (0.04, 1.4),
         Mat::Stone | Mat::Brick => (0.05, 6.0),
         Mat::Clay => (0.1, 2.4),
-        Mat::Terracotta => (0.14, 3.0),
+        Mat::Terracotta | Mat::Vault => (0.14, 3.0),
         Mat::Iron | Mat::Steel => (0.5, 2.5),
         Mat::Glass | Mat::Shard => (0.08, 3.0),
         // Real molten rock holds about as much heat as solid rock, plus the heat it gives off as it
@@ -898,8 +898,9 @@ impl World {
                 self.latent[i] += (t - boil) * C_WATER;
                 self.temp[i] = boil;
                 if self.latent[i] >= LATENT_VAPOUR {
-                    self.set(x, y, Mat::Steam);
+                    // It swells into several cells of steam (see `vaporize`).
                     self.temp[i] = boil + 1.0;
+                    self.vaporize(x, y);
                     return true;
                 }
             } else if t < FREEZE_C {

@@ -133,6 +133,7 @@ impl Game {
                     self.selected_car = Some(id);
                     self.car_remote = true;
                     self.selected_motor = None;
+                    self.remote_menu.show(2.0);
                 }
             }
             self.drag = self.selection.map(|sel| {

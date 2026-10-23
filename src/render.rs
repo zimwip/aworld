@@ -71,11 +71,39 @@ uniform vec4 sky;
 float hash(vec2 p) {
     return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
 }
+// Smooth value noise and two octaves of it: soft blobs with no grid in them.
+float vnoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+float fbm(vec2 p) {
+    return 0.65 * vnoise(p) + 0.35 * vnoise(p * 2.3 + vec2(17.0, 9.0));
+}
 void main() {
-    // Heat haze: hot air shifts what is seen through it, in ripples that rise with the warm air.
-    float heat = texture2D(Light, uv).g;
+    // Heat haze: hot air shifts what is seen through it. The light map is coarse (a texel per six
+    // cells), so it is blurred into a soft mask first, a little more from below so the haze sits
+    // over the source. The shift itself is turbulence: smooth noise that rises with the warm air
+    // and is itself bent by slower noise (domain warping), so it swirls and wavers instead of
+    // marching in straight rows.
+    vec2 lt = texel * 6.0;
+    float heat = 0.3 * texture2D(Light, uv).g
+        + 0.2 * texture2D(Light, uv + vec2(0.0, lt.y)).g
+        + 0.15 * (texture2D(Light, uv + vec2(lt.x, 0.0)).g + texture2D(Light, uv - vec2(lt.x, 0.0)).g)
+        + 0.1 * (texture2D(Light, uv - vec2(0.0, lt.y)).g + texture2D(Light, uv + vec2(0.0, 2.0 * lt.y)).g);
+    heat = smoothstep(0.05, 0.9, heat);
     vec2 cellf = uv / texel;
-    vec2 p = uv + vec2(sin(cellf.y * 0.45 + time * 6.0 + cellf.x * 0.08), 0.4 * cos(cellf.x * 0.3 - time * 4.0)) * texel * heat * 0.7;
+    vec2 p = uv;
+    float shim = 0.0;
+    if (heat > 0.0) {
+        vec2 q = cellf * vec2(0.09, 0.07) + vec2(0.0, time * 1.4);
+        vec2 w = vec2(fbm(q * 0.45 + vec2(time * 0.35, 0.0)), fbm(q * 0.45 + vec2(5.2, 1.3 - time * 0.25)));
+        vec2 r = q + (w - 0.5) * 2.6;
+        vec2 d = vec2(fbm(r), fbm(r + vec2(8.3, 2.8))) - 0.5;
+        p = uv + d * vec2(1.6, 0.9) * texel * heat;
+        shim = fbm(r * 1.8 + vec2(3.1, 0.0)) - 0.5;
+    }
     vec4 c = texture2D(Texture, p);
     vec3 glow = vec3(0.0);
     float wsum = 0.0;
@@ -116,8 +144,8 @@ void main() {
         rgb += vec3(1.0, 0.97, 0.86) * surf * lit * (flash * 2.4 + wave * 0.16);
     }
     float a = max(c.a, clamp(length(glow) * 2.0, 0.0, 1.0));
-    // In clear air the haze shows itself as faint bright and dark ripples.
-    float rip = sin(cellf.y * 0.5 + time * 7.0 + cellf.x * 0.11) * heat * 0.025 * (1.0 - a);
+    // In clear air the haze shows itself as faint bright and dark swirls.
+    float rip = shim * heat * 0.05 * (1.0 - a);
     gl_FragColor = vec4(rgb + vec3(max(rip, 0.0)), a + max(-rip, 0.0));
 }";
 
