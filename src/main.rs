@@ -3995,6 +3995,12 @@ async fn main() {
                     }
                 }
             }
+            // `--truck-boom n`: the fire engine is set off n frames before the shot.
+            if let Some(n) = arg("--truck-boom").and_then(|v| v.parse::<u32>().ok()) {
+                if frame + n == 360 {
+                    game.blow_up_truck();
+                }
+            }
         }
         // `--crater n`: the buried powder is lit n frames before the shot.
         if shot.is_some() {
