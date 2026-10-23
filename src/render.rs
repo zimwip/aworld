@@ -761,6 +761,41 @@ impl Renderer {
     }
 
     /// Bolts of lightning and the flash that lights the whole picture.
+    /// Saint Elmo's fire: where the ground or what stands on it is close to breaking down under a
+    /// charged cloud, faint violet sparks crackle on its top.
+    pub fn draw_corona(&self, world: &World, v: View, time: f32) {
+        use crate::world::{GROUND_BREAKDOWN, QH, QS, QW};
+        for qy in 1..QH {
+            for qx in 0..QW {
+                let q = world.mcharge[qy * QW + qx].abs() / GROUND_BREAKDOWN;
+                if q < 0.45 {
+                    continue;
+                }
+                let x = (qx * QS + QS / 2) as i32;
+                // The top of the matter in this square, with air just above it.
+                let Some(y) = ((qy * QS) as i32..((qy + 1) * QS) as i32)
+                    .find(|&y| !matches!(world.raw(x, y).kind(), crate::world::Kind::Empty | crate::world::Kind::Gas | crate::world::Kind::Flame))
+                    .filter(|&y| matches!(world.raw(x, y - 1).kind(), crate::world::Kind::Empty | crate::world::Kind::Gas))
+                else {
+                    continue;
+                };
+                let a = ((q - 0.45) / 0.55).clamp(0.0, 1.0);
+                let p = vec2(v.ox + (x as f32 + 0.5) * v.s, v.oy + y as f32 * v.s);
+                draw_circle(p.x, p.y, 5.0 * v.s.max(0.6), Color::new(0.6, 0.5, 1.0, 0.12 * a));
+                for k in 0..3 {
+                    let t = time * 17.0 + k as f32 * 2.1 + qx as f32 * 1.7;
+                    if (t.sin() * 43.7).fract().abs() < 0.4 {
+                        continue;
+                    }
+                    let ang = -1.57 + (t * 1.3).sin() * 0.9;
+                    let len = (2.0 + 3.0 * a) * v.s.max(0.6);
+                    let q2 = p + vec2(ang.cos(), ang.sin()) * len;
+                    draw_line(p.x, p.y, q2.x, q2.y, 1.0, Color::new(0.75, 0.7, 1.0, 0.7 * a));
+                }
+            }
+        }
+    }
+
     pub fn draw_bolts(&self, bolts: &[LiveBolt], v: View) {
         if bolts.is_empty() {
             return;
