@@ -196,6 +196,9 @@ fn props(m: Mat) -> (f32, f32) {
         Mat::Ember => (0.25, 1.0),
         Mat::Gunpowder | Mat::Saltpeter | Mat::Ash | Mat::Rust => (0.04, 1.2),
         Mat::Charcoal => (0.04, 1.0),
+        // Diamond carries heat five times better than copper.
+        Mat::Diamond => (0.9, C_ROCK),
+        Mat::Dynamite => (0.04, 1.2),
     }
 }
 
@@ -288,7 +291,7 @@ fn tables() -> &'static Tables {
                 m,
                 Mat::Water | Mat::Ice | Mat::Snow | Mat::Hail | Mat::Steam | Mat::Lava | Mat::Molten | Mat::MoltenSteel | Mat::Stone | Mat::Sand
                     | Mat::Shard | Mat::Glass | Mat::Rust | Mat::Iron | Mat::Steel | Mat::Wood | Mat::Trunk | Mat::Leaf | Mat::Branch | Mat::DeadLeaf
-                    | Mat::Grass | Mat::Seed | Mat::Sapling | Mat::Gunpowder | Mat::Oil | Mat::Clay | Mat::Charcoal
+                    | Mat::Grass | Mat::Seed | Mat::Sapling | Mat::Gunpowder | Mat::Dynamite | Mat::Oil | Mat::Clay | Mat::Charcoal
             );
         }
         t
@@ -1336,7 +1339,7 @@ impl World {
                     self.ignite_oil(x, y);
                 }
             }
-            Mat::Gunpowder => {
+            Mat::Gunpowder | Mat::Dynamite => {
                 if t >= POWDER_IGNITE_C {
                     self.set_off_powder(x, y);
                 }

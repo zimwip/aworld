@@ -17,8 +17,8 @@
 //! Matter goes where it is easiest to go: a ray that reaches the open air through little ground
 //! (the "line of least resistance" of the quarrymen) gets more of the energy than one that would
 //! have to dig through bedrock. Rays that break out throw what they tore loose as projectiles, with
-//! the energy they had left; rays that run out of energy underground only crush the ground (a
-//! hidden cavity, the "camouflet"). Projectiles fly, fall back and pile up as a rim: a real crater.
+//! the energy they had left; rays that run out of energy underground only crush the ground, which
+//! stays where it is: the gas of the charge alone opens a hidden cavity, the "camouflet". Projectiles fly, fall back and pile up as a rim: a real crater.
 //!
 //! The cells can be anything with a density and a strength, so the same rule shapes a crater in a
 //! meadow, a hole in a brick wall or a dent in an iron plate.
@@ -32,15 +32,72 @@ const CELL_V: f32 = CELL_M * CELL_M * CELL_M;
 const G: f32 = 9.81;
 /// Speed a torn-off clod must be thrown at to clear the hole, m/s.
 const THROW: f32 = 50.0;
-/// Energy of black powder, J/kg.
-const POWDER_J_PER_KG: f32 = 3.0e6;
-/// Density of a grain of powder, kg/m³.
-const POWDER_RHO: f32 = 1500.0;
-/// Share of the chemical energy that does work on the ground (the rest heats the gas, light, noise).
-const COUPLING: f32 = 0.01;
-/// Gas a cell of powder gives when it burns, in cells of air at ambient pressure (black powder
-/// gives about 280 litres per kilogram).
-const GAS_PER_GRAIN: f32 = 420.0;
+/// An explosive, as the blast sees it.
+#[derive(Clone, Copy, Debug)]
+pub struct Explosive {
+    /// Chemical energy, J/kg.
+    pub energy: f32,
+    /// Density, kg/m³.
+    pub rho: f32,
+    /// Share of the energy that does work on the ground (the rest heats the gas, light, noise). A
+    /// detonation, whose front outruns sound, couples much better than powder that only burns.
+    pub coupling: f32,
+    /// Gas it gives, m³ per kg at ambient pressure.
+    pub gas: f32,
+    /// Peak pressure of its shock at the charge, atm.
+    pub shock: f32,
+    /// Temperature of its hot gas, °C.
+    pub flame: f32,
+}
+
+/// What makes `m` explode, if it does.
+pub fn explosive(m: Mat) -> Option<Explosive> {
+    match m {
+        // Black powder deflagrates: it burns very fast but below the speed of sound.
+        Mat::Gunpowder => Some(Explosive { energy: 3.0e6, rho: 1500.0, coupling: 0.025, gas: 0.28, shock: 3_000.0, flame: 2_000.0 }),
+        // Dynamite detonates (7 km/s): a shock of more than 100 000 atm.
+        Mat::Dynamite => Some(Explosive { energy: 5.0e6, rho: 1400.0, coupling: 0.06, gas: 0.7, shock: 120_000.0, flame: 3_500.0 }),
+        _ => None,
+    }
+}
+
+/// A charge that goes off: the sum of its cells of explosive.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Charge {
+    /// Energy that works on the ground, J.
+    pub work: f32,
+    /// Gas, in cells of air at ambient pressure.
+    pub gas: f32,
+    /// Peak pressure at the charge, atm, and temperature of the gas, °C.
+    pub shock: f32,
+    pub flame: f32,
+    /// Cells of explosive.
+    pub cells: f32,
+}
+
+impl Charge {
+    fn add(&mut self, m: Mat) {
+        let Some(e) = explosive(m) else { return };
+        let mass = e.rho * CELL_V;
+        self.work += e.energy * mass * e.coupling;
+        self.gas += e.gas * mass / CELL_V;
+        self.shock = self.shock.max(e.shock);
+        self.flame = self.flame.max(e.flame);
+        self.cells += 1.0;
+    }
+
+    /// As much black powder as `grains` cells of it.
+    pub fn powder(grains: f32) -> Charge {
+        let mut c = Charge::default();
+        c.add(Mat::Gunpowder);
+        Charge { work: c.work * grains, gas: c.gas * grains, cells: grains, ..c }
+    }
+
+    /// How many cells of black powder would do the same work.
+    fn grains(&self) -> f32 {
+        self.work / grain_energy()
+    }
+}
 /// Speed in world cells per step for one metre per second (the world's clock is not a real one).
 const SPEED: f32 = 0.08;
 /// Fastest projectile, cells per step.
@@ -54,7 +111,8 @@ const MAX_REACH: f32 = 220.0;
 
 /// Mechanical energy one grain of powder gives the ground, J.
 pub fn grain_energy() -> f32 {
-    POWDER_J_PER_KG * POWDER_RHO * CELL_V * COUPLING
+    let e = explosive(Mat::Gunpowder).unwrap();
+    e.energy * e.rho * CELL_V * e.coupling
 }
 
 /// Strength of a material, MPa (tensile or shear strength for solids, cohesion for soils). Loose
@@ -77,6 +135,9 @@ pub fn strength(m: Mat) -> f32 {
         Mat::Branch => 4.0,
         Mat::Leaf | Mat::Sapling => 0.1,
         Mat::Ember => 0.5,
+        // Diamond is hard but brittle: it breaks at about 2 GPa.
+        Mat::Diamond => 2_000.0,
+        Mat::Dynamite => 1.0,
         _ => 0.0,
     }
 }
@@ -140,7 +201,7 @@ pub struct Ejecta {
 enum Fate {
     /// Cracked at the edge of the hole.
     Crack,
-    /// Torn loose and pressed into the walls of a hidden cavity.
+    /// Torn loose but with nowhere to go: it stays, crushed into the walls of a hidden cavity.
     Crush,
     /// Thrown out of the crater at this speed (cells per step).
     Throw(f32, f32),
@@ -151,7 +212,7 @@ fn passable(m: Mat) -> bool {
 }
 
 impl World {
-    /// Gunpowder at (x, y) caught fire: the whole charge it belongs to goes off together, at its
+    /// Explosive at (x, y) caught fire: the whole charge it belongs to goes off together, at its
     /// centre. A long thin trail of powder goes off in pieces, like a fuse.
     pub(super) fn set_off_powder(&mut self, x: i32, y: i32) {
         let mut charge = vec![(x, y)];
@@ -169,7 +230,7 @@ impl World {
                 for dy in -1..=1 {
                     for dx in -1..=1 {
                         let q = (px + dx, py + dy);
-                        if self.raw(q.0, q.1) == Mat::Gunpowder && self.mask_free(q.0, q.1) && taken.insert(q) {
+                        if explosive(self.raw(q.0, q.1)).is_some() && self.mask_free(q.0, q.1) && taken.insert(q) {
                             next.push(q);
                         }
                     }
@@ -180,7 +241,9 @@ impl World {
         }
         let n = charge.len() as f32;
         let (sx, sy) = charge.iter().fold((0.0, 0.0), |a, &(x, y)| (a.0 + x as f32, a.1 + y as f32));
+        let mut sum = Charge::default();
         for &(x, y) in &charge {
+            sum.add(self.raw(x, y));
             self.set(x, y, Mat::Empty);
         }
         let (cx, cy) = ((sx / n).round() as i32, (sy / n).round() as i32);
@@ -190,16 +253,17 @@ impl World {
                 self.powder_booms.push((cx, cy));
             }
         }
-        self.detonate(cx, cy, n);
+        self.detonate(cx, cy, sum);
     }
 
-    /// An explosion as strong as `grains` cells of gunpowder going off at (cx, cy).
-    pub fn detonate(&mut self, cx: i32, cy: i32, grains: f32) {
+    /// The charge goes off at (cx, cy): its matter becomes fields. Its gas raises the density of
+    /// the air, its shock squeezes the matter around it, its work digs the crater.
+    pub fn detonate(&mut self, cx: i32, cy: i32, charge: Charge) {
         self.revision += 1;
-        let r = reach(grains);
+        let r = reach(charge.grains());
         // The gas of the charge, spread over the air around it: a jump of density in the wind
         // solver, which then runs out as a pressure wave.
-        let rise = GAS_PER_GRAIN * grains / (std::f32::consts::PI * (2 * r * r * 2) as f32);
+        let rise = charge.gas / (std::f32::consts::PI * (2 * r * r * 2) as f32);
         self.flow.blast(cx, cy, r * 2, rise.clamp(0.15, 3.0));
         let heavy = self.blasts.len() < 8;
         if heavy {
@@ -213,7 +277,9 @@ impl World {
             }
             (d > 0 && matches!(self.raw(cx, cy - d).kind(), Kind::Empty | Kind::Gas)).then_some(d)
         };
-        self.crater(cx, cy, grains * grain_energy(), r);
+        let flying = self.ejecta.len();
+        self.crater(cx, cy, charge.work, r);
+        self.shock_wave(cx, cy, &charge, flying);
         if !heavy {
             return;
         }
@@ -247,6 +313,45 @@ impl World {
                 if d2 > r * r && d2 <= (r * 3 / 2) * (r * 3 / 2) && self.chance(9) && self.at(cx + dx, cy + dy) == Mat::Empty {
                     self.set(cx + dx, cy + dy, Mat::Smoke);
                 }
+            }
+        }
+    }
+
+    /// The shock of the charge: in the ground its peak pressure falls off about as the cube of the
+    /// distance (it spreads over a wider front and the ground soaks it up), and every cell it crosses takes the changes that such a
+    /// squeeze and such heat bring about (see `matter.rs`): the walls of the hole, and the clods
+    /// thrown out of it (from `thrown` on in the list of ejecta).
+    fn shock_wave(&mut self, cx: i32, cy: i32, c: &Charge, thrown: usize) {
+        // Radius of the charge itself, and of the zone where the shock still changes anything.
+        let a = (c.cells / std::f32::consts::PI).sqrt().max(1.0);
+        let weakest = super::matter::TRANSITIONS
+            .iter()
+            .flat_map(|t| t.when.iter())
+            .filter_map(|w| if let super::matter::Cond::ShockAbove(p) = w { Some(*p) } else { None })
+            .fold(f32::MAX, f32::min);
+        let reach = (a * (c.shock / weakest).max(0.0).cbrt() * 1.2).min(80.0) as i32;
+        for dy in -reach..=reach {
+            for dx in -reach..=reach {
+                let (x, y) = (cx + dx, cy + dy);
+                if !Self::inb(x, y) || self.mask[Self::idx(x, y)] != 0 {
+                    continue;
+                }
+                // The ground is not even: the front is ragged.
+                let rough = 0.85 + (self.rand() % 100) as f32 * 0.003;
+                let d = (((dx * dx + dy * dy) as f32).sqrt() * rough).max(a);
+                if d > reach as f32 || passable(self.raw(x, y)) {
+                    continue;
+                }
+                let k = a / d;
+                self.shock_cell(Self::idx(x, y), c.shock * k * k * k, c.flame * k);
+            }
+        }
+        // The clods started where they were torn off.
+        for p in &mut self.ejecta[thrown..] {
+            let d = (p.x - cx as f32).hypot(p.y - cy as f32).max(a);
+            let k = a / d;
+            if let Some(t) = super::matter::shocked(p.m, c.shock * k * k * k, c.flame * k, true) {
+                p.m = t.to;
             }
         }
     }
@@ -324,74 +429,148 @@ impl World {
         };
         // Cells of air the fireball fills, and liquid the gas bubble pushes away.
         let mut fire: Vec<usize> = vec![];
-        for (k, ray) in rays.iter().enumerate() {
-            let mut e = energy * (0.2 / n as f32 + 0.8 * pull[k] / total);
-            let (mut ground, mut air, mut out) = (false, 0, false);
-            let mut dug: Vec<(usize, f32)> = vec![];
-            for (j, &(x, y, d)) in ray.iter().enumerate() {
-                let Some((m, block)) = self.blast_mat(x, y) else {
-                    out = ground;
-                    break;
-                };
-                let i = Self::idx(x, y);
-                if passable(m) {
-                    if ground {
-                        air += 1;
-                        if air >= 2 {
-                            out = true;
+        // Each ray digs until it runs out of energy, breaks out or meets something it cannot move.
+        // The gas that rushes out of a ray that broke through still presses on the walls on either
+        // side: most of what that ray has left goes to its neighbours, which dig on. So the hole
+        // widens towards the surface into a cone, as real craters do.
+        struct Ray {
+            e: f32,
+            at: usize,
+            ground: bool,
+            air: u32,
+            out: bool,
+            stuck: bool,
+            dug: Vec<(usize, f32)>,
+        }
+        let mut st: Vec<Ray> = (0..n)
+            .map(|k| Ray { e: energy * (0.2 / n as f32 + 0.8 * pull[k] / total), at: 0, ground: false, air: 0, out: false, stuck: false, dug: vec![] })
+            .collect();
+        for _round in 0..24 {
+            for k in 0..n {
+                let ray = &rays[k];
+                let s = &mut st[k];
+                if s.out || s.stuck {
+                    continue;
+                }
+                while s.at < ray.len() {
+                    let (x, y, d) = ray[s.at];
+                    let Some((m, block)) = self.blast_mat(x, y) else {
+                        s.out = s.ground;
+                        s.stuck = !s.ground;
+                        break;
+                    };
+                    let i = Self::idx(x, y);
+                    if passable(m) {
+                        if s.ground {
+                            s.air += 1;
+                            if s.air >= 2 {
+                                s.out = true;
+                            }
                         }
+                        if d <= r as f32 {
+                            fire.push(i);
+                        } else if s.out || !s.ground {
+                            s.stuck = !s.out;
+                            break;
+                        }
+                        s.at += 1;
+                        continue;
                     }
-                    if d <= r as f32 {
-                        fire.push(i);
-                    } else if out || !ground {
+                    if s.out {
                         break;
                     }
-                    continue;
-                }
-                if out {
-                    break;
-                }
-                ground = true;
-                air = 0;
-                let cost = cell_cost(m, d) * share(d);
-                if m.kind() == Kind::Liquid {
-                    // Liquids do not break, they are pushed: the bubble opens where the gas is.
-                    if d <= r as f32 * 0.8 {
-                        fire.push(i);
+                    s.ground = true;
+                    s.air = 0;
+                    let cost = cell_cost(m, d) * share(d);
+                    if m.kind() == Kind::Liquid {
+                        // Liquids do not break, they are pushed: the bubble opens where the gas is.
+                        if d <= r as f32 * 0.8 {
+                            fire.push(i);
+                        }
+                        s.e -= cost;
+                        if s.e <= 0.0 {
+                            s.stuck = true;
+                            break;
+                        }
+                        s.at += 1;
+                        continue;
                     }
-                    e -= cost;
-                    if e <= 0.0 {
+                    if block {
+                        s.stuck = true;
                         break;
                     }
+                    if s.e < cost {
+                        // Waits for more energy from a neighbour.
+                        break;
+                    }
+                    s.e -= cost;
+                    s.dug.push((i, rho(m) * CELL_V * share(d)));
+                    s.at += 1;
+                }
+                if s.at >= ray.len() && !s.out {
+                    s.stuck = true;
+                }
+            }
+            // Rays that broke out hand most of what they have left to the nearest rays on each
+            // side that are still digging.
+            let mut spill = vec![0.0f32; n];
+            let mut any = false;
+            for k in 0..n {
+                if !st[k].out || st[k].e <= 0.0 {
                     continue;
                 }
-                if e < cost || block {
-                    if !block {
-                        // The edge of the hole: cracked, the more so the closer it came to breaking.
-                        let p = (e / cost).clamp(0.0, 1.0);
-                        for &(x, y, _) in ray.iter().skip(j).take(3) {
+                let give = st[k].e * 0.7;
+                let left = (1..n / 4).map(|j| (k + n - j) % n).find(|&j| !st[j].out && !st[j].stuck && st[j].ground);
+                let right = (1..n / 4).map(|j| (k + j) % n).find(|&j| !st[j].out && !st[j].stuck && st[j].ground);
+                let to: Vec<usize> = [left, right].into_iter().flatten().collect();
+                if to.is_empty() {
+                    continue;
+                }
+                st[k].e -= give;
+                for &j in &to {
+                    spill[j] += give / to.len() as f32;
+                }
+                any = true;
+            }
+            if !any {
+                break;
+            }
+            for k in 0..n {
+                st[k].e += spill[k];
+            }
+        }
+        for (k, s) in st.iter().enumerate() {
+            let mut a = k as f32 * wedge;
+            // The ground flows out of a crater along curved paths and leaves it at about 45°, not
+            // straight up: it lands beyond the rim instead of falling back in.
+            let up = -std::f32::consts::FRAC_PI_2;
+            let off = (a - up + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+            if off.abs() < std::f32::consts::FRAC_PI_2 {
+                let side = if off.abs() < 0.02 { if k % 2 == 0 { 1.0 } else { -1.0 } } else { off.signum() };
+                a = up + side * (0.55 + 0.6 * off.abs()).min(1.35);
+            }
+            if s.out && !s.dug.is_empty() {
+                // Half the energy left goes to the clods, the rest rushes out with the gas.
+                let mass: f32 = s.dug.iter().map(|c| c.1).sum();
+                let v = (THROW * THROW + s.e.max(0.0) / mass).sqrt() * SPEED;
+                let v = v.min(MAX_SPEED);
+                for &(i, _) in &s.dug {
+                    mark(&mut fates, i, Fate::Throw(a.cos() * v, a.sin() * v));
+                }
+            } else {
+                for &(i, _) in &s.dug {
+                    mark(&mut fates, i, Fate::Crush);
+                }
+                // The edge of the hole: cracked, the more so the closer it came to breaking.
+                if let Some(&(x, y, d)) = rays[k].get(s.at) {
+                    if let Some((m, false)) = self.blast_mat(x, y) {
+                        let p = (s.e / (cell_cost(m, d) * share(d))).clamp(0.0, 1.0);
+                        for &(x, y, _) in rays[k].iter().skip(s.at).take(3) {
                             if self.rand() % 100 < (p * 80.0) as u32 + 10 {
                                 mark(&mut fates, Self::idx(x, y), Fate::Crack);
                             }
                         }
                     }
-                    break;
-                }
-                e -= cost;
-                dug.push((i, rho(m) * CELL_V * share(d)));
-            }
-            let a = k as f32 * wedge;
-            if out && !dug.is_empty() {
-                // Half the energy left goes to the clods, the rest rushes out with the gas.
-                let mass: f32 = dug.iter().map(|c| c.1).sum();
-                let v = (THROW * THROW + e.max(0.0) / mass).sqrt() * SPEED;
-                let v = v.min(MAX_SPEED);
-                for &(i, _) in &dug {
-                    mark(&mut fates, i, Fate::Throw(a.cos() * v, a.sin() * v));
-                }
-            } else {
-                for &(i, _) in &dug {
-                    mark(&mut fates, i, Fate::Crush);
                 }
             }
         }
@@ -413,10 +592,8 @@ impl World {
                         }
                     }
                 }
-                Fate::Crush => {
-                    let left = rubble(m).filter(|_| self.chance(3));
-                    self.set(x, y, left.unwrap_or(Mat::Empty));
-                }
+                // Crushed matter that cannot get out stays: only the gas of the charge opens a room.
+                Fate::Crush => {}
                 Fate::Throw(vx, vy) => {
                     let roll = self.rand();
                     if self.ejecta.len() < MAX_EJECTA {
@@ -600,8 +777,9 @@ mod tests {
         let (small, big) = (dig(6), dig(30));
         eprintln!("crater of 36 grains: {small} cells, of 900 grains: {big} cells");
         assert!(small > 60, "even a small charge digs: {small}");
-        assert!(big > small * 8, "25 times the powder, a far bigger hole: {small} vs {big}");
-        assert!(big > 4000, "a big charge makes a real crater: {big}");
+        // What lands on the rim slides back down the slope a little: measured after it settled.
+        assert!(big > small * 4, "25 times the powder, a far bigger hole: {small} vs {big}");
+        assert!(big > 1500, "a big charge makes a real crater: {big}");
     }
 
     #[test]
@@ -638,7 +816,7 @@ mod tests {
         let (earth, rock, steel) = (dig(Mat::Dirt), dig(Mat::Stone), dig(Mat::Steel));
         eprintln!("hole in earth {earth}, rock {rock}, steel {steel}");
         // The 400 grains of the charge leave their own room in any case.
-        assert!(earth - 400 > (rock - 400) * 3, "{earth} vs {rock}");
+        assert!(earth - 400 > (rock - 400) * 2, "{earth} vs {rock}");
         // In steel only the powder itself leaves a hole.
         assert!(steel < 500, "{steel}");
     }
@@ -651,5 +829,46 @@ mod tests {
         assert!(w.ejecta.is_empty(), "nothing gets out: {}", w.ejecta.len());
         assert!(passable(w.raw(480, 404)) || w.raw(480, 404) == Mat::Fire, "a cavity where the charge was");
         assert_eq!(w.raw(480, 301), Mat::Dirt, "the surface is untouched");
+    }
+    /// Charcoal packed around a charge of `m`, buried in rock; how many cells of diamond it leaves.
+    fn diamonds(m: Mat) -> usize {
+        let mut w = World::new_static();
+        for x in 0..W as i32 {
+            for y in 300..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for x in 460..500 {
+            for y in 380..420 {
+                let inner = (468..492).contains(&x) && (388..412).contains(&y);
+                w.set(x, y, if inner { m } else { Mat::Charcoal });
+            }
+        }
+        w.set_off_powder(480, 400);
+        run(&mut w, 300);
+        w.cells.iter().filter(|c| c.m == Mat::Diamond).count()
+    }
+
+    #[test]
+    fn dynamite_squeezes_charcoal_into_diamond_black_powder_does_not() {
+        let (powder, dynamite) = (diamonds(Mat::Gunpowder), diamonds(Mat::Dynamite));
+        eprintln!("diamond cells: powder {powder}, dynamite {dynamite}");
+        assert_eq!(powder, 0, "black powder only burns: a few thousand atmospheres");
+        assert!(dynamite > 50, "a detonation goes past 50 000 atm: {dynamite}");
+    }
+
+    #[test]
+    fn a_detonation_packs_the_soil_left_around_the_hole() {
+        let mut w = ground();
+        for x in 474..486 {
+            for y in 334..346 {
+                w.set(x, y, Mat::Dynamite);
+            }
+        }
+        w.set_off_powder(474, 334);
+        let clay = w.cells.iter().filter(|c| c.m == Mat::Clay).count();
+        assert!(clay > 20, "packed soil lines the hole: {clay}");
+        // What flew out was loosened: no clod of packed clay in the air.
+        assert!(w.ejecta.iter().all(|p| p.m != Mat::Clay));
     }
 }

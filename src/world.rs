@@ -3,10 +3,12 @@
 //! so particles and the car treat them as solid.
 
 mod blast;
+pub mod matter;
 pub use blast::Ejecta;
 pub mod flow;
 mod pockets;
 mod pressure;
+mod hydro;
 pub mod sleep;
 pub use pockets::boil_c;
 mod thermal;
@@ -56,7 +58,7 @@ impl Biome {
 }
 
 /// Room for this many materials in per-material tables.
-pub const NMAT: usize = 40;
+pub const NMAT: usize = Mat::ALL.len();
 
 pub const W: usize = 960;
 pub const H: usize = 540;
@@ -117,14 +119,20 @@ pub enum Mat {
     /// The masonry vault the tunnel tool leaves over its hole. It is bolted into the ground
     /// around it, so it holds up the roof even when the tunnel cuts a hill in two.
     Vault,
+    /// Carbon squeezed past 50 000 atmospheres while white hot: the hardest thing there is, and
+    /// the best conductor of heat.
+    Diamond,
+    /// A high explosive: it detonates instead of burning, with a shock forty times the pressure
+    /// of black powder's.
+    Dynamite,
 }
 
 impl Mat {
-    pub const ALL: [Mat; 39] = [
+    pub const ALL: [Mat; 41] = [
         Mat::Empty, Mat::Sand, Mat::Water, Mat::Fire, Mat::Steam, Mat::Iron, Mat::Wood, Mat::Stone,
         Mat::Brick, Mat::Rust, Mat::Ash, Mat::Ember, Mat::Lava, Mat::Ice, Mat::Gunpowder, Mat::Dirt, Mat::Grass,
         Mat::Leaf, Mat::Steel, Mat::Cloud, Mat::Seed, Mat::Sapling, Mat::Mud, Mat::Glass, Mat::Snow, Mat::Shard, Mat::DeadLeaf, Mat::Branch, Mat::Trunk, Mat::Hail, Mat::Oil, Mat::Smoke, Mat::Molten, Mat::Clay, Mat::Terracotta,
-        Mat::Charcoal, Mat::Saltpeter, Mat::MoltenSteel, Mat::Vault,
+        Mat::Charcoal, Mat::Saltpeter, Mat::MoltenSteel, Mat::Vault, Mat::Diamond, Mat::Dynamite,
     ];
 
     pub fn from_u8(v: u8) -> Mat {
@@ -151,7 +159,7 @@ impl Mat {
             Water | Lava | Oil | Molten | MoltenSteel => Kind::Liquid,
             Steam | Cloud | Smoke => Kind::Gas,
             Fire => Kind::Flame,
-            Iron | Wood | Stone | Brick | Ember | Ice | Dirt | Grass | Leaf | Steel | Sapling | Glass | Branch | Trunk | Clay | Terracotta | Vault => Kind::Static,
+            Iron | Wood | Stone | Brick | Ember | Ice | Dirt | Grass | Leaf | Steel | Sapling | Glass | Branch | Trunk | Clay | Terracotta | Vault | Diamond | Dynamite => Kind::Static,
         }
     }
 
@@ -274,6 +282,8 @@ fn density(m: Mat) -> f32 {
         Mat::Charcoal => 0.3,
         Mat::Gunpowder | Mat::Rust => 1.5,
         Mat::Saltpeter => 2.1,
+        Mat::Diamond => 3.5,
+        Mat::Dynamite => 1.4,
         _ => 1.0,
     }
 }
@@ -380,6 +390,9 @@ pub struct World {
     rng: u32,
     seen: Vec<bool>,
     stack: Vec<usize>,
+    /// Mouths of full pipes the levelling lets go (see `hydro.rs`), and the list of them to clear.
+    released: Vec<bool>,
+    released_list: Vec<usize>,
     falling: Vec<Piece>,
     ticks: u32,
     /// Temperature in °C of every cell (air included).
@@ -471,6 +484,8 @@ impl World {
             rng: 0x1234_5678,
             seen: vec![false; W * H],
             stack: Vec::new(),
+            released: vec![false; W * H],
+            released_list: Vec::new(),
             falling: Vec::new(),
             ticks: 0,
             temp: vec![15.0; W * H],
@@ -958,7 +973,7 @@ impl World {
     /// pressure wave and shove reach that far (see `blast.rs`).
     pub fn explode(&mut self, cx: i32, cy: i32, r: i32) {
         let grains = ((r as f32 - 6.0).max(0.5) / 2.2).powi(2);
-        self.detonate(cx, cy, grains);
+        self.detonate(cx, cy, blast::Charge::powder(grains));
     }
 
     /// Pressure wave: loose matter near (cx, cy) is thrown outward, the closer the harder.
@@ -1174,7 +1189,7 @@ impl World {
                         }
                         Mat::Smoke => self.step_smoke(x, y),
                         Mat::Steel => self.step_iron(x, y, 1500),
-                        Mat::Gunpowder => self.step_gunpowder(x, y),
+                        Mat::Gunpowder | Mat::Dynamite => self.step_gunpowder(x, y),
                         Mat::Saltpeter => self.step_saltpeter(x, y),
                         Mat::Water => {
                             if !self.fly(x, y) && !self.jet(x, y) && !self.seep(x, y) {
@@ -1220,6 +1235,9 @@ impl World {
             self.update_pockets();
         }
         self.step_ejecta();
+        if self.ticks % matter::SETTLE_EVERY == 17 {
+            self.settle_matter();
+        }
         self.update_wind();
         self.update_flow();
         if self.ticks % 4 == 0 {
@@ -1235,75 +1253,9 @@ impl World {
         if self.day_cycle {
             self.clock = self.clock.wrapping_add(1);
         }
-        if self.frame % 4 == 0 {
-            self.level_water();
+        if self.ticks % hydro::LEVEL_EVERY == 0 {
+            self.level_liquids();
         }
-    }
-
-    /// Hydrostatic balance: inside one connected body of water, a calm surface whose head is well
-    /// above another one's gives cells to it. The head of a surface is its height plus the
-    /// pressure of the gas pressing on it, in cells of water (a closed boiler full of steam pushes
-    /// its water as if it stood much higher). That makes water climb back up in U-shaped tubes
-    /// (communicating vessels), and up a pipe out of a boiler under pressure.
-    fn level_water(&mut self) {
-        let mut seen = std::mem::take(&mut self.seen);
-        let mut stack = std::mem::take(&mut self.stack);
-        seen.fill(false);
-        let head = |w: &World, x: i32, y: i32| (H as i32 - y) as f32 + (w.gas_pressure(x, y - 1) - 1.0) / pockets::ATM_PER_CELL;
-        for start in 0..W * H {
-            if seen[start] || self.cells[start].m != Mat::Water {
-                continue;
-            }
-            let mut donor: Option<(i32, i32, f32)> = None;
-            let mut recv: Option<(i32, i32, f32)> = None;
-            seen[start] = true;
-            stack.push(start);
-            while let Some(i) = stack.pop() {
-                let (x, y) = ((i % W) as i32, (i / W) as i32);
-                let above = self.at(x, y - 1);
-                if matches!(above.kind(), Kind::Empty | Kind::Gas) && self.at(x, y + 1) == Mat::Water {
-                    let h = head(self, x, y);
-                    if above == Mat::Empty && recv.map_or(true, |r| h < r.2) {
-                        recv = Some((x, y, h));
-                    }
-                    if !matches!(self.at(x - 1, y).kind(), Kind::Empty | Kind::Gas)
-                        && !matches!(self.at(x + 1, y).kind(), Kind::Empty | Kind::Gas)
-                        && donor.map_or(true, |d| h > d.2)
-                    {
-                        donor = Some((x, y, h));
-                    }
-                }
-                for (nx, ny) in Self::neighbors(x, y) {
-                    if Self::inb(nx, ny) {
-                        let j = Self::idx(nx, ny);
-                        if !seen[j] && self.cells[j].m == Mat::Water {
-                            seen[j] = true;
-                            stack.push(j);
-                        }
-                    }
-                }
-            }
-            if let (Some(d), Some(r)) = (donor, recv) {
-                let gap = d.2 - r.2;
-                if gap >= 3.0 && (d.0, d.1) != (r.0, r.1) {
-                    // A big difference of head moves several cells at once (a strong push).
-                    let n = ((gap / 6.0) as i32).clamp(1, 4);
-                    for k in 0..n {
-                        let (dx, dy) = (d.0, d.1 + k);
-                        let (rx, ry) = (r.0, r.1 - 1 - k);
-                        if self.raw(dx, dy) != Mat::Water || self.at(rx, ry) != Mat::Empty {
-                            break;
-                        }
-                        let t = self.temp[Self::idx(dx, dy)];
-                        self.set(dx, dy, Mat::Empty);
-                        self.set(rx, ry, Mat::Water);
-                        self.temp[Self::idx(rx, ry)] = t;
-                    }
-                }
-            }
-        }
-        self.seen = seen;
-        self.stack = stack;
     }
 
     fn neighbors(x: i32, y: i32) -> [(i32, i32); 4] {
@@ -2056,7 +2008,8 @@ impl World {
             return;
         }
         let d = self.dir();
-        for dx in [0, d, -d] {
+        let down: &[i32] = if self.held(x, y) { &[] } else { &[0, d, -d] };
+        for &dx in down {
             if matches!(self.at(x + dx, y + 1).kind(), Kind::Empty | Kind::Gas) {
                 self.swap((x, y), (x + dx, y + 1));
                 return;
@@ -2184,7 +2137,9 @@ impl World {
             return;
         }
         let d = self.dir();
-        for dx in [0, d, -d] {
+        // The mouth of a full pipe: the pressure behind holds the column (see `hydro.rs`).
+        let down: &[i32] = if self.held(x, y) { &[] } else { &[0, d, -d] };
+        for &dx in down {
             if matches!(self.at(x + dx, y + 1).kind(), Kind::Empty | Kind::Gas) {
                 self.swap((x, y), (x + dx, y + 1));
                 return;
@@ -2619,7 +2574,8 @@ impl World {
             return;
         }
         let d = self.dir();
-        for dx in [0, d, -d] {
+        let down: &[i32] = if self.held(x, y) { &[] } else { &[0, d, -d] };
+        for &dx in down {
             if matches!(self.at(x + dx, y + 1).kind(), Kind::Empty | Kind::Gas) {
                 self.swap((x, y), (x + dx, y + 1));
                 return;
@@ -3181,6 +3137,10 @@ impl World {
             Mat::Lava => (255, 78 + flick * 3 + v, 12, 255),
             Mat::Ice => (176 + v, 226 + v, 248, 225),
             Mat::Gunpowder => (62 + v, 58 + v, 66 + v + (flick / 8) * 6, 255),
+            // Clear, with the odd cell that catches the light.
+            Mat::Diamond => if flick > 28 { (255, 255, 255, 255) } else { (196 + v, 236 + v / 2, 246, 235) },
+            // Red sticks with a pale band of paper.
+            Mat::Dynamite => if y % 6 == 0 { (226 + v / 2, 214 + v / 2, 190, 255) } else { (196 + v, 46 + v / 2, 38, 255) },
             Mat::Dirt => {
                 // Wet earth is darker.
                 let k = 256 - 96 * (c.life.min(SOIL_FULL) as i32) / SOIL_FULL as i32;
@@ -3329,7 +3289,7 @@ impl World {
             let push = time(&mut || w.pressure_push());
             let thermal = time(&mut || w.thermal_pass());
             let carry = time(&mut || w.carry_air_heat_for_bench());
-            let level = time(&mut || w.level_water());
+            let level = time(&mut || w.level_liquids());
             let per = |d: Duration, every: f32| format!("{:6.2} ms/call x1/{every} = {:5.2} ms/tick", d.as_secs_f32() * 1000.0, d.as_secs_f32() * 1000.0 / every);
             eprintln!("=== {biome:?}: whole tick {:.2} ms", whole.as_secs_f32() * 1000.0);
             eprintln!("  cells              {}  ({} of {} zones awake)", per(cells, 1.0), w.zones.awake_count(), sleep::CW * sleep::CH);
@@ -3338,7 +3298,7 @@ impl World {
             eprintln!("  pressure_push      {}", per(push, 1.0));
             eprintln!("  thermal_pass       {}", per(thermal, 3.0));
             eprintln!("  (carry_air_heat    {})", per(carry, 6.0));
-            eprintln!("  level_water        {}", per(level, 4.0));
+            eprintln!("  level_liquids      {}", per(level, hydro::LEVEL_EVERY as f32));
             for lod in 0..=3 {
                 w.lod = lod;
                 for _ in 0..30 {
@@ -4753,7 +4713,7 @@ mod profile {
         };
         time("full step", Box::new(|w| w.step()), &mut w);
         time("thermal pass", Box::new(|w| w.thermal_pass()), &mut w);
-        time("level water", Box::new(|w| w.level_water()), &mut w);
+        time("level water", Box::new(|w| w.level_liquids()), &mut w);
         time("structure pass", Box::new(|w| w.structure_pass()), &mut w);
         time("census", Box::new(|w| {
             let _ = w.census();
