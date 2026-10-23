@@ -153,7 +153,7 @@ impl World {
                     if self.cls[k] == 1 {
                         p.cells += 1;
                         p.kelvin += self.temp[k] + 273.15;
-                        p.steam += matches!(self.cells[k].m, Mat::Steam | Mat::Cloud) as u32;
+                        p.steam += self.vapour_units(k);
                         p.smoke += (self.cells[k].m == Mat::Smoke) as u32;
                     }
                 }

@@ -21,7 +21,7 @@ const GROUND_Y: f32 = 360.0;
 pub const FIRE_C: f32 = 650.0;
 pub const EMBER_C: f32 = 500.0;
 /// How much hotter burning charcoal glows than burning wood.
-pub const COAL_EXTRA_C: f32 = 150.0;
+pub const COAL_EXTRA_C: f32 = 250.0;
 pub const LAVA_C: f32 = 1100.0;
 pub const BOIL_C: f32 = 100.0;
 /// Water freezes and ice melts at 0 °C. What keeps it from flickering between the two is the
@@ -34,18 +34,20 @@ pub const LATENT_FUSION: f32 = 240.0;
 /// Heat a cell of boiling water takes in to become steam. Real water: about 540 °C worth;
 /// the game uses a third of it so that a pot still boils dry in a reasonable time.
 pub const LATENT_VAPOUR: f32 = 540.0;
-/// Heat capacities of water and ice (as in `props`).
-const C_WATER: f32 = 3.0;
-const C_ICE: f32 = 2.0;
-/// Lava turns to rock once it has cooled below this.
-pub const LAVA_SOLID_C: f32 = 390.0;
+/// Heat a cell of rock takes in to melt into lava (and lava gives back as it sets): about 250 °C
+/// worth of heating, like real rock (400 kJ/kg). This, not a huge heat capacity, is what keeps a
+/// lava flow hot: it stays at its melting point while its crust sets.
+pub const LATENT_ROCK: f32 = 400.0;
+/// The same for iron and steel: real iron takes as much heat to melt (247 kJ/kg) as to warm up
+/// by 500 °C; the game uses 300 °C worth, its hot end of the scale being squeezed.
+pub const LATENT_METAL: f32 = 750.0;
+/// Rock melts into lava and lava sets into rock at this one temperature.
 pub const ROCK_MELT_C: f32 = 540.0;
 pub const GLASS_C: f32 = 600.0;
-/// Metal melts in fresh lava or at the heart of a closed charcoal forge, and sets again once it
-/// cools below `METAL_SOLID_C`. (Real iron melts at 1538 °C; the game squeezes the hot end of the
+/// Metal melts in fresh lava or at the heart of a closed charcoal forge, and sets again at the
+/// same temperature. (Real iron melts at 1538 °C; the game squeezes the hot end of the
 /// scale the same way for rock and sand, so that a forge can get there.)
 pub const METAL_MELT_C: f32 = 900.0;
-pub const METAL_SOLID_C: f32 = 820.0;
 pub const STEEL_C: f32 = 400.0;
 /// Clay turns to terracotta once it has been this hot.
 pub const KILN_C: f32 = 550.0;
@@ -164,25 +166,27 @@ const TS: f32 = THERMAL_EVERY as f32 / 2.0;
 /// heat up and slow to cool down: lava keeps its heat for a long time.
 fn props(m: Mat) -> (f32, f32) {
     match m {
-        Mat::Empty => (0.12, 1.0),
-        Mat::Oil => (0.1, 2.0),
-        Mat::Steam | Mat::Cloud | Mat::Smoke => (0.12, 1.5),
+        // A cell of air holds a tenth of the heat of a cell of water. Real air holds 3500 times less;
+        // the game keeps more so that the air around a fire still warms up. Its conductivity is
+        // lowered with it, so that warmth spreads through the air as fast as before.
+        Mat::Empty => (0.04, C_AIR),
+        Mat::Oil => (0.1, 1.4),
+        Mat::Steam | Mat::Cloud | Mat::Smoke => (0.05, C_GAS),
         Mat::Water => (0.25, 3.0),
         Mat::Ice => (0.15, 2.0),
         Mat::Snow | Mat::Hail => (0.05, 1.5),
         Mat::Sand | Mat::Dirt | Mat::Mud | Mat::Grass => (0.06, 1.8),
         Mat::Wood | Mat::Trunk | Mat::Leaf | Mat::Seed | Mat::Sapling | Mat::Branch | Mat::DeadLeaf => (0.04, 1.4),
-        Mat::Stone | Mat::Brick => (0.05, 6.0),
-        Mat::Clay => (0.1, 2.4),
-        Mat::Terracotta | Mat::Vault => (0.14, 3.0),
-        Mat::Iron | Mat::Steel => (0.5, 2.5),
-        Mat::Glass | Mat::Shard => (0.08, 3.0),
-        // Real molten rock holds about as much heat as solid rock, plus the heat it gives off as it
-        // sets. The game gives it about 16 times more, so that a lava flow runs a while and still
-        // melts the rock and the iron it covers (it used to be 70 times: a pool of lava then held
-        // ten times the heat of the whole rest of the world, and took days to cool).
-        Mat::Lava => (0.2, 100.0),
-        Mat::Molten | Mat::MoltenSteel => (0.5, 300.0),
+        // Rock holds about half the heat of water, volume for volume (water 4.2, granite 2.2 MJ/m³K).
+        Mat::Stone | Mat::Brick => (0.05, C_ROCK),
+        Mat::Clay => (0.1, 1.8),
+        Mat::Terracotta | Mat::Vault => (0.14, 1.5),
+        Mat::Iron | Mat::Steel => (0.5, C_METAL),
+        Mat::Glass | Mat::Shard => (0.08, 1.5),
+        // Molten rock and metal hold about as much heat as when they are solid; what they hold
+        // on top is their latent heat (see `latent0`).
+        Mat::Lava => (0.2, C_ROCK),
+        Mat::Molten | Mat::MoltenSteel => (0.5, C_METAL),
         Mat::Fire => (0.4, 1.0),
         Mat::Ember => (0.25, 1.0),
         Mat::Gunpowder | Mat::Saltpeter | Mat::Ash | Mat::Rust => (0.04, 1.2),
@@ -190,20 +194,91 @@ fn props(m: Mat) -> (f32, f32) {
     }
 }
 
+/// Heat capacities (per cell, in the units of the heat flow), water being 3.
+const C_WATER: f32 = 3.0;
+const C_AIR: f32 = 0.3;
+const C_GAS: f32 = 0.4;
+const C_ROCK: f32 = 1.6;
+const C_METAL: f32 = 2.5;
+
+/// Heat capacity of a cell of `m`.
+pub(super) fn cap(m: Mat) -> f32 {
+    1.0 / tables().inv_c[m as usize]
+}
+
+/// The heat a cell of `m` holds at 0 °C, on top of what its temperature gives it: the latent
+/// heat of the changes of state that made it. Solids hold none, a liquid the heat that melted it,
+/// a vapour the heat that boiled it as well. So a cell of `m` at `t` holds `cap(m) * t +
+/// latent0(m)` (see `heat_of`), and any change of state, at whatever temperature it happens,
+/// gives off (or takes in) exactly the difference: the world neither gains nor loses heat by it.
+pub(super) fn latent0(m: Mat) -> f32 {
+    match m {
+        Mat::Water => LATENT_FUSION,
+        Mat::Lava => LATENT_ROCK,
+        Mat::Molten | Mat::MoltenSteel => LATENT_METAL,
+        // One cell of water boils into `VAPOUR_PER_WATER` cells of steam at 100 °C, which between
+        // them hold the water's heat and the heat that boiled it.
+        Mat::Steam => (LATENT_FUSION + C_WATER * BOIL_C + LATENT_VAPOUR) / VAPOUR_PER_WATER as f32 - C_GAS * BOIL_C,
+        // A cloud is the same water condensed into droplets: four cells of it make a drop.
+        Mat::Cloud => LATENT_FUSION / VAPOUR_PER_WATER as f32,
+        _ => 0.0,
+    }
+}
+
+/// Heat held by one cell of `m` at `t` °C, counted from a solid at 0 °C.
+pub(super) fn heat_of(m: Mat, t: f32) -> f32 {
+    cap(m) * t + latent0(m)
+}
+
+/// The air and the vapour, which take up the heat a change of state gives off nearby.
+fn takes_heat(m: Mat) -> bool {
+    matches!(m, Mat::Empty | Mat::Steam | Mat::Cloud | Mat::Smoke)
+}
+
+/// Solid and liquid states of one matter, the temperature where one turns into the other, and the
+/// latent heat between them. Water boils as well (see `latent_heat`).
+fn fusion(m: Mat) -> Option<(Mat, Mat, f32, f32)> {
+    match m {
+        Mat::Ice | Mat::Snow | Mat::Hail => Some((m, Mat::Water, MELT_C, LATENT_FUSION)),
+        Mat::Water => Some((Mat::Ice, Mat::Water, FREEZE_C, LATENT_FUSION)),
+        Mat::Stone | Mat::Lava => Some((Mat::Stone, Mat::Lava, ROCK_MELT_C, LATENT_ROCK)),
+        Mat::Iron | Mat::Molten => Some((Mat::Iron, Mat::Molten, METAL_MELT_C, LATENT_METAL)),
+        Mat::Steel | Mat::MoltenSteel => Some((Mat::Steel, Mat::MoltenSteel, METAL_MELT_C, LATENT_METAL)),
+        _ => None,
+    }
+}
+
+/// How warm a vapour can get before it no longer condenses: its dew point. `share` is how much
+/// of the air around it is vapour (0 to 1); a cell of steam on its own is damp air (saturated at
+/// `STEAM_DEW_C`), steam all around holds more water, and sparse vapour needs a colder night to
+/// condense. (The partial pressure of the vapour is what counts, not the temperature of the air.)
+pub(super) fn dew_point(share: f32) -> f32 {
+    let e = super::vapour_pressure(STEAM_DEW_C) * share.max(0.01);
+    // The Magnus formula turned round.
+    let g = (e / 0.6108).ln();
+    237.3 * g / (17.27 - g)
+}
+
+/// Dew point of the vapour where a whole 3 x 3 block of cells is steam.
+const STEAM_DEW_C: f32 = 45.0;
+
 struct Tables {
     k: [f32; NMAT],
     inv_c: [f32; NMAT],
     reactive: [bool; NMAT],
+    /// Air and gases.
+    airy: [bool; NMAT],
 }
 
 fn tables() -> &'static Tables {
     static T: std::sync::OnceLock<Tables> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        let mut t = Tables { k: [0.1; NMAT], inv_c: [1.0; NMAT], reactive: [false; NMAT] };
+        let mut t = Tables { k: [0.1; NMAT], inv_c: [1.0; NMAT], reactive: [false; NMAT], airy: [false; NMAT] };
         for m in Mat::ALL {
             let (k, c) = props(m);
             t.k[m as usize] = k;
             t.inv_c[m as usize] = 1.0 / c;
+            t.airy[m as usize] = matches!(m.kind(), super::Kind::Empty | super::Kind::Gas);
             t.reactive[m as usize] = matches!(
                 m,
                 Mat::Water | Mat::Ice | Mat::Snow | Mat::Hail | Mat::Steam | Mat::Lava | Mat::Molten | Mat::MoltenSteel | Mat::Stone | Mat::Sand
@@ -213,33 +288,6 @@ fn tables() -> &'static Tables {
         }
         t
     })
-}
-
-/// Where a material changes state. Every solid/liquid/gas change goes through
-/// this one table, the same way for all of them: above the first threshold it
-/// becomes the first material, below the second it becomes the second.
-struct Phase {
-    up: Option<(f32, Mat, u32)>,
-    down: Option<(f32, Mat, u32)>,
-}
-
-fn phase(m: Mat) -> Phase {
-    let none = Phase { up: None, down: None };
-    match m {
-        // ice <-> water <-> steam
-        // ice <-> water <-> steam: see `latent_heat`, which also counts the heat they take in.
-        // rock <-> lava
-        Mat::Stone => Phase { up: Some((ROCK_MELT_C, Mat::Lava, 30)), down: None },
-        Mat::Lava => Phase { up: None, down: Some((LAVA_SOLID_C, Mat::Stone, 20)) },
-        // iron <-> molten iron, steel <-> molten steel (fresh lava or a closed charcoal forge)
-        Mat::Iron => Phase { up: Some((METAL_MELT_C, Mat::Molten, 40)), down: None },
-        Mat::Molten => Phase { up: None, down: Some((METAL_SOLID_C, Mat::Iron, 20)) },
-        Mat::Steel => Phase { up: Some((METAL_MELT_C, Mat::MoltenSteel, 40)), down: None },
-        Mat::MoltenSteel => Phase { up: None, down: Some((METAL_SOLID_C, Mat::Steel, 20)) },
-        // sand fuses into glass
-        Mat::Sand | Mat::Shard => Phase { up: Some((GLASS_C, Mat::Glass, 15)), down: None },
-        _ => none,
-    }
 }
 
 /// The temperature a freshly painted state starts at, when it is not the air's: a state only
@@ -518,14 +566,18 @@ impl World {
                 // Flames and embers pour heat into whatever touches them.
                 let k = if mi == Mat::Fire as usize || mi == Mat::Ember as usize || mj == Mat::Fire as usize || mj == Mat::Ember as usize {
                     0.25
-                } else if mi == Mat::Lava as usize || mj == Mat::Lava as usize || mi == Mat::Molten as usize || mj == Mat::Molten as usize || mi == Mat::MoltenSteel as usize || mj == Mat::MoltenSteel as usize {
-                    // Lava and molten metal soak into whatever they touch.
+                } else if (Mat::from_u8(mi as u8).is_melt() || Mat::from_u8(mj as u8).is_melt()) && !tb.airy[mi] && !tb.airy[mj] {
+                    // Lava and molten metal soak into whatever they touch. The air only takes their
+                    // heat slowly: a crust sets on top and holds it in.
                     0.2
+                } else if Mat::from_u8(mi as u8).is_melt() || Mat::from_u8(mj as u8).is_melt() {
+                    0.01
                 } else {
                     tb.k[mi].min(tb.k[mj])
                 };
-                // (Capped so that a longer covered time can never overshoot and oscillate.)
-                let flux = d * (k * ts).min(0.9);
+                // (Capped so that a longer covered time, or a cell that holds little heat, can never
+                // overshoot and oscillate: at most 90 % of the way to the same temperature.)
+                let flux = d * (k * ts).min(0.9).min(0.9 / (tb.inv_c[mi] + tb.inv_c[mj]));
                 self.temp[i] = ti + flux * tb.inv_c[mi];
                 self.temp[j] = tj - flux * tb.inv_c[mj];
             }
@@ -546,7 +598,6 @@ impl World {
 
         // 2. Air relaxes toward the ambient profile; fixed sources; reactions.
         let surf = self.surface_temp_c();
-        let night_cold = surf < 5.0;
         // Heat the open air took from the sky, and heat the flames gave off.
         let (mut to_cells, mut flames) = (0.0f32, 0.0f32);
         let mut row_amb = [0.0f32; H];
@@ -554,7 +605,6 @@ impl World {
         for y in 0..H {
             let base = self.ambient_c(y as i32);
             row_amb[y] = base;
-            let can_condense = (y as i32) < COLD_Y || base <= 5.0 || night_cold && (y as i32) < GROUND_Y as i32;
             for x in 0..W {
                 let i = y * W + x;
                 let m = self.cells[i].m;
@@ -571,12 +621,12 @@ impl World {
                     Mat::Empty => {
                         let d = (amb - t) * 0.12 * ts;
                         self.temp[i] = t + d;
-                        to_cells += d;
+                        to_cells += d * C_AIR;
                     }
                     Mat::Steam | Mat::Cloud | Mat::Snow | Mat::Hail | Mat::Smoke => {
                         let d = (amb - t) * 0.03 * ts;
                         self.temp[i] = t + d;
-                        to_cells += d * 1.5;
+                        to_cells += d / tb.inv_c[m as usize];
                     }
                     Mat::Fire => {
                         flames += FIRE_C - t;
@@ -595,7 +645,7 @@ impl World {
                     _ => {}
                 }
                 if tb.reactive[m as usize] {
-                    self.react(i, x as i32, y as i32, m, self.temp[i], can_condense);
+                    self.react(i, x as i32, y as i32, m, self.temp[i]);
                 }
             }
         }
@@ -615,8 +665,8 @@ impl World {
                         Mat::Empty | Mat::Fire => {}
                         Mat::Smoke => cover += 0.05,
                         Mat::Cloud | Mat::Steam => cover += 0.2,
-                        // Too hot to be pushed around by the sky; lava's own heat is far too big for it.
-                        Mat::Ember | Mat::Lava => break,
+                        // Embers are held at their glow by the burning (see above).
+                        Mat::Ember => break,
                         _ => {
                             let t = self.temp[i];
                             let amb = row_amb[y];
@@ -680,7 +730,7 @@ impl World {
                             if target > self.temp[i] {
                                 let d = (target - self.temp[i]) * 0.05 * ts;
                                 self.temp[i] += d;
-                                from_sun += d * 1.5;
+                                from_sun += d / tb.inv_c[m as usize];
                             }
                             break true;
                         }
@@ -689,7 +739,7 @@ impl World {
                             if target > self.temp[i] {
                                 let d = (target - self.temp[i]) * 0.04 * ts;
                                 self.temp[i] += d;
-                                from_sun += d * 1.5;
+                                from_sun += d / tb.inv_c[m as usize];
                             }
                             light *= 0.8;
                         }
@@ -806,7 +856,17 @@ impl World {
     /// rest of the sky.
     pub fn total_heat(&self) -> f32 {
         let tb = tables();
-        let cells: f64 = self.cells.iter().zip(&self.temp).map(|(c, &t)| t as f64 / tb.inv_c[c.m as usize] as f64).sum();
+        let cells: f64 = self
+            .cells
+            .iter()
+            .zip(&self.temp)
+            .zip(&self.latent)
+            .map(|((c, &t), &l)| {
+                // Packed vapour holds the latent heat of every cell of vapour in it.
+                let packed = if matches!(c.m, Mat::Steam | Mat::Cloud) { c.life as f32 * latent0(c.m) } else { 0.0 };
+                (t / tb.inv_c[c.m as usize] + latent0(c.m) + l + packed) as f64
+            })
+            .sum();
         cells as f32 + self.climate.sky_dev * SKY_C
     }
 
@@ -875,7 +935,7 @@ impl World {
                             }
                             let flux = (self.temp[i] - self.temp[j]) * gust;
                             self.temp[j] += flux * tb.inv_c[m as usize];
-                            self.temp[i] -= flux * tb.inv_c[Mat::Empty as usize].min(1.0);
+                            self.temp[i] -= flux * tb.inv_c[Mat::Empty as usize];
                         }
                     }
                 }
@@ -883,12 +943,13 @@ impl World {
         }
     }
 
-    /// Water, ice and snow change state only once they have taken in (or given up) their latent
-    /// heat. Meanwhile their temperature stays put at the change point: boiling water stays at
-    /// 100 °C (more under pressure) however hot the fire, melting ice stays at 0 °C. Heat that
-    /// went in and was not enough is given back if the cell cools again. Returns true when the
-    /// cell changed state.
+    /// A matter changes state only once it has taken in (or given up) its latent heat: ice and
+    /// water, rock and lava, iron and steel and their melt. Meanwhile its temperature stays put
+    /// at the change point: boiling water stays at 100 °C (more under pressure) however hot the
+    /// fire, melting ice at 0 °C, setting lava at its melting point. Heat that went in and was not
+    /// enough is given back if the cell cools again. Returns true when the cell changed state.
     fn latent_heat(&mut self, i: usize, x: i32, y: i32, m: Mat, t: f32) -> bool {
+        let Some((solid, liquid, at, lat)) = fusion(m) else { return false };
         if m == Mat::Water {
             // Water boils later under pressure (a pressure cooker, the deep of a lake) and earlier
             // in a partial vacuum.
@@ -899,79 +960,146 @@ impl World {
                 self.temp[i] = boil;
                 if self.latent[i] >= LATENT_VAPOUR {
                     // It swells into several cells of steam (see `vaporize`).
-                    self.temp[i] = boil + 1.0;
                     self.vaporize(x, y);
                     return true;
                 }
-            } else if t < FREEZE_C {
-                self.latent[i] += (t - FREEZE_C) * C_WATER;
-                self.temp[i] = FREEZE_C;
-                if self.latent[i] <= -LATENT_FUSION {
-                    self.set(x, y, Mat::Ice);
-                    self.temp[i] = FREEZE_C;
-                    return true;
-                }
+                return false;
             } else if stored > 0.0 {
                 // Half-boiled water that cools gives its heat back first.
                 let dt = (stored / C_WATER).min(boil - t);
                 self.temp[i] = t + dt;
                 self.latent[i] -= dt * C_WATER;
-            } else if stored < 0.0 {
-                // Half-frozen water that warms takes back the cold first.
-                let dt = (-stored / C_WATER).min(t - FREEZE_C);
-                self.temp[i] = t - dt;
-                self.latent[i] += dt * C_WATER;
+                return false;
             }
-            return false;
         }
-        // Ice, snow, hail.
-        if t > MELT_C {
-            self.latent[i] += (t - MELT_C) * C_ICE;
-            self.temp[i] = MELT_C;
-            if self.latent[i] >= LATENT_FUSION {
-                self.set(x, y, Mat::Water);
-                self.temp[i] = MELT_C;
+        let c = cap(m);
+        if m == liquid {
+            if t < at {
+                self.latent[i] += (t - at) * c;
+                self.temp[i] = at;
+                if self.latent[i] <= -lat {
+                    self.set(x, y, solid);
+                    self.temp[i] = at;
+                    return true;
+                }
+            } else if self.latent[i] < 0.0 {
+                // Half-set, it takes back the cold first.
+                let dt = (-self.latent[i] / c).min(t - at);
+                self.temp[i] = t - dt;
+                self.latent[i] += dt * c;
+            }
+        } else if t > at {
+            self.latent[i] += (t - at) * c;
+            self.temp[i] = at;
+            if self.latent[i] >= lat {
+                self.set(x, y, liquid);
+                self.temp[i] = at;
                 return true;
             }
-        } else if self.latent[i] > 0.0 && t < MELT_C {
-            let dt = (self.latent[i] / C_ICE).min(MELT_C - t);
+        } else if self.latent[i] > 0.0 {
+            let dt = (self.latent[i] / c).min(at - t);
             self.temp[i] = t + dt;
-            self.latent[i] -= dt * C_ICE;
+            self.latent[i] -= dt * c;
         }
         false
     }
 
+    /// Heat given off (`q` > 0) or taken in (`q` < 0) by a change of state at (x, y): the air and
+    /// vapour right around take what they can without jumping more than a few degrees, and the
+    /// rest goes to (or comes from) the rest of the sky, like the heat the open air trades with
+    /// it. Nothing is lost on the way. (Liquids and solids nearby are left alone: their own
+    /// changes of state keep count of the heat that reaches them, see `latent_heat`.)
+    pub(super) fn release_heat(&mut self, x: i32, y: i32, q: f32) {
+        const LOCAL_DT: f32 = 4.0;
+        let tb = tables();
+        let mut c_sum = 0.0;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if Self::inb(x + dx, y + dy) {
+                    let m = self.raw(x + dx, y + dy);
+                    if takes_heat(m) {
+                        c_sum += 1.0 / tb.inv_c[m as usize];
+                    }
+                }
+            }
+        }
+        let dt = if c_sum > 0.0 { (q / c_sum).clamp(-LOCAL_DT, LOCAL_DT) } else { 0.0 };
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if Self::inb(x + dx, y + dy) && takes_heat(self.raw(x + dx, y + dy)) {
+                    self.temp[Self::idx(x + dx, y + dy)] += dt;
+                }
+            }
+        }
+        if self.climate_fixed.is_none() {
+            self.climate.sky_dev += (q - dt * c_sum) / SKY_C;
+        }
+    }
+
+    /// The cell at (x, y) becomes `to` at the same temperature, giving off (or taking in) the
+    /// difference in the heat they hold.
+    pub(super) fn turn(&mut self, x: i32, y: i32, to: Mat) {
+        let i = Self::idx(x, y);
+        let (m, t) = (self.cells[i].m, self.temp[i]);
+        let q = heat_of(m, t) + self.latent[i] - heat_of(to, t);
+        self.set(x, y, to);
+        self.temp[i] = t;
+        self.release_heat(x, y, q);
+    }
+
+    /// How much of the air around (x, y) is vapour (steam and cloud, packed vapour counting
+    /// more): what sets its dew point.
+    fn vapour_share(&self, x: i32, y: i32) -> f32 {
+        let mut n = 0;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if Self::inb(x + dx, y + dy) {
+                    let c = self.cells[Self::idx(x + dx, y + dy)];
+                    if matches!(c.m, Mat::Steam | Mat::Cloud) {
+                        n += 1 + c.life as u32;
+                    }
+                }
+            }
+        }
+        n as f32 / 9.0
+    }
+
+    /// The vapour at (x, y) has cooled to its dew point: it condenses into droplets (a cloud,
+    /// fog, the plume over a kettle) and gives back the heat that made it vapour.
+    fn condense(&mut self, x: i32, y: i32) {
+        let i = Self::idx(x, y);
+        let units = 1.0 + self.cells[i].life as f32;
+        let (life, t) = (self.cells[i].life, self.temp[i]);
+        self.set(x, y, Mat::Cloud);
+        self.cells[i].life = life;
+        self.temp[i] = t;
+        self.release_heat(x, y, units * (latent0(Mat::Steam) - latent0(Mat::Cloud)));
+    }
+
+    /// Droplets of cloud at (x, y) warmed above their dew point (or left alone in dry air)
+    /// evaporate back into vapour, taking the heat for it from around.
+    pub(super) fn evaporate_cloud(&mut self, x: i32, y: i32) {
+        let i = Self::idx(x, y);
+        let units = 1.0 + self.cells[i].life as f32;
+        let (life, t) = (self.cells[i].life, self.temp[i]);
+        self.set(x, y, Mat::Steam);
+        self.cells[i].life = life;
+        self.temp[i] = t;
+        self.release_heat(x, y, units * (latent0(Mat::Cloud) - latent0(Mat::Steam)));
+    }
+
+    /// Whether the droplets of a cloud at (x, y) are warmer than their dew point.
+    pub(super) fn above_dew_point(&self, x: i32, y: i32) -> bool {
+        self.temp[Self::idx(x, y)] > dew_point(self.vapour_share(x, y)) + 2.0
+    }
+
     /// Material changes driven by temperature. Transformations consume their
     /// inputs: water that boils is gone, steam that condenses is a cloud.
-    fn react(&mut self, i: usize, x: i32, y: i32, m: Mat, t: f32, can_condense: bool) {
-        if matches!(m, Mat::Water | Mat::Ice | Mat::Snow | Mat::Hail) && self.latent_heat(i, x, y, m, t) {
+    fn react(&mut self, i: usize, x: i32, y: i32, m: Mat, t: f32) {
+        if fusion(m).is_some() && self.latent_heat(i, x, y, m, t) {
             return;
         }
-        // Melting, boiling, freezing, setting: one rule for every material.
-        let ph = phase(m);
-        if let Some((th, to, rate)) = ph.up {
-            if t >= th && self.chance_t(rate) {
-                self.set(x, y, to);
-                // The new phase takes the heat from whatever made it change: halfway
-                // between the threshold and its hottest neighbour. That is how fresh
-                // lava keeps melting the rock beside it, layer after layer, until the
-                // heat has thinned out.
-                let hottest = Self::neighbors(x, y)
-                    .iter()
-                    .filter(|&&(nx, ny)| Self::inb(nx, ny))
-                    .map(|&(nx, ny)| self.temp[Self::idx(nx, ny)])
-                    .fold(th, f32::max);
-                self.temp[i] = (0.5 * (th + hottest)).min(1300.0);
-                return;
-            }
-        }
-        if let Some((th, to, rate)) = ph.down {
-            if t <= th && self.chance_t(rate) {
-                self.set(x, y, to);
-                self.temp[i] = t.max(th);
-                return;
-            }
-        }
+        let t = self.temp[i];
         match m {
             Mat::Water | Mat::Molten | Mat::MoltenSteel => {}
             Mat::Ice | Mat::Snow | Mat::Hail => {
@@ -979,13 +1107,15 @@ impl World {
                     // Deep, cold snow is pressed into ice (the way a glacier forms).
                     let above = (1..=3).filter(|d| matches!(self.raw(x, y - d), Mat::Snow | Mat::Ice | Mat::Hail)).count();
                     if (above >= 2 && self.chance_t(500)) || (t < -12.0 && above >= 1 && self.chance_t(4000)) {
-                        self.set(x, y, Mat::Ice);
+                        self.turn(x, y, Mat::Ice);
                     }
                 }
             }
             Mat::Steam => {
-                if t <= 45.0 && can_condense && self.chance_t(8) {
-                    self.set(x, y, Mat::Cloud);
+                // Vapour condenses where the air has cooled to its dew point: up in the cold sky,
+                // on a cold night near the ground (fog), right over a kettle where it is dense.
+                if self.chance_t(8) && t <= dew_point(self.vapour_share(x, y)) {
+                    self.condense(x, y);
                 }
             }
             Mat::Lava => {}
@@ -998,7 +1128,12 @@ impl World {
                     }
                 }
             }
-            Mat::Sand | Mat::Shard => {}
+            Mat::Sand | Mat::Shard => {
+                // Sand fuses into glass (which does not melt back in a fire).
+                if t >= GLASS_C && self.chance_t(15) {
+                    self.turn(x, y, Mat::Glass);
+                }
+            }
             Mat::Glass => {
                 // Thermal shock: neighbours at very different temperatures crack it.
                 let mut worst = 0.0f32;
@@ -1195,6 +1330,155 @@ mod bench_tests {
 mod latent_tests {
     use super::*;
 
+    /// A world whose heat goes nowhere on its own (no sky forcing in the cells we look at): the
+    /// changes of state are called by hand and the total heat, sky included, must not move.
+    fn still() -> World {
+        let mut w = World::new();
+        w.structures_fall = false;
+        w.day_cycle = false;
+        w
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() <= 1e-4 * a.abs().max(b.abs()).max(1e5)
+    }
+
+    #[test]
+    fn boiling_evaporating_and_condensing_neither_make_nor_lose_heat() {
+        let mut w = still();
+        // Water that has taken in all its heat of boiling, and cold water evaporating.
+        w.set(100, 200, Mat::Water);
+        w.temp[200 * W + 100] = 100.0;
+        w.latent[200 * W + 100] = LATENT_VAPOUR;
+        w.set(300, 200, Mat::Water);
+        w.temp[200 * W + 300] = 20.0;
+        let before = w.total_heat();
+        let sky = w.climate.sky_dev;
+        w.vaporize(100, 200);
+        w.vaporize(300, 200);
+        assert!(close(w.total_heat(), before), "{} vs {before}", w.total_heat());
+        // Boiling water held its own heat; cold water evaporating took heat from around.
+        assert!(w.climate.sky_dev < sky, "evaporation cools: {} vs {sky}", w.climate.sky_dev);
+        let steam = (0..W * H).filter(|&k| w.cells[k].m == Mat::Steam).count();
+        assert_eq!(steam, 2 * VAPOUR_PER_WATER, "each cell of water swells into four of steam");
+
+        // The vapour condenses: it gives its heat of boiling back.
+        let (before, sky) = (w.total_heat(), w.climate.sky_dev);
+        for k in 0..W * H {
+            if w.cells[k].m == Mat::Steam {
+                w.condense((k % W) as i32, (k / W) as i32);
+            }
+        }
+        assert!(close(w.total_heat(), before));
+        assert!(w.climate.sky_dev > sky, "condensing warms the air");
+    }
+
+    #[test]
+    fn rain_and_snow_out_of_a_cloud_keep_the_heat_count() {
+        let mut w = still();
+        for (x0, t) in [(100, 5.0), (300, -5.0)] {
+            for y in 100..106 {
+                for x in x0..x0 + 6 {
+                    w.set(x, y, Mat::Cloud);
+                    w.temp[y as usize * W + x as usize] = t;
+                }
+            }
+        }
+        let before = w.total_heat();
+        let mut drops = 0;
+        for x0 in [100, 300] {
+            for y in 100..106 {
+                for x in x0..x0 + 6 {
+                    if w.raw(x, y) == Mat::Cloud && w.gather_vapour(x, y) {
+                        let i = y as usize * W + x as usize;
+                        let t = w.temp[i];
+                        let own = heat_of(Mat::Cloud, t) + w.cells[i].life as f32 * latent0(Mat::Cloud);
+                        let to = if t > 2.0 { Mat::Water } else { Mat::Snow };
+                        w.set(x, y, to);
+                        w.temp[i] = t;
+                        w.release_heat(x, y, own - heat_of(to, t));
+                        drops += 1;
+                    }
+                }
+            }
+        }
+        assert!(drops >= 6, "{drops} drops");
+        assert!(close(w.total_heat(), before), "{} vs {before}", w.total_heat());
+    }
+
+    #[test]
+    fn a_full_boiler_keeps_all_its_water_as_packed_vapour() {
+        let mut w = still();
+        // Water walled in on every side: no room for the steam it makes.
+        for y in 199..=201 {
+            for x in 99..=101 {
+                w.set(x, y, Mat::Terracotta);
+            }
+        }
+        w.set(100, 200, Mat::Water);
+        w.temp[200 * W + 100] = 100.0;
+        w.latent[200 * W + 100] = LATENT_VAPOUR;
+        let before = w.total_heat();
+        w.vaporize(100, 200);
+        assert_eq!(w.raw(100, 200), Mat::Steam);
+        assert_eq!(w.vapour_units(200 * W + 100), VAPOUR_PER_WATER as u32, "no water lost");
+        assert!(close(w.total_heat(), before));
+        // Opened, the packed vapour spreads out.
+        w.set(100, 199, Mat::Empty);
+        for _ in 0..200 {
+            w.step();
+        }
+        let units: u32 = (0..W * H).map(|k| w.vapour_units(k)).sum();
+        let cells = (0..W * H).filter(|&k| matches!(w.cells[k].m, Mat::Steam | Mat::Cloud)).count();
+        assert!(cells >= 2 && units >= cells as u32, "it spread: {cells} cells, {units} units");
+    }
+
+    #[test]
+    fn dense_vapour_condenses_sooner_than_sparse_vapour() {
+        assert!((dew_point(1.0) - STEAM_DEW_C).abs() < 0.5);
+        assert!(dew_point(4.0) > 70.0, "the packed vapour of a boiler condenses well above 45 °C");
+        let lone = dew_point(1.0 / 9.0);
+        assert!(lone < 10.0 && lone > 0.0, "a lone wisp needs a cold night: {lone}");
+    }
+
+    #[test]
+    fn setting_lava_stays_at_its_melting_point_while_it_gives_off_its_latent_heat() {
+        let mut w = World::new_static();
+        for x in 100..140 {
+            for y in 300..306 {
+                w.set(x, y, Mat::Stone);
+            }
+            for y in 298..300 {
+                w.set(x, y, Mat::Lava);
+                w.temp[y as usize * W + x as usize] = LAVA_C;
+            }
+        }
+        let (mut plateau, mut set) = (false, false);
+        for _ in 0..6000 {
+            w.step();
+            let i = 299 * W + 120;
+            if w.cells[i].m == Mat::Lava && w.latent[i] < -10.0 {
+                plateau |= (w.temp[i] - ROCK_MELT_C).abs() < 0.5;
+            }
+            set |= w.cells[i].m == Mat::Stone;
+        }
+        assert!(plateau, "half-set lava sits at its melting point");
+        assert!(set, "and sets in the end");
+    }
+
+    #[test]
+    fn quenched_lava_boils_the_water_with_its_own_heat() {
+        let mut w = still();
+        w.set(100, 200, Mat::Lava);
+        w.temp[200 * W + 100] = LAVA_C;
+        w.set(100, 201, Mat::Water);
+        w.temp[201 * W + 100] = 20.0;
+        let before = w.total_heat();
+        w.step_hot_liquid(100, 200, Mat::Stone);
+        assert_eq!(w.raw(100, 200), Mat::Stone);
+        assert!(close(w.total_heat(), before), "{} vs {before}", w.total_heat());
+    }
+
     #[test]
     fn boiling_water_stays_at_100_until_it_has_all_turned_to_steam() {
         let mut w = World::new_static();
@@ -1340,7 +1624,9 @@ mod budget_tests {
             hot.thermal_pass();
         }
         let warmed = hot.climate.sky_dev - calm.climate.sky_dev;
-        assert!(warmed > 0.05, "the sky took the heat of the hot air: {warmed}");
+        // Most of the heat of the hot air (about 385 °C above the night air, 120 x 60 cells).
+        let excess = 120.0 * 60.0 * 385.0 * cap(Mat::Empty) / SKY_C;
+        assert!(warmed > 0.6 * excess, "the sky took the heat of the hot air: {warmed} of {excess}");
         // Six hours later (a thermal pass covers 3 steps) most of it has gone out to space.
         for _ in 0..(DAY_STEPS / 4 / THERMAL_EVERY) {
             calm.thermal_pass();
