@@ -204,7 +204,11 @@ et faire des loopings et des culbutes. S'il touche quoi que ce soit (sol, eau, b
 - Cliquer sur la saison dans la pastille en haut à gauche de la simulation passe à la saison suivante. Un clic ailleurs
   sur la pastille ouvre le **bilan d'énergie** (un second clic le referme) : soleil entrant, sortie vers l'espace, chaleur
   des feux, courbe de la chaleur du monde sur 24 h, et trois curseurs (*Soleil*, *Sortie vers l'espace*, *Nuages et fumée
-  gardent*) avec un bouton *Revenir au neutre*.
+  gardent*) avec un bouton *Revenir au neutre*. La bulle reprend aussi *Temps*, *Saison* et *Vent* : l'onglet Monde
+  donne le point de départ, la bulle permet de jouer avec en pleine simulation.
+- **Lance-flammes** (barre d'outils, icône flamme) : garder le clic enfoncé envoie un jet à 1500 °C de la taille du
+  pinceau. Le bois s'embrase, la roche rougit puis fond en lave, le fer fond, l'eau bout ; ce qui est lourd chauffe plus
+  lentement. Sa chaleur compte dans le bilan d'énergie avec celle des feux.
 - La palette de gauche se cache comme celle de droite : elle sort quand la souris va au bord gauche. La petite poignée en
   haut la garde dehors (et l'image se place à côté).
 - Les feuillages laissent passer l'eau : elle goutte à travers les arbres.
@@ -289,6 +293,9 @@ Le monde est fermé sur les côtés et au fond, ouvert seulement par le haut (`t
   quelques heures. Un grand feu réchauffe donc tout le ciel d'un ou deux degrés, puis tout revient.
 - L'air enfermé dans une boîte sans fissure ne suit plus le ciel : il se mélange dans sa boîte et ne perd sa chaleur
   qu'à travers les parois. Une boîte de verre au soleil devient une serre.
+- La lave garde environ 16 fois plus de chaleur que la roche (au lieu de 70 fois avant) : elle coule un moment, fond
+  encore la roche et le fer qu'elle recouvre, mais une nappe de lave ne contient plus dix fois la chaleur du reste du
+  monde.
 - Sans rien faire, le cycle est neutre : sur trois jours de jeu, la réserve du ciel reste à moins de 1 °C du cycle
   habituel. Le test ignoré `energy_probe` imprime le bilan toutes les trois heures (`BONFIRE=1` pour un grand feu,
   `FIRE=1` pour une nappe de lave).

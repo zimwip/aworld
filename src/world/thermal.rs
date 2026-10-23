@@ -66,6 +66,9 @@ const SKY_C: f32 = 2.0e7;
 const SKY_TAU: f32 = DAY_STEPS as f32 / 8.0;
 /// How far (°C) the sky settles when the sun or the escape to space is doubled or cut off.
 const SKY_SWING_C: f32 = 15.0;
+/// The flamethrower's blast: as hot as a blowtorch, and the heat it gives one cell per frame.
+pub const FLAMETHROWER_C: f32 = 1500.0;
+const FLAMETHROWER_Q: f32 = 150.0;
 /// How freely a surface that sees the sky radiates its excess warmth to space.
 const RADIATE_K: f32 = 0.01;
 /// One sample of the world's heat every this many steps (a quarter of an hour), a day of them kept.
@@ -99,6 +102,11 @@ impl Default for Climate {
 }
 
 impl Climate {
+    /// Heat the player puts in by hand (the flamethrower), counted with the flames.
+    pub fn add_player_heat(&mut self, q: f32) {
+        self.acc[2] += q;
+    }
+
     /// Where the sky settles with the player's settings: warmer with more sun or less escape.
     pub fn sky_target(&self) -> f32 {
         SKY_SWING_C * (self.sun_gain - 1.0) - SKY_SWING_C * (self.space_gain - 1.0)
@@ -169,7 +177,11 @@ fn props(m: Mat) -> (f32, f32) {
         Mat::Terracotta | Mat::Vault => (0.14, 3.0),
         Mat::Iron | Mat::Steel => (0.5, 2.5),
         Mat::Glass | Mat::Shard => (0.08, 3.0),
-        Mat::Lava => (0.2, 400.0),
+        // Real molten rock holds about as much heat as solid rock, plus the heat it gives off as it
+        // sets. The game gives it about 16 times more, so that a lava flow runs a while and still
+        // melts the rock and the iron it covers (it used to be 70 times: a pool of lava then held
+        // ten times the heat of the whole rest of the world, and took days to cool).
+        Mat::Lava => (0.2, 100.0),
         Mat::Molten | Mat::MoltenSteel => (0.5, 300.0),
         Mat::Fire => (0.4, 1.0),
         Mat::Ember => (0.25, 1.0),
@@ -722,6 +734,49 @@ impl World {
             }
         }
         self.tally_energy(from_sun, to_space, flames, THERMAL_EVERY as f32 * scale);
+    }
+
+    /// The flamethrower: everything within `r` cells of (cx, cy) is blasted towards
+    /// `FLAMETHROWER_C` (heavy things heat slower), the air in the blast catches fire, and wood
+    /// burns. Returns the heat it put in.
+    pub fn flamethrower(&mut self, cx: i32, cy: i32, r: i32) -> f32 {
+        let tb = tables();
+        let mut heat = 0.0;
+        self.revision += 1;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let (x, y) = (cx + dx, cy + dy);
+                if dx * dx + dy * dy > r * r || !Self::inb(x, y) {
+                    continue;
+                }
+                let i = Self::idx(x, y);
+                match self.cells[i].m {
+                    Mat::Empty => {
+                        if self.chance(3) {
+                            self.set(x, y, Mat::Fire);
+                        }
+                    }
+                    Mat::Fire | Mat::Ember => {}
+                    m => {
+                        let t = self.temp[i];
+                        if t < FLAMETHROWER_C {
+                            // The same blast of heat for every cell: what it does to the
+                            // temperature depends on the heat capacity.
+                            let q = ((FLAMETHROWER_C - t) * 0.5).min(FLAMETHROWER_Q);
+                            let d = (q * tb.inv_c[m as usize]).min(FLAMETHROWER_C - t);
+                            self.temp[i] = t + d;
+                            heat += d / tb.inv_c[m as usize];
+                        }
+                        if m.is_wooden() && self.chance(4) {
+                            self.set(x, y, Mat::Ember);
+                        }
+                        self.zones.wake(i);
+                    }
+                }
+            }
+        }
+        self.climate.add_player_heat(heat);
+        heat
     }
 
     /// Adds one pass to the budget, and every quarter of an hour takes a sample of the heat held by
@@ -1331,6 +1386,26 @@ mod budget_tests {
         };
         let (lit, shade) = (surface(420), surface(540));
         assert!(lit > shade + 3.0, "the slope facing the rising sun is warmer: {lit} vs {shade}");
+    }
+
+    #[test]
+    fn the_flamethrower_sets_wood_alight_and_melts_rock_into_lava() {
+        let mut w = open_world(0.25);
+        for x in 100..120 {
+            for y in 380..400 {
+                w.set(x, y, Mat::Wood);
+            }
+        }
+        let mut heat = 0.0;
+        for _ in 0..60 {
+            heat += w.flamethrower(110, 385, 6);
+            heat += w.flamethrower(300, 403, 4);
+            w.step();
+        }
+        let near = |m: Mat, x0: i32| (x0 - 10..x0 + 10).flat_map(|x| (370..410).map(move |y| (x, y))).filter(|&(x, y)| w.raw(x, y) == m).count();
+        assert!(near(Mat::Ember, 110) + near(Mat::Fire, 110) > 10, "the wood burns");
+        assert!(near(Mat::Lava, 300) > 5, "the rock melts: {}", near(Mat::Lava, 300));
+        assert!(heat > 0.0);
     }
 
     #[test]

@@ -93,6 +93,7 @@ enum Tool {
     Eraser,
     Tunnel,
     Hammer,
+    Flame,
     Loupe,
     Sensor,
     Entry,
@@ -1444,6 +1445,9 @@ impl Game {
             Tool::Select => self.select_mouse(at, click, left, is_key_down(KeyCode::LeftShift)),
             Tool::Tunnel => self.world.tunnel_line(from, g, self.brush.max(2)),
             Tool::Hammer if click => self.hammer(at),
+            Tool::Flame => {
+                self.world.flamethrower(g.0, g.1, self.brush.max(3));
+            }
             Tool::Sensor if click => self.sensor_click(at),
             Tool::Entry if click => self.entry = Some(g),
             Tool::Exit if click => self.exit = Some(g),
@@ -2009,6 +2013,7 @@ impl Game {
                 }
                 Tool::Shovel => self.draw_shovel_cursor(ui, view, at),
                 Tool::Hammer => draw_circle_lines(ui.mouse.x, ui.mouse.y, 3.5 * view.s, 1.5, ACCENT),
+                Tool::Flame => draw_circle_lines(ui.mouse.x, ui.mouse.y, self.brush.max(3) as f32 * view.s, 1.5, RED),
                 Tool::Loupe => self.draw_lens(ui, view, at),
                 _ => {}
             }
@@ -2113,10 +2118,11 @@ impl Game {
     /// last day, and the settings of the sun and of the escape to space.
     fn draw_climate_menu(&mut self, ui: &mut Ui) {
         let pill = self.hud_hit;
-        let r = Rect::new(pill.x, pill.y + pill.h + 6.0, 340.0, 332.0);
+        let r = Rect::new(pill.x, pill.y + pill.h + 6.0, 640.0, 332.0);
         self.hud_hit = Rect::new(pill.x, pill.y, pill.w.max(r.w), r.y + r.h - pill.y);
         rrect(r, 14.0, Color::new(0.06, 0.07, 0.13, 0.94));
-        let (x, w) = (r.x + 14.0, r.w - 28.0);
+        self.draw_live_weather(ui, Rect::new(r.x + 340.0, r.y, r.w - 340.0, r.h));
+        let (x, w) = (r.x + 14.0, 340.0 - 28.0);
         let c = &self.world.climate;
         ui.text("Bilan d'énergie (par heure)", x, r.y + 24.0, 16, ACCENT);
         // Where the energy comes from and where it goes: one bar each, on the same scale.
@@ -2168,6 +2174,47 @@ impl Game {
             c.reset_settings();
             self.say("Le soleil et le ciel reprennent leur cycle habituel".to_string());
         }
+    }
+
+    /// The time, the season and the wind, beside the energy budget: the Monde tab sets the starting
+    /// point, these let the child play with them while the simulation runs.
+    fn draw_live_weather(&mut self, ui: &mut Ui, r: Rect) {
+        let (x, w) = (r.x + 4.0, r.w - 18.0);
+        let half = (w - 6.0) / 2.0;
+        ui.text("Temps", x, r.y + 24.0, 16, ACCENT);
+        if ui.button(Rect::new(x, r.y + 32.0, half, 26.0), "Midi", Icon::Sun, false, true, ACCENT) {
+            self.world.set_phase(0.25);
+        }
+        if ui.button(Rect::new(x + half + 6.0, r.y + 32.0, half, 26.0), "Minuit", Icon::Moon, false, true, BLUE) {
+            self.world.set_phase(0.75);
+        }
+        let cycle = self.world.day_cycle;
+        if ui.button(Rect::new(x, r.y + 62.0, w, 24.0), if cycle { "Jour et nuit : en marche" } else { "Jour et nuit : figé" }, Icon::None, cycle, true, GREEN) {
+            self.world.day_cycle = !cycle;
+        }
+        let sy = r.y + 112.0;
+        ui.text("Saison", x, sy, 16, ACCENT);
+        for (i, s) in Season::ALL.iter().enumerate() {
+            let b = Rect::new(x + (i % 2) as f32 * (half + 6.0), sy + 8.0 + (i / 2) as f32 * 28.0, half, 24.0);
+            if ui.button(b, s.name(), Icon::None, self.world.season() == *s, true, ACCENT) {
+                self.world.set_season(*s);
+            }
+        }
+        let vy = sy + 84.0;
+        ui.text("Vent", x, vy, 16, ACCENT);
+        let mut vals = [self.world.wind_max, self.world.wind_changes, self.world.windiness];
+        let rows: [(&str, f32, f32, String); 3] = [
+            ("Force max", 0.05, 1.0, format!("{:.0} km/h", vals[0] * 40.0)),
+            ("Virages", 0.0, 3.0, if vals[1] < 0.05 { "jamais".to_string() } else { format!("x{:.1}", vals[1]) }),
+            ("Calme-venteux", 0.0, 1.0, format!("{:.0} %", vals[2] * 100.0)),
+        ];
+        for (k, (label, lo, hi, shown)) in rows.iter().enumerate() {
+            let y = vy + 8.0 + k as f32 * 24.0;
+            ui.text(label, x, y + 13.0, 12, TEXT);
+            ui.slider(Rect::new(x + 96.0, y, w - 96.0 - 66.0, 18.0), &mut vals[k], *lo, *hi, BLUE);
+            ui.text(shown, x + w - 58.0, y + 13.0, 12, DIM);
+        }
+        (self.world.wind_max, self.world.wind_changes, self.world.windiness) = (vals[0], vals[1], vals[2]);
     }
 
     /// Left edge of the picture: beside the palette when it is pinned, else the whole window.
@@ -2383,11 +2430,12 @@ impl Game {
 
     /// The tools, always in reach on the left edge of the picture.
     fn draw_tools_strip(&mut self, ui: &mut Ui, sh: f32) {
-        let tools: [(Tool, &str, Icon, &str); 7] = [
+        let tools: [(Tool, &str, Icon, &str); 8] = [
             (Tool::Select, "Sélection", Icon::Select, "Clique un élément (bloc, tige, engrenage, câble, tuyau, rail, voiture...) : il est entouré. Glisse-le pour le déplacer ; pour une tige, un câble, un tuyau ou un rail, glisse une poignée au bout pour le retailler. Suppr l'efface. Échap désélectionne. Une voiture sélectionnée affiche ses réglages."),
             (Tool::Eraser, "Gomme", Icon::Eraser, "Efface la matière, les blocs et les câbles (clic droit aussi)."),
             (Tool::Tunnel, "Tunnel", Icon::Tunnel, "Creuse comme la gomme, mais pose une voûte de briques au-dessus du trou : le sable, la terre ou l'eau du plafond ne s'effondrent plus dedans. La roche, elle, tient toute seule et reste telle quelle ; le sol du tunnel n'est pas touché. Le pinceau règle la largeur."),
             (Tool::Hammer, "Marteau", Icon::Hammer, "Tape sur le verre et la glace pour les casser, secoue les autres blocs."),
+            (Tool::Flame, "Lance-flammes", Icon::Flame, "Garde le clic enfoncé : un jet de flammes à 1500 °C. Le bois prend feu, la pierre rougit puis fond en lave, le fer fond, l'eau bout. Ce qui est lourd (pierre, eau) chauffe plus lentement. Le pinceau règle la taille du jet."),
             (Tool::Loupe, "Loupe", Icon::Loupe, "Le pointeur est une loupe : une vue ronde en bas à droite montre la matière sous la croix."),
             (Tool::Sensor, "Capteur", Icon::Thermo, "Pose une sonde (jusqu'à 4) : thermomètre, baromètre et hygromètre. Ses courbes s'affichent en bas de l'image : l'eau qui chauffe puis reste à 100 °C, une chaudière qui monte en pression, l'air qui sèche à midi. Clique sur une sonde pour l'enlever."),
             (Tool::Shovel, "Pelle", Icon::Shovel, "Clique un tas (cendre, sable, eau, fer...) : la bulle se remplit. Déplace-la, elle reste pleine. Garde le clic enfoncé : plus tu attends, plus le morceau est gros (jusqu'à tout) ; relâche pour le verser. La pelle ne se remplit que si elle est vide. Clic droit : tout verser. Le pinceau règle sa taille."),
