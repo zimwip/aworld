@@ -1048,6 +1048,9 @@ impl World {
         let (t1, c1) = STOPS[k];
         let f = ((t - t0) / (t1 - t0)).clamp(0.0, 1.0);
         let mix = |a: f32, b: f32| (a + (b - a) * f) as u8;
+        if gas_grain(self.cells[i].m) {
+            return grain_dot([mix(c0[0], c1[0]), mix(c0[1], c1[1]), mix(c0[2], c1[2])]);
+        }
         // Solid things are drawn a little darker than air so shapes stay readable.
         let dim = if self.cells[i].m == Mat::Empty { 0.78 } else { 1.0 };
         [(mix(c0[0], c1[0]) as f32 * dim) as u8, (mix(c0[1], c1[1]) as f32 * dim) as u8, (mix(c0[2], c1[2]) as f32 * dim) as u8, 255]
