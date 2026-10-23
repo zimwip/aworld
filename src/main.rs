@@ -3443,6 +3443,8 @@ fn demo_siphon(g: &mut Game) {
     rect(g, 830, 300, 870, 460, Mat::Empty);
     rect(g, 731, 452, 829, 460, Mat::Empty);
     rect(g, 690, 360, 730, 460, Mat::Oil);
+    // The thin walls between the vessels and around the pipes hang free: keep them up.
+    g.world.structures_fall = false;
     g.set_running(true);
 }
 
