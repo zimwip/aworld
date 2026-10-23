@@ -3525,8 +3525,9 @@ fn demo_tunnel(g: &mut Game) {
     g.set_running(true);
 }
 
-/// A meadow over rock with a big charge of powder buried in it: `--crater` lights it.
-fn demo_crater(g: &mut Game) {
+/// A meadow over rock with a big charge of powder buried in it: `--crater` lights it. With
+/// `dynamite`, the charge is a stick of dynamite packed in charcoal (it leaves diamonds).
+fn demo_crater(g: &mut Game, dynamite: bool) {
     g.empty_world();
     let ground = 330;
     for x in 0..W as i32 {
@@ -3539,7 +3540,8 @@ fn demo_crater(g: &mut Game) {
     // 40 x 24 cells of powder, its top 30 cells under the grass.
     for x in 460..500 {
         for y in 360..384 {
-            g.world.set(x, y, Mat::Gunpowder);
+            let core = (472..488).contains(&x) && (366..378).contains(&y);
+            g.world.set(x, y, if !dynamite { Mat::Gunpowder } else if core { Mat::Dynamite } else { Mat::Charcoal });
         }
     }
     g.set_running(true);
@@ -3740,7 +3742,7 @@ async fn main() {
             demo_tunnel(&mut game);
         }
         if args.iter().any(|a| a == "--crater") {
-            demo_crater(&mut game);
+            demo_crater(&mut game, args.iter().any(|a| a == "--dynamite"));
         }
     }
     // `--mouse x,y` pins the pointer for screenshots.
@@ -3823,6 +3825,7 @@ async fn main() {
                 if frame + n == 360 {
                     game.world.set(480, 359, Mat::Fire);
                     game.world.set(480, 360, Mat::Fire);
+                    game.world.set(480, 365, Mat::Fire);
                 }
             }
         }

@@ -3,6 +3,7 @@
 //! so particles and the car treat them as solid.
 
 mod blast;
+pub mod matter;
 pub use blast::Ejecta;
 pub mod flow;
 mod pockets;
@@ -56,7 +57,7 @@ impl Biome {
 }
 
 /// Room for this many materials in per-material tables.
-pub const NMAT: usize = 40;
+pub const NMAT: usize = Mat::ALL.len();
 
 pub const W: usize = 960;
 pub const H: usize = 540;
@@ -117,14 +118,20 @@ pub enum Mat {
     /// The masonry vault the tunnel tool leaves over its hole. It is bolted into the ground
     /// around it, so it holds up the roof even when the tunnel cuts a hill in two.
     Vault,
+    /// Carbon squeezed past 50 000 atmospheres while white hot: the hardest thing there is, and
+    /// the best conductor of heat.
+    Diamond,
+    /// A high explosive: it detonates instead of burning, with a shock forty times the pressure
+    /// of black powder's.
+    Dynamite,
 }
 
 impl Mat {
-    pub const ALL: [Mat; 39] = [
+    pub const ALL: [Mat; 41] = [
         Mat::Empty, Mat::Sand, Mat::Water, Mat::Fire, Mat::Steam, Mat::Iron, Mat::Wood, Mat::Stone,
         Mat::Brick, Mat::Rust, Mat::Ash, Mat::Ember, Mat::Lava, Mat::Ice, Mat::Gunpowder, Mat::Dirt, Mat::Grass,
         Mat::Leaf, Mat::Steel, Mat::Cloud, Mat::Seed, Mat::Sapling, Mat::Mud, Mat::Glass, Mat::Snow, Mat::Shard, Mat::DeadLeaf, Mat::Branch, Mat::Trunk, Mat::Hail, Mat::Oil, Mat::Smoke, Mat::Molten, Mat::Clay, Mat::Terracotta,
-        Mat::Charcoal, Mat::Saltpeter, Mat::MoltenSteel, Mat::Vault,
+        Mat::Charcoal, Mat::Saltpeter, Mat::MoltenSteel, Mat::Vault, Mat::Diamond, Mat::Dynamite,
     ];
 
     pub fn from_u8(v: u8) -> Mat {
@@ -151,7 +158,7 @@ impl Mat {
             Water | Lava | Oil | Molten | MoltenSteel => Kind::Liquid,
             Steam | Cloud | Smoke => Kind::Gas,
             Fire => Kind::Flame,
-            Iron | Wood | Stone | Brick | Ember | Ice | Dirt | Grass | Leaf | Steel | Sapling | Glass | Branch | Trunk | Clay | Terracotta | Vault => Kind::Static,
+            Iron | Wood | Stone | Brick | Ember | Ice | Dirt | Grass | Leaf | Steel | Sapling | Glass | Branch | Trunk | Clay | Terracotta | Vault | Diamond | Dynamite => Kind::Static,
         }
     }
 
@@ -274,6 +281,8 @@ fn density(m: Mat) -> f32 {
         Mat::Charcoal => 0.3,
         Mat::Gunpowder | Mat::Rust => 1.5,
         Mat::Saltpeter => 2.1,
+        Mat::Diamond => 3.5,
+        Mat::Dynamite => 1.4,
         _ => 1.0,
     }
 }
@@ -930,7 +939,7 @@ impl World {
     /// pressure wave and shove reach that far (see `blast.rs`).
     pub fn explode(&mut self, cx: i32, cy: i32, r: i32) {
         let grains = ((r as f32 - 6.0).max(0.5) / 2.2).powi(2);
-        self.detonate(cx, cy, grains);
+        self.detonate(cx, cy, blast::Charge::powder(grains));
     }
 
     /// Pressure wave: loose matter near (cx, cy) is thrown outward, the closer the harder.
@@ -1143,7 +1152,7 @@ impl World {
                         }
                         Mat::Smoke => self.step_smoke(x, y),
                         Mat::Steel => self.step_iron(x, y, 1500),
-                        Mat::Gunpowder => self.step_gunpowder(x, y),
+                        Mat::Gunpowder | Mat::Dynamite => self.step_gunpowder(x, y),
                         Mat::Saltpeter => self.step_saltpeter(x, y),
                         Mat::Water => {
                             if !self.fly(x, y) && !self.jet(x, y) && !self.seep(x, y) {
@@ -1189,6 +1198,9 @@ impl World {
             self.update_pockets();
         }
         self.step_ejecta();
+        if self.ticks % matter::SETTLE_EVERY == 17 {
+            self.settle_matter();
+        }
         self.update_wind();
         self.update_flow();
         if self.ticks % 4 == 0 {
@@ -3029,6 +3041,10 @@ impl World {
             Mat::Lava => (255, 78 + flick * 3 + v, 12, 255),
             Mat::Ice => (176 + v, 226 + v, 248, 225),
             Mat::Gunpowder => (62 + v, 58 + v, 66 + v + (flick / 8) * 6, 255),
+            // Clear, with the odd cell that catches the light.
+            Mat::Diamond => if flick > 28 { (255, 255, 255, 255) } else { (196 + v, 236 + v / 2, 246, 235) },
+            // Red sticks with a pale band of paper.
+            Mat::Dynamite => if y % 6 == 0 { (226 + v / 2, 214 + v / 2, 190, 255) } else { (196 + v, 46 + v / 2, 38, 255) },
             Mat::Dirt => (112 + v, 78 + v / 2, 52 + v / 2, 255),
             Mat::Grass => (self.grass_rgb.0 + v / 2, self.grass_rgb.1 + v, self.grass_rgb.2 + v / 2, 255),
             Mat::Leaf => {
