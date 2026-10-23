@@ -10,6 +10,10 @@
 //! drift apart stop meshing and spin free, a slider reaching its stop stalls the motor, and the
 //! force in a rod or on a tooth follows from virtual work (so a rod near dead centre, or a
 //! tooth under a stalled motor, can give way).
+//!
+//! A lead screw (vis sans fin) is a rail whose carriage is a nut on a threaded shaft turned by a
+//! gear: the carriage moves `SCREW_LEAD` cells per turn of the gear. Like a real one it is
+//! irreversible: pushing on the nut does not turn the screw, so a screw with no motor holds.
 
 use crate::blocks::Anchor;
 use crate::pipes::Plumbing;
@@ -35,6 +39,8 @@ const MESH_TOLERANCE: f32 = 1.5;
 const STOP_TICKS: f32 = 8.0;
 /// Steps of overload before a rod or a tooth gives way.
 const FATIGUE: u32 = 3;
+/// How far (cells) the nut of a lead screw travels for one turn of its gear.
+pub const SCREW_LEAD: f32 = 8.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GearSize {
@@ -137,12 +143,17 @@ pub struct Gear {
     pub tooth_load: f32,
     /// For a motor: how hard it is pushing against its load, as a share of its stall torque.
     pub motor_load: f32,
+    /// A tige this gear swings about one of its ends (uid of the tige, end 0 or 1): an arm.
+    pub arm: Option<(u32, u8)>,
+    /// Where the gear and the arm were when the drive took hold (gear angle, arm angle against its
+    /// support). Not saved: set again when the physics is built.
+    pub arm_base: Option<(f32, f32)>,
     stress: u32,
 }
 
 impl Gear {
     pub fn new(uid: u32, size: GearSize, pos: Vec2) -> Self {
-        Gear { uid, size, pos, mount: Anchor::Free(pos), angle: 0.0, omega: 0.0, motor: None, stripped: false, jammed: false, wheel: None, reel: None, limit: None, ext_torque: 0.0, shaft_torque: 0.0, torque: 0.0, tooth_load: 0.0, motor_load: 0.0, stress: 0 }
+        Gear { uid, size, pos, mount: Anchor::Free(pos), angle: 0.0, omega: 0.0, motor: None, stripped: false, jammed: false, wheel: None, reel: None, limit: None, ext_torque: 0.0, shaft_torque: 0.0, torque: 0.0, tooth_load: 0.0, motor_load: 0.0, arm: None, arm_base: None, stress: 0 }
     }
 }
 
@@ -178,6 +189,8 @@ pub struct Slider {
     pub blocked_hi: bool,
     /// Half size of the carriage, for drawing and for pushing things.
     pub half: Vec2,
+    /// A lead screw: the gear (uid) that turns the threaded shaft the carriage rides on.
+    pub screw: Option<u32>,
 }
 
 impl Slider {
@@ -199,6 +212,7 @@ impl Slider {
             blocked_lo: false,
             blocked_hi: false,
             half: vec2(5.0, 4.0),
+            screw: None,
         }
     }
 
@@ -366,6 +380,11 @@ impl Mechanism {
         let gears: Vec<u32> = self.gears.iter().map(|g| g.uid).collect();
         let sliders: Vec<u32> = self.sliders.iter().map(|s| s.uid).collect();
         self.axles.retain(|a| gears.contains(&a.a) && gears.contains(&a.b));
+        for sl in &mut self.sliders {
+            if sl.screw.map_or(false, |g| !gears.contains(&g)) {
+                sl.screw = None;
+            }
+        }
         let ok = |e: &End| match e {
             End::Pin { gear, .. } => gears.contains(gear),
             End::Carriage(u) => sliders.contains(u),
@@ -531,6 +550,9 @@ impl Mechanism {
             })
             .collect();
 
+        // Lead screws: (slider, gear) by index.
+        let screws: Vec<(usize, usize)> = self.sliders.iter().enumerate().filter_map(|(si, sl)| Some((si, self.gear_index(sl.screw?)?))).collect();
+
         let mut rod_force: Vec<f32> = vec![0.0; self.rods.len()];
         let mut seen_g = vec![false; groups.len()];
         let mut seen_s = vec![false; self.sliders.len()];
@@ -544,7 +566,7 @@ impl Mechanism {
                 continue;
             }
             seen_g[root_group] = true;
-            let tree = self.build_tree(root_group, &solver_rods, &comp, &mut seen_g, &mut seen_s);
+            let tree = self.build_tree(root_group, &solver_rods, &screws, &comp, &mut seen_g, &mut seen_s);
             let ctx = Ctx { k: &k, comp: &comp, groups: &groups };
             self.drive_tree(&tree, &ctx, &mut rod_force, &mut tooth_force, &mut events);
         }
@@ -615,11 +637,23 @@ impl Mechanism {
     /// Who follows whom, starting from a root group: rods lead from a known gear or carriage to one
     /// that has no motor and is not known yet, which then follows it. Rods between things that are
     /// both known already only check that the geometry stays consistent.
-    fn build_tree(&self, root: usize, rods: &[usize], comp: &[usize], seen_g: &mut [bool], seen_s: &mut [bool]) -> Tree {
+    fn build_tree(&self, root: usize, rods: &[usize], screws: &[(usize, usize)], comp: &[usize], seen_g: &mut [bool], seen_s: &mut [bool]) -> Tree {
         let mut tree = Tree { root, edges: vec![], checks: vec![], groups: vec![root], sliders: vec![] };
         let mut used = vec![false; self.rods.len()];
+        let mut used_screw = vec![false; screws.len()];
         loop {
             let mut grew = false;
+            // A screw leads only from its gear to its nut (it cannot be driven backwards).
+            for (k, &(si, gi)) in screws.iter().enumerate() {
+                if used_screw[k] || !tree.groups.contains(&comp[gi]) || seen_s[si] {
+                    continue;
+                }
+                used_screw[k] = true;
+                grew = true;
+                seen_s[si] = true;
+                tree.sliders.push(si);
+                tree.edges.push(Edge { link: Link::Screw { gear: gi, nut: si }, child: Node::Slider(si) });
+            }
             for &r in rods {
                 if used[r] {
                     continue;
@@ -653,7 +687,7 @@ impl Mechanism {
                         tree.sliders.push(s);
                     }
                 }
-                tree.edges.push(Edge { rod: r, parent_is_a, child });
+                tree.edges.push(Edge { link: Link::Rod { rod: r, parent_is_a }, child });
             }
             if !grew {
                 break;
@@ -668,8 +702,13 @@ impl Mechanism {
                     Node::Slider(s) => tree.sliders.contains(&s),
                 };
                 if in_tree(na) && in_tree(nb) {
-                    tree.checks.push(r);
+                    tree.checks.push(Link::Rod { rod: r, parent_is_a: true });
                 }
+            }
+        }
+        for (k, &(si, gi)) in screws.iter().enumerate() {
+            if !used_screw[k] && tree.groups.contains(&comp[gi]) && tree.sliders.contains(&si) {
+                tree.checks.push(Link::Screw { gear: gi, nut: si });
             }
         }
         tree
@@ -684,8 +723,21 @@ impl Mechanism {
             p.theta[m] += ctx.k[m] * dq;
         }
         for e in &tree.edges {
-            let rod = &self.rods[e.rod];
-            let (from, to) = if e.parent_is_a { (&rod.a, &rod.b) } else { (&rod.b, &rod.a) };
+            let (r, parent_is_a) = match e.link {
+                Link::Rod { rod, parent_is_a } => (rod, parent_is_a),
+                Link::Screw { gear, nut: si } => {
+                    let sl = &self.sliders[si];
+                    let s = sl.s + Self::screw_travel(p.theta[gear] - self.gears[gear].angle);
+                    let (lo, hi) = sl.range();
+                    if s < lo - 1e-3 || s > hi + 1e-3 {
+                        return None;
+                    }
+                    p.s[si] = s;
+                    continue;
+                }
+            };
+            let rod = &self.rods[r];
+            let (from, to) = if parent_is_a { (&rod.a, &rod.b) } else { (&rod.b, &rod.a) };
             let parent_point = self.end_point_in(from, &p)?;
             match (e.child, to) {
                 (Node::Slider(si), _) => {
@@ -719,14 +771,29 @@ impl Mechanism {
                 }
             }
         }
-        for &r in &tree.checks {
-            let rod = &self.rods[r];
-            let (a, b) = (self.end_point_in(&rod.a, &p)?, self.end_point_in(&rod.b, &p)?);
-            if ((a - b).length() - rod.len).abs() > 0.7 {
-                return None;
+        for link in &tree.checks {
+            match *link {
+                Link::Rod { rod: r, .. } => {
+                    let rod = &self.rods[r];
+                    let (a, b) = (self.end_point_in(&rod.a, &p)?, self.end_point_in(&rod.b, &p)?);
+                    if ((a - b).length() - rod.len).abs() > 0.7 {
+                        return None;
+                    }
+                }
+                Link::Screw { gear, nut: si } => {
+                    let want = Self::screw_travel(p.theta[gear] - self.gears[gear].angle);
+                    if (p.s[si] - self.sliders[si].s - want).abs() > 0.7 {
+                        return None;
+                    }
+                }
             }
         }
         Some(p)
+    }
+
+    /// How far the nut of a lead screw moves when its gear turns by `dtheta`.
+    pub fn screw_travel(dtheta: f32) -> f32 {
+        dtheta * SCREW_LEAD / std::f32::consts::TAU
     }
 
     fn end_point_in(&self, e: &End, p: &Pose) -> Option<Vec2> {
@@ -811,6 +878,9 @@ impl Mechanism {
             load += sl.ext_force * dsl[si];
         }
         let total = motor_torque + friction + load;
+        // A lead screw cannot be driven backwards: with no running motor, a tree with one holds.
+        let driven = tree.groups[0] == tree.root && root_members.iter().any(|&m| self.gears[m].motor.map_or(false, |mo| mo.on));
+        let jam = jam || (!driven && tree.edges.iter().any(|e| matches!(e.link, Link::Screw { .. })));
         let (qdd, new_qd) = if jam || base.is_none() {
             (0.0, 0.0)
         } else {
@@ -920,12 +990,20 @@ impl Mechanism {
         let mut carried_g = below_g.clone();
         let mut carried_s = below_s.clone();
         for e in tree.edges.iter().rev() {
-            let rod = &self.rods[e.rod];
-            let (from, to) = if e.parent_is_a { (&rod.a, &rod.b) } else { (&rod.b, &rod.a) };
             let child_sum = match e.child {
                 Node::Group(g) => carried_g[g],
                 Node::Slider(s) => carried_s[s],
             };
+            let (r, parent_is_a) = match e.link {
+                Link::Rod { rod, parent_is_a } => (rod, parent_is_a),
+                // The screw's gear carries what its nut pushes.
+                Link::Screw { gear, .. } => {
+                    carried_g[ctx.comp[gear]] += child_sum;
+                    continue;
+                }
+            };
+            let rod = &self.rods[r];
+            let (from, to) = if parent_is_a { (&rod.a, &rod.b) } else { (&rod.b, &rod.a) };
             // The parent receives what the child carries.
             match self.node_of(from, ctx.comp) {
                 Some(Node::Group(g)) => carried_g[g] += child_sum,
@@ -948,7 +1026,7 @@ impl Mechanism {
             };
             let dir = (pa - pb).normalize_or_zero();
             let dproj = ((pc - mc) / (2.0 * eps)).dot(dir).abs();
-            rod_force[e.rod] = q_sub / dproj.max(1e-3);
+            rod_force[r] = q_sub / dproj.max(1e-3);
         }
         if stalled {
             let uid = blocked.first().map_or(self.gears[root_members[0]].uid, |&s| self.sliders[s].uid);
@@ -963,18 +1041,26 @@ enum Node {
     Slider(usize),
 }
 
+/// How a follower is tied to what drives it.
+#[derive(Clone, Copy, Debug)]
+enum Link {
+    /// A rod; is the known end of the rod its `a` end?
+    Rod { rod: usize, parent_is_a: bool },
+    /// A lead screw turned by a gear, and the carriage that is its nut (indices).
+    Screw { gear: usize, nut: usize },
+}
+
 struct Edge {
-    rod: usize,
-    /// Is the known end of the rod its `a` end?
-    parent_is_a: bool,
+    link: Link,
     child: Node,
 }
 
 struct Tree {
     root: usize,
     edges: Vec<Edge>,
-    /// Rods between two things that are already in the tree: they only have to stay consistent.
-    checks: Vec<usize>,
+    /// Rods and screws between two things that are already in the tree: they only have to stay
+    /// consistent.
+    checks: Vec<Link>,
     groups: Vec<usize>,
     sliders: Vec<usize>,
 }
@@ -1254,6 +1340,91 @@ mod tests {
             }
         }
         assert!(flips >= 1, "never reversed under load");
+    }
+
+    /// A motor meshed with a large gear that turns a lead screw: a rail from (120,100) to (320,100),
+    /// its nut 20 cells along.
+    fn screw_jack() -> Mechanism {
+        let mut m = Mechanism::default();
+        m.gears.push(Gear::new(1, GearSize::Large, vec2(100.0, 100.0)));
+        m.gears.push(motor_gear(2, GearSize::Small, vec2(100.0, 120.0)));
+        m.gears[1].motor.as_mut().unwrap().dir = -1.0;
+        m.sliders.push(Slider::new(1, vec2(120.0, 100.0), vec2(320.0, 100.0)));
+        m.sliders[0].s = 20.0;
+        m.sliders[0].screw = Some(1);
+        m
+    }
+
+    #[test]
+    fn a_lead_screw_moves_its_nut_one_lead_per_turn_then_stalls_at_the_end() {
+        let mut m = screw_jack();
+        let mut ev = vec![];
+        for _ in 0..300 {
+            ev.extend(m.step());
+            let want = 20.0 + m.gears[0].angle * SCREW_LEAD / std::f32::consts::TAU;
+            assert!((m.sliders[0].s - want).abs() < 1e-2, "nut {} vs {want}", m.sliders[0].s);
+        }
+        assert!(m.sliders[0].v > 0.05, "the nut travels: {}", m.sliders[0].v);
+        assert!(m.sliders[0].load < 1.0, "nothing in its way");
+        // It runs on to the end of its rail, and the motor stalls there.
+        ev.extend(run(&mut m, 4000));
+        let sl = &m.sliders[0];
+        assert!((sl.s - (sl.len - sl.margin)).abs() < 0.05, "it stops at the end: {}", sl.s);
+        assert!(ev.iter().any(|e| matches!(e, Event::Stalled(1))), "the motor is told: {ev:?}");
+        assert!(m.gears[1].omega.abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_lead_screw_pushes_hard_and_cannot_be_pushed_back() {
+        // A load that would stop a crank (see the reversing test) hardly slows a screw: it gears
+        // the motor down a lot.
+        let mut m = screw_jack();
+        m.sliders[0].ext_force = -8.0;
+        run(&mut m, 400);
+        assert!(m.sliders[0].s > 25.0, "the screw pushes the load: {}", m.sliders[0].s);
+        // Motor off: the load leans on the nut, nothing moves.
+        m.gears[1].motor.as_mut().unwrap().on = false;
+        run(&mut m, 5);
+        let held = m.sliders[0].s;
+        m.sliders[0].ext_force = -30.0;
+        run(&mut m, 400);
+        assert_eq!(m.sliders[0].s, held, "the screw holds");
+        assert_eq!(m.gears[0].omega, 0.0);
+        // Without its screw the same carriage is pushed away.
+        m.sliders[0].screw = None;
+        run(&mut m, 50);
+        assert!(m.sliders[0].s < held - 5.0, "a plain carriage slides: {}", m.sliders[0].s);
+    }
+
+    #[test]
+    fn a_screw_turned_through_gears_and_an_axle_drives_a_rod_from_its_nut() {
+        // Motor -> meshed gear -> axle -> far gear that turns the screw; a rod from the nut swings a
+        // lever (a gear pin).
+        let mut m = Mechanism::default();
+        m.gears.push(motor_gear(1, GearSize::Small, vec2(100.0, 200.0)));
+        m.gears.push(Gear::new(2, GearSize::Large, vec2(120.0, 200.0)));
+        m.gears.push(Gear::new(3, GearSize::Small, vec2(100.0, 100.0)));
+        m.axles.push(Axle { uid: 0, a: 2, b: 3 });
+        m.sliders.push(Slider::new(1, vec2(120.0, 100.0), vec2(320.0, 100.0)));
+        m.sliders[0].s = 20.0;
+        m.sliders[0].screw = Some(3);
+        m.gears.push(Gear::new(4, GearSize::Medium, vec2(160.0, 60.0)));
+        let pin = vec2(0.0, 8.0);
+        let len = (vec2(160.0, 60.0) + pin - m.sliders[0].point()).length();
+        m.rods.push(Rod::between(1, End::Carriage(1), End::Pin { gear: 4, pin }, len));
+        m.rods[0].strength = 1e6;
+        let mut worst = 0.0f32;
+        for _ in 0..600 {
+            m.step();
+            let (pa, pb) = (m.end_point(&m.rods[0].a).unwrap(), m.end_point(&m.rods[0].b).unwrap());
+            worst = worst.max(((pa - pb).length() - len).abs());
+        }
+        // The large gear turns the other way, slower: the nut goes backwards, 6/14 as fast.
+        let want = 20.0 + m.gears[2].angle * SCREW_LEAD / std::f32::consts::TAU;
+        assert!(m.gears[2].angle < -1.0, "the screw turns: {}", m.gears[2].angle);
+        assert!((m.sliders[0].s - want).abs() < 1e-2, "nut {} vs {want}", m.sliders[0].s);
+        assert!(worst < 0.05, "the rod keeps its length: {worst}");
+        assert!(m.gears[3].angle.abs() > 0.1, "the lever swings: {}", m.gears[3].angle);
     }
 
     #[test]

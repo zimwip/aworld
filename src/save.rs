@@ -11,7 +11,7 @@ use std::io::{self, Error, ErrorKind};
 use std::path::PathBuf;
 
 const MAGIC: &[u8; 4] = b"AWLD";
-const VERSION: u8 = 7;
+const VERSION: u8 = 8;
 
 pub struct Loaded {
     pub mats: Vec<Mat>,
@@ -277,6 +277,20 @@ pub fn encode(world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>
         out.push(p.on as u8);
         out.extend(p.driver.unwrap_or(0).to_le_bytes());
     }
+    // Version 8: gears that swing a tige (an arm), and lead screws.
+    let arms: Vec<(u32, usize, u8)> = mech.gears.iter().filter_map(|g| g.arm.and_then(|(m, e)| Some((g.uid, member_index(m)?, e)))).collect();
+    out.extend((arms.len() as u16).to_le_bytes());
+    for (gear, m, end) in arms {
+        out.extend(gear.to_le_bytes());
+        out.extend((m as u16).to_le_bytes());
+        out.push(end);
+    }
+    let screws: Vec<(u32, u32)> = mech.sliders.iter().filter_map(|sl| Some((sl.uid, sl.screw?))).collect();
+    out.extend((screws.len() as u16).to_le_bytes());
+    for (slider, gear) in screws {
+        out.extend(slider.to_le_bytes());
+        out.extend(gear.to_le_bytes());
+    }
     out
 }
 
@@ -523,6 +537,16 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
             plumbing.pumps.push(pm);
         }
     }
+    let mut raw_arms: Vec<(u32, usize, u8)> = vec![];
+    let mut raw_screws: Vec<(u32, u32)> = vec![];
+    if version >= 8 {
+        for _ in 0..r.u16()? {
+            raw_arms.push((r.u32()?, r.u16()? as usize, r.u8()?));
+        }
+        for _ in 0..r.u16()? {
+            raw_screws.push((r.u32()?, r.u32()?));
+        }
+    }
     let uids: Vec<u32> = members.iter().map(|m| m.uid).collect();
     let blocks_uids: Vec<u32> = blocks.iter().map(|b| b.uid).collect();
     let resolve = |raw: Raw, fallback: Vec2| match raw {
@@ -597,6 +621,17 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
         let pos = if let Anchor::Free(p) = mount { p } else { Vec2::ZERO };
         mech.pulleys.push(crate::mech::Pulley { uid, mount, pos, radius });
     }
+    for (gear, m, end) in raw_arms {
+        if let (Some(g), Some(m)) = (mech.gears.iter_mut().find(|g| g.uid == gear), uids.get(m)) {
+            g.arm = Some((*m, end.min(1)));
+        }
+    }
+    for (slider, gear) in raw_screws {
+        if let Some(sl) = mech.sliders.iter_mut().find(|s| s.uid == slider) {
+            sl.screw = Some(gear);
+        }
+    }
+    mech.prune();
     for (w, a) in raw_pivots {
         if let Some(b) = blocks_uids.get(w) {
             mech.pivots.push(Pivot { wheel: *b, support: resolve(a, Vec2::ZERO) });

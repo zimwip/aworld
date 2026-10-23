@@ -18,6 +18,11 @@ pub enum MechDraft {
     AxleSlider(u32),
     /// A pump picked, waiting for the gear that turns it.
     AxlePump(u32),
+    /// A tige (uid, the end it swings about) picked as an arm, waiting for the gear that swings it.
+    AxleArm(u32, u8),
+    /// The gear of a lead screw, waiting for its rail; or the rail, waiting for its gear.
+    ScrewGear(u32),
+    ScrewRail(u32),
     /// First end of a rail.
     Rail(Anchor, Vec2),
     /// The first end of a connecting rod (a pin on a gear, a carriage, or any fixed point).
@@ -40,6 +45,28 @@ const REEL_MIN: f32 = 14.0;
 /// Wheel torque (physics units) for one unit of mechanism torque, and what a gear can always hold.
 const WHEEL_TORQUE_PER_UNIT: f32 = 60.0;
 const WHEEL_HOLD: f32 = 120.0;
+/// How fast an arm that lags behind its gear catches up: this share of the lag per step.
+const ARM_CATCH_UP: f32 = 0.15;
+
+/// A threaded shaft the length of its rail.
+fn screw_cost(sl: &Slider) -> u32 {
+    8 + (sl.len * 0.1).ceil() as u32
+}
+
+/// The end of a rail nearest to `p`: where the screw's shaft comes in.
+fn screw_end(sl: &Slider, p: Vec2) -> Vec2 {
+    let (a, b) = (sl.origin, sl.origin + sl.dir * sl.len);
+    if (a - p).length() <= (b - p).length() {
+        a
+    } else {
+        b
+    }
+}
+
+/// `a` brought back between -pi and pi.
+fn wrap_angle(a: f32) -> f32 {
+    (a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+}
 
 fn gear_cost(size: GearSize) -> u32 {
     (size.radius() * size.radius() * 0.18).ceil() as u32
@@ -87,6 +114,30 @@ fn draw_shaft(a: Vec2, b: Vec2, phase: f32, thickness: f32) {
         let (p, q) = (c - side * thickness * 0.5 - dir * thickness * 0.3, c + side * thickness * 0.5 + dir * thickness * 0.3);
         draw_line(p.x, p.y, q.x, q.y, (thickness * 0.35).max(1.2), Color::from_rgba(244, 246, 252, 235));
         t += spacing;
+    }
+}
+
+/// A threaded shaft from `a` to `b` (screen pixels): the thread, `pitch` apart, slides along by
+/// `travel` as the screw turns (so it keeps pace with its nut).
+fn draw_screw(a: Vec2, b: Vec2, travel: f32, thickness: f32, pitch: f32) {
+    draw_line(a.x, a.y, b.x, b.y, thickness, Color::from_rgba(96, 100, 118, 255));
+    let d = b - a;
+    let len = d.length();
+    if len < 1.0 || pitch < 0.5 {
+        return;
+    }
+    let dir = d / len;
+    let side = vec2(-dir.y, dir.x);
+    let mut t = travel.rem_euclid(pitch);
+    while t < len {
+        let c = a + dir * t;
+        let (p, q) = (c - side * thickness * 0.5 - dir * pitch * 0.25, c + side * thickness * 0.5 + dir * pitch * 0.25);
+        draw_line(p.x, p.y, q.x, q.y, (thickness * 0.3).max(1.2), Color::from_rgba(196, 200, 214, 255));
+        t += pitch;
+    }
+    for p in [a, b] {
+        draw_circle(p.x, p.y, thickness * 0.7, Color::from_rgba(200, 204, 216, 255));
+        draw_circle(p.x, p.y, thickness * 0.3, Color::from_rgba(50, 54, 68, 255));
     }
 }
 
@@ -146,6 +197,10 @@ impl Game {
             },
             Tool::Crank => 6,
             Tool::Pivot => 4,
+            Tool::Screw => match self.mech_draft {
+                Some(MechDraft::ScrewRail(r)) => self.mech.slider_index(r).map_or(8, |i| screw_cost(&self.mech.sliders[i])),
+                _ => 8,
+            },
             Tool::Winch => gear_cost(GearSize::Medium) + 10,
             Tool::Pulley => 4,
             _ => return None,
@@ -339,6 +394,53 @@ impl Game {
         self.say("Arbre posé : l'engrenage entraîne la roue");
     }
 
+    /// The tige under `at` and the end it would swing about: the end that is fixed to something
+    /// when only one is, else the end clicked, else the one nearest `near` (where the gear is).
+    fn arm_end_at(&self, at: Vec2, near: Vec2) -> Option<(u32, u8)> {
+        let (uid, clicked) = match node_at(&self.world, &self.blocks, &self.members, at)? {
+            Anchor::End { uid, end } => (uid, Some(end)),
+            Anchor::Along { uid, .. } => (uid, None),
+            _ => return None,
+        };
+        let m = self.members.iter().find(|m| m.uid == uid)?;
+        let fixed = |a: &Anchor| !matches!(a, Anchor::Free(_));
+        let end = match (fixed(&m.a), fixed(&m.b), clicked) {
+            (true, false, _) => 0,
+            (false, true, _) => 1,
+            (_, _, Some(e)) => e,
+            _ => u8::from((m.p1 - near).length() < (m.p0 - near).length()),
+        };
+        Some((uid, end))
+    }
+
+    /// Shaft from a gear to a tige: the gear swings the tige about one of its ends (an arm). A loose
+    /// end gets an axle where it is.
+    fn link_arm(&mut self, gear: u32, (member, end): (u32, u8)) {
+        let Some(gi) = self.mech.gear_index(gear) else { return };
+        let Some(mi) = self.members.iter().position(|m| m.uid == member) else { return };
+        let pos = self.mech.gears[gi].pos;
+        if !self.mech_pay(8, pos) {
+            return;
+        }
+        self.checkpoint();
+        // One gear per arm: two would fight over it.
+        for g in &mut self.mech.gears {
+            if g.arm.map_or(false, |(u, _)| u == member) {
+                g.arm = None;
+            }
+        }
+        let m = &mut self.members[mi];
+        let (anchor, p) = if end == 0 { (&mut m.a, m.p0) } else { (&mut m.b, m.p1) };
+        if matches!(anchor, Anchor::Free(_)) {
+            *anchor = Anchor::Ground(p);
+        }
+        let g = &mut self.mech.gears[gi];
+        g.arm = Some((member, end));
+        g.arm_base = None;
+        self.rebuild_physics_if_running();
+        self.say("Arbre posé : l'engrenage fait pivoter la tige autour de son bout, comme un bras");
+    }
+
     fn place_axle(&mut self, at: Vec2) {
         let gear_hit = self.gear_at(at);
         let wheel_hit = self.wheel_at(at);
@@ -386,7 +488,13 @@ impl Game {
                 self.link_valve(v, crate::pipes::Driver::Gear(first));
             }
             Some(MechDraft::Axle(first)) => {
-                if let Some(i) = gear_hit {
+                let from = self.mech.gear_index(first).map_or(at, |i| self.mech.gears[i].pos);
+                // A gear sitting on the end of a tige: clicking it again picks the tige.
+                let on_itself = gear_hit.map_or(false, |i| self.mech.gears[i].uid == first);
+                let arm_hit = if gear_hit.is_none() || on_itself { self.arm_end_at(at, from) } else { None };
+                if let (Some(arm), None) = (arm_hit, wheel_hit) {
+                    self.link_arm(first, arm);
+                } else if let Some(i) = gear_hit {
                     let uid = self.mech.gears[i].uid;
                     if first == uid {
                         return;
@@ -413,7 +521,7 @@ impl Game {
                     self.link_wheel(first, wuid);
                 } else {
                     self.mech_draft = Some(MechDraft::Axle(first));
-                    self.say("Clique un engrenage ou une roue pour l'autre bout");
+                    self.say("Clique un engrenage, une roue ou une tige pour l'autre bout");
                 }
             }
             Some(MechDraft::AxleWheel(w)) => {
@@ -423,6 +531,15 @@ impl Game {
                 } else {
                     self.mech_draft = Some(MechDraft::AxleWheel(w));
                     self.say("Clique l'engrenage qui entraîne cette roue");
+                }
+            }
+            Some(MechDraft::AxleArm(m, end)) => {
+                if let Some(i) = gear_hit {
+                    let guid = self.mech.gears[i].uid;
+                    self.link_arm(guid, (m, end));
+                } else {
+                    self.mech_draft = Some(MechDraft::AxleArm(m, end));
+                    self.say("Clique l'engrenage qui fait pivoter cette tige");
                 }
             }
             _ => {
@@ -436,8 +553,11 @@ impl Game {
                     self.mech_draft = Some(MechDraft::AxleValve(self.mech.plumbing.valves[i].uid));
                 } else if let Some(i) = rail_hit {
                     self.mech_draft = Some(MechDraft::AxleSlider(self.mech.sliders[i].uid));
+                } else if let Some((m, end)) = self.arm_end_at(at, at) {
+                    self.mech_draft = Some(MechDraft::AxleArm(m, end));
+                    self.say("Clique l'engrenage qui fait pivoter cette tige");
                 } else {
-                    self.say("Clique sur un engrenage (ou une roue) pour fixer un bout de l'axe");
+                    self.say("Clique sur un engrenage (ou une roue, une tige) pour fixer un bout de l'axe");
                 }
             }
         }
@@ -446,7 +566,7 @@ impl Game {
     /// Fixes a wheel on an axle (a pulley, a drum, a drive wheel), or takes the axle off again.
     fn place_pivot(&mut self, at: Vec2) {
         let Some(wi) = self.wheel_at(at) else {
-            self.say("Clique sur une roue pour la fixer sur un axe");
+            self.pivot_tige_end(at);
             return;
         };
         let (uid, centre) = (self.blocks[wi].uid, self.blocks[wi].pos);
@@ -473,6 +593,93 @@ impl Game {
         self.mech.pivots.push(Pivot { wheel: uid, support });
         self.rebuild_physics_if_running();
         self.say(format!("Roue fixée sur un axe, tenu par {name}"));
+    }
+
+    /// A pivot on the end of a tige: a loose end gets an axle where it is (the tige then turns
+    /// about it); clicking an axle in the air again takes it off.
+    fn pivot_tige_end(&mut self, at: Vec2) {
+        let Some(Anchor::End { uid, end }) = node_at(&self.world, &self.blocks, &self.members, at) else {
+            self.say("Clique sur une roue ou sur un bout de tige pour y mettre un pivot");
+            return;
+        };
+        let Some(mi) = self.members.iter().position(|m| m.uid == uid) else { return };
+        let m = &self.members[mi];
+        let (anchor, p) = if end == 0 { (m.a, m.p0) } else { (m.b, m.p1) };
+        match anchor {
+            Anchor::Free(_) => {
+                if !self.mech_pay(4, p) {
+                    return;
+                }
+                self.checkpoint();
+                let m = &mut self.members[mi];
+                *(if end == 0 { &mut m.a } else { &mut m.b }) = Anchor::Ground(p);
+                self.rebuild_physics_if_running();
+                self.say("Pivot posé au bout de la tige : elle tourne autour. Avec l'outil Axe, un engrenage peut la faire pivoter");
+            }
+            Anchor::Ground(q) if !self.world.raw(q.x as i32, q.y as i32).is_hard() => {
+                self.checkpoint();
+                let m = &mut self.members[mi];
+                *(if end == 0 { &mut m.a } else { &mut m.b }) = Anchor::Free(p);
+                for g in &mut self.mech.gears {
+                    if g.arm == Some((uid, end)) {
+                        g.arm = None;
+                    }
+                }
+                self.rebuild_physics_if_running();
+                self.say("Pivot retiré : ce bout de tige est libre");
+            }
+            _ => self.say("Ce bout de tige pivote déjà sur ce qui le tient. Avec l'outil Axe, un engrenage peut la faire pivoter"),
+        }
+    }
+
+    /// A lead screw: a gear and a rail, in either order. The rail's carriage becomes the nut.
+    fn place_screw(&mut self, at: Vec2) {
+        let gear_hit = self.gear_at(at).map(|i| self.mech.gears[i].uid);
+        let rail_hit = if gear_hit.is_none() { self.rail_at(at).map(|(i, _)| self.mech.sliders[i].uid) } else { None };
+        match (self.mech_draft.take(), gear_hit, rail_hit) {
+            (Some(MechDraft::ScrewGear(g)), _, Some(r)) | (Some(MechDraft::ScrewRail(r)), Some(g), _) => self.link_screw(g, r),
+            (Some(d @ MechDraft::ScrewGear(_)), _, _) => {
+                self.mech_draft = Some(d);
+                self.say("Clique le rail que la vis doit faire avancer");
+            }
+            (Some(d @ MechDraft::ScrewRail(_)), _, _) => {
+                self.mech_draft = Some(d);
+                self.say("Clique l'engrenage qui doit tourner la vis");
+            }
+            (_, Some(g), _) => {
+                self.mech_draft = Some(MechDraft::ScrewGear(g));
+                self.say("Clique maintenant un rail : il devient une vis sans fin");
+            }
+            (_, _, Some(r)) => {
+                self.mech_draft = Some(MechDraft::ScrewRail(r));
+                self.say("Clique maintenant l'engrenage qui tourne la vis");
+            }
+            _ => self.say("Clique un engrenage puis un rail (ou l'inverse) : le rail devient une vis sans fin"),
+        }
+    }
+
+    fn link_screw(&mut self, gear: u32, rail: u32) {
+        let (Some(gi), Some(si)) = (self.mech.gear_index(gear), self.mech.slider_index(rail)) else { return };
+        let sl = &self.mech.sliders[si];
+        if sl.screw == Some(gear) {
+            self.say("Cet engrenage tourne déjà cette vis");
+            return;
+        }
+        let pos = self.mech.gears[gi].pos;
+        if (screw_end(sl, pos) - pos).length() > AXLE_MAX {
+            self.say("La vis est trop loin de l'engrenage");
+            self.mech_draft = Some(MechDraft::ScrewGear(gear));
+            return;
+        }
+        if !self.mech_pay(screw_cost(sl), pos) {
+            return;
+        }
+        self.checkpoint();
+        self.mech.sliders[si].screw = Some(gear);
+        self.say(format!(
+            "Vis sans fin posée : un tour d'engrenage avance le chariot de {:.0}. Elle pousse fort et tient la charge, même moteur arrêté",
+            mech::SCREW_LEAD
+        ));
     }
 
     fn rebuild_physics_if_running(&mut self) {
@@ -633,6 +840,7 @@ impl Game {
             Tool::Rail => self.place_rail(at),
             Tool::Crank => self.place_crank(at),
             Tool::Pivot => self.place_pivot(at),
+            Tool::Screw => self.place_screw(at),
             Tool::Winch => self.place_gear(GearSize::Medium, false, true, at),
             Tool::Pulley => self.place_pulley(at),
             _ => {}
@@ -665,6 +873,26 @@ impl Game {
         if let Some(i) = shaft {
             self.checkpoint();
             self.mech.gears[i].wheel = None;
+            return true;
+        }
+        // The shaft from a gear to the tige it swings.
+        let arm = self.mech.gears.iter().position(|g| {
+            self.arm_pivot(g).map_or(false, |p| point_to_segment(at, g.pos, p).0 < 3.0 && (at - g.pos).length() > g.size.radius() + 1.5 && (at - p).length() > 4.0)
+        });
+        if let Some(i) = arm {
+            self.checkpoint();
+            self.mech.gears[i].arm = None;
+            return true;
+        }
+        // The shaft from a gear to the screw it turns: the rail is a plain rail again.
+        let screw = self.mech.sliders.iter().position(|sl| {
+            let Some(g) = sl.screw.and_then(|u| self.mech.gear_index(u)).map(|i| &self.mech.gears[i]) else { return false };
+            let e = screw_end(sl, g.pos);
+            point_to_segment(at, g.pos, e).0 < 3.0 && (at - g.pos).length() > g.size.radius() + 1.5 && (at - e).length() > 4.0
+        });
+        if let Some(i) = screw {
+            self.checkpoint();
+            self.mech.sliders[i].screw = None;
             return true;
         }
         if let Some(i) = self.gear_at(at) {
@@ -903,18 +1131,61 @@ impl Game {
                 g.ext_torque = 0.0;
             }
         }
+        let tiges: Vec<u32> = self.members.iter().map(|m| m.uid).collect();
+        for g in &mut self.mech.gears {
+            if g.arm.map_or(false, |(m, _)| !tiges.contains(&m)) {
+                g.arm = None;
+                g.arm_base = None;
+            }
+        }
+    }
+
+    /// Where the tige a gear swings turns: its pivot end.
+    fn arm_pivot(&self, g: &Gear) -> Option<Vec2> {
+        let (uid, end) = g.arm?;
+        let m = self.members.iter().find(|m| m.uid == uid)?;
+        Some(if end == 0 { m.p0 } else { m.p1 })
+    }
+
+    /// The angle of what an arm's pivot is fixed to: a block, another tige, or the ground (which
+    /// does not turn).
+    fn arm_support_angle(&self, support: &Anchor) -> f32 {
+        match support {
+            Anchor::Block { uid, .. } => self.blocks.iter().find(|b| b.uid == *uid).map_or(0.0, |b| b.angle),
+            Anchor::End { uid, .. } | Anchor::Along { uid, .. } => self.members.iter().find(|m| m.uid == *uid).map_or(0.0, |m| m.angle()),
+            _ => 0.0,
+        }
+    }
+
+    /// A gear swinging a tige: the axle at the tige's pivot is driven so that the tige follows the
+    /// gear's angle (against its support), with at most the torque the motor gets to that shaft. The
+    /// tige pushes back on the gear with the effort it takes. Returns that push.
+    fn mech_drive_arm(&mut self, gi: usize) -> f32 {
+        let g = &self.mech.gears[gi];
+        let Some((uid, end)) = g.arm else { return 0.0 };
+        let Some(m) = self.members.iter().find(|m| m.uid == uid) else { return 0.0 };
+        let support = if end == 0 { m.a } else { m.b };
+        let rel = m.angle() - self.arm_support_angle(&support);
+        let g = &mut self.mech.gears[gi];
+        let (g0, a0) = *g.arm_base.get_or_insert((g.angle, rel));
+        let lag = wrap_angle(a0 + (g.angle - g0) - rel);
+        let speed = (g.omega + lag * ARM_CATCH_UP) * 60.0;
+        let reach = (g.shaft_torque * WHEEL_TORQUE_PER_UNIT).max(WHEEL_HOLD);
+        let Some(p) = self.phys.as_mut() else { return 0.0 };
+        p.drive_member_end(m, end, speed, reach).map_or(0.0, |t| -t / WHEEL_TORQUE_PER_UNIT)
     }
 
     /// A gear on a shaft twists its wheel towards the gear's speed, with at most the torque the
     /// motor gets to that shaft; the wheel pushes back on the gear with the same effort.
     fn mech_drive_wheels(&mut self) {
         for gi in 0..self.mech.gears.len() {
+            let arm = self.mech_drive_arm(gi);
             let Some(uid) = self.mech.gears[gi].wheel else {
-                self.mech.gears[gi].ext_torque = 0.0;
+                self.mech.gears[gi].ext_torque = arm;
                 continue;
             };
             let (Some(p), Some(b)) = (self.phys.as_mut(), self.blocks.iter().find(|b| b.uid == uid)) else {
-                self.mech.gears[gi].ext_torque = 0.0;
+                self.mech.gears[gi].ext_torque = arm;
                 continue;
             };
             let g = &mut self.mech.gears[gi];
@@ -923,7 +1194,7 @@ impl Game {
             // The wheel can always be held by the gear (a brake), and driven up to what the motor gives.
             let reach = (g.shaft_torque * WHEEL_TORQUE_PER_UNIT).max(WHEEL_HOLD);
             p.twist(b, effort * reach);
-            g.ext_torque = -effort * reach / WHEEL_TORQUE_PER_UNIT;
+            g.ext_torque = arm - effort * reach / WHEEL_TORQUE_PER_UNIT;
         }
     }
 
@@ -1031,9 +1302,10 @@ impl Game {
             T { tool: Tool::Gear(GearSize::Small), label: "Petit", text: "Petit engrenage (rayon 6). Posé près d'un autre, il s'engrène : les dents collent à la bonne distance." },
             T { tool: Tool::Gear(GearSize::Medium), label: "Moyen", text: "Engrenage moyen (rayon 10). Deux engrenages qui s'engrènent tournent en sens inverse, plus vite pour le plus petit." },
             T { tool: Tool::Gear(GearSize::Large), label: "Grand", text: "Grand engrenage (rayon 14) : lourd, il sert de volant d'inertie et passe les points morts." },
-            T { tool: Tool::Axle, label: "Axe", text: "Deux clics sur deux engrenages : l'axe les fait tourner ensemble, à la même vitesse, même s'ils sont loin l'un de l'autre." },
+            T { tool: Tool::Axle, label: "Axe", text: "Deux clics sur deux engrenages : l'axe les fait tourner ensemble, à la même vitesse, même s'ils sont loin l'un de l'autre. Un engrenage puis une tige : l'engrenage fait pivoter la tige autour de son bout fixé, comme un bras (une tige accrochée au bout d'une autre fait un bras articulé)." },
             T { tool: Tool::Rail, label: "Coulisseau", text: "Deux clics : un rail (fixé au sol, à un bloc, ou dans le vide) avec un chariot qui glisse dessus. Il pousse le sable, l'eau et les blocs." },
-            T { tool: Tool::Pivot, label: "Pivot", text: "Clique une roue pour la fixer sur un axe (sur le bloc ou le sol dessous, sinon dans l'air) : elle tourne sur place, comme une poulie ou un tambour de treuil. Re-clique pour l'enlever. Avec l'outil Axe, un engrenage peut l'entraîner : enroule un câble accroché sur son bord et c'est un treuil." },
+            T { tool: Tool::Screw, label: "Vis", text: "Vis sans fin : clique un engrenage puis un rail (ou l'inverse). Le rail devient une vis et son chariot un écrou : un tour d'engrenage l'avance de 8. Lent mais très fort, et irréversible : la charge ne la fait pas tourner, même moteur arrêté (un vérin, un cric, un ascenseur)." },
+            T { tool: Tool::Pivot, label: "Pivot", text: "Clique une roue pour la fixer sur un axe (sur le bloc ou le sol dessous, sinon dans l'air) : elle tourne sur place, comme une poulie ou un tambour de treuil. Clique le bout d'une tige libre : il se fixe là, la tige tourne autour. Re-clique pour l'enlever. Avec l'outil Axe, un engrenage peut entraîner la roue (un treuil) ou faire pivoter la tige (un bras articulé)." },
             T { tool: Tool::Winch, label: "Treuil", text: "Un tambour à enrouleur sur un engrenage. Avec l'outil Câble, accroche un bout de câble sur le tambour : en tournant, il enroule ou déroule le câble. Quand il n'y a plus de câble le tambour bute (le moteur cale ou repart dans l'autre sens)." },
             T { tool: Tool::Pulley, label: "Poulie", text: "Une poulie fixée sur un bloc, le sol ou dans le vide, sans roue. Avec l'outil Câble : un bout, puis la poulie, puis l'autre bout. Le câble glisse dessus sans frottement." },
             T { tool: Tool::Crank, label: "Bielle", text: "Un clic sur un engrenage pose le point d'accroche, un clic sur un rail y relie la bielle. Le chariot va et vient quand l'engrenage tourne." },
@@ -1071,6 +1343,10 @@ impl Game {
                     Tool::Rail => {
                         draw_line(c.x - 18.0, c.y, c.x + 18.0, c.y, 5.0, Color::from_rgba(70, 74, 90, 255));
                         draw_rectangle(c.x - 5.0, c.y - 6.0, 10.0, 12.0, Color::from_rgba(214, 160, 70, 255));
+                    }
+                    Tool::Screw => {
+                        draw_screw(c - vec2(18.0, 0.0), c + vec2(18.0, 0.0), 0.0, 6.0, 4.0);
+                        draw_rectangle(c.x + 1.0, c.y - 7.0, 9.0, 14.0, Color::from_rgba(214, 160, 70, 255));
                     }
                     Tool::Winch => {
                         draw_circle(c.x, c.y, 13.0, Color::from_rgba(120, 88, 56, 255));
@@ -1140,6 +1416,7 @@ impl Game {
             Tool::Gear(_) | Tool::Motor | Tool::Winch => format!("Coût : {} de fer ou d'acier. En stock : {have}.", self.mech_cost_for(tool)),
             Tool::Axle => format!("Coût : 0,12 par cellule de longueur. En stock : {have}."),
             Tool::Rail => format!("Coût : 0,2 par cellule (max {RAIL_MAX:.0}). En stock : {have}."),
+            Tool::Screw => format!("Coût : 8 + 0,1 par cellule de rail. En stock : {have}."),
             _ => format!("Coût : 6 + 0,1 par cellule. En stock : {have}."),
         }
     }
@@ -1151,8 +1428,15 @@ impl Game {
         // Rails first, then axles, then gears on top, then rods and carriages.
         for sl in &self.mech.sliders {
             let (a, b) = (view.to_screen(sl.origin), view.to_screen(sl.origin + sl.dir * sl.len));
-            draw_line(a.x, a.y, b.x, b.y, 6.0 * view.s, Color::from_rgba(52, 56, 70, 255));
-            draw_line(a.x, a.y, b.x, b.y, 2.4 * view.s, Color::from_rgba(120, 126, 146, 255));
+            if let Some(g) = sl.screw.and_then(|u| self.mech.gear_index(u)).map(|i| &self.mech.gears[i]) {
+                // A threaded shaft, and the shaft that brings the gear's turn to it.
+                let (from, to) = (view.to_screen(g.pos), view.to_screen(screw_end(sl, g.pos)));
+                draw_shaft(from, to, g.angle, 3.6 * view.s);
+                draw_screw(a, b, Mechanism::screw_travel(g.angle) * view.s, 6.0 * view.s, mech::SCREW_LEAD / 2.0 * view.s);
+            } else {
+                draw_line(a.x, a.y, b.x, b.y, 6.0 * view.s, Color::from_rgba(52, 56, 70, 255));
+                draw_line(a.x, a.y, b.x, b.y, 2.4 * view.s, Color::from_rgba(120, 126, 146, 255));
+            }
             for p in [a, b] {
                 draw_circle(p.x, p.y, 4.0 * view.s, Color::from_rgba(200, 204, 216, 255));
                 draw_circle(p.x, p.y, 1.8 * view.s, Color::from_rgba(50, 54, 68, 255));
@@ -1169,6 +1453,23 @@ impl Game {
                 let (a, c) = (view.to_screen(g.pos), view.to_screen(b.pos));
                 draw_shaft(a, c, g.angle, 3.6 * view.s);
             }
+        }
+        // Gears swinging tiges: the shaft to the pivot.
+        for g in &self.mech.gears {
+            if let Some(p) = self.arm_pivot(g) {
+                draw_shaft(view.to_screen(g.pos), view.to_screen(p), g.angle, 3.6 * view.s);
+            }
+        }
+        // Axles at the ends of tiges: in the air, or swung by a gear.
+        let swung: Vec<(u32, u8)> = self.mech.gears.iter().filter_map(|g| g.arm).collect();
+        let hubs = self.members.iter().flat_map(|m| [(m, 0u8, m.a, m.p0), (m, 1u8, m.b, m.p1)]).filter(|(m, end, a, _)| {
+            swung.contains(&(m.uid, *end)) || matches!(a, Anchor::Ground(q) if !self.world.raw(q.x as i32, q.y as i32).is_hard())
+        });
+        for (_, _, _, p) in hubs {
+            let c = view.to_screen(p);
+            draw_circle(c.x, c.y, 3.6 * view.s, Color::from_rgba(40, 44, 58, 255));
+            draw_circle_lines(c.x, c.y, 3.6 * view.s, 1.6, Color::from_rgba(214, 218, 230, 255));
+            draw_circle(c.x, c.y, 1.3 * view.s, Color::from_rgba(214, 218, 230, 255));
         }
         for pv in &self.mech.pivots {
             if let Some(b) = self.blocks.iter().find(|b| b.uid == pv.wheel) {
@@ -1314,6 +1615,17 @@ impl Game {
                     let c = view.to_screen(self.blocks[w].pos);
                     draw_circle_lines(c.x, c.y, 14.0 * view.s, 2.0, GREEN);
                 }
+                // The pivot a tige would swing about.
+                if self.gear_at(at).is_none() || matches!(self.mech_draft, Some(MechDraft::Axle(_))) {
+                    let near = match self.mech_draft {
+                        Some(MechDraft::Axle(g)) => self.mech.gear_index(g).map_or(at, |i| self.mech.gears[i].pos),
+                        _ => at,
+                    };
+                    if let Some(p) = self.arm_end_at(at, near).and_then(|(u, e)| self.members.iter().find(|m| m.uid == u).map(|m| if e == 0 { m.p0 } else { m.p1 })) {
+                        let c = view.to_screen(p);
+                        draw_circle_lines(c.x, c.y, 6.0 * view.s, 2.0, GREEN);
+                    }
+                }
             }
             Tool::Rail => {
                 let (spot, snapped) = match self.mech_draft {
@@ -1343,6 +1655,30 @@ impl Game {
                     let c = view.to_screen(b.pos);
                     draw_circle_lines(c.x, c.y, 14.0 * view.s, 2.0, GREEN);
                     draw_circle(c.x, c.y, 3.0 * view.s, GREEN);
+                } else if let Some(p) = matches!(node_at(&self.world, &self.blocks, &self.members, at), Some(Anchor::End { .. })).then(|| self.snap_point(at)).flatten() {
+                    let c = view.to_screen(p);
+                    draw_circle_lines(c.x, c.y, 6.0 * view.s, 2.0, GREEN);
+                    draw_circle(c.x, c.y, 2.5 * view.s, GREEN);
+                }
+            }
+            Tool::Screw => {
+                let from = match self.mech_draft {
+                    Some(MechDraft::ScrewGear(g)) => self.mech.gear_index(g).map(|i| self.mech.gears[i].pos),
+                    Some(MechDraft::ScrewRail(r)) => self.mech.slider_index(r).map(|i| self.mech.sliders[i].point()),
+                    _ => None,
+                };
+                if let Some(p) = from {
+                    let a = view.to_screen(p);
+                    let hot = self.gear_at(at).is_some() || self.rail_at(at).is_some();
+                    draw_line(a.x, a.y, ui.mouse.x, ui.mouse.y, 3.0, if hot { GREEN } else { Color::new(1.0, 1.0, 1.0, 0.5) });
+                }
+                if let Some(i) = self.gear_at(at) {
+                    let c = view.to_screen(self.mech.gears[i].pos);
+                    draw_circle_lines(c.x, c.y, (self.mech.gears[i].size.radius() + 2.0) * view.s, 2.0, GREEN);
+                } else if let Some((i, _)) = self.rail_at(at) {
+                    let sl = &self.mech.sliders[i];
+                    let (a, b) = (view.to_screen(sl.origin), view.to_screen(sl.origin + sl.dir * sl.len));
+                    draw_line(a.x, a.y, b.x, b.y, 8.0 * view.s, Color::new(0.5, 1.0, 0.6, 0.45));
                 }
             }
             Tool::Crank => {

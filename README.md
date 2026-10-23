@@ -106,7 +106,8 @@ la simulation en pause ; Échap y reprend le jeu, **Entrée** quitte.
 
 Pièces : **moteur** (petit engrenage vu de face), **engrenages** petit/moyen/grand, **axe** (relie deux engrenages
 éloignés, ou un engrenage à une roue), **coulisseau** (un rail et son chariot), **bielle** (d'un point d'accroche
-d'engrenage au chariot) et **pivot** (une roue sur un axe : poulie, tambour de treuil, roue motrice).
+d'engrenage au chariot), **vis sans fin** (un engrenage tourne la vis d'un rail, le chariot avance) et **pivot** (une roue
+sur un axe : poulie, tambour de treuil, roue motrice ; ou le bout d'une tige).
 
 - Les engrenages s'engrènent quand leurs centres sont à `r1 + r2` ; la pose s'aimante à cette distance (en ligne
   droite ou en diagonale), sur le centre d'un bloc, ou s'aligne sur un autre engrenage. Les rails se redressent
@@ -132,6 +133,16 @@ d'engrenage au chariot) et **pivot** (une roue sur un axe : poulie, tambour de t
   seuil de retournement, et les mesures en direct (tr/min, charge). Vue Efforts : couple, charge des dents, force
   des bielles, pression sur les chariots.
 - Câbles : un bout peut rester libre (le second clic dans le vide) ; l'acier est bien plus raide.
+- **Vis sans fin** (outil Vis) : un engrenage puis un rail, ou l'inverse. Le rail devient une vis filetée et son chariot
+  un écrou : un tour d'engrenage l'avance de 8 cellules, le filet défile avec lui. C'est l'actionneur longitudinal : lent
+  mais très fort (il démultiplie le moteur), et irréversible : une charge qui pousse sur l'écrou ne fait pas tourner la
+  vis, même moteur arrêté (cric, vérin, ascenseur). L'écrou bute en bout de vis (le moteur cale ou repart) et accepte
+  des bielles comme un chariot ordinaire. La gomme sur l'arbre entre l'engrenage et la vis en refait un rail simple.
+- **Bras articulés** : l'outil Pivot sur le bout libre d'une tige y pose un axe, en l'air (re-clic pour l'enlever).
+  L'outil Axe, d'un engrenage à une tige, fait pivoter la tige autour de son bout fixé : elle suit l'angle de l'engrenage,
+  avec la force que le moteur donne à cet arbre (une démultiplication la rend plus forte), et pèse en retour sur le
+  moteur. Une tige accrochée au bout d'une autre pivote par rapport à elle : un engrenage par articulation, et on
+  monte une grue, une pelleteuse ou un bras robot. Les bielles et les autres tiges complètent la cinématique.
 
 ## L'air qui s'écoule
 
