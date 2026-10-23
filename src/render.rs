@@ -161,11 +161,14 @@ void main() {
             float n = fbm(vec2(cellf.x * 0.3 + sway / texel.x * 0.1, cellf.y * 0.2 + time * 4.5));
             float tall = fbm(vec2(cellf.x * 0.12 - time * 0.4, time * 1.3));
             float v = fire * (0.9 + 0.9 * tall) - 0.35 + (n - 0.5) * 1.0;
-            float fa = smoothstep(0.0, 0.2, v) * 0.9;
-            vec3 col = mix(vec3(0.9, 0.2, 0.04), vec3(1.0, 0.58, 0.1), smoothstep(0.05, 0.4, v));
-            col = mix(col, vec3(1.0, 0.92, 0.55), smoothstep(0.5, 0.9, v));
-            rgb = rgb * (1.0 - fa) + col * fa;
-            a = a + fa * (1.0 - a);
+            // Flames give off light: their colours run past white into the glow, and a soft
+            // orange halo spills round each tongue.
+            float fa = smoothstep(0.0, 0.2, v) * 0.95;
+            vec3 col = mix(vec3(1.0, 0.42, 0.08), vec3(1.0, 0.72, 0.18), smoothstep(0.05, 0.35, v));
+            col = mix(col, vec3(1.0, 0.97, 0.7), smoothstep(0.4, 0.8, v)) * (1.15 + 0.5 * smoothstep(0.3, 0.9, v));
+            float halo = smoothstep(-0.35, 0.05, v) * (1.0 - fa) * 0.45 * smoothstep(0.1, 0.5, fire);
+            rgb = rgb * (1.0 - fa) + col * min(fa * 1.6, 1.0) + vec3(1.0, 0.55, 0.15) * halo;
+            a = a + (fa + halo * 0.6) * (1.0 - a);
         }
     }
     // In clear air the haze shows itself as faint bright and dark swirls.
@@ -185,6 +188,9 @@ uniform float time;
 uniform float night;
 void main() {
     float l = texture2D(Texture, uv).a;
+    // The flames dancing above a fire are lights themselves: no veil over them.
+    float flames = max(texture2D(Texture, uv + vec2(0.0, texel.y)).r, texture2D(Texture, uv + vec2(0.0, 2.0 * texel.y)).r * 0.8);
+    l = max(l, flames);
     l *= 0.88 + 0.08 * sin(time * 13.0 + uv.x * 40.0) + 0.06 * sin(time * 23.0 - uv.y * 30.0);
     l = clamp(l, 0.0, 1.0);
     float a = 0.46 * night * (1.0 - 0.9 * l);
