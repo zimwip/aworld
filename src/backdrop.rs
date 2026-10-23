@@ -67,7 +67,9 @@ pub struct Moon {
     pub wink: f32,
 }
 
-pub fn draw_sky(v: View, biome: Biome, phase: f32, wind: f32, time: f32, season: Season, moon: Moon) {
+/// `year`: how far into the year, 0 at the start of spring (see `World::year_phase`).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_sky(v: View, biome: Biome, phase: f32, year: f32, wind: f32, time: f32, season: Season, moon: Moon) {
     let r = v.rect();
     let tau = std::f32::consts::TAU;
     let s = (phase * tau).sin();
@@ -99,30 +101,10 @@ pub fn draw_sky(v: View, biome: Biome, phase: f32, wind: f32, time: f32, season:
         }
     }
 
-    // Stars fade in with the night. They twinkle because the air between them and us is turbulent:
-    // the lower the star (the more air its light crosses) and the stronger the wind, the more it
-    // flickers, flashing colours near the horizon. The planets (the first few) shine steadily:
-    // they are discs, not points, so the turbulence averages out.
+    // Stars fade in with the night, on a vault that turns once a day around the pole star.
     let night = 1.0 - day;
     if night > 0.05 {
-        for k in 0..110 {
-            let h = (k as f32 * 12.9898).sin() * 43758.547;
-            let (fx, fy) = (h.fract().abs(), ((h * 1.7).fract()).abs());
-            let (x, y) = (r.x + fx * r.w, r.y + fy * r.h * 0.6);
-            if k < 3 {
-                let planet = [(1.0, 0.95, 0.8), (1.0, 0.75, 0.6), (0.95, 0.97, 1.0)][k];
-                draw_circle(x, y, 2.0, Color::new(planet.0, planet.1, planet.2, night * 0.95));
-                continue;
-            }
-            let k = k as f32;
-            let turb = (0.25 + 0.75 * fy) * (0.6 + 0.8 * wind.abs());
-            let flick = (time * (9.0 + k % 7.0) + k).sin() * (time * (5.3 + k % 5.0) + 2.0 * k).sin();
-            let tw = (1.0 - turb * (0.5 + 0.5 * flick)).max(0.05);
-            // Each colour bends a little differently in the moving air.
-            let hue = (time * 7.0 + k * 1.3).sin() * turb * 0.5;
-            let col = Color::new(1.0 - hue.max(0.0) * 0.6, 1.0 - hue.abs() * 0.3, 0.95 + hue.min(0.0) * 0.6, night * 0.85 * tw);
-            draw_circle(x, y, 0.8 + (k as i32 % 3) as f32 * 0.5 + 0.4 * (1.0 - tw), col);
-        }
+        draw_stars(r, night, wind, time, sidereal_angle(phase, year));
     }
 
     // The sun by day, following its arc; the moon follows the same arc but lags behind the sun by
@@ -285,6 +267,132 @@ fn draw_sea(v: View, day: f32, glitter: Option<(f32, f32)>, time: f32) {
     }
 }
 
+// ----- the starry vault ----------------------------------------------------
+
+/// A few real stars: right ascension and declination in degrees, magnitude (smaller is brighter)
+/// and colour. Only the dots, no lines or names: finding the shapes is the fun.
+type Star = (f32, f32, f32, (f32, f32, f32));
+
+const NAMED_STARS: [Star; 20] = [
+    // The Big Dipper (Grande Ourse): Dubhe, Merak, Phecda, Megrez, Alioth, Mizar and its faint
+    // companion Alcor (a classic eyesight test), Alkaid.
+    (165.93, 61.75, 1.8, (1.0, 0.86, 0.66)),
+    (165.46, 56.38, 2.4, (0.92, 0.95, 1.0)),
+    (178.46, 53.69, 2.4, (0.92, 0.95, 1.0)),
+    (183.86, 57.03, 3.3, (0.95, 0.97, 1.0)),
+    (193.51, 55.96, 1.8, (0.92, 0.95, 1.0)),
+    (200.98, 54.93, 2.2, (0.94, 0.96, 1.0)),
+    (201.31, 54.99, 4.0, (0.95, 0.97, 1.0)),
+    (206.89, 49.31, 1.9, (0.86, 0.9, 1.0)),
+    // Cassiopeia, the W: Caph, Schedar, Gamma, Ruchbah, Segin.
+    (2.29, 59.15, 2.3, (1.0, 0.98, 0.9)),
+    (10.13, 56.54, 2.2, (1.0, 0.84, 0.64)),
+    (14.18, 60.72, 2.2, (0.86, 0.9, 1.0)),
+    (21.45, 60.24, 2.7, (0.95, 0.97, 1.0)),
+    (28.60, 63.67, 3.4, (0.88, 0.92, 1.0)),
+    // The Little Dipper (Petite Ourse), the pole star at the tip of its handle: Polaris, Yildun,
+    // epsilon, zeta, eta, Pherkad, Kochab.
+    (37.95, 89.26, 2.0, (1.0, 0.96, 0.84)),
+    (263.05, 86.59, 4.4, (0.95, 0.97, 1.0)),
+    (251.49, 82.04, 4.2, (1.0, 0.94, 0.82)),
+    (236.01, 77.79, 4.3, (0.95, 0.97, 1.0)),
+    (244.38, 75.76, 5.0, (1.0, 0.98, 0.92)),
+    (230.18, 71.83, 3.0, (0.95, 0.97, 1.0)),
+    (222.68, 74.16, 2.1, (1.0, 0.82, 0.62)),
+];
+
+/// The pole in the sky (as fractions of the world's width and height), and how many pixels per
+/// world height one unit of the stereographic map takes. Seen facing north, as if from mid
+/// latitudes: the pole high up, the Big Dipper and Cassiopeia wheeling around it.
+const POLE: (f32, f32) = (0.5, 0.38);
+const SKY_UNIT: f32 = 0.26;
+
+/// Where the stars stand, in degrees (local sidereal time): which right ascension is due south
+/// right now. It goes round once a day, and a little further each day of the year, as the sun
+/// drifts east among the stars: in winter Orion and Cassiopeia rule the evening, in spring the
+/// Big Dipper stands high over the pole.
+pub fn sidereal_angle(phase: f32, year: f32) -> f32 {
+    // Solar time (0 sunrise is 6 h) minus noon, in degrees, plus the sun's right ascension
+    // (0 at the spring equinox, when the year starts).
+    360.0 * phase - 90.0 + 360.0 * year
+}
+
+/// Where a star at (`ra`, `dec`) appears around the pole, as an offset in map units (y down),
+/// for the sidereal angle `lst`. Stereographic map, so the shapes keep their look. Facing north,
+/// a star is above the pole when it crosses the meridian (hour angle 0) and the vault turns
+/// anticlockwise: stars climb on the right (east) and set on the left (west).
+pub fn star_offset(ra: f32, dec: f32, lst: f32) -> (f32, f32) {
+    let ha = (lst - ra).to_radians();
+    let rad = 2.0 * ((90.0 - dec).to_radians() * 0.5).tan();
+    (-rad * ha.sin(), -rad * ha.cos())
+}
+
+/// One star: a dot whose size and brightness follow the magnitude, and that twinkles more the
+/// lower it is (the more air its light crosses) and the stronger the wind, flashing colours near
+/// the horizon. `steady` for the planets: discs, not points, so the turbulence averages out.
+#[allow(clippy::too_many_arguments)]
+fn draw_star(r: Rect, x: f32, y: f32, mag: f32, col: (f32, f32, f32), night: f32, wind: f32, time: f32, k: f32, steady: bool) {
+    let horizon = r.y + r.h * 0.62;
+    if x < r.x - 4.0 || x > r.x + r.w + 4.0 || y < r.y - 4.0 || y > horizon {
+        return;
+    }
+    let fy = ((y - r.y) / (r.h * 0.6)).clamp(0.0, 1.0);
+    // Low down, the thick air dims them (extinction) until they are lost in the haze.
+    let fade = 1.0 - smooth(0.9, 1.04, fy);
+    let bright = (1.0 - (mag - 2.0) / 5.0).clamp(0.4, 1.0);
+    let size = (0.7 + (4.6 - mag) * 0.7).clamp(0.7, 3.2);
+    let (tw, hue) = if steady {
+        (1.0, 0.0)
+    } else {
+        let turb = (0.25 + 0.75 * fy) * (0.6 + 0.8 * wind.abs());
+        let flick = (time * (9.0 + k % 7.0) + k).sin() * (time * (5.3 + k % 5.0) + 2.0 * k).sin();
+        // Each colour bends a little differently in the moving air.
+        ((1.0 - turb * (0.5 + 0.5 * flick)).max(0.05), (time * 7.0 + k * 1.3).sin() * turb * 0.5)
+    };
+    let a = night * fade * bright * tw;
+    let c = (col.0 - hue.max(0.0) * 0.6, col.1 - hue.abs() * 0.3, col.2 + hue.min(0.0) * 0.6);
+    if mag < 2.6 {
+        // The bright ones have a soft halo.
+        draw_circle(x, y, size * 2.8, Color::new(c.0, c.1, c.2, a * 0.16));
+    }
+    draw_circle(x, y, size + 0.4 * (1.0 - tw), Color::new(c.0, c.1, c.2, a.min(1.0)));
+    if mag < 3.0 {
+        // A white-hot core, so the bright ones still sparkle through the night veil.
+        draw_circle(x, y, size * 0.5, Color::new(1.0, 1.0, 1.0, a.min(1.0)));
+        // And four little rays, as the eye sees them.
+        let (l, ray) = (size * (2.2 + 0.8 * tw), Color::new(c.0, c.1, c.2, a.min(1.0) * 0.55));
+        draw_line(x - l, y, x + l, y, 0.8, ray);
+        draw_line(x, y - l, x, y + l, 0.8, ray);
+    }
+}
+
+/// The starry vault: a few hundred faint stars scattered over it, a few planets, and the real
+/// constellations around the pole, all turning together with the sidereal angle `lst`.
+fn draw_stars(r: Rect, night: f32, wind: f32, time: f32, lst: f32) {
+    let (px, py) = (r.x + r.w * POLE.0, r.y + r.h * POLE.1);
+    let unit = r.h * SKY_UNIT;
+    // The background, spread evenly over a disc wide enough to fill any window as it turns.
+    // Most stars are faint, a few are bright, as in the real sky.
+    for k in 0..900 {
+        let h = (k as f32 * 12.9898).sin() * 43758.547;
+        let (u, w, m) = (h.fract().abs(), (h * 1.7).fract().abs(), (h * 3.1).fract().abs());
+        let (ra, rad) = (360.0 * u, 4.6 * w.sqrt());
+        let ha = (lst - ra).to_radians();
+        let (x, y) = (px - rad * unit * ha.sin(), py - rad * unit * ha.cos());
+        if k < 3 {
+            let planet = [(1.0, 0.95, 0.8), (1.0, 0.75, 0.6), (0.95, 0.97, 1.0)][k];
+            draw_star(r, x, y, 0.5, planet, night, wind, time, k as f32, true);
+        } else {
+            let tint = (k % 5) as f32 * 0.025;
+            draw_star(r, x, y, 3.2 + 2.6 * m.sqrt(), (1.0 - tint, 1.0 - tint * 0.5, 0.95 + tint), night, wind, time, k as f32, false);
+        }
+    }
+    for (i, &(ra, dec, mag, col)) in NAMED_STARS.iter().enumerate() {
+        let (dx, dy) = star_offset(ra, dec, lst);
+        draw_star(r, px + dx * unit, py + dy * unit, mag, col, night, wind, time, 700.0 + i as f32, false);
+    }
+}
+
 /// Which part of each row of the moon's disc is lit, as (left, right) for a row at height `y`
 /// (-1..1 from top to bottom, radius 1). The sun lights one half of the moon; seen from the Earth,
 /// the line between day and night on it (the terminator) is a half ellipse whose width follows the
@@ -371,5 +479,40 @@ mod tests {
         // The sky does not go dark the moment the sun touches the horizon.
         assert!(daylight(0.5) < 0.05 && sky_light(0.5) > 0.5);
         assert_eq!(sky_light(0.25), daylight(0.25));
+    }
+
+    #[test]
+    fn the_vault_turns_anticlockwise_once_a_day_around_the_pole_star() {
+        let dubhe = (165.93, 61.75);
+        let at = |phase: f32| star_offset(dubhe.0, dubhe.1, sidereal_angle(phase, 0.0));
+        // The pole star barely moves.
+        let polaris = (0..8).map(|i| star_offset(37.95, 89.26, i as f32 * 45.0)).map(|(x, y)| x.hypot(y)).fold(0.0, f32::max);
+        assert!(polaris < 0.02, "{polaris}");
+        // A day later, the same place; on the way, the same distance from the pole.
+        let (a, b) = (at(0.1), at(1.1));
+        assert!((a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3);
+        let d = |p: (f32, f32)| p.0.hypot(p.1);
+        assert!((d(at(0.1)) - d(at(0.6))).abs() < 1e-4);
+        // Above the pole (y < 0) it moves left, below it moves right: anticlockwise on screen.
+        for lst in [0.0f32, 90.0, 180.0, 270.0] {
+            let (x0, y0) = star_offset(dubhe.0, dubhe.1, lst);
+            let (x1, _) = star_offset(dubhe.0, dubhe.1, lst + 1.0);
+            if y0 < -0.1 {
+                assert!(x1 < x0, "{lst}");
+            } else if y0 > 0.1 {
+                assert!(x1 > x0, "{lst}");
+            }
+        }
+    }
+
+    #[test]
+    fn cassiopeia_faces_the_big_dipper_across_the_pole() {
+        let lst = 120.0;
+        let dipper = star_offset(193.51, 55.96, lst);
+        let cassiopeia = star_offset(14.18, 60.72, lst);
+        assert!(dipper.0 * cassiopeia.0 + dipper.1 * cassiopeia.1 < 0.0, "{dipper:?} {cassiopeia:?}");
+        // In spring at midnight the Big Dipper stands high over the pole.
+        let spring_midnight = sidereal_angle(0.75, 0.0);
+        assert!(star_offset(193.51, 55.96, spring_midnight).1 < -0.3);
     }
 }

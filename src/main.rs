@@ -1992,7 +1992,7 @@ impl Game {
         };
         if !flat {
             let moon = backdrop::Moon { arc: self.world.moon_arc(), age: self.world.moon_age(), light: self.world.moon_light(), wink: self.wolves.wink() };
-            backdrop::draw_sky(view, self.world.biome, phase, self.world.wind, self.time, self.world.season(), moon);
+            backdrop::draw_sky(view, self.world.biome, phase, self.world.year_phase(), self.world.wind, self.time, self.world.season(), moon);
         }
         renderer.draw_world(&self.world, view, render_mode, self.time);
         if !flat {
