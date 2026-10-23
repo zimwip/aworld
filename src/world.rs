@@ -15,7 +15,7 @@ mod thermal;
 mod storm;
 mod statics;
 pub use statics::Slab;
-pub use storm::{Bolt, BREAKDOWN, QS, QW, QH};
+pub use storm::{Bolt, BREAKDOWN, GROUND_BREAKDOWN, QS, QW, QH};
 pub use thermal::{air_pressure_atm, Season, DAY_STEPS};
 use thermal::adiabatic_cooling_c;
 
@@ -656,6 +656,9 @@ pub struct World {
     pub bursts: Vec<(i32, i32, f32)>,
     /// Electric charge of the clouds, one value per `QS`×`QS` square (see `storm.rs`).
     pub charge: Vec<f32>,
+    /// Electric charge held in the ground and the things on it, one value per `QS`×`QS` square:
+    /// what a charged cloud draws up under it, and what a bolt leaves behind (see `storm.rs`).
+    pub mcharge: Vec<f32>,
     /// Bolts of lightning since they were last read. For the picture and the thunder.
     pub bolts: Vec<Bolt>,
     storm_rng: storm::StormRng,
@@ -729,6 +732,7 @@ impl World {
             bursts: Vec::new(),
             zones: sleep::Zones::new(),
             charge: vec![0.0; QW * QH],
+            mcharge: vec![0.0; QW * QH],
             bolts: Vec::new(),
             storm_rng: storm::StormRng(0x9e37_79b9),
         }
@@ -747,6 +751,7 @@ impl World {
     pub fn clear(&mut self) {
         self.revision += 1;
         self.charge.fill(0.0);
+        self.mcharge.fill(0.0);
         self.cells.fill(EMPTY);
         self.log.fill(0);
         self.ejecta.clear();

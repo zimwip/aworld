@@ -28,6 +28,10 @@ const STORM_EVERY: u32 = 4;
 /// Temperature of the lightning channel (the air in it reaches about 30 000 °C for an instant; the
 /// game keeps it to something its heat flow can cope with).
 const CHANNEL_C: f32 = 2500.0;
+/// Charge in the ground at which the air above it breaks down: a bolt leaves for it.
+pub const GROUND_BREAKDOWN: f32 = 1.0;
+/// How strongly a charged cloud draws the opposite charge up into what lies under it.
+const INDUCE: f32 = 0.6;
 
 /// A bolt of lightning, in cell coordinates: the main channel from top to bottom, and its branches.
 #[derive(Clone, Debug)]
@@ -105,26 +109,36 @@ impl World {
             return;
         }
         // Cloud in each square, and how cold it is.
+        // Also, for the charge in the ground: whether a square holds matter, how well the best of
+        // it conducts, and whether it has air in it.
         let mut cloud = vec![0.0f32; QW * QH];
         let mut cold = vec![0.0f32; QW * QH];
+        let mut cond = vec![-1.0f32; QW * QH];
+        let mut open = vec![false; QW * QH];
         for qy in 0..QH {
             for qx in 0..QW {
                 let (mut n, mut t) = (0u32, 0.0f32);
+                let k = qy * QW + qx;
                 for y in qy * QS..(qy + 1) * QS {
                     for x in qx * QS..(qx + 1) * QS {
                         let i = y * W + x;
-                        if self.cells[i].m == Mat::Cloud {
+                        let m = self.cells[i].m;
+                        if m == Mat::Cloud {
                             n += 1;
                             t += self.temp[i];
                         }
+                        if matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) {
+                            open[k] = true;
+                        } else {
+                            cond[k] = cond[k].max(conductivity(m));
+                        }
                     }
                 }
-                let k = qy * QW + qx;
                 cloud[k] = n as f32 / (QS * QS) as f32;
                 cold[k] = if n > 0 && t / (n as f32) < ICE_C { 1.0 } else { 0.0 };
             }
         }
-        let any_charge = self.charge.iter().any(|q| q.abs() > 1e-4);
+        let any_charge = self.charge.iter().chain(&self.mcharge).any(|q| q.abs() > 1e-4);
         if !any_charge && !cloud.iter().zip(&cold).any(|(c, k)| *c > 0.5 && *k > 0.0) {
             return;
         }
@@ -178,6 +192,13 @@ impl World {
         // same source is a small error the leak soon hides.)
         q = moved;
         self.charge = q;
+        // 2b. The ground under a charged cloud takes the opposite charge, most where it stands
+        //     close to the cloud and conducts; the charge spreads along conductors and drains away.
+        let exposed = self.ground_charge_step(&cond, &open);
+        // The air between the ground and the cloud breaks down where the ground is most charged.
+        if self.ground_breakdown(&exposed) {
+            return;
+        }
         // 3. Breakdown.
         let (mut best, mut at) = (0.0f32, 0usize);
         for (k, v) in self.charge.iter().enumerate() {
@@ -248,13 +269,13 @@ impl World {
         while x <= (x0 + reach).min(W as i32 - 1) {
             if let Some(y) = self.first_hit(x, y0) {
                 let m = self.raw(x, y);
-                let s = -(y as f32) + 40.0 * conductivity(m) - (x - x0).abs() as f32 * 0.35 + self.storm_rng.f() * 6.0;
+                let s = -(y as f32) + 40.0 * conductivity(m) + 40.0 * self.mcharge_at(x, y).abs() - (x - x0).abs() as f32 * 0.35 + self.storm_rng.f() * 6.0;
                 if s > score {
                     score = s;
                     best = (x, y);
                 }
             }
-            x += 2;
+            x += if reach <= 12 { 1 } else { 2 };
         }
         best
     }
@@ -519,6 +540,12 @@ impl World {
             (cx, cy) = n;
             trail.push((cx as f32, cy as f32));
         }
+        // The bolt leaves its charge (negative, from the base of the cloud) where its current went.
+        let mut squares: Vec<usize> = trail.iter().map(|p| (p.1 as usize / QS).min(QH - 1) * QW + (p.0 as usize / QS).min(QW - 1)).collect();
+        squares.dedup();
+        for k in squares {
+            self.mcharge[k] = (self.mcharge[k] - 0.6 * power.max(0.5)).max(-1.5);
+        }
         if trail.len() > 1 {
             lines.push(trail);
         }
@@ -542,23 +569,191 @@ impl World {
     }
 }
 
+impl World {
+    /// Charge held in the ground at the square of cell (x, y).
+    pub fn mcharge_at(&self, x: i32, y: i32) -> f32 {
+        let (qx, qy) = ((x.clamp(0, W as i32 - 1) as usize) / QS, (y.clamp(0, H as i32 - 1) as usize) / QS);
+        self.mcharge[qy * QW + qx]
+    }
+
+    /// One step of the charge in the ground. `cond`: how well the best matter of each square
+    /// conducts (-1: no matter); `open`: the square has air in it. Returns which squares are
+    /// exposed: matter with air in or just above it (only those feel the cloud).
+    fn ground_charge_step(&mut self, cond: &[f32], open: &[bool]) -> Vec<bool> {
+        let mut exposed = vec![false; QW * QH];
+        for qy in 0..QH {
+            for qx in 0..QW {
+                let k = qy * QW + qx;
+                exposed[k] = cond[k] >= 0.0 && (open[k] || (qy > 0 && open[k - QW]));
+            }
+        }
+        let clouds: Vec<(i32, i32, f32)> = self
+            .charge
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| q.abs() > 0.02)
+            .map(|(k, q)| ((k % QW) as i32, (k / QW) as i32, *q))
+            .collect();
+        if clouds.is_empty() && self.mcharge.iter().all(|q| q.abs() < 1e-4) {
+            return exposed;
+        }
+        // Conductors share their charge with their neighbours, quickly (several passes).
+        for _ in 0..4 {
+            let m = self.mcharge.clone();
+            for qy in 0..QH {
+                for qx in 0..QW {
+                    let k = qy * QW + qx;
+                    if cond[k] <= 0.0 {
+                        continue;
+                    }
+                    let mut flow = 0.0;
+                    for (nx, ny) in [(qx as i32 - 1, qy as i32), (qx as i32 + 1, qy as i32), (qx as i32, qy as i32 - 1), (qx as i32, qy as i32 + 1)] {
+                        if nx < 0 || ny < 0 || nx >= QW as i32 || ny >= QH as i32 {
+                            continue;
+                        }
+                        let n = ny as usize * QW + nx as usize;
+                        if cond[n] > 0.0 {
+                            flow += 0.22 * cond[k].min(cond[n]) * (m[n] - m[k]);
+                        }
+                    }
+                    self.mcharge[k] += flow;
+                }
+            }
+        }
+        let m = &self.mcharge;
+        let mut next = m.clone();
+        for qy in 0..QH {
+            for qx in 0..QW {
+                let k = qy * QW + qx;
+                if cond[k] < 0.0 {
+                    next[k] = 0.0;
+                    continue;
+                }
+                // The field of the cloud charge over it: nearer charge counts much more.
+                let mut target = 0.0;
+                if exposed[k] {
+                    let mut field = 0.0;
+                    for &(cx, cy, q) in &clouds {
+                        let (dx, dy) = (cx - qx as i32, cy - qy as i32);
+                        if dy >= 0 || dx.abs() > 12 {
+                            continue;
+                        }
+                        let d2 = (dx * dx + dy * dy) as f32;
+                        field += q / (1.0 + d2 / 16.0);
+                    }
+                    target = -INDUCE * field * (0.5 + cond[k]);
+                }
+                // It follows the cloud's pull (or drains away without one), quicker in a conductor.
+                let rate = 0.002 + 0.006 * cond[k];
+                next[k] = m[k] + (target - m[k]) * rate;
+            }
+        }
+        self.mcharge = next;
+        exposed
+    }
+
+    /// Lets the ground take the charge the clouds draw up for `steps` storm steps, without any
+    /// bolt (for a demo picture).
+    pub fn settle_ground_charge(&mut self, steps: u32) {
+        let mut cond = vec![-1.0f32; QW * QH];
+        let mut open = vec![false; QW * QH];
+        for y in 0..H {
+            for x in 0..W {
+                let k = (y / QS) * QW + x / QS;
+                let m = self.cells[y * W + x].m;
+                if matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) {
+                    open[k] = true;
+                } else {
+                    cond[k] = cond[k].max(conductivity(m));
+                }
+            }
+        }
+        for _ in 0..steps {
+            self.ground_charge_step(&cond, &open);
+            for q in &mut self.mcharge {
+                *q = q.clamp(-0.95 * GROUND_BREAKDOWN, 0.95 * GROUND_BREAKDOWN);
+            }
+        }
+    }
+
+    /// When the charge somewhere in the ground passes `GROUND_BREAKDOWN` under a cloud charged the
+    /// other way, a bolt leaves the cloud for it. True if one did.
+    fn ground_breakdown(&mut self, exposed: &[bool]) -> bool {
+        let (mut best, mut at) = (0.0f32, 0usize);
+        for (k, v) in self.mcharge.iter().enumerate() {
+            if exposed[k] && v.abs() > best {
+                best = v.abs();
+                at = k;
+            }
+        }
+        if best < GROUND_BREAKDOWN {
+            return false;
+        }
+        let (gx, gy) = (at % QW, at / QW);
+        let sign = self.mcharge[at].signum();
+        // The cloud square above with the most charge of the other sign.
+        let (mut from, mut fq) = (None, 0.3f32);
+        for qy in 0..gy {
+            for qx in gx.saturating_sub(6)..(gx + 7).min(QW) {
+                let v = -self.charge[qy * QW + qx] * sign;
+                if v > fq {
+                    fq = v;
+                    from = Some((qx, qy));
+                }
+            }
+        }
+        let Some((cx, cy)) = from else { return false };
+        let x0 = (cx * QS + QS / 2) as i32;
+        let mut base = (cy * QS + QS / 2) as i32;
+        while base < H as i32 - 1 && matches!(self.raw(x0, base + 1), Mat::Cloud | Mat::Snow | Mat::Hail) {
+            base += 1;
+        }
+        let tx = (gx * QS + QS / 2) as i32;
+        let target = self.lightning_target(tx, (gy * QS) as i32 - 1, QS as i32);
+        self.discharge_around(cx, cy, 5);
+        for dy in -2i32..=2 {
+            for dx in -2i32..=2 {
+                let (x, y) = (gx as i32 + dx, gy as i32 + dy);
+                if x >= 0 && y >= 0 && x < QW as i32 && y < QH as i32 {
+                    self.mcharge[y as usize * QW + x as usize] *= 0.1;
+                }
+            }
+        }
+        self.lightning_bolt((x0 as f32, base as f32), None, target, (fq.min(3.0) / 3.0).max(0.5), true);
+        true
+    }
+}
+
 /// Lightning goes into snow lying on the ground (low down), not into falling flakes.
 const GROUND_ROW: i32 = (H as i32) / 2;
 
 impl World {
-    /// Charge at a cell, smoothly interpolated between the squares of the grid.
-    pub fn charge_smooth(&self, x: usize, y: usize) -> f32 {
-        let fx = ((x as f32 + 0.5) / QS as f32 - 0.5).clamp(0.0, QW as f32 - 1.001);
-        let fy = ((y as f32 + 0.5) / QS as f32 - 0.5).clamp(0.0, QH as f32 - 1.001);
-        let (i, j) = (fx as usize, fy as usize);
-        let (tx, ty) = (fx - i as f32, fy - j as f32);
-        let q = |a: usize, b: usize| self.charge[b * QW + a];
-        (q(i, j) * (1.0 - tx) + q(i + 1, j) * tx) * (1.0 - ty) + (q(i, j + 1) * (1.0 - tx) + q(i + 1, j + 1) * tx) * ty
+    /// Charge in the ground at a cell, smoothly interpolated between the squares of the grid.
+    pub fn mcharge_smooth(&self, x: usize, y: usize) -> f32 {
+        smooth(&self.mcharge, x, y)
     }
 
+    /// Charge at a cell, smoothly interpolated between the squares of the grid.
+    pub fn charge_smooth(&self, x: usize, y: usize) -> f32 {
+        smooth(&self.charge, x, y)
+    }
+}
+
+/// A value of a `QS` grid at cell (x, y), smoothly interpolated between the squares.
+fn smooth(grid: &[f32], x: usize, y: usize) -> f32 {
+    let fx = ((x as f32 + 0.5) / QS as f32 - 0.5).clamp(0.0, QW as f32 - 1.001);
+    let fy = ((y as f32 + 0.5) / QS as f32 - 0.5).clamp(0.0, QH as f32 - 1.001);
+    let (i, j) = (fx as usize, fy as usize);
+    let (tx, ty) = (fx - i as f32, fy - j as f32);
+    let q = |a: usize, b: usize| grid[b * QW + a];
+    (q(i, j) * (1.0 - tx) + q(i + 1, j) * tx) * (1.0 - ty) + (q(i, j + 1) * (1.0 - tx) + q(i + 1, j + 1) * tx) * ty
+}
+
+impl World {
     /// The electricity view: the world dimmed to grey, what conducts lit up (metal gold, water
-    /// and wet things cyan), and the charge of the clouds over it, red where positive and blue
-    /// where negative, brightest close to breaking down.
+    /// and wet things cyan), and the charge over it, red where positive and blue where negative,
+    /// brightest close to breaking down: in the clouds, and in the ground and what stands on it
+    /// (drawn up under a charged cloud, or left by a bolt).
     pub fn electric_color(&self, x: usize, y: usize) -> [u8; 4] {
         let m = self.cells[y * W + x].m;
         let base = self.color(x, y);
@@ -574,7 +769,8 @@ impl World {
         if m == Mat::Cloud {
             c = [62.0, 66.0, 82.0];
         }
-        let q = self.charge_smooth(x, y) / BREAKDOWN;
+        let matter = !matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame);
+        let q = if matter { self.mcharge_smooth(x, y) / GROUND_BREAKDOWN } else { self.charge_smooth(x, y) / BREAKDOWN };
         let a = q.abs().min(1.0).sqrt();
         if a > 0.02 {
             let tint = if q > 0.0 { [255.0, 70.0, 60.0] } else { [70.0, 130.0, 255.0] };
@@ -751,6 +947,87 @@ mod tests {
         let b = &w.bolts[0];
         let (x0, y0) = b.path[0];
         assert!((290.0..610.0).contains(&x0) && (110.0..270.0).contains(&y0), "it starts in the cloud: {x0}, {y0}");
+    }
+
+    #[test]
+    fn a_charged_cloud_draws_charge_up_the_mast_until_lightning_leaves_for_it() {
+        let mut w = World::new_static();
+        w.climate_fixed = Some(-10.0);
+        w.reset_temps();
+        ground(&mut w, 470);
+        for y in 380..470 {
+            w.set(450, y, Mat::Iron);
+        }
+        for x in 300..600 {
+            for y in 120..260 {
+                w.set(x, y, Mat::Cloud);
+            }
+        }
+        // A charged cloud: positive at the top, negative at the base.
+        for qy in 0..QH {
+            for qx in 0..QW {
+                let (x, y) = (qx * QS, qy * QS);
+                if (300..600).contains(&x) {
+                    w.charge[qy * QW + qx] = if (120..170).contains(&y) { 0.5 } else if (200..260).contains(&y) { -0.6 } else { 0.0 };
+                }
+            }
+        }
+        let (cells, temp, charge) = (w.cells.clone(), w.temp.clone(), w.charge.clone());
+        let mut seen = None;
+        for step in 0..6000 {
+            // Keep the cloud and its charge as they are: only the ground is under test.
+            w.cells.copy_from_slice(&cells);
+            w.temp.copy_from_slice(&temp);
+            w.charge.copy_from_slice(&charge);
+            w.ticks = 0;
+            w.storm_step();
+            if step == 40 {
+                seen = Some((w.mcharge_at(450, 381), w.mcharge_at(380, 469), w.mcharge_at(50, 469)));
+            }
+            if !w.bolts.is_empty() {
+                assert!(step > 50, "the charge takes a while to build up: {step}");
+                assert!(step < 1500, "but not forever: {step}");
+                break;
+            }
+        }
+        let (mast, ground_under, far) = seen.unwrap();
+        assert!(mast > 0.0 && ground_under > 0.0, "under the negative base the ground turns positive: mast {mast}, ground {ground_under}");
+        assert!(mast > ground_under, "most on the tall iron mast: {mast} / {ground_under}");
+        assert!(far.abs() < ground_under * 0.2, "far from the cloud, little: {far}");
+        assert!(!w.bolts.is_empty(), "the charge builds up until the air breaks down");
+        let end = w.bolts[0].path.last().unwrap();
+        assert!((end.0 - 450.0).abs() < 4.0 && (end.1 - 380.0).abs() < 6.0, "the bolt leaves for the mast: {end:?}");
+        assert!(w.mcharge_at(450, 381).abs() < GROUND_BREAKDOWN * 0.5, "the strike drains the mast");
+    }
+
+    #[test]
+    fn a_bolt_leaves_its_charge_in_what_it_strikes_and_it_runs_along_the_iron() {
+        let mut w = World::new_static();
+        ground(&mut w, 420);
+        for x in 300..500 {
+            w.set(x, 419, Mat::Iron);
+        }
+        w.strike(310, 418);
+        assert!(w.mcharge_at(310, 419) < -0.2, "the bolt leaves negative charge: {}", w.mcharge_at(310, 419));
+        for _ in 0..200 {
+            w.ticks = 0;
+            w.storm_step();
+        }
+        assert!(w.mcharge_at(400, 419) < -0.01, "the charge spreads along the rail: {}", w.mcharge_at(400, 419));
+        let blank = {
+            let mut b = World::new_static();
+            ground(&mut b, 420);
+            for x in 300..500 {
+                b.set(x, 419, Mat::Iron);
+            }
+            b.electric_color(400, 419)
+        };
+        assert_ne!(w.electric_color(400, 419), blank, "the electricity view shows the charge in the rail");
+        for _ in 0..3000 {
+            w.ticks = 0;
+            w.storm_step();
+        }
+        assert!(w.mcharge_at(310, 419).abs() < 0.05, "and it drains away into the ground: {}", w.mcharge_at(310, 419));
     }
 
     #[test]
