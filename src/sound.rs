@@ -41,6 +41,10 @@ pub enum Ev {
     Pop,
     /// A whale breathing out at the surface.
     Blow,
+    /// A wolf howling at the full moon.
+    Howl,
+    /// The wolf cub trying too: short, high, off-key.
+    Yip,
 }
 
 impl Ev {
@@ -55,6 +59,8 @@ impl Ev {
             Ev::Siren => 6,
             Ev::Pop => 7,
             Ev::Blow => 8,
+            Ev::Howl => 9,
+            Ev::Yip => 10,
         }
     }
 }
@@ -326,6 +332,30 @@ pub fn blow() -> Vec<f32> {
     v
 }
 
+/// A howl: a voice that slides up, holds a long wavering note, then sinks and dies away.
+/// `hz` is where it holds, `len` its length in seconds, `off_key` makes it wobble out of tune.
+pub fn howl(hz: f32, len: f32, off_key: f32) -> Vec<f32> {
+    let mut rng = Rng(9001);
+    let n = secs(len);
+    let mut ph = 0.0f32;
+    let mut v: Vec<f32> = (0..n)
+        .map(|i| {
+            let t = i as f32 / n as f32;
+            let secs_in = i as f32 / RATE as f32;
+            let slide = (t / 0.18).min(1.0);
+            let sink = ((t - 0.7) / 0.3).clamp(0.0, 1.0);
+            let pitch = hz * (0.72 + 0.28 * slide * (2.0 - slide)) * (1.0 - 0.25 * sink * sink)
+                * (1.0 + 0.012 * (TAU * 5.5 * secs_in).sin() + off_key * (TAU * 3.1 * secs_in).sin());
+            ph += pitch / RATE as f32;
+            let voice = (TAU * ph).sin() + 0.35 * (TAU * ph * 2.0).sin() + 0.12 * (TAU * ph * 3.0).sin();
+            let env = (t / 0.08).min(1.0) * (1.0 - t).powf(0.6);
+            (voice + rng.next() * 0.05) * env
+        })
+        .collect();
+    normalize(&mut v, 0.6);
+    v
+}
+
 /// 16-bit mono PCM WAV, for macroquad's audio (Linux plays the samples directly).
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn wav(samples: &[f32]) -> Vec<u8> {
@@ -368,6 +398,8 @@ struct Bank {
     siren: Clip,
     pop: Clip,
     blow: Clip,
+    howl: Clip,
+    yip: Clip,
 }
 
 pub struct Sounds {
@@ -375,7 +407,7 @@ pub struct Sounds {
     bank: Option<Bank>,
     pub muted: bool,
     queue: Vec<Ev>,
-    cooldown: [f32; 9],
+    cooldown: [f32; 11],
     /// Smoothed loop volumes: engine x4, wind, water, fire.
     level: [f32; 7],
 }
@@ -388,7 +420,7 @@ impl Sounds {
             bank: None,
             muted: true,
             queue: vec![],
-            cooldown: [0.0; 9],
+            cooldown: [0.0; 11],
             level: [0.0; 7],
         }
     }
@@ -429,6 +461,8 @@ impl Sounds {
                 siren: one(siren()).await?,
                 pop: one(pop()).await?,
                 blow: one(blow()).await?,
+                howl: one(howl(470.0, 2.6, 0.0)).await?,
+                yip: one(howl(820.0, 1.1, 0.06)).await?,
             })
         }
         .await;
@@ -492,6 +526,7 @@ impl Sounds {
                     // The siren is two seconds long: never two at once.
                     Ev::Siren => 2.0,
                     Ev::Pop => 0.2,
+                    Ev::Howl => 0.3,
                     _ => 0.07,
                 };
                 let (s, v) = match e {
@@ -504,6 +539,8 @@ impl Sounds {
                     Ev::Siren => (&b.siren, 0.35),
                     Ev::Pop => (&b.pop, 0.55),
                     Ev::Blow => (&b.blow, 0.5),
+                    Ev::Howl => (&b.howl, 0.45),
+                    Ev::Yip => (&b.yip, 0.4),
                 };
                 b.out.play(s, false, v);
             }
@@ -529,7 +566,7 @@ mod tests {
         for hz in ENGINE_HZ {
             sane(&engine(hz));
         }
-        for v in [wind(), water(), fire(), boom(2.0, 1.0), boom(0.8, 0.4), thud(), clink(), crack(), spray(), snap(), siren(), pop(), blow()] {
+        for v in [wind(), water(), fire(), boom(2.0, 1.0), boom(0.8, 0.4), thud(), clink(), crack(), spray(), snap(), siren(), pop(), blow(), howl(470.0, 2.6, 0.0), howl(820.0, 1.1, 0.06)] {
             sane(&v);
         }
     }

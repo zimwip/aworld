@@ -20,6 +20,7 @@ mod science;
 mod sound;
 mod ui;
 mod whale;
+mod wolves;
 mod world;
 
 use blocks::{anchor_world, block_at, clip, node_at, placement_ok, snap, stamp_all, Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, Physics, Spring, SpringKind, MEMBER_MAX_LEN, SPRING_MAX_LEN};
@@ -165,6 +166,8 @@ struct Game {
     /// powder going off at night sends up.
     whales: whale::Whales,
     trucks: firetruck::FireTrucks,
+    /// The wolves howling on full-moon nights.
+    wolves: wolves::Wolves,
     fireworks: fireworks::Fireworks,
     /// The night (day number) whose fireworks were explained already.
     fireworks_told: u32,
@@ -302,6 +305,7 @@ impl Game {
             planes: plane::Planes::new(),
             whales: whale::Whales::new(),
             trucks: firetruck::FireTrucks::new(),
+            wolves: wolves::Wolves::new(),
             fireworks: fireworks::Fireworks::new(),
             fireworks_told: 0,
             hud_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
@@ -1256,6 +1260,21 @@ impl Game {
                 self.say("Il faut une grande étendue d'eau profonde pour une baleine");
             }
         }
+        if is_key_pressed(KeyCode::L) {
+            let night = self.world.sun() <= 0.0 && self.world.moon_arc().is_some();
+            if self.world.full_moon() && night {
+                if self.wolves.summon(&self.world) {
+                    self.say("Les loups arrivent sous la pleine lune...");
+                }
+            } else {
+                let n = self.world.nights_to_full_moon();
+                self.say(match n {
+                    0 => format!("Les loups attendent que la pleine lune se lève ({})", self.world.moon_name()),
+                    1 => format!("Les loups attendent la pleine lune : demain soir ! ({} ce soir)", self.world.moon_name()),
+                    _ => format!("Les loups attendent la pleine lune : encore {n} nuits ({} ce soir)", self.world.moon_name()),
+                });
+            }
+        }
         if is_key_pressed(KeyCode::Y) {
             self.mode = if self.mode == ViewMode::Humidity { ViewMode::Normal } else { ViewMode::Humidity };
         }
@@ -1505,6 +1524,21 @@ impl Game {
         }
         if self.whales.update(dt, &self.world) {
             self.sounds.emit(Ev::Blow);
+        }
+        match self.wolves.update(dt, &self.world) {
+            Some(wolves::News::Howl) => {
+                self.sounds.emit(Ev::Howl);
+                if self.wolves.pack.as_ref().map_or(false, |p| p.age < 4.0) {
+                    self.say("Pleine lune : les loups hurlent ! Aouuuuh !");
+                }
+            }
+            Some(wolves::News::Cub) => {
+                self.sounds.emit(Ev::Yip);
+                self.say("Le louveteau essaie aussi... il chante un peu faux");
+            }
+            Some(wolves::News::Wink) => self.say("La lune, flattée, leur fait un clin d'œil !"),
+            Some(wolves::News::Fact) => self.say("En vrai, les loups ne hurlent pas à la lune : ils lèvent la tête pour que leur appel porte loin"),
+            None => {}
         }
         self.fireworks.update(dt);
         if self.fireworks.take_bursts() > 0 {
@@ -1816,6 +1850,7 @@ impl Game {
     fn draw_cameos(&self, view: View) {
         self.planes.draw(view, self.time);
         self.whales.draw(view);
+        self.wolves.draw(view);
         self.trucks.draw(view, self.time);
     }
 
@@ -1832,7 +1867,8 @@ impl Game {
             _ => RenderMode::Normal,
         };
         if !flat {
-            backdrop::draw_sky(view, self.world.biome, phase, self.world.wind, self.time, self.world.season());
+            let moon = backdrop::Moon { arc: self.world.moon_arc(), age: self.world.moon_age(), light: self.world.moon_light(), wink: self.wolves.wink() };
+            backdrop::draw_sky(view, self.world.biome, phase, self.world.wind, self.time, self.world.season(), moon);
         }
         renderer.draw_world(&self.world, view, render_mode, self.time);
         if !flat {
@@ -1891,6 +1927,7 @@ impl Game {
         }
         // Fireworks are light: drawn over the night, so they glow in the dark.
         self.fireworks.draw(view, self.time);
+        self.wolves.draw_song(view, ui);
         if self.mode == ViewMode::Wind {
             self.draw_wind_field(view);
         }
@@ -2042,7 +2079,6 @@ impl Game {
     /// moon) is: the sun is the hottest thing up there and warms the air around it.
     fn draw_sun_on_thermal(&self, view: View, ui: &Ui) {
         let w = &self.world;
-        let phase = w.phase();
         if w.sun() > 0.0 {
             let (sx, sy) = w.sun_position();
             let c = view.to_screen(vec2(sx, sy));
@@ -2051,9 +2087,8 @@ impl Game {
             }
             draw_circle_lines(c.x, c.y, 16.0 * view.s.max(0.8), 2.0, WHITE);
             ui.text("Soleil", c.x + 24.0, c.y - 20.0, 15, WHITE);
-        } else {
-            let u = ((phase - 0.5) / 0.5).clamp(0.0, 1.0);
-            let c = view.to_screen(vec2(W as f32 * (0.08 + 0.84 * u), H as f32 * (0.64 - 0.52 * (std::f32::consts::PI * u).sin())));
+        } else if let Some((mx, my)) = w.moon_position() {
+            let c = view.to_screen(vec2(mx, my));
             draw_circle(c.x, c.y, 12.0 * view.s.max(0.8), Color::new(0.75, 0.82, 1.0, 0.8));
             ui.text("Lune", c.x + 18.0, c.y - 14.0, 14, Color::new(0.85, 0.9, 1.0, 1.0));
         }
@@ -2064,7 +2099,7 @@ impl Game {
         let w = &self.world;
         let night = w.sun() <= 0.0;
         let arrow = if w.wind > 0.08 { "→" } else if w.wind < -0.08 { "←" } else { "·" };
-        let text = format!(
+        let mut text = format!(
             "{}  jour {}  ·  {}  ·  {:.0} °C  ·  vent {} {:.0} km/h",
             w.clock_label(),
             w.day_number(),
@@ -2073,6 +2108,10 @@ impl Game {
             arrow,
             w.wind.abs() * 40.0
         );
+        // At night, tonight's moon.
+        if night {
+            text += &format!("  ·  {}", w.moon_name());
+        }
         let tw = ui.text_w(&text, 14) + 38.0;
         let pill = Rect::new(r.x + 8.0, r.y + 8.0, tw, 26.0);
         self.hud_hit = pill;
@@ -3568,6 +3607,10 @@ async fn main() {
                 _ => Season::Spring,
             });
         }
+        // `--day n`: that day of the moon's cycle (3 is a full moon), at the same hour.
+        if let Some(d) = arg("--day").and_then(|d| d.parse::<u32>().ok()) {
+            game.world.set_day(d);
+        }
         game.mode = match arg("--view").as_deref() {
             Some("thermique") => ViewMode::Thermal,
             Some("efforts") => ViewMode::Stress,
@@ -3669,6 +3712,15 @@ async fn main() {
             if (320..=340).contains(&frame) && frame % 10 == 0 && args.iter().any(|a| a == "--fireworks") {
                 game.fireworks.launch(vec2(260.0 + (frame - 320) as f32 * 20.0, 430.0), 3);
                 game.fireworks.update(0.4);
+            }
+            // `--wolves t`: the pack is t seconds into its visit at the shot.
+            if let Some(t) = arg("--wolves").and_then(|v| v.parse::<f32>().ok()) {
+                if frame == 300 {
+                    game.wolves.summon(&game.world);
+                }
+                if let Some(p) = game.wolves.pack.as_mut().filter(|_| frame >= 355) {
+                    p.age = t;
+                }
             }
             if frame == 240 && args.iter().any(|a| a == "--whale") {
                 game.whales.summon(&game.world);
