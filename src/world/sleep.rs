@@ -87,7 +87,7 @@ impl World {
             Mat::Empty | Mat::Stone | Mat::Brick | Mat::Glass | Mat::Ice | Mat::Clay | Mat::Terracotta => false,
             Mat::Dirt => c.life > 0,
             Mat::Grass => c.life > 0 || !self.at(x, y + 1).is_hard(),
-            Mat::Sand | Mat::Rust | Mat::Hail | Mat::Snow | Mat::Gunpowder | Mat::Ash => {
+            Mat::Sand | Mat::Rust | Mat::Hail | Mat::Snow | Mat::Gunpowder | Mat::Ash | Mat::Charcoal => {
                 let can_fall = sinks_into(self.at(x, y + 1)) || sinks_into(self.at(x - 1, y + 1)) || sinks_into(self.at(x + 1, y + 1));
                 let wet = c.m == Mat::Ash && Self::neighbors(x, y).iter().any(|&(nx, ny)| self.at(nx, ny) == Mat::Water);
                 can_fall || wet

@@ -13,6 +13,8 @@ const GROUND_Y: f32 = 360.0;
 
 pub const FIRE_C: f32 = 650.0;
 pub const EMBER_C: f32 = 500.0;
+/// How much hotter burning charcoal glows than burning wood.
+pub const COAL_EXTRA_C: f32 = 150.0;
 pub const LAVA_C: f32 = 1100.0;
 pub const BOIL_C: f32 = 100.0;
 /// Water freezes and ice melts at 0 °C. What keeps it from flickering between the two is the
@@ -40,6 +42,8 @@ pub const STEEL_C: f32 = 400.0;
 pub const KILN_C: f32 = 550.0;
 pub const SMELT_C: f32 = 400.0;
 pub const WOOD_IGNITE_C: f32 = 300.0;
+/// Charcoal catches fire in the air from this temperature.
+pub const CHARCOAL_IGNITE_C: f32 = 300.0;
 pub const POWDER_IGNITE_C: f32 = 210.0;
 /// A glass cell whose neighbours differ by more than this cracks.
 pub const SHOCK_C: f32 = 320.0;
@@ -71,6 +75,7 @@ fn props(m: Mat) -> (f32, f32) {
         Mat::Fire => (0.4, 1.0),
         Mat::Ember => (0.25, 1.0),
         Mat::Gunpowder | Mat::Ash | Mat::Rust => (0.04, 1.2),
+        Mat::Charcoal => (0.04, 1.0),
     }
 }
 
@@ -92,7 +97,7 @@ fn tables() -> &'static Tables {
                 m,
                 Mat::Water | Mat::Ice | Mat::Snow | Mat::Hail | Mat::Steam | Mat::Lava | Mat::Molten | Mat::Stone | Mat::Sand
                     | Mat::Shard | Mat::Glass | Mat::Rust | Mat::Iron | Mat::Steel | Mat::Wood | Mat::Trunk | Mat::Leaf | Mat::Branch | Mat::DeadLeaf
-                    | Mat::Grass | Mat::Seed | Mat::Sapling | Mat::Gunpowder | Mat::Oil | Mat::Clay
+                    | Mat::Grass | Mat::Seed | Mat::Sapling | Mat::Gunpowder | Mat::Oil | Mat::Clay | Mat::Charcoal
             );
         }
         t
@@ -421,7 +426,10 @@ impl World {
                     // Embers a draught cannot reach glow hotter (and last longer, see `step_ember`).
                     Mat::Ember => {
                         let open = Self::neighbors(x as i32, y as i32).iter().filter(|&&(nx, ny)| matches!(self.at(nx, ny).kind(), super::Kind::Empty | super::Kind::Gas)).count();
-                        self.temp[i] = EMBER_C + 300.0 * (1.0 - open as f32 / 4.0);
+                        // Charcoal burns hotter than wood: nothing is left in it but carbon.
+                        let glow = EMBER_C + 300.0 * (1.0 - open as f32 / 4.0);
+                        let coal = self.cells[i].life >= super::COAL_LIFE;
+                        self.temp[i] = if coal { glow + COAL_EXTRA_C } else { glow };
                     }
                     _ => {}
                 }
@@ -674,21 +682,45 @@ impl World {
                 }
             }
             Mat::Rust => {
+                // Rust is iron oxide: carbon takes its oxygen away. The carbon is charcoal close
+                // by, or the carbon monoxide of a wood fire's flames and embers right against it.
                 if t >= SMELT_C && self.chance_t(15) {
-                    self.set(x, y, Mat::Iron);
+                    if let Some((cx, cy)) = self.find_near(x, y, 2, Mat::Charcoal) {
+                        if self.chance(3) {
+                            self.set(cx, cy, Mat::Empty);
+                        }
+                        self.set(x, y, Mat::Iron);
+                    } else if Self::neighbors(x, y).iter().any(|&(nx, ny)| matches!(self.raw(nx, ny), Mat::Fire | Mat::Ember)) {
+                        self.set(x, y, Mat::Iron);
+                    }
                 }
             }
             Mat::Iron => {
+                // Hot iron soaks up carbon from the charcoal beside it: steel.
+                // Glowing coals close by give it carbon too (the smith hardens iron in the forge's
+                // coals), and burn away as they do.
                 if t >= STEEL_C && self.chance_t(10) {
-                    if let Some((ax, ay)) = self.find_near(x, y, 3, Mat::Ash) {
-                        self.set(ax, ay, Mat::Empty);
+                    if let Some((cx, cy)) = self.find_near(x, y, 3, Mat::Charcoal).or_else(|| self.find_near(x, y, 3, Mat::Ember)) {
+                        self.set(cx, cy, Mat::Empty);
                         self.set(x, y, Mat::Steel);
                     }
                 }
             }
             Mat::Wood | Mat::Trunk | Mat::Leaf | Mat::Branch | Mat::DeadLeaf => {
-                if t >= WOOD_IGNITE_C && self.chance_t(10) {
-                    self.set(x, y, Mat::Ember);
+                // With air it burns; shut away from the air it only chars (pyrolysis): the
+                // water and the tars leave and almost pure carbon stays, charcoal.
+                if t >= WOOD_IGNITE_C {
+                    let air = self.breathes(x, y);
+                    if air && self.chance_t(10) {
+                        self.set(x, y, Mat::Ember);
+                    } else if !air && self.chance_t(40) {
+                        self.set(x, y, Mat::Charcoal);
+                    }
+                }
+            }
+            Mat::Charcoal => {
+                if t >= CHARCOAL_IGNITE_C && self.chance_t(20) {
+                    self.light_charcoal(x, y, 1);
                 }
             }
             Mat::Grass | Mat::Seed | Mat::Sapling => {

@@ -37,6 +37,8 @@ pub struct Pocket {
     pub cells: u32,
     /// Steam and cloud cells among them.
     pub steam: u32,
+    /// Smoke cells among them: air whose oxygen a fire has burnt.
+    pub smoke: u32,
     /// Sum of the absolute temperatures of its cells.
     pub kelvin: f32,
     pub open: bool,
@@ -47,11 +49,14 @@ pub struct Pocket {
     /// Cell sides it shares with walls and with liquid.
     wall_edge: u32,
     liquid_edge: u32,
+    /// Walls full of cracks (embers, charcoal, ash) round it: the gas seeps out and never
+    /// builds up pressure, but no fresh air comes in either.
+    leaky: bool,
 }
 
 impl Pocket {
     fn settle(&mut self) {
-        self.pressure = if self.open || self.cells == 0 {
+        self.pressure = if self.open || self.leaky || self.cells == 0 {
             1.0
         } else {
             let v = self.cells as f32;
@@ -67,7 +72,7 @@ pub fn wall_strength(m: Mat) -> Option<f32> {
     Some(match m {
         Mat::Ice => 0.6,
         Mat::Glass => 0.8,
-        Mat::Snow | Mat::Hail | Mat::Ash | Mat::Sand | Mat::Mud | Mat::Seed | Mat::Shard | Mat::Rust | Mat::Gunpowder | Mat::DeadLeaf => 0.6,
+        Mat::Snow | Mat::Hail | Mat::Ash | Mat::Charcoal | Mat::Sand | Mat::Mud | Mat::Seed | Mat::Shard | Mat::Rust | Mat::Gunpowder | Mat::DeadLeaf => 0.6,
         Mat::Dirt | Mat::Grass => 2.0,
         Mat::Clay => 1.5,
         Mat::Wood | Mat::Trunk => 2.5,
@@ -149,6 +154,7 @@ impl World {
                         p.cells += 1;
                         p.kelvin += self.temp[k] + 273.15;
                         p.steam += matches!(self.cells[k].m, Mat::Steam | Mat::Cloud) as u32;
+                        p.smoke += (self.cells[k].m == Mat::Smoke) as u32;
                     }
                 }
                 // One seed per run of free cells in the rows above and below.
@@ -192,6 +198,7 @@ impl World {
                     p.liquid_edge += 1;
                 } else {
                     p.wall_edge += 1;
+                    p.leaky |= matches!(self.cells[i].m, Mat::Ember | Mat::Charcoal | Mat::Ash);
                 }
                 if let Some(s) = strength {
                     if p.weakest.map_or(true, |w| s < w.1) {
@@ -222,6 +229,17 @@ impl World {
             id if gassy(self.cells[i].m) && self.mask[i] == 0 => Some(id as usize - 1),
             _ => None,
         }
+    }
+
+    /// Whether the gas at a cell is shut in a closed pocket (cut off from the open air).
+    pub fn sealed(&self, x: i32, y: i32) -> bool {
+        self.pocket_at(x, y).and_then(|k| self.pockets.get(k)).is_some_and(|p| !p.open)
+    }
+
+    /// Whether the gas at a cell is shut in with too little oxygen left for a flame: a closed
+    /// pocket that is half smoke or more.
+    pub fn stale(&self, x: i32, y: i32) -> bool {
+        self.pocket_at(x, y).and_then(|k| self.pockets.get(k)).is_some_and(|p| !p.open && p.smoke * 2 >= p.cells)
     }
 
     /// Absolute pressure (atm) of the gas at a cell: 1 in the open air.

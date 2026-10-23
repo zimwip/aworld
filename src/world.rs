@@ -102,13 +102,17 @@ pub enum Mat {
     /// Clay: fired in a hot fire it becomes terracotta.
     Clay,
     Terracotta,
+    /// Wood heated without air: almost pure carbon. It burns hot and slowly, and gives its
+    /// carbon to iron (steel) and to rust (iron again).
+    Charcoal,
 }
 
 impl Mat {
-    pub const ALL: [Mat; 35] = [
+    pub const ALL: [Mat; 36] = [
         Mat::Empty, Mat::Sand, Mat::Water, Mat::Fire, Mat::Steam, Mat::Iron, Mat::Wood, Mat::Stone,
         Mat::Brick, Mat::Rust, Mat::Ash, Mat::Ember, Mat::Lava, Mat::Ice, Mat::Gunpowder, Mat::Dirt, Mat::Grass,
         Mat::Leaf, Mat::Steel, Mat::Cloud, Mat::Seed, Mat::Sapling, Mat::Mud, Mat::Glass, Mat::Snow, Mat::Shard, Mat::DeadLeaf, Mat::Branch, Mat::Trunk, Mat::Hail, Mat::Oil, Mat::Smoke, Mat::Molten, Mat::Clay, Mat::Terracotta,
+        Mat::Charcoal,
     ];
 
     pub fn from_u8(v: u8) -> Mat {
@@ -131,7 +135,7 @@ impl Mat {
         use Mat::*;
         match self {
             Empty => Kind::Empty,
-            Sand | Rust | Ash | Gunpowder | Seed | Mud | Snow | Shard | DeadLeaf | Hail => Kind::Powder,
+            Sand | Rust | Ash | Charcoal | Gunpowder | Seed | Mud | Snow | Shard | DeadLeaf | Hail => Kind::Powder,
             Water | Lava | Oil | Molten => Kind::Liquid,
             Steam | Cloud | Smoke => Kind::Gas,
             Fire => Kind::Flame,
@@ -198,6 +202,7 @@ fn density(m: Mat) -> f32 {
         Mat::Ice | Mat::Hail => 0.92,
         Mat::Snow => 0.3,
         Mat::Ash => 0.5,
+        Mat::Charcoal => 0.3,
         Mat::Gunpowder | Mat::Rust => 1.5,
         _ => 1.0,
     }
@@ -211,6 +216,9 @@ pub struct Cell {
 }
 
 const EMPTY: Cell = Cell { m: Mat::Empty, life: 0, stamp: 0 };
+
+/// An ember whose life is at least this is burning charcoal: hotter and slower than wood.
+pub(crate) const COAL_LIFE: u8 = 200;
 
 /// A rigid piece of solid material that has lost its support and is falling.
 struct Piece {
@@ -1006,6 +1014,7 @@ impl World {
                         }
                         Mat::Shard => self.step_shard(x, y),
                         Mat::Ash => self.step_ash(x, y),
+                        Mat::Charcoal => self.step_charcoal(x, y),
                         Mat::Seed => self.step_seed(x, y),
                         Mat::Sapling => self.step_sapling(x, y),
                         Mat::Leaf => self.step_leaf(x, y),
@@ -1282,6 +1291,18 @@ impl World {
         if self.at(n.0, n.1) == Mat::Water && self.chance(500) {
             self.set(x, y, Mat::Dirt);
             return;
+        }
+        self.step_powder(x, y);
+    }
+
+    /// Charcoal is a powder, set alight by lava as well as by flames.
+    fn step_charcoal(&mut self, x: i32, y: i32) {
+        let n = Self::neighbors(x, y)[(self.rand() % 4) as usize];
+        if self.at(n.0, n.1) == Mat::Lava {
+            self.light_charcoal(x, y, 20);
+            if self.at(x, y) != Mat::Charcoal {
+                return;
+            }
         }
         self.step_powder(x, y);
     }
@@ -1605,7 +1626,8 @@ impl World {
 
     /// Smoke rises, drifts with the wind (wrapping at the sides) and thins out.
     fn step_smoke(&mut self, x: i32, y: i32) {
-        if self.chance(900) {
+        // In the open air smoke thins out; shut in a box it stays, and chokes the fire.
+        if self.chance(900) && !self.sealed(x, y) {
             self.set(x, y, Mat::Empty);
             return;
         }
@@ -1783,6 +1805,17 @@ impl World {
             return;
         }
         self.cells[i].life -= 1;
+        // A flame burns the oxygen of the air touching it. With no air around (only smoke,
+        // steam or walls) it chokes within a few steps: that is why a glass over a candle
+        // puts it out.
+        let air = Self::neighbors(x, y).iter().any(|&(nx, ny)| match self.at(nx, ny) {
+            Mat::Empty => !self.stale(nx, ny),
+            Mat::Smoke => !self.sealed(nx, ny),
+            _ => false,
+        });
+        if !air {
+            self.cells[i].life = self.cells[i].life.saturating_sub(6);
+        }
         for (nx, ny) in Self::neighbors(x, y) {
             match self.at(nx, ny) {
                 // Water puts the flame out (the warmth it took stays in the water).
@@ -1793,6 +1826,7 @@ impl World {
                     }
                 }
                 m if m.is_wooden() => self.ignite(nx, ny, 25),
+                Mat::Charcoal => self.light_charcoal(nx, ny, 40),
                 Mat::Oil => {
                     if self.chance(2) {
                         self.ignite_oil(nx, ny);
@@ -1819,7 +1853,9 @@ impl World {
 
     fn step_ember(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
-        if self.cells[i].life == 0 {
+        // Burning charcoal (life from COAL_LIFE up) lasts several times longer than burning wood.
+        let coal = self.cells[i].life >= COAL_LIFE;
+        if self.cells[i].life == 0 || self.cells[i].life == COAL_LIFE {
             let m = if self.chance(2) { Mat::Ash } else { Mat::Empty };
             self.set(x, y, m);
             return;
@@ -1833,8 +1869,18 @@ impl World {
             2 => 2,
             _ => 1,
         };
+        let slow = if coal { slow * 8 } else { slow };
         if slow == 1 || self.chance(slow) {
             self.cells[i].life -= 1;
+        }
+        // Only an ember that air reaches can light the wood beside it. Under a cover of soil the
+        // coals keep their heat, and the wood they warm chars into charcoal instead of burning
+        // (see `react`): the charcoal burner's mound.
+        let air = self.breathes(x, y);
+        // Shut in a box whose air is used up, it goes out: what is left is charcoal.
+        if !air && self.chance(40) && Self::neighbors(x, y).iter().any(|&(nx, ny)| matches!(self.at(nx, ny).kind(), Kind::Empty | Kind::Gas) && self.stale(nx, ny)) {
+            self.set(x, y, Mat::Charcoal);
+            return;
         }
         for (nx, ny) in Self::neighbors(x, y) {
             match self.at(nx, ny) {
@@ -1842,15 +1888,43 @@ impl World {
                     self.set(x, y, Mat::Ash);
                     return;
                 }
-                m if m.is_wooden() => self.ignite(nx, ny, 80),
+                m if m.is_wooden() && air => self.ignite(nx, ny, 80),
+                Mat::Charcoal if air => self.light_charcoal(nx, ny, 120),
                 _ => {}
             }
         }
-        if self.at(x, y - 1) == Mat::Empty && self.chance(12) {
+        if air && self.at(x, y - 1) == Mat::Empty && self.chance(12) {
             self.set(x, y - 1, Mat::Fire);
         }
     }
 
+
+    /// Whether air with oxygen in it reaches the cell: open air, or a flame (fed by the air it
+    /// draws in), or smoke still mixed with the open air. In a closed box the fire burns the
+    /// oxygen: once the box is half smoke, nothing in it can burn any more.
+    /// Air also seeps through one cell of something full of cracks (ash, charcoal, embers): a
+    /// heap of coals burns right through, while a cover of soil keeps the air out.
+    pub(super) fn breathes(&self, x: i32, y: i32) -> bool {
+        let air = |w: &World, (nx, ny): (i32, i32)| match w.at(nx, ny) {
+            Mat::Empty | Mat::Fire => !w.stale(nx, ny),
+            Mat::Smoke => !w.sealed(nx, ny),
+            _ => false,
+        };
+        let n = Self::neighbors(x, y);
+        n.iter().any(|&c| air(self, c))
+            || n.iter().any(|&(nx, ny)| matches!(self.at(nx, ny), Mat::Ash | Mat::Charcoal | Mat::Ember) && Self::neighbors(nx, ny).iter().any(|&c| air(self, c)))
+    }
+
+    /// Charcoal touching a flame catches when it has air, as an ember that lasts much longer
+    /// than one of wood.
+    pub(super) fn light_charcoal(&mut self, x: i32, y: i32, one_in: u32) {
+        if !self.chance(one_in) || !self.breathes(x, y) {
+            return;
+        }
+        self.set(x, y, Mat::Ember);
+        let i = Self::idx(x, y);
+        self.cells[i].life = COAL_LIFE + 30 + (self.rand() % 26) as u8;
+    }
 
     /// Lava and molten metal: they flow slowly, set wood alight, and when quenched
     /// by water set solid (`solid`) while the water flashes to steam.
@@ -2375,6 +2449,7 @@ impl World {
             Mat::Terracotta => (196 + v, 98 + v / 2, 60 + v / 3, 255),
             Mat::Rust => (156 + v, 84 + v / 2, 42, 255),
             Mat::Ash => (100 + v, 100 + v, 106 + v, 255),
+            Mat::Charcoal => (34 + v / 2, 32 + v / 2, 34 + v / 2, 255),
             Mat::Ember => (255, 110 + flick * 3, 24, 255),
             Mat::Lava => (255, 78 + flick * 3 + v, 12, 255),
             Mat::Ice => (176 + v, 226 + v, 248, 225),
@@ -3707,13 +3782,13 @@ mod science {
     }
 
     #[test]
-    fn iron_ash_and_fire_make_steel() {
+    fn iron_charcoal_and_fire_make_steel() {
         let mut w = World::new_static();
         floor(&mut w, 300, 100, 120);
         for x in 105..115 {
             w.set(x, 299, Mat::Iron);
             if x % 2 == 0 {
-                w.set(x, 298, Mat::Ash);
+                w.set(x, 298, Mat::Charcoal);
             }
         }
         for _ in 0..2500 {
@@ -3725,6 +3800,155 @@ mod science {
             w.step();
         }
         assert!(count(&w, Mat::Steel) > 0, "no steel");
+    }
+
+    /// A fired clay box (it does not melt), 3 thick, with a layer of wood on its floor set
+    /// alight; `lid` closes it.
+    fn wood_fire_in_a_box(lid: bool) -> World {
+        let mut w = World::new_static();
+        for x in 97..134 {
+            for y in 300..303 {
+                w.set(x, y, Mat::Terracotta);
+            }
+            if lid {
+                for y in 257..260 {
+                    w.set(x, y, Mat::Terracotta);
+                }
+            }
+        }
+        for y in 257..300 {
+            for x in (97..100).chain(131..134) {
+                w.set(x, y, Mat::Terracotta);
+            }
+        }
+        for x in 100..131 {
+            for y in 296..300 {
+                w.set(x, y, Mat::Wood);
+            }
+            w.set(x, 295, Mat::Fire);
+        }
+        w
+    }
+
+    #[test]
+    fn a_fire_shut_in_a_box_fills_it_with_smoke_and_chokes() {
+        let wood = |w: &World| count(w, Mat::Wood);
+        let mut open = wood_fire_in_a_box(false);
+        let mut shut = wood_fire_in_a_box(true);
+        for _ in 0..5000 {
+            open.step();
+            shut.step();
+        }
+        let smoke = (100..131).flat_map(|x| (260..300).map(move |y| (x, y))).filter(|&(x, y)| shut.raw(x, y) == Mat::Smoke).count();
+        let flames = |w: &World| w.cells.iter().filter(|c| matches!(c.m, Mat::Fire)).count();
+        assert!(shut.sealed(115, 270), "the box is still a closed pocket");
+        assert!(smoke > 150, "the smoke stays in the box: {smoke}");
+        // A last flicker now and then, when a little smoke has leaked into the coals.
+        assert!(flames(&shut) <= 3, "no air left: the flames are out: {}", flames(&shut));
+        // Shut away from the air the wood only chars: its carbon stays, as charcoal. In the
+        // open it burns to ash.
+        assert!(wood(&shut) + count(&shut, Mat::Charcoal) > 60, "the shut box keeps its carbon: {} wood, {} charcoal", wood(&shut), count(&shut, Mat::Charcoal));
+        assert_eq!(wood(&open), 0, "the open fire burns all its wood");
+    }
+
+    #[test]
+    fn wood_heated_under_soil_chars_into_charcoal_and_charcoal_burns_long() {
+        // The charcoal burner's mound: a woodpile under soil, warmed by a coal bed at its foot.
+        let mut w = World::new_static();
+        floor(&mut w, 300, 90, 150);
+        for x in 100..140 {
+            for y in 285..300 {
+                w.set(x, y, Mat::Wood);
+            }
+            for y in 280..285 {
+                w.set(x, y, Mat::Dirt);
+            }
+        }
+        for y in 280..300 {
+            for x in (95..100).chain(140..145) {
+                w.set(x, y, Mat::Dirt);
+            }
+        }
+        for _ in 0..4000 {
+            for x in 100..140 {
+                let i = World::idx(x, 299);
+                if w.raw(x, 299) != Mat::Empty {
+                    w.temp[i] = 450.0;
+                }
+            }
+            w.step();
+        }
+        let charcoal = count(&w, Mat::Charcoal);
+        let ash = count(&w, Mat::Ash);
+        assert!(charcoal > 100, "the wood chars without air: {charcoal}");
+        assert!(charcoal > 4 * ash, "it chars rather than burns: {charcoal} charcoal, {ash} ash");
+        // Lit in the open air, charcoal smoulders much longer than wood.
+        let embers_of = |m: Mat| {
+            let mut w = World::new_static();
+            floor(&mut w, 300, 90, 150);
+            for x in 100..140 {
+                w.set(x, 299, m);
+            }
+            for x in 100..140 {
+                w.set(x, 298, Mat::Fire);
+            }
+            let mut last = 0;
+            for t in 0..3000 {
+                w.step();
+                if w.cells.iter().any(|c| c.m == Mat::Ember) {
+                    last = t;
+                }
+            }
+            last
+        };
+        let (wood_t, coal_t) = (embers_of(Mat::Wood), embers_of(Mat::Charcoal));
+        assert!(coal_t > wood_t, "charcoal glows longer: {coal_t} / {wood_t}");
+    }
+
+    #[test]
+    fn rust_needs_carbon_to_turn_back_into_iron() {
+        let heated = |carbon: bool| {
+            let mut w = World::new_static();
+            floor(&mut w, 300, 100, 120);
+            for x in 105..115 {
+                w.set(x, 299, Mat::Rust);
+                if carbon && x % 2 == 0 {
+                    w.set(x, 298, Mat::Charcoal);
+                }
+            }
+            // Heat with no flame at all: hot metal under the floor, like an oven wall.
+            for _ in 0..1500 {
+                for x in 105..115 {
+                    for y in 298..300 {
+                        let i = World::idx(x, y);
+                        if w.raw(x, y) == Mat::Rust || w.raw(x, y) == Mat::Iron {
+                            w.temp[i] = 450.0;
+                        }
+                    }
+                }
+                w.step();
+            }
+            count(&w, Mat::Iron)
+        };
+        assert_eq!(heated(false), 0, "heat alone leaves rust as rust");
+        assert!(heated(true) > 0, "with charcoal the rust gives iron back");
+    }
+
+    #[test]
+    fn ash_has_no_carbon_left_to_make_steel() {
+        let mut w = World::new_static();
+        floor(&mut w, 300, 100, 120);
+        for x in 105..115 {
+            w.set(x, 299, Mat::Iron);
+            w.set(x, 298, Mat::Ash);
+        }
+        for _ in 0..1500 {
+            for x in 105..115 {
+                w.temp[World::idx(x, 299)] = 500.0;
+            }
+            w.step();
+        }
+        assert_eq!(count(&w, Mat::Steel), 0);
     }
 
     #[test]
@@ -3903,7 +4127,7 @@ fn rain_slants_with_the_local_wind() {
     assert!(mean > 312.0, "falling drops are pushed along: mean x {mean}");
 }
 
-/// A crucible of fired clay, a wood fire under it, iron and ash inside.
+/// A crucible of fired clay, a wood fire under it, iron and charcoal inside.
 fn crucible_world(wall: Mat) -> World {
     let mut w = World::new_static();
     let floor = 300;
@@ -3945,7 +4169,7 @@ fn crucible_world(wall: Mat) -> World {
             }
         }
     }
-    // A little iron (three rows) with ash on top, inside the 12-wide bowl.
+    // A little iron (three rows) with charcoal on top, inside the 12-wide bowl.
     for y in base - 3..base {
         for x in 205..217 {
             w.set(x, y, Mat::Iron);
@@ -3953,18 +4177,19 @@ fn crucible_world(wall: Mat) -> World {
     }
     for y in base - 5..base - 3 {
         for x in 205..217 {
-            w.set(x, y, Mat::Ash);
+            w.set(x, y, Mat::Charcoal);
         }
     }
-    // Light the wood from below.
-    for x in 205..215 {
-        w.set(x, floor - 1, Mat::Fire);
+    // Light the foot of the woodpile from both sides, where the air reaches it.
+    for y in floor - 10..floor {
+        w.set(199, y, Mat::Fire);
+        w.set(220, y, Mat::Fire);
     }
     w
 }
 
 #[test]
-fn a_clay_crucible_fired_by_a_wood_fire_turns_iron_and_ash_into_steel() {
+fn a_clay_crucible_fired_by_a_wood_fire_turns_iron_and_charcoal_into_steel() {
     let mut w = crucible_world(Mat::Clay);
     let mut steel_at = None;
     for t in 0..6000 {
@@ -3975,7 +4200,7 @@ fn a_clay_crucible_fired_by_a_wood_fire_turns_iron_and_ash_into_steel() {
     }
     let count = |m: Mat| (190..230).flat_map(|x| (240..300).map(move |y| (x, y))).filter(|&(x, y)| w.raw(x, y) == m).count();
     assert!(count(Mat::Terracotta) > 20, "the fire fires the clay into terracotta: {}", count(Mat::Terracotta));
-    assert!(count(Mat::Steel) >= 10, "the hot iron takes carbon from the ash and becomes steel: {}", count(Mat::Steel));
+    assert!(count(Mat::Steel) >= 10, "the hot iron takes carbon from the charcoal and becomes steel: {}", count(Mat::Steel));
     // The crucible itself did not burn or melt away.
     assert!(count(Mat::Terracotta) + count(Mat::Clay) > 100, "the walls hold");
 }

@@ -90,9 +90,9 @@ enum Tool {
     Exit,
 }
 
-const MATTER: [Mat; 21] = [
+const MATTER: [Mat; 22] = [
     Mat::Sand, Mat::Water, Mat::Dirt, Mat::Grass, Mat::Seed, Mat::Wood, Mat::Stone, Mat::Iron, Mat::Steel, Mat::Glass,
-    Mat::Ash, Mat::Rust, Mat::Ice, Mat::Snow, Mat::Fire, Mat::Lava, Mat::Steam, Mat::Cloud, Mat::Gunpowder, Mat::Clay, Mat::Terracotta,
+    Mat::Ash, Mat::Charcoal, Mat::Rust, Mat::Ice, Mat::Snow, Mat::Fire, Mat::Lava, Mat::Steam, Mat::Cloud, Mat::Gunpowder, Mat::Clay, Mat::Terracotta,
 ];
 
 fn window_conf() -> Conf {
