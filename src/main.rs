@@ -2621,7 +2621,7 @@ impl Game {
             (Tool::Tunnel, "Tunnel", Icon::Tunnel, "Creuse comme la gomme, mais pose une voûte de briques au-dessus du trou : le sable, la terre ou l'eau du plafond ne s'effondrent plus dedans. La roche, elle, tient toute seule et reste telle quelle ; le sol du tunnel n'est pas touché. Le pinceau règle la largeur."),
             (Tool::Hammer, "Marteau", Icon::Hammer, "Tape sur le verre et la glace pour les casser, secoue les autres blocs."),
             (Tool::Flame, "Lance-flammes", Icon::Flame, "Garde le clic enfoncé : un jet de flammes à 1500 °C. Le bois prend feu, la pierre rougit puis fond en lave, le fer fond, l'eau bout. Ce qui est lourd (pierre, eau) chauffe plus lentement. Le pinceau règle la taille du jet."),
-            (Tool::Lightning, "Éclair", Icon::Bolt, "Clique : la foudre tombe du ciel (du nuage au-dessus s'il y en a un) sur ce qui est sous le pointeur. Elle chauffe l'air à des milliers de degrés, met le feu au bois et à l'herbe, fond le sable en tube de verre (fulgurite), fait bouillir l'eau et court dans le fer. Le tonnerre suit, d'autant plus tard que c'est loin. Les gros nuages froids font leurs propres orages : vue Électricité (E)."),
+            (Tool::Lightning, "Éclair", Icon::Bolt, "Clique : la foudre tombe du ciel (du nuage au-dessus s'il y en a un) jusqu'au pointeur. Lâchée en l'air, elle saute vers le conducteur le plus proche ; sous terre, elle frappe la surface au-dessus. Tout son trajet chauffe : l'air à des milliers de degrés, le bois, l'herbe et le charbon prennent feu. Son courant file dans le sol par le meilleur conducteur, fond le sable en tube de verre (fulgurite), fait bouillir l'eau et court dans le fer. Le tonnerre suit, d'autant plus tard que c'est loin. Les gros nuages froids font leurs propres orages : vue Électricité (E)."),
             (Tool::Loupe, "Loupe", Icon::Loupe, "Le pointeur est une loupe : une vue ronde en bas à droite montre la matière sous la croix."),
             (Tool::Sensor, "Capteur", Icon::Thermo, "Pose une sonde (jusqu'à 4) : thermomètre, baromètre et hygromètre. Ses courbes s'affichent en bas de l'image : l'eau qui chauffe puis reste à 100 °C, une chaudière qui monte en pression, l'air qui sèche à midi. Clique sur une sonde pour l'enlever."),
             (Tool::Shovel, "Pelle", Icon::Shovel, "Clique un tas (cendre, sable, eau, fer...) : la bulle se remplit. Déplace-la, elle reste pleine. Garde le clic enfoncé : plus tu attends, plus le morceau est gros (jusqu'à tout) ; relâche pour le verser. La pelle ne se remplit que si elle est vide. Clic droit : tout verser. Le pinceau règle sa taille."),
@@ -3745,7 +3745,7 @@ fn demo_crater(g: &mut Game, dynamite: bool) {
 }
 
 /// `--demo --lava`: underground pockets of lava, a big one and a small one, to see the light they
-/// cast at night.
+/// cast at night, and a heap of charcoal and an iron post on the surface (for `--lightning`).
 fn demo_lava(g: &mut Game) {
     g.empty_world();
     for x in 0..W as i32 {
@@ -3753,6 +3753,14 @@ fn demo_lava(g: &mut Game) {
         for y in 331..H as i32 {
             g.world.set(x, y, Mat::Stone);
         }
+    }
+    for x in 700..740 {
+        for y in 330 - (20 - (x - 720i32).abs() / 2)..330 {
+            g.world.set(x, y, Mat::Charcoal);
+        }
+    }
+    for y in 290..330 {
+        g.world.set(800, y, Mat::Iron);
     }
     for (cx, cy, r) in [(400i32, 380i32, 30i32), (620, 390, 3)] {
         for x in cx - r..=cx + r {
@@ -3995,6 +4003,8 @@ async fn main() {
         }
         if args.iter().any(|a| a == "--lava") {
             demo_lava(&mut game);
+            // A bolt is only drawn while the world runs.
+            game.set_running(arg("--lightning").is_some());
         }
         // `--advance n`: the world runs n steps before the first frame.
         for _ in 0..arg("--advance").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) {
@@ -4140,9 +4150,13 @@ async fn main() {
                 }
             }
         }
-        if shot.is_some() && frame == 352 {
-            if let Some(x) = arg("--lightning").and_then(|v| v.parse::<i32>().ok()) {
-                game.world.strike(x, 0);
+        if shot.is_some() && frame == 356 {
+            // `--lightning x` or `--lightning x,y` (y: where the pointer is; the top of the sky by default).
+            if let Some(v) = arg("--lightning") {
+                let mut it = v.split(',').filter_map(|n| n.parse::<i32>().ok());
+                if let Some(x) = it.next() {
+                    game.world.strike(x, it.next().unwrap_or(0));
+                }
             }
         }
         // `--bridge`: a truck sets off over the bridge shortly before the shot.
