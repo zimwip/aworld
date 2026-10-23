@@ -168,17 +168,13 @@ struct Game {
     fireworks: fireworks::Fireworks,
     /// The night (day number) whose fireworks were explained already.
     fireworks_told: u32,
-    /// Where the tool strip, the corner buttons are (so that clicks on them do not paint the world).
-    tools_hit: Rect,
-    corner_hit: Rect,
+    /// The day pill (the world's menu opens under it).
     hud_hit: Rect,
     /// The world's settings (sun, escape to space) and its energy budget, under the day pill.
     climate_menu: bool,
-    launch_hit: Rect,
     /// The left palette hides like the views on the right; pinned, it stays out (and the picture
-    /// beside it). `panel_hit` is where it is, so that clicks on it do not paint the world.
+    /// beside it).
     panel: Drawer,
-    panel_hit: Rect,
     /// The car settings are shown under the views.
     car_remote: bool,
     /// The selection tool: what is selected and the drag in progress.
@@ -256,7 +252,6 @@ struct Game {
     /// The motor's remote control (or the car settings), a side menu of its own under the views:
     /// its tab shows while a motor or a car is chosen.
     remote_menu: Drawer,
-    views_hit: Rect,
     /// Ctrl + wheel / Ctrl + drag zoom and move the view; Escape brings back the whole world.
     camera: camera::Camera,
     /// Camera shake in pixels (explosions), and frame-rate watching for auto speed.
@@ -309,13 +304,9 @@ impl Game {
             trucks: firetruck::FireTrucks::new(),
             fireworks: fireworks::Fireworks::new(),
             fireworks_told: 0,
-            tools_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
-            corner_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             hud_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             climate_menu: false,
-            launch_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             panel: Drawer { open: 1.0, pin: false, peek: 0.0 },
-            panel_hit: Rect::new(0.0, 0.0, PANEL_W, 10000.0),
             car_remote: false,
             selection: None,
             drag: None,
@@ -369,7 +360,6 @@ impl Game {
             matter_menu: None,
             views: Drawer::new(false),
             remote_menu: Drawer::new(false),
-            views_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             camera: camera::Camera::default(),
             shake: 0.0,
             frame_ema: 0.016,
@@ -1322,7 +1312,7 @@ impl Game {
             self.camera.drag(base, ui.mouse, false, false);
             return;
         }
-        let over_ui = self.panel_hit.contains(ui.mouse) || self.views_hit.contains(ui.mouse) || self.tools_hit.contains(ui.mouse) || self.corner_hit.contains(ui.mouse) || self.hud_hit.contains(ui.mouse) || self.launch_hit.contains(ui.mouse);
+        let over_ui = ui.over_ui();
         let inside = !over_ui && base.visible().contains(ui.mouse);
         let pressed = is_mouse_button_pressed(MouseButton::Left);
         if self.camera.dragging() || (ctrl_down() && inside && pressed) {
@@ -1345,7 +1335,7 @@ impl Game {
             self.last = None;
             return;
         }
-        let over_ui = self.panel_hit.contains(ui.mouse) || self.views_hit.contains(ui.mouse) || self.tools_hit.contains(ui.mouse) || self.corner_hit.contains(ui.mouse) || self.hud_hit.contains(ui.mouse) || self.launch_hit.contains(ui.mouse);
+        let over_ui = ui.over_ui();
         let inside = !over_ui && view.visible().contains(ui.mouse);
         let wheel = mouse_wheel().1;
         if inside && wheel != 0.0 {
@@ -1829,7 +1819,7 @@ impl Game {
         self.trucks.draw(view, self.time);
     }
 
-    fn draw_scene(&mut self, view: View, renderer: &mut Renderer, ui: &Ui) {
+    fn draw_scene(&mut self, view: View, renderer: &mut Renderer, ui: &mut Ui) {
         let phase = self.world.phase();
         let day = backdrop::daylight(phase);
         let thermal = self.mode == ViewMode::Thermal;
@@ -1866,7 +1856,7 @@ impl Game {
             let st = if self.mode == ViewMode::Stress { Some(c.stress) } else { None };
             draw_cable(&pts, view, c.snapped, true, c.mat.color(), st);
         }
-        let over_ui_now = self.panel_hit.contains(ui.mouse) || self.views_hit.contains(ui.mouse) || self.tools_hit.contains(ui.mouse) || self.corner_hit.contains(ui.mouse) || self.hud_hit.contains(ui.mouse) || self.launch_hit.contains(ui.mouse);
+        let over_ui_now = ui.over_ui();
         let inside_now = !over_ui_now && view.visible().contains(ui.mouse) && !self.show_science;
         self.draw_pipes(view, ui, inside_now);
         self.draw_mech(view, ui, inside_now);
@@ -1906,7 +1896,7 @@ impl Game {
         }
 
         // Cursor preview.
-        let over_ui = self.panel_hit.contains(ui.mouse) || self.views_hit.contains(ui.mouse) || self.tools_hit.contains(ui.mouse) || self.corner_hit.contains(ui.mouse) || self.hud_hit.contains(ui.mouse) || self.launch_hit.contains(ui.mouse);
+        let over_ui = ui.over_ui();
         let inside = !over_ui && view.visible().contains(ui.mouse) && !self.show_science;
         if let Some(a) = &self.cable_from {
             if let Some(p) = anchor_world(a, &self.blocks, &self.members) {
@@ -2069,7 +2059,7 @@ impl Game {
         }
     }
 
-    fn draw_hud(&mut self, ui: &Ui, view: View) {
+    fn draw_hud(&mut self, ui: &mut Ui, view: View) {
         let r = view.visible();
         let w = &self.world;
         let night = w.sun() <= 0.0;
@@ -2086,6 +2076,8 @@ impl Game {
         let tw = ui.text_w(&text, 14) + 38.0;
         let pill = Rect::new(r.x + 8.0, r.y + 8.0, tw, 26.0);
         self.hud_hit = pill;
+        ui.layer("hud");
+        ui.claim("hud", pill);
         rrect(pill, 13.0, Color::new(0.0, 0.0, 0.0, 0.5));
         draw_icon(if night { Icon::Moon } else { Icon::Sun }, vec2(pill.x + 16.0, pill.y + 13.0), 17.0, if night { Color::new(0.85, 0.9, 1.0, 1.0) } else { ACCENT });
         ui.text(&text, pill.x + 30.0, pill.y + 18.0, 14, WHITE);
@@ -2127,7 +2119,9 @@ impl Game {
     fn draw_climate_menu(&mut self, ui: &mut Ui) {
         let pill = self.hud_hit;
         let r = Rect::new(pill.x, pill.y + pill.h + 6.0, 640.0, 332.0);
-        self.hud_hit = Rect::new(pill.x, pill.y, pill.w.max(r.w), r.y + r.h - pill.y);
+        ui.layer("climate");
+        // From under the pill, which stays clickable to close the menu.
+        ui.claim("climate", Rect::new(r.x, pill.y + pill.h, r.w, r.y + r.h - pill.y - pill.h));
         rrect(r, 14.0, Color::new(0.06, 0.07, 0.13, 0.94));
         self.draw_live_weather(ui, Rect::new(r.x + 340.0, r.y, r.w - 340.0, r.h));
         let (x, w) = (r.x + 14.0, 340.0 - 28.0);
@@ -2242,7 +2236,8 @@ impl Game {
         let total = n * bw + (n - 1.0) * gap + pad * 2.0;
         let l = self.left();
         let bar = Rect::new(l + (sw - l - total) / 2.0, TOP_H + 6.0, total, 50.0);
-        self.launch_hit = bar;
+        ui.layer("launch");
+        ui.claim("launch", bar);
         rrect(bar, 16.0, Color::new(0.06, 0.07, 0.13, 0.9));
         for (i, k) in ModelKind::ALL.iter().enumerate() {
             let m = k.model();
@@ -2268,10 +2263,8 @@ impl Game {
     fn draw_ui(&mut self, ui: &mut Ui, sw: f32, sh: f32) {
         self.hover_info = None;
         // Under the leave-the-game window nothing answers a click.
-        let real_click = ui.pressed;
-        if self.quit_modal {
-            ui.pressed = false;
-        }
+        ui.muted = self.quit_modal;
+        ui.layer("panel");
         // The palette: it slides out when the mouse goes to the left edge, and tucks away again.
         let handle_w = 16.0;
         let edge = PANEL_W + self.panel_shift();
@@ -2297,7 +2290,7 @@ impl Game {
         if ui.pressed && handle.contains(ui.mouse) && !self.quit_modal {
             self.panel.toggle_pin();
         }
-        self.panel_hit = if self.panel.visible() { Rect::new(0.0, TOP_H, edge.max(0.0) + handle_w, sh - TOP_H) } else { handle };
+        ui.claim("panel", if self.panel.visible() { Rect::new(0.0, TOP_H, edge.max(0.0) + handle_w, sh - TOP_H) } else { handle });
         self.draw_tools_strip(ui, sh);
         self.draw_corner_buttons(ui, sw);
         self.draw_launch_bar(ui, sw);
@@ -2311,7 +2304,9 @@ impl Game {
             self.draw_science(ui, sw, sh);
         }
         if self.quit_modal {
-            ui.pressed = real_click;
+            ui.muted = false;
+            ui.layer("quit");
+            ui.claim("quit", Rect::new(0.0, 0.0, sw, sh));
             self.draw_quit_modal(ui, sw, sh);
         }
 
@@ -2353,6 +2348,8 @@ impl Game {
         }
         // It slides down out of sight.
         let bar = Rect::new(rest.x, rest.y + (1.0 - self.player_alpha) * 90.0, rest.w, rest.h);
+        ui.layer("player");
+        ui.claim("player", bar);
         draw_rectangle(bar.x - 4.0, bar.y - 4.0, bar.w + 8.0, bar.h + 8.0, Color::new(0.0, 0.0, 0.0, 0.0));
         rrect(Rect::new(bar.x, bar.y + 3.0, bar.w, bar.h), 25.0, Color::new(0.0, 0.0, 0.0, 0.35));
         rrect(bar, 25.0, Color::new(0.07, 0.08, 0.15, 0.94));
@@ -2451,7 +2448,8 @@ impl Game {
         let (bw, gap) = (38.0, 6.0);
         let total = tools.len() as f32 * (bw + gap) + gap;
         let pill = Rect::new((PANEL_W + self.panel_shift()).max(0.0) + 8.0 + 16.0, (sh - total) / 2.0, bw + 12.0, total);
-        self.tools_hit = pill;
+        ui.layer("tools");
+        ui.claim("tools", pill);
         rrect(pill, 14.0, Color::new(0.06, 0.07, 0.13, 0.9));
         for (i, (t, label, icon, text)) in tools.iter().enumerate() {
             let r = Rect::new(pill.x + 6.0, pill.y + gap + i as f32 * (bw + gap), bw, bw);
@@ -2469,7 +2467,8 @@ impl Game {
         let (s, gap) = (34.0, 6.0);
         let sci = Rect::new(sw - 8.0 - s * 2.0 - gap, 10.0, s, s);
         let full = Rect::new(sw - 8.0 - s, 10.0, s, s);
-        self.corner_hit = Rect::new(sci.x - 4.0, 4.0, s * 2.0 + gap + 12.0, s + 12.0);
+        ui.layer("corner");
+        ui.claim("corner", Rect::new(sci.x - 4.0, 4.0, s * 2.0 + gap + 12.0, s + 12.0));
         if ui.hover(sci) {
             self.hover_info = Some(("Science".to_string(), "Les transformations de la matière.".to_string()));
         }
@@ -3028,7 +3027,8 @@ impl Game {
         self.views.update(hovering, get_frame_time());
         let px = sw - VIEWS_TAB - VIEWS_W * self.views.open;
         let panel = Rect::new(px, y, VIEWS_W, h);
-        self.views_hit = if self.views.visible() { tab.combine_with(panel) } else { tab };
+        ui.layer("views");
+        ui.claim("views", if self.views.visible() { tab.combine_with(panel) } else { tab });
 
         // The tab that stays visible: click it to pin the views out (or to unpin them).
         rrect(tab, 8.0, Color::new(0.1, 0.12, 0.2, 0.92));
@@ -3157,9 +3157,8 @@ impl Game {
         let hovering = tab.contains(ui.mouse) || (self.remote_menu.open > 0.05 && panel.contains(ui.mouse)) || near_edge;
         self.remote_menu.update(hovering, get_frame_time());
         let panel = Rect::new(sw - VIEWS_TAB - VIEWS_W * self.remote_menu.open, y, VIEWS_W, h);
-        // Clicks on it must not reach the world, like on the views.
-        let hit = if self.remote_menu.visible() { tab.combine_with(panel) } else { tab };
-        self.views_hit = self.views_hit.combine_with(hit);
+        ui.layer("remote");
+        ui.claim("remote", if self.remote_menu.visible() { tab.combine_with(panel) } else { tab });
 
         // The tab that stays visible while something is chosen: click it to pin the menu.
         rrect(tab, 8.0, Color::new(0.1, 0.12, 0.2, 0.92));
@@ -3255,6 +3254,8 @@ impl Game {
 
     fn draw_science(&mut self, ui: &mut Ui, sw: f32, sh: f32) {
         draw_rectangle(0.0, TOP_H, sw, sh - TOP_H, Color::new(0.02, 0.03, 0.07, 0.86));
+        ui.layer("science");
+        ui.claim("science", Rect::new(0.0, TOP_H, sw, sh - TOP_H));
         let area = Rect::new(30.0, TOP_H + 20.0, sw - 60.0, sh - TOP_H - 40.0);
         ui.text("Les transformations de la matière", area.x, area.y + 28.0, 28, ACCENT);
         if ui.button(Rect::new(area.x + area.w - 110.0, area.y, 110.0, 36.0), "Fermer", Icon::None, false, true, ACCENT) {
@@ -3534,7 +3535,7 @@ async fn main() {
     let shot = arg("--demo");
 
     let font = load_ttf_font_from_bytes(include_bytes!("../assets/font.ttf")).expect("font");
-    let mut ui = Ui { font, mouse: Vec2::ZERO, pressed: false, force_size: None };
+    let mut ui = Ui::new(font);
     let mut renderer = Renderer::new();
     let mut game = Game::new();
     #[cfg(feature = "sound")]
@@ -3638,8 +3639,7 @@ async fn main() {
         ui.begin();
         // Screenshots must not depend on where the real pointer happens to be.
         if shot.is_some() {
-            ui.pressed = false;
-            ui.mouse = demo_mouse.unwrap_or(vec2(-1000.0, -1000.0));
+            ui.freeze(demo_mouse.unwrap_or(vec2(-1000.0, -1000.0)));
         }
         game.handle_keys();
         game.handle_camera(base, &ui);
@@ -3705,7 +3705,7 @@ async fn main() {
             shaken.ox += (t * 97.0).sin() * game.shake;
             shaken.oy += (t * 83.0).cos() * game.shake;
         }
-        game.draw_scene(shaken, &mut renderer, &ui);
+        game.draw_scene(shaken, &mut renderer, &mut ui);
         game.draw_ui(&mut ui, sw, sh);
 
         frame += 1;
