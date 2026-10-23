@@ -5841,11 +5841,13 @@ fn flowing_water_erodes_bare_soil() {
             }
         }
         let before = all_water(&w);
-        for _ in 0..8000 {
+        for t in 0..8000 {
             w.step();
+            // Exactly, while the soil drinks (later, clouds drifting off the world take some away).
+            if t == 1500 {
+                assert_eq!(all_water(&w), before, "the water is kept, in the ground, in the puddle or in the air");
+            }
         }
-        // Within a little vapour that the wind carries off the edge of the world.
-        assert!(all_water(&w).abs_diff(before) < before / 100, "the water is kept, in the ground or in the air: {} -> {}", before, all_water(&w));
         assert!(w.cells.iter().all(|c| !matches!(c.m, Mat::Dirt | Mat::Grass) || c.life <= SOIL_FULL), "no soil holds more than saturated");
         for y in 316..320 {
             assert!(soil_row(&w, y) > SOIL_FULL as u32 - SOIL_WATER as u32, "row {y} soaked through: {}", soil_row(&w, y));
