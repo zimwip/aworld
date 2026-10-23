@@ -454,9 +454,11 @@ impl World {
         while k < v && self.at(x + dir * (k + 1), y) == Mat::Empty {
             k += 1;
         }
-        let to = Self::idx(x + dir * k, y);
         self.swap((x, y), (x + dir * k, y));
-        self.jet[to] = (v as u8) << 1 | (dir > 0) as u8;
+        // Shot past the side of the world, the drop is gone.
+        if let Some(to) = Self::ix(x + dir * k, y) {
+            self.jet[to] = (v as u8) << 1 | (dir > 0) as u8;
+        }
         true
     }
 

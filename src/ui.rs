@@ -1,5 +1,6 @@
 //! Immediate-mode widgets: big friendly buttons with drawn icons.
 
+use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation, PipelineParams};
 use macroquad::prelude::*;
 
 pub const BG: Color = Color::new(0.075, 0.085, 0.13, 1.0);
@@ -62,6 +63,84 @@ pub struct Ui {
     click: bool,
     screen_mouse: Vec2,
     layers: Layers,
+    /// A tool is being dragged across the world: it started on the world, the button is still
+    /// down. Meanwhile the windows let the pointer through (no hover, no click, drawers stay in)
+    /// and the one under it fades so that the world shows through.
+    pub stroke: bool,
+    /// How faded the window under the stroke is (0 = not at all), and where it is.
+    fade: f32,
+    fade_rect: Rect,
+    /// A screenshot: no easing, the fade is there at once.
+    snap: bool,
+    veil: Option<Veil>,
+}
+
+/// How much of a window still shows while a stroke passes over it.
+const FADED: f32 = 0.28;
+
+/// The windows drawn off screen first, so that the one under a stroke can be laid down
+/// see-through. The target keeps premultiplied colours: windows are themselves see-through
+/// in places, and blending them over nothing must not darken them.
+struct Veil {
+    target: RenderTarget,
+    size: (u32, u32),
+    draw: Material,
+    show: Material,
+}
+
+const VEIL_VERT: &str = "#version 100
+attribute vec3 position;
+attribute vec2 texcoord;
+attribute vec4 color0;
+varying lowp vec2 uv;
+varying lowp vec4 color;
+uniform mat4 Model;
+uniform mat4 Projection;
+void main() {
+    gl_Position = Projection * Model * vec4(position, 1.0);
+    color = color0 / 255.0;
+    uv = texcoord;
+}";
+
+// Drawing a window: straight colours, written premultiplied.
+const VEIL_DRAW: &str = "#version 100
+precision mediump float;
+varying lowp vec2 uv;
+varying lowp vec4 color;
+uniform sampler2D Texture;
+void main() {
+    gl_FragColor = texture2D(Texture, uv) * color;
+}";
+
+// Laying the target down: already premultiplied, so the fade scales all four channels.
+const VEIL_SHOW: &str = "#version 100
+precision mediump float;
+varying lowp vec2 uv;
+varying lowp vec4 color;
+uniform sampler2D Texture;
+void main() {
+    gl_FragColor = texture2D(Texture, uv) * color.a;
+}";
+
+impl Veil {
+    fn new(w: u32, h: u32) -> Veil {
+        let straight = BlendState::new(Equation::Add, BlendFactor::Value(BlendValue::SourceAlpha), BlendFactor::OneMinusValue(BlendValue::SourceAlpha));
+        let premul = BlendState::new(Equation::Add, BlendFactor::One, BlendFactor::OneMinusValue(BlendValue::SourceAlpha));
+        let material = |frag: &str, color: BlendState| {
+            load_material(
+                ShaderSource::Glsl { vertex: VEIL_VERT, fragment: frag },
+                MaterialParams { pipeline_params: PipelineParams { color_blend: Some(color), alpha_blend: Some(premul), ..Default::default() }, ..Default::default() },
+            )
+            .expect("veil shader")
+        };
+        Veil { target: Veil::target(w, h), size: (w, h), draw: material(VEIL_DRAW, straight), show: material(VEIL_SHOW, premul) }
+    }
+
+    fn target(w: u32, h: u32) -> RenderTarget {
+        let t = render_target(w.max(1), h.max(1));
+        t.texture.set_filter(FilterMode::Nearest);
+        t
+    }
 }
 
 /// The windows (menus, bars, pills) in the order they are drawn, back first, so that a click goes
@@ -95,6 +174,12 @@ impl Layers {
     /// Is `p` on any window (so not on the world)?
     pub fn any(&self, p: Vec2) -> bool {
         self.seen.iter().any(|(_, r)| r.contains(p))
+    }
+
+    /// The frontmost window under `p`: all of it, as one rectangle.
+    pub fn top_at(&self, p: Vec2) -> Option<Rect> {
+        let (id, _) = self.seen.iter().rev().find(|(_, r)| r.contains(p))?;
+        self.seen.iter().filter(|(n, _)| n == id).map(|(_, r)| *r).reduce(|a, b| a.combine_with(b))
     }
 }
 
@@ -327,7 +412,7 @@ pub fn draw_icon(icon: Icon, c: Vec2, s: f32, col: Color) {
 
 impl Ui {
     pub fn new(font: Font) -> Ui {
-        Ui { font, mouse: Vec2::ZERO, pressed: false, force_size: None, muted: false, click: false, screen_mouse: Vec2::ZERO, layers: Layers::default() }
+        Ui { font, mouse: Vec2::ZERO, pressed: false, force_size: None, muted: false, click: false, screen_mouse: Vec2::ZERO, layers: Layers::default(), stroke: false, fade: 0.0, fade_rect: Rect::default(), snap: false, veil: None }
     }
 
     pub fn begin(&mut self) {
@@ -338,14 +423,94 @@ impl Ui {
         self.pressed = self.click;
         self.muted = false;
         self.layers.next_frame();
+        let (left, right) = (is_mouse_button_down(MouseButton::Left), is_mouse_button_down(MouseButton::Right));
+        let press = is_mouse_button_pressed(MouseButton::Left) || is_mouse_button_pressed(MouseButton::Right);
+        // Ctrl + drag moves the view: that is not a tool.
+        let ctrl = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
+        if !left && !right {
+            self.stroke = false;
+        } else if press && !ctrl && !self.layers.any(self.mouse) {
+            self.stroke = true;
+        }
+        if self.stroke {
+            self.pressed = false;
+        }
+        self.snap = false;
     }
 
-    /// No click this frame (and the pointer at `at`), for screenshots.
-    pub fn freeze(&mut self, at: Vec2) {
+    /// No click this frame (and the pointer at `at`), for screenshots; `stroke` pretends a tool
+    /// is being dragged there.
+    pub fn freeze(&mut self, at: Vec2, stroke: bool) {
         self.click = false;
         self.pressed = false;
         self.mouse = at;
         self.screen_mouse = at;
+        self.stroke = stroke;
+        self.snap = true;
+    }
+
+    /// The window under a stroke fades out quickly, and comes back once the stroke has left it.
+    /// Only where it lies over the world (`world`, on the screen): elsewhere there is nothing to see.
+    fn ease_fade(&mut self, world: Rect) {
+        let over_world = self.stroke && world.contains(self.screen_mouse);
+        let under = if over_world { self.layers.top_at(self.screen_mouse) } else { None };
+        if let Some(r) = under {
+            self.fade_rect = r;
+        }
+        let want = if under.is_some() { 1.0 } else { 0.0 };
+        let dt = if self.snap { 1.0 } else { get_frame_time() };
+        self.fade = if want > self.fade { (self.fade + dt * 10.0).min(want) } else { (self.fade - dt * 5.0).max(want) };
+    }
+
+    /// Call before drawing the windows: while one of them is faded, they are drawn off screen.
+    pub fn begin_windows(&mut self, world: Rect) {
+        self.ease_fade(world);
+        if self.fade <= 0.0 {
+            return;
+        }
+        let (w, h) = (screen_width(), screen_height());
+        let size = (w as u32, h as u32);
+        let veil = self.veil.get_or_insert_with(|| Veil::new(size.0, size.1));
+        if veil.size != size {
+            veil.target = Veil::target(size.0, size.1);
+            veil.size = size;
+        }
+        let mut camera = Camera2D::from_display_rect(Rect::new(0.0, 0.0, w, h));
+        // Upside down, so that the target reads the right way up once laid on the screen.
+        camera.zoom.y = -camera.zoom.y;
+        camera.render_target = Some(veil.target.clone());
+        set_camera(&camera);
+        clear_background(Color::new(0.0, 0.0, 0.0, 0.0));
+        gl_use_material(&veil.draw);
+    }
+
+    /// Call after drawing the windows: lays them on the screen, the one under the stroke faded.
+    pub fn end_windows(&mut self) {
+        let Some(veil) = self.veil.as_ref().filter(|_| self.fade > 0.0) else {
+            return;
+        };
+        set_default_camera();
+        gl_use_material(&veil.show);
+        let (w, h) = (screen_width(), screen_height());
+        let f = self.fade_rect;
+        let (x0, y0) = (f.x.clamp(0.0, w), f.y.clamp(0.0, h));
+        let (x1, y1) = ((f.x + f.w).clamp(0.0, w), (f.y + f.h).clamp(0.0, h));
+        let faded = 1.0 - (1.0 - FADED) * self.fade;
+        // Around the faded window (as four bands), then the window itself.
+        let pieces = [
+            (Rect::new(0.0, 0.0, w, y0), 1.0),
+            (Rect::new(0.0, y1, w, h - y1), 1.0),
+            (Rect::new(0.0, y0, x0, y1 - y0), 1.0),
+            (Rect::new(x1, y0, w - x1, y1 - y0), 1.0),
+            (Rect::new(x0, y0, x1 - x0, y1 - y0), faded),
+        ];
+        for (r, a) in pieces {
+            if r.w <= 0.0 || r.h <= 0.0 {
+                continue;
+            }
+            draw_texture_ex(&veil.target.texture, r.x, r.y, Color::new(1.0, 1.0, 1.0, a), DrawTextureParams { dest_size: Some(r.size()), source: Some(r), ..Default::default() });
+        }
+        gl_use_default_material();
     }
 
     /// What follows is drawn in the window `id`: it gets the click only if no window in front of
@@ -359,9 +524,10 @@ impl Ui {
         self.layers.claim(id, r);
     }
 
-    /// Is the pointer on a window rather than on the world?
+    /// Is the pointer on a window rather than on the world? Never during a stroke: the tool
+    /// goes on under the windows.
     pub fn over_ui(&self) -> bool {
-        self.layers.any(self.screen_mouse)
+        !self.stroke && self.layers.any(self.screen_mouse)
     }
 
     pub fn text(&self, s: &str, x: f32, y: f32, size: u16, c: Color) {
@@ -377,7 +543,7 @@ impl Ui {
     }
 
     pub fn hover(&self, r: Rect) -> bool {
-        r.contains(self.mouse)
+        !self.stroke && r.contains(self.mouse)
     }
 
     /// Big rounded button with an icon and a label; returns true on click.
@@ -439,7 +605,7 @@ impl Ui {
         rrect(Rect::new(r.x, r.y + r.h / 2.0 - 3.0, r.w, 6.0), 3.0, Color::new(0.0, 0.0, 0.0, 0.4));
         let t = ((*value - min) / (max - min)).clamp(0.0, 1.0);
         rrect(Rect::new(r.x, r.y + r.h / 2.0 - 3.0, (r.w * t).max(6.0), 6.0), 3.0, col);
-        let hot = r.contains(self.mouse);
+        let hot = self.hover(r);
         let mut changed = false;
         if hot && is_mouse_button_down(MouseButton::Left) {
             let nt = ((self.mouse.x - r.x) / r.w).clamp(0.0, 1.0);
@@ -584,6 +750,19 @@ mod tests {
     fn a_window_that_just_opened_is_in_front() {
         let l = pill_under_palette();
         assert!(!l.covered("climate", vec2(100.0, 10.0)));
+    }
+
+    #[test]
+    fn the_window_under_a_stroke_is_the_frontmost_one_all_of_it() {
+        let mut l = Layers::default();
+        l.claim("hud", Rect::new(0.0, 0.0, 300.0, 26.0));
+        l.claim("panel", Rect::new(0.0, 0.0, 200.0, 600.0));
+        l.claim("views", Rect::new(700.0, 100.0, 30.0, 60.0));
+        l.claim("views", Rect::new(500.0, 100.0, 200.0, 300.0));
+        l.next_frame();
+        assert_eq!(l.top_at(vec2(100.0, 10.0)), Some(Rect::new(0.0, 0.0, 200.0, 600.0)), "the palette, in front of the pill");
+        assert_eq!(l.top_at(vec2(710.0, 120.0)), Some(Rect::new(500.0, 100.0, 230.0, 300.0)), "the tab and its menu fade together");
+        assert_eq!(l.top_at(vec2(400.0, 300.0)), None, "the world");
     }
 
     fn run(d: &mut Drawer, hovering: bool, frames: usize) {

@@ -17,8 +17,10 @@ mod statics;
 pub mod prof;
 #[cfg(test)]
 mod bench;
+#[cfg(test)]
+mod edges;
 pub use statics::Slab;
-pub use storm::{Bolt, BREAKDOWN, QS, QW, QH};
+pub use storm::{Bolt, BREAKDOWN, GROUND_BREAKDOWN, QS, QW, QH};
 pub use thermal::{air_pressure_atm, Season, DAY_STEPS};
 use thermal::adiabatic_cooling_c;
 
@@ -407,7 +409,8 @@ pub enum Aspect {
     Water,
     /// `fuel`: what is left to burn in a flame or an ember, and whether it is charcoal.
     Fuel,
-    /// `growth`: what a young tree still has to grow.
+    /// `growth`: what a young tree still has to grow; in soil, the seeds sown in it (fertile
+    /// earth), each of which can start a tree.
     Growth,
     /// `jet`: sideways speed and direction of a drop shot out of a jet (see `pockets::fly`).
     Jet,
@@ -420,7 +423,7 @@ impl Mat {
             Aspect::Heat => true,
             Aspect::Water => matches!(self, Mat::Dirt | Mat::Grass | Mat::Mud | Mat::Steam | Mat::Cloud),
             Aspect::Fuel => matches!(self, Mat::Fire | Mat::Ember),
-            Aspect::Growth => self == Mat::Sapling,
+            Aspect::Growth => matches!(self, Mat::Sapling | Mat::Dirt | Mat::Grass | Mat::Mud),
             Aspect::Jet => self.kind() == Kind::Liquid,
         }
     }
@@ -467,6 +470,12 @@ const SOIL_VAPOUR: u16 = VAPOUR_UNITS;
 const SOIL_SEEP: u32 = 8;
 /// Saturated soil over a hole lets a drop fall once in this many steps.
 const SOIL_DRIP: u32 = 300;
+/// Most seeds a cell of soil holds.
+pub const SOIL_SEEDS: u8 = 8;
+/// A seed in the top of the soil sprouts once in this many steps, when the soil is at least
+/// `TREE_MOIST` moist, warm and in the light, with room to grow.
+const TREE_SPROUT: u32 = 400;
+const TREE_MOIST: u16 = 48;
 /// Grass sprouts on soil at least this moist, and stays fully green down to `GRASS_GREEN`.
 const GRASS_GROW: u16 = 40;
 const GRASS_GREEN: u16 = 48;
@@ -659,6 +668,9 @@ pub struct World {
     pub bursts: Vec<(i32, i32, f32)>,
     /// Electric charge of the clouds, one value per `QS`×`QS` square (see `storm.rs`).
     pub charge: Vec<f32>,
+    /// Electric charge held in the ground and the things on it, one value per `QS`×`QS` square:
+    /// what a charged cloud draws up under it, and what a bolt leaves behind (see `storm.rs`).
+    pub mcharge: Vec<f32>,
     /// Bolts of lightning since they were last read. For the picture and the thunder.
     pub bolts: Vec<Bolt>,
     storm_rng: storm::StormRng,
@@ -748,6 +760,7 @@ impl World {
             bursts: Vec::new(),
             zones: sleep::Zones::new(),
             charge: vec![0.0; QW * QH],
+            mcharge: vec![0.0; QW * QH],
             bolts: Vec::new(),
             storm_rng: storm::StormRng(0x9e37_79b9),
             prof: prof::Profile::default(),
@@ -769,6 +782,7 @@ impl World {
     pub fn clear(&mut self) {
         self.revision += 1;
         self.charge.fill(0.0);
+        self.mcharge.fill(0.0);
         self.cells.fill(EMPTY);
         self.log.fill(0);
         self.ejecta.clear();
@@ -926,8 +940,19 @@ impl World {
         x >= 0 && y >= 0 && (x as usize) < W && (y as usize) < H
     }
 
+    /// Index of an in-bounds cell. Callers check `inb` first (or use `ix`): out of bounds, a
+    /// cell past the right side would land on the next row, and one below the last row past
+    /// the end of the grid. Debug builds and the tests catch it here.
+    #[cfg_attr(debug_assertions, track_caller)]
     fn idx(x: i32, y: i32) -> usize {
+        debug_assert!(Self::inb(x, y), "cell ({x}, {y}) is outside the world");
         y as usize * W + x as usize
+    }
+
+    /// Index of a cell, or None outside the world. Mind that `at` reads Empty past the sides
+    /// and the bottom: a free cell by `at` may still be outside the grid.
+    fn ix(x: i32, y: i32) -> Option<usize> {
+        if Self::inb(x, y) { Some(y as usize * W + x as usize) } else { None }
     }
 
     /// Material at a cell, blocks included. The ceiling is stone; sides and
@@ -1145,10 +1170,10 @@ impl World {
             let (x, y) = ((i % W) as i32, (i / W) as i32);
             let mut moved = false;
             for dy in 1..=30 {
-                let j = (y - dy) as usize * W + x as usize;
                 if y - dy < 0 {
                     break;
                 }
+                let j = (y - dy) as usize * W + x as usize;
                 if self.mask[j] == 0 && self.cells[j].m == Mat::Empty {
                     self.carry(i, j);
                     self.cells[j].stamp = self.frame;
@@ -1181,6 +1206,10 @@ impl World {
                 }
                 let (x, y) = (cx + dx, cy + dy);
                 if !Self::inb(x, y) || self.mask[Self::idx(x, y)] != 0 {
+                    continue;
+                }
+                // Seeds are sown: on earth they go into the soil and make it fertile.
+                if m == Mat::Seed && !matches!(rule, PaintRule::Replace) && self.sow(x, y) {
                     continue;
                 }
                 match rule {
@@ -1245,8 +1274,10 @@ impl World {
 
     /// Empties a disc of radius `r`, then lines the ring just around it with masonry, from the
     /// top down to a little below the middle: a masonry vault. Sand, snow or water above can no
-    /// longer pour in, and the roof holds as long as the walls rest on something. Rock, metal and
-    /// masonry are left as they are (a tunnel through rock needs no lining), and so is the floor.
+    /// longer pour in, and the roof holds as long as the walls rest on something. Rock is lined
+    /// too: the rock over a bore is held by the vault (the world is flat: a tunnel through it
+    /// cuts the rock above from the rock below). Metal and masonry are left as they are, and so
+    /// is the floor.
     pub fn tunnel(&mut self, cx: i32, cy: i32, r: i32) {
         self.paint_rule(cx, cy, r, Mat::Empty, PaintRule::Fill);
         let outer = r + TUNNEL_LINING;
@@ -1274,7 +1305,7 @@ impl World {
             // Hot liquids would fire the masonry: they are left to the player's care.
             Kind::Liquid => !m.hot() && !matches!(m, Mat::Molten | Mat::MoltenSteel),
             Kind::Powder => true,
-            Kind::Static => !m.is_vegetation() && !matches!(m, Mat::Stone | Mat::Iron | Mat::Steel | Mat::Brick | Mat::Terracotta | Mat::Glass | Mat::Vault),
+            Kind::Static => !m.is_vegetation() && !matches!(m, Mat::Iron | Mat::Steel | Mat::Brick | Mat::Terracotta | Mat::Glass | Mat::Vault),
         }
     }
 
@@ -1761,6 +1792,9 @@ impl World {
             return;
         }
         self.step_soil(x, y);
+        if self.sprout_tree(x, y) {
+            return;
+        }
         if (!self.turf_open(x, y) && self.chance(GRASS_SMOTHER)) || (self.moisture[i] < GRASS_DRY && self.chance(GRASS_WILT)) {
             self.retype(x, y, Mat::Dirt);
         }
@@ -1798,6 +1832,9 @@ impl World {
             return;
         }
         self.step_soil(x, y);
+        if self.sprout_tree(x, y) {
+            return;
+        }
         if self.moisture[i] >= GRASS_GROW && self.temp[i] > 5.0 && matches!(self.at(x, y - 1), Mat::Empty | Mat::Grass) && self.turf_open(x, y) {
             // Grass creeps sideways along the ground, and its roots thicken the turf downwards.
             let near = self.raw(x, y - 1) == Mat::Grass || (-1..=1).any(|dy| self.raw(x - 1, y + dy) == Mat::Grass || self.raw(x + 1, y + dy) == Mat::Grass);
@@ -1845,9 +1882,12 @@ impl World {
             }
         }
         if self.moisture[i] >= SOIL_FULL && self.at(x, y + 1) == Mat::Empty && self.mask_free(x, y + 1) && self.chance(SOIL_DRIP) {
-            let (j, t) = (Self::idx(x, y + 1), self.temp[i]);
-            self.set(x, y + 1, Mat::Water);
-            self.temp[j] = t;
+            // On the bottom row the drop falls out of the world.
+            if let Some(j) = Self::ix(x, y + 1) {
+                let t = self.temp[i];
+                self.set(x, y + 1, Mat::Water);
+                self.temp[j] = t;
+            }
             self.moisture[i] -= SOIL_WATER;
             return;
         }
@@ -2026,47 +2066,67 @@ impl World {
         false
     }
 
-    /// Is there anything to drink within reach (standing water or moist soil)?
-    fn water_within(&self, x: i32, y: i32, reach: i32, depth: i32) -> bool {
-        for dy in 0..=depth {
-            for dx in -reach..=reach {
-                if self.raw(x + dx, y + dy) == Mat::Water {
-                    return true;
-                }
-            }
-        }
-        self.find_moist_soil(x, y, reach, depth).is_some()
-    }
-
-    /// A seed falls, then sprouts on moist soil in the light, with room to grow.
-    /// Seeds are short-lived: with no water around for a while, they rot into soil.
+    /// A seed is not a matter that stays: it falls, and the soil it lands on takes it in (the
+    /// earth becomes fertile, see `sow`). Fallen on anything else, it rots away.
     fn step_seed(&mut self, x: i32, y: i32) {
         if self.step_powder(x, y) {
             return;
         }
-        if !self.water_within(x, y, 3, 3) {
-            if self.chance(2500) {
-                self.set(x, y, Mat::Dirt);
-            }
-            return;
-        }
-        if !matches!(self.at(x, y + 1), Mat::Dirt | Mat::Grass) || !self.lit(x, y) {
-            return;
-        }
-        if self.surface_temp_c() < 6.0 || self.find_near(x, y, 5 * K, Mat::Trunk).is_some() || self.find_near(x, y, 5 * K, Mat::Sapling).is_some() {
-            return;
-        }
-        if self.drink(x, y, 3, 3) {
-            let budget = 40 + (self.rand() % 40) as u8;
+        if self.sow(x, y + 1) {
             self.set(x, y, Mat::Empty);
-            for dx in -1..=1 {
-                if self.raw(x + dx, y) == Mat::Empty {
-                    self.set(x + dx, y, Mat::Sapling);
-                    let i = Self::idx(x + dx, y);
-                    self.growth[i] = budget;
-                }
+            return;
+        }
+        if self.chance(2500) {
+            self.set(x, y, Mat::Empty);
+        }
+    }
+
+    /// Puts a seed into the soil at (x, y), if it is soil with room for one more.
+    fn sow(&mut self, x: i32, y: i32) -> bool {
+        if !Self::inb(x, y) || !matches!(self.raw(x, y), Mat::Dirt | Mat::Grass | Mat::Mud) {
+            return false;
+        }
+        let i = Self::idx(x, y);
+        if self.growth[i] >= SOIL_SEEDS {
+            return false;
+        }
+        self.growth[i] += 1;
+        self.zones.wake(i);
+        true
+    }
+
+    /// Can a seed in the soil at (x, y) start a tree here: open air above it?
+    pub(super) fn seed_waits(&self, x: i32, y: i32) -> bool {
+        self.growth[Self::idx(x, y)] > 0 && self.at(x, y - 1) == Mat::Empty
+    }
+
+    /// A seed in the top of fertile soil sprouts when the soil is moist and warm, in the light,
+    /// with no tree too close: it drinks, and a sapling three cells wide starts above it.
+    /// Buried or in dry earth the seeds wait.
+    fn sprout_tree(&mut self, x: i32, y: i32) -> bool {
+        let i = Self::idx(x, y);
+        if !self.seed_waits(x, y) || !self.chance(TREE_SPROUT) {
+            return false;
+        }
+        if self.moisture[i] < TREE_MOIST || self.temp[i] < 6.0 || !self.lit(x, y - 1) {
+            return false;
+        }
+        if self.find_near(x, y - 1, 5 * K, Mat::Trunk).is_some() || self.find_near(x, y - 1, 5 * K, Mat::Sapling).is_some() {
+            return false;
+        }
+        if !self.drink(x, y, 3, 3) {
+            return false;
+        }
+        self.growth[i] -= 1;
+        let budget = 40 + (self.rand() % 40) as u8;
+        for dx in -1..=1 {
+            // `raw` reads Empty past the sides too.
+            if let Some(j) = Self::ix(x + dx, y - 1).filter(|_| self.raw(x + dx, y - 1) == Mat::Empty) {
+                self.set(x + dx, y - 1, Mat::Sapling);
+                self.growth[j] = budget;
             }
         }
+        true
     }
 
     /// Plants a grown tree where the player clicked: its trunk stands on the first ground under
@@ -2151,9 +2211,11 @@ impl World {
         }
         if self.chance(30) && self.surface_temp_c() > 6.0 && self.lit(x, y) && self.drink(x, y, 8, 50) {
             self.set(x, y, Mat::Trunk);
-            self.set(x, y - 1, Mat::Sapling);
-            let j = Self::idx(x, y - 1);
-            self.growth[j] = left - 1;
+            // Grown to the top of the world, it stops there.
+            if let Some(j) = Self::ix(x, y - 1) {
+                self.set(x, y - 1, Mat::Sapling);
+                self.growth[j] = left - 1;
+            }
         }
     }
 
@@ -2268,10 +2330,12 @@ impl World {
             steps += 1;
         }
         let (vx, vy) = (cx + dx, cy + dy);
+        // `raw` reads Empty past the edges: the vapour goes only into a cell of the grid.
+        let Some(j) = Self::ix(vx, vy) else { return };
         if self.raw(cx, cy) == Mat::Leaf && self.raw(vx, vy) == Mat::Empty && self.drink(x, y + 1, 4 * K, 6 * K) {
             // A quarter of a cell of water leaves as vapour, with the heat that takes (the leaf
             // and the air around it cool).
-            let (j, t) = (Self::idx(vx, vy), self.temp[Self::idx(cx, cy)]);
+            let t = self.temp[Self::idx(cx, cy)];
             let q = thermal::heat_of(Mat::Empty, self.temp[j]) + thermal::heat_of(Mat::Water, t) / VAPOUR_PER_WATER as f32 - thermal::heat_of(Mat::Steam, t);
             self.set(vx, vy, Mat::Steam);
             self.temp[j] = t;
@@ -2646,8 +2710,9 @@ impl World {
         // Packed vapour (a full boiler) spreads into any room it finds.
         if self.packed(i) > 0 {
             let n = Self::neighbors(x, y)[(self.rand() % 4) as usize];
-            if self.at(n.0, n.1) == Mat::Empty {
-                let (j, t) = (Self::idx(n.0, n.1), self.temp[i]);
+            // Past the sides and the bottom `at` reads Empty too: only a cell of the grid takes it.
+            if let Some(j) = Self::ix(n.0, n.1).filter(|_| self.at(n.0, n.1) == Mat::Empty) {
+                let t = self.temp[i];
                 let q = thermal::heat_of(Mat::Empty, self.temp[j]) - thermal::cap(Mat::Steam) * t;
                 self.moisture[i] -= VAPOUR_UNITS;
                 self.set(n.0, n.1, Mat::Steam);
@@ -3673,7 +3738,13 @@ impl World {
             Mat::Dirt => {
                 // Wet earth is darker.
                 let k = 256 - 96 * (self.moisture[y * W + x].min(SOIL_FULL) as i32) / SOIL_FULL as i32;
-                ((112 + v) * k / 256, (78 + v / 2) * k / 256, (52 + v / 2) * k / 256, 255)
+                // Fertile earth shows its seeds: pale specks, more of them the more it holds.
+                let seeds = self.growth[y * W + x] as u32;
+                if seeds > 0 && (h >> 3) % 16 < 2 + seeds {
+                    (184 + v, 150 + v, 96 + v / 2, 255)
+                } else {
+                    ((112 + v) * k / 256, (78 + v / 2) * k / 256, (52 + v / 2) * k / 256, 255)
+                }
             }
             Mat::Grass => {
                 // Green on moist soil, turning straw yellow as the soil dries.
@@ -4382,30 +4453,50 @@ mod tests {
     }
 
     #[test]
-    fn a_dry_seed_rots_into_soil_but_a_watered_one_does_not() {
+    fn a_seed_goes_into_the_soil_and_makes_it_fertile_but_rots_on_rock() {
         let mut w = World::new_static();
         for x in 100..140 {
+            for y in 300..320 {
+                w.set(x, y, if x < 120 { Mat::Dirt } else { Mat::Stone });
+            }
+        }
+        w.set(110, 290, Mat::Seed);
+        w.set(130, 290, Mat::Seed);
+        // Night: the sown seed must wait in the soil, not sprout.
+        w.set_phase(0.75);
+        w.day_cycle = false;
+        for _ in 0..30 {
+            w.step();
+        }
+        assert_eq!(w.raw(110, 300), Mat::Dirt, "the seed does not pile up: it goes into the earth");
+        assert_eq!(w.growth[300 * W + 110], 1, "the earth under it is fertile");
+        assert!((280..300).all(|y| w.raw(110, y) == Mat::Empty));
+        for _ in 0..15_000 {
+            w.step();
+        }
+        assert_eq!(w.cells.iter().filter(|c| c.m == Mat::Seed).count(), 0, "a seed on rock rots away");
+        assert_eq!(w.growth[300 * W + 110], 1, "the sown seed waits in the dark");
+    }
+
+    #[test]
+    fn painting_seeds_sows_the_earth() {
+        let mut w = World::new_static();
+        for x in 100..200 {
             for y in 300..320 {
                 w.set(x, y, Mat::Dirt);
             }
         }
-        // One seed on dry soil, one on soil that is already damp.
-        w.set(110, 299, Mat::Seed);
-        w.set(130, 299, Mat::Seed);
-        for x in 126..135 {
-            let i = 300 * W + x;
-            w.moisture[i] = 220;
+        w.paint(150, 310, 6, Mat::Seed);
+        assert!(w.cells.iter().filter(|c| c.m == Mat::Seed).count() == 0, "painted on earth, seeds are sown into it");
+        let fertile = (0..W * H).filter(|&i| w.growth[i] > 0).count();
+        assert!(fertile > 50, "the earth under the brush is fertile: {fertile}");
+        for _ in 0..12 {
+            w.paint(150, 310, 6, Mat::Seed);
         }
-        // Dark and cold enough that the damp seed cannot sprout: it just has to survive.
-        w.set_phase(0.75);
-        w.day_cycle = false;
-        let mut steps = 0;
-        while w.raw(110, 299) == Mat::Seed && steps < 40_000 {
-            w.step();
-            steps += 1;
-        }
-        assert_eq!(w.raw(110, 299), Mat::Dirt, "a seed with no water around should become soil");
-        assert_eq!(w.raw(130, 299), Mat::Seed, "the damp seed should still be waiting");
+        assert!(w.growth[305 * W + 150] <= SOIL_SEEDS, "a cell holds at most {SOIL_SEEDS} seeds");
+        // In the air, seeds fall as grains.
+        w.paint(150, 250, 4, Mat::Seed);
+        assert!(w.cells.iter().filter(|c| c.m == Mat::Seed).count() > 10);
     }
 
     #[test]
@@ -4513,16 +4604,31 @@ mod tests {
     }
 
     #[test]
-    fn a_tunnel_leaves_rock_bare() {
+    fn a_tunnel_through_rock_keeps_its_roof() {
+        // A hill of rock on a bed of earth, with seams of earth in it (as the mountains have):
+        // the rock over a tunnel right through it is a body of its own, held up by the vault.
         let mut w = World::new_static();
-        for x in 100..200 {
-            for y in 300..340 {
+        w.structures_fall = true;
+        for x in 100..300 {
+            for y in H as i32 - 10..H as i32 {
                 w.set(x, y, Mat::Stone);
             }
+            for y in H as i32 - 30..H as i32 - 10 {
+                w.set(x, y, Mat::Dirt);
+            }
+            for y in H as i32 - 90..H as i32 - 30 {
+                w.set(x, y, if y == H as i32 - 70 { Mat::Dirt } else { Mat::Stone });
+            }
         }
-        w.tunnel(150, 320, 6);
-        assert_eq!(w.raw(150, 320), Mat::Empty);
-        assert!(w.cells.iter().all(|c| c.m != Mat::Vault), "rock holds by itself: no lining");
+        let y = H as i32 - 50;
+        w.tunnel_line((90, y), (310, y), 6);
+        assert_eq!(w.raw(200, y), Mat::Empty);
+        assert!(w.cells.iter().any(|c| c.m == Mat::Vault), "the rock is lined");
+        for _ in 0..300 {
+            w.step();
+        }
+        assert_eq!(w.raw(200, y), Mat::Empty, "the tunnel stays open");
+        assert_eq!(w.raw(200, H as i32 - 89), Mat::Stone, "the rock over it stays up");
     }
 
     #[test]
@@ -6004,7 +6110,7 @@ mod science {
     }
 
     #[test]
-    fn seed_on_wet_soil_grows_into_a_tree() {
+    fn seeds_in_moist_earth_grow_into_a_tree_and_wait_in_dry_earth() {
         let mut w = World::new_static();
         floor(&mut w, 320, 100, 220);
         for x in 100..220 {
@@ -6022,14 +6128,24 @@ mod science {
             w.set(125, y, Mat::Stone);
             w.set(160, y, Mat::Stone);
         }
-        w.set(122, 309, Mat::Seed);
+        // The bank by the puddle is moist.
+        for x in 110..125 {
+            for y in 310..320 {
+                w.moisture[y * W + x] = 120;
+            }
+        }
+        // Seeds sown on the moist bank, and on dry earth far from it.
+        w.set(122, 300, Mat::Seed);
         w.set(123, 309, Mat::Water);
         w.set(124, 309, Mat::Water);
+        w.paint(200, 309, 2, Mat::Seed);
         for _ in 0..4000 {
             w.step();
         }
         let wood = count(&w, Mat::Wood) + count(&w, Mat::Trunk) + count(&w, Mat::Sapling);
         assert!(wood >= 6, "tree only {wood} cells tall");
+        assert!((190..215).all(|x| (280..310).all(|y| !matches!(w.raw(x, y), Mat::Sapling | Mat::Trunk))), "on dry earth the seeds wait");
+        assert!(w.growth[310 * W + 200] > 0, "still there, in the earth");
     }
 
     /// Cells of water a wide pan held at `t` °C loses in 3000 steps, under air of humidity
