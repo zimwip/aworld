@@ -3557,6 +3557,10 @@ async fn main() {
             Some("planet") => Tab::Planet,
             _ => Tab::Blocks,
         };
+        // `--lawn n`: wet earth on the left, dry on the right, and n steps for the grass to answer.
+        if let Some(n) = arg("--lawn").and_then(|v| v.parse::<u32>().ok()) {
+            game.world.demo_lawn(n);
+        }
         if let Some(h) = arg("--hour").and_then(|h| h.parse::<f32>().ok()) {
             game.world.set_phase(((h - 6.0).rem_euclid(24.0)) / 24.0);
         }
@@ -3624,6 +3628,7 @@ async fn main() {
         if args.iter().any(|a| a == "--tunnel") {
             demo_tunnel(&mut game);
         }
+
     }
     // `--mouse x,y` pins the pointer for screenshots.
     let demo_mouse = arg("--mouse").and_then(|v| {

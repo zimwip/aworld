@@ -1193,7 +1193,16 @@ impl World {
                     self.light_charcoal(x, y, 1);
                 }
             }
-            Mat::Grass | Mat::Seed | Mat::Sapling => {
+            // Grass burns off its earth: the soil stays, the flame goes up into the air.
+            Mat::Grass => {
+                if t >= WOOD_IGNITE_C - 40.0 && self.chance_t(10) {
+                    self.retype(x, y, Mat::Dirt);
+                    if self.at(x, y - 1) == Mat::Empty {
+                        self.set(x, y - 1, Mat::Fire);
+                    }
+                }
+            }
+            Mat::Seed | Mat::Sapling => {
                 if t >= WOOD_IGNITE_C - 40.0 && self.chance_t(10) {
                     self.set(x, y, Mat::Fire);
                 }
