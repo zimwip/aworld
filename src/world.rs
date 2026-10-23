@@ -2528,7 +2528,8 @@ impl World {
 
     /// Relative humidity of the air at every cell (0..1). Water vapour and clouds count toward it, set
     /// against how much the air can hold at its temperature (cold air holds little), and the air
-    /// over and around water is damper to begin with. Liquids themselves are always 1.
+    /// over and around water is damper to begin with. Water itself is always 1; other liquids (lava,
+    /// oil, molten metal) hold no water and show as dry.
     pub fn humidity_field(&self) -> Vec<f32> {
         const B: usize = 8;
         let (bw, bh) = (W / B, H.div_ceil(B));
@@ -2602,7 +2603,8 @@ impl World {
     pub fn humidity_color(&self, field: &[f32], x: usize, y: usize) -> [u8; 4] {
         let m = self.at(x as i32, y as i32);
         let rh = match m.kind() {
-            Kind::Liquid => Some(1.0),
+            // Humidity is water: lava, oil and molten metal are liquids without any.
+            Kind::Liquid => (m == Mat::Water).then_some(1.0),
             Kind::Empty | Kind::Gas => Some(if matches!(m, Mat::Cloud | Mat::Steam) { 1.0f32.min(field[y * W + x] + 0.15) } else { field[y * W + x] }),
             _ => match m {
                 // Soil holds moisture of its own.
