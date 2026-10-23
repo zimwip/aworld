@@ -450,7 +450,7 @@ impl World {
         }
         let to = Self::idx(x + dir * k, y);
         self.swap((x, y), (x + dir * k, y));
-        self.cells[to].life = (v as u8) << 1 | (dir > 0) as u8;
+        self.jet[to] = (v as u8) << 1 | (dir > 0) as u8;
         true
     }
 
@@ -458,13 +458,13 @@ impl World {
     /// line until it lands. Returns whether it moved.
     pub(super) fn fly(&mut self, x: i32, y: i32) -> bool {
         let i = Self::idx(x, y);
-        let l = self.cells[i].life;
+        let l = self.jet[i];
         if l < 2 {
             return false;
         }
         if self.at(x, y + 1) != Mat::Empty {
             // Landed: it is ordinary liquid again.
-            self.cells[i].life = 0;
+            self.jet[i] = 0;
             return false;
         }
         let (v, dir) = ((l >> 1) as i32, if l & 1 == 1 { 1 } else { -1 });
@@ -481,7 +481,7 @@ impl World {
         // Air drag slows it now and then; blocked sideways, it just drops.
         let v = if k == 0 { 0 } else if self.chance(6) { v - 1 } else { v };
         let j = Self::idx(to.0, to.1);
-        self.cells[j].life = if v > 0 { (v as u8) << 1 | (dir > 0) as u8 } else { 0 };
+        self.jet[j] = if v > 0 { (v as u8) << 1 | (dir > 0) as u8 } else { 0 };
         true
     }
 
