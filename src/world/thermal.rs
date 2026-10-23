@@ -15,6 +15,11 @@ use super::*;
 pub const DAY_STEPS: u32 = 21_600;
 /// Days per season; a year is four seasons.
 pub const SEASON_DAYS: u32 = 2;
+/// Days from one new moon to the next (29.5 for the real Moon; squeezed so that a game year,
+/// eight days, holds one whole cycle and the full moon comes back often enough to be seen).
+pub const MOON_DAYS: u32 = 8;
+/// Where the cycle starts: the first night is a growing moon, the third one full.
+const MOON_START_DAYS: f32 = 1.25;
 /// Row considered "ground level" for the air temperature profile.
 const GROUND_Y: f32 = 360.0;
 
@@ -470,6 +475,66 @@ impl World {
     pub fn sun_position(&self) -> (f32, f32) {
         let u = (self.phase() / 0.5).min(1.0);
         (W as f32 * (0.08 + 0.84 * u), H as f32 * (0.64 - 0.52 * (std::f32::consts::PI * u).sin()))
+    }
+
+    // ----- the moon ---------------------------------------------------------
+
+    /// Age of the moon, 0..1: 0 new moon, 0.25 first quarter, 0.5 full moon, 0.75 last quarter.
+    pub fn moon_age(&self) -> f32 {
+        ((self.clock as f32 / DAY_STEPS as f32 + MOON_START_DAYS) / MOON_DAYS as f32).fract()
+    }
+
+    /// How much of the moon's face is lit by the sun, 0 (new moon) to 1 (full moon).
+    pub fn moon_light(&self) -> f32 {
+        (1.0 - (self.moon_age() * std::f32::consts::TAU).cos()) * 0.5
+    }
+
+    /// The moon lies `age` of a turn behind the sun, so it rises later every day: the new moon
+    /// rises and sets with the sun (lost in its glare), the first quarter rises at noon and sets
+    /// at midnight, the full moon rises at sunset and sets at sunrise (opposite the sun), the last
+    /// quarter rises at midnight. How far along its arc it is, 0..1, while it is above the horizon.
+    pub fn moon_arc(&self) -> Option<f32> {
+        let m = (self.phase() - self.moon_age()).rem_euclid(1.0);
+        (m < 0.5).then_some(m / 0.5)
+    }
+
+    /// Where the moon sits in the world, in cells (same arc as the sun's), if it is up.
+    pub fn moon_position(&self) -> Option<(f32, f32)> {
+        self.moon_arc().map(|u| (W as f32 * (0.08 + 0.84 * u), H as f32 * (0.64 - 0.52 * (std::f32::consts::PI * u).sin())))
+    }
+
+    /// The name of tonight's moon.
+    pub fn moon_name(&self) -> &'static str {
+        const NAMES: [&str; 8] = [
+            "nouvelle lune",
+            "premier croissant",
+            "premier quartier",
+            "lune gibbeuse croissante",
+            "pleine lune",
+            "lune gibbeuse décroissante",
+            "dernier quartier",
+            "dernier croissant",
+        ];
+        NAMES[((self.moon_age() * 8.0 + 0.5) as usize) % 8]
+    }
+
+    /// Full moon: almost all of its face is lit.
+    pub fn full_moon(&self) -> bool {
+        self.moon_light() > 0.95
+    }
+
+    /// Whole nights to wait until the next full moon (0 tonight).
+    pub fn nights_to_full_moon(&self) -> u32 {
+        // Moon age at tonight's midnight, then whole cycles of eight nights from there.
+        let midnight = (self.clock / DAY_STEPS) as f32 + 0.75 + MOON_START_DAYS;
+        let age = (midnight / MOON_DAYS as f32).fract();
+        (((0.5 - age).rem_euclid(1.0) * MOON_DAYS as f32).round() as u32) % MOON_DAYS
+    }
+
+    /// Jumps to another day (counting from 1), keeping the time of day.
+    pub fn set_day(&mut self, n: u32) {
+        self.clock = n.saturating_sub(1) * DAY_STEPS + self.clock % DAY_STEPS;
+        self.update_season_cache();
     }
 
     pub fn temp_c(&self, x: i32, y: i32) -> f32 {

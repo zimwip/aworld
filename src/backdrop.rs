@@ -24,6 +24,22 @@ pub fn daylight(phase: f32) -> f32 {
     smooth(0.0, 0.3, (phase * std::f32::consts::TAU).sin())
 }
 
+/// How strongly a low sun colours the sky and the clouds (1 when it touches the horizon, fading
+/// over the hour or so either side, before sunrise and after sunset too), and where across the
+/// world (0 to 1) that light comes from: the sun itself, or the point where it rose or set.
+pub fn twilight(phase: f32) -> (f32, f32) {
+    let s = (phase * std::f32::consts::TAU).sin();
+    let g = smooth(0.0, 1.0, 1.0 - s.abs() / 0.28);
+    let x = if phase < 0.5 { 0.08 + 0.84 * phase / 0.5 } else if phase < 0.75 { 0.92 } else { 0.08 };
+    (g, x)
+}
+
+/// How bright the sky looks: the daylight, but around sunrise and sunset the glow of the low sun
+/// keeps it from going dark all at once.
+pub fn sky_light(phase: f32) -> f32 {
+    daylight(phase).max(0.55 * twilight(phase).0)
+}
+
 /// Dims a colour toward a cold blue at night.
 fn lit(c: Color, day: f32) -> Color {
     mix(rgb(14, 20, 44), c, 0.28 + 0.72 * day)
@@ -38,22 +54,49 @@ fn season_ground(season: Season) -> (Color, Color) {
     }
 }
 
-pub fn draw_sky(v: View, biome: Biome, phase: f32, wind: f32, time: f32, season: Season) {
+/// What the backdrop needs to know about the moon.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Moon {
+    /// How far along its arc across the sky, while it is up.
+    pub arc: Option<f32>,
+    /// Age in its cycle, 0..1 (0 new, 0.5 full).
+    pub age: f32,
+    /// How much of its face is lit, 0..1.
+    pub light: f32,
+    /// 0..1: the full moon, flattered by the wolves' song, winks at them.
+    pub wink: f32,
+}
+
+pub fn draw_sky(v: View, biome: Biome, phase: f32, wind: f32, time: f32, season: Season, moon: Moon) {
     let r = v.rect();
     let tau = std::f32::consts::TAU;
     let s = (phase * tau).sin();
-    let day = daylight(phase);
+    let day = sky_light(phase);
     let glow = (1.0 - s.abs() / 0.28).clamp(0.0, 1.0);
 
-    // Sky gradient.
-    let top = mix(rgb(6, 10, 34), rgb(70, 120, 214), day);
-    let mid = mix(rgb(14, 22, 60), rgb(150, 200, 238), day);
-    let low = mix(mix(rgb(30, 34, 74), rgb(255, 224, 182), day), rgb(255, 140, 80), glow * 0.85);
+    // Sky gradient. At dawn and dusk the light crosses so much air that only its reds get through
+    // near the horizon: orange low down, pink above it, the zenith turning violet.
+    let (dusk, sun_x) = twilight(phase);
+    let top = mix(mix(rgb(6, 10, 34), rgb(70, 120, 214), day), rgb(62, 54, 128), dusk * 0.45);
+    let mid = mix(mix(rgb(14, 22, 60), rgb(150, 200, 238), day), rgb(226, 140, 150), dusk * 0.6);
+    let low = mix(mix(rgb(30, 34, 74), rgb(255, 224, 182), day), rgb(255, 130, 70), glow * 0.85);
     let bands = 48;
     for i in 0..bands {
         let t = i as f32 / bands as f32;
         let c = if t < 0.6 { mix(top, mid, t / 0.6) } else { mix(mid, low, (t - 0.6) / 0.4) };
         draw_rectangle(r.x, r.y + r.h * t, r.w, r.h / bands as f32 + 1.0, c);
+    }
+
+    // The glow around the low sun: a wide golden-to-rose halo lying along the horizon, on the side
+    // where the sun rises or sets (and lingering there a while after it has set).
+    if dusk > 0.01 {
+        let (hx, hy) = (r.x + r.w * sun_x, r.y + r.h * 0.56);
+        for i in 0..48 {
+            let t = i as f32 / 47.0;
+            let c = mix(rgb(236, 110, 130), rgb(255, 214, 120), t);
+            let rad = r.h * (0.95 - 0.85 * t);
+            draw_ellipse(hx, hy, rad * 1.9, rad, 0.0, Color::new(c.r, c.g, c.b, 0.027 * dusk));
+        }
     }
 
     // Stars fade in with the night. They twinkle because the air between them and us is turbulent:
@@ -82,19 +125,18 @@ pub fn draw_sky(v: View, biome: Biome, phase: f32, wind: f32, time: f32, season:
         }
     }
 
-    // Sun by day, moon by night, each following an arc.
-    let (u, is_sun) = if phase < 0.5 { (phase / 0.5, true) } else { ((phase - 0.5) / 0.5, false) };
-    let cx = r.x + r.w * (0.08 + 0.84 * u);
-    let cy = r.y + r.h * (0.64 - 0.52 * (std::f32::consts::PI * u).sin());
-    if is_sun {
+    // The sun by day, following its arc; the moon follows the same arc but lags behind the sun by
+    // its age, so it can be up in the daytime too (pale in the blue sky) or missing at night.
+    let arc = |u: f32| (r.x + r.w * (0.08 + 0.84 * u), r.y + r.h * (0.64 - 0.52 * (std::f32::consts::PI * u).sin()));
+    if let Some(u) = moon.arc {
+        let (cx, cy) = arc(u);
+        draw_moon(cx, cy, r.h * 0.04, moon, day);
+    }
+    if phase < 0.5 {
+        let (cx, cy) = arc(phase / 0.5);
         let warm = mix(rgb(255, 250, 220), rgb(255, 150, 70), glow);
         draw_circle(cx, cy, r.h * 0.085, Color::new(warm.r, warm.g, warm.b, 0.25));
         draw_circle(cx, cy, r.h * 0.05, warm);
-    } else {
-        draw_circle(cx, cy, r.h * 0.07, Color::new(0.8, 0.85, 1.0, 0.12));
-        draw_circle(cx, cy, r.h * 0.04, rgb(238, 240, 250));
-        draw_circle(cx - r.h * 0.012, cy - r.h * 0.006, r.h * 0.008, rgb(214, 218, 232));
-        draw_circle(cx + r.h * 0.014, cy + r.h * 0.012, r.h * 0.006, rgb(220, 224, 236));
     }
 
     // Wind streaks drifting across the sky.
@@ -109,7 +151,15 @@ pub fn draw_sky(v: View, biome: Biome, phase: f32, wind: f32, time: f32, season:
     match biome {
         Biome::Mountain => draw_mountains(v, day, season),
         Biome::Countryside => draw_countryside(v, day, season, time, wind),
-        Biome::Sea => draw_sea(v, day, phase, time),
+        Biome::Sea => {
+            // Glitter on the water under the sun, or under the moon at night.
+            let glitter = if phase < 0.5 {
+                Some((phase / 0.5, 0.35 * day.max(0.25)))
+            } else {
+                moon.arc.map(|u| (u, 0.12 * moon.light))
+            };
+            draw_sea(v, day, glitter, time)
+        }
     }
 }
 
@@ -191,7 +241,8 @@ fn draw_countryside(v: View, day: f32, season: Season, time: f32, wind: f32) {
     }
 }
 
-fn draw_sea(v: View, day: f32, phase: f32, time: f32) {
+/// `glitter`: where the sun or the moon is along its arc (0..1) and how bright its path on the sea.
+fn draw_sea(v: View, day: f32, glitter: Option<(f32, f32)>, time: f32) {
     let r = v.rect();
     let horizon = r.y + r.h * 0.66;
     // Open water to the horizon, deeper blue toward the viewer.
@@ -224,12 +275,101 @@ fn draw_sea(v: View, day: f32, phase: f32, time: f32) {
     draw_triangle(vec2(bx - 10.0, by), vec2(bx + 12.0, by), vec2(bx + 8.0, by + 6.0), lit(rgb(120, 80, 56), day));
     draw_triangle(vec2(bx, by - 2.0), vec2(bx, by - 26.0), vec2(bx + 14.0, by - 2.0), lit(rgb(250, 250, 250), day));
     // Glitter on the water under the sun or moon.
-    let u = if phase < 0.5 { phase / 0.5 } else { (phase - 0.5) / 0.5 };
+    let Some((u, bright)) = glitter else { return };
     let gx = r.x + r.w * (0.08 + 0.84 * u);
     for k in 0..26 {
         let y = horizon + 4.0 + k as f32 * 7.5;
         let spread = 6.0 + k as f32 * 2.2;
         let off = ((time * 3.0 + k as f32 * 1.3).sin()) * spread * 0.6;
-        draw_line(gx + off - spread * 0.5, y, gx + off + spread * 0.5, y, 1.5, Color::new(1.0, 1.0, 0.9, 0.35 * (day.max(0.25))));
+        draw_line(gx + off - spread * 0.5, y, gx + off + spread * 0.5, y, 1.5, Color::new(1.0, 1.0, 0.9, bright));
+    }
+}
+
+/// Which part of each row of the moon's disc is lit, as (left, right) for a row at height `y`
+/// (-1..1 from top to bottom, radius 1). The sun lights one half of the moon; seen from the Earth,
+/// the line between day and night on it (the terminator) is a half ellipse whose width follows the
+/// age: lit on the right while it grows (northern hemisphere), all lit at full moon, lit on the
+/// left while it wanes.
+pub fn moon_lit_span(age: f32, y: f32) -> (f32, f32) {
+    let w = (1.0 - y * y).max(0.0).sqrt();
+    let k = (age * std::f32::consts::TAU).cos();
+    if age < 0.5 { (k * w, w) } else { (-w, -k * w) }
+}
+
+/// The moon: its lit part (crescent, quarter, gibbous or full) with a few grey seas on it, and the
+/// dark part faintly visible at night (earthshine: sunlight bounced off the Earth).
+fn draw_moon(cx: f32, cy: f32, rad: f32, moon: Moon, day: f32) {
+    let night = 1.0 - day;
+    // In daylight the moon is a pale ghost in the blue.
+    let a = 0.35 + 0.65 * night;
+    draw_circle(cx, cy, rad * 1.75, Color::new(0.8, 0.85, 1.0, 0.12 * moon.light * night));
+    draw_circle(cx, cy, rad, Color::new(0.16, 0.19, 0.3, 0.55 * night));
+    let lit = Color::new(0.933, 0.941, 0.98, a);
+    let rows = 32;
+    let row = |i: usize| {
+        let y = -1.0 + 2.0 * i as f32 / rows as f32;
+        let (l, r) = moon_lit_span(moon.age, y);
+        (cx + l * rad, cx + r * rad, cy + y * rad)
+    };
+    for i in 0..rows {
+        let ((l0, r0, y0), (l1, r1, y1)) = (row(i), row(i + 1));
+        draw_triangle(vec2(l0, y0), vec2(r0, y0), vec2(r1, y1), lit);
+        draw_triangle(vec2(l0, y0), vec2(r1, y1), vec2(l1, y1), lit);
+    }
+    // The seas, only where the sun lights them.
+    let sea = Color::new(0.82, 0.84, 0.9, a);
+    for (x, y, s) in [(-0.3, -0.15, 0.2), (0.35, 0.3, 0.15), (0.1, -0.45, 0.12), (-0.15, 0.45, 0.1)] {
+        let (l, r) = moon_lit_span(moon.age, y);
+        if x - s * 0.5 > l && x + s * 0.5 < r {
+            draw_circle(cx + x * rad, cy + y * rad, s * rad, sea);
+        }
+    }
+    // The wink: one eye shut, one open, a smile.
+    if moon.wink > 0.0 {
+        let ink = Color::new(0.45, 0.47, 0.6, moon.wink * a);
+        let t = (rad * 0.07).max(1.2);
+        draw_line(cx - rad * 0.5, cy - rad * 0.2, cx - rad * 0.15, cy - rad * 0.2, t, ink);
+        draw_circle(cx + rad * 0.32, cy - rad * 0.2, rad * 0.11, ink);
+        for k in 0..8 {
+            let (a0, a1) = (0.5 + 2.1 * k as f32 / 8.0, 0.5 + 2.1 * (k + 1) as f32 / 8.0);
+            let p = |a: f32| vec2(cx + a.cos() * rad * 0.45, cy + rad * 0.05 + a.sin() * rad * 0.4);
+            let (p0, p1) = (p(a0), p(a1));
+            draw_line(p0.x, p0.y, p1.x, p1.y, t, ink);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_moon_is_lit_on_the_right_side_while_it_grows() {
+        let span = |age: f32| moon_lit_span(age, 0.0);
+        let width = |age: f32| span(age).1 - span(age).0;
+        assert!(width(0.0) < 1e-3, "new moon: nothing lit");
+        assert!((width(0.5) - 2.0).abs() < 1e-3, "full moon: all lit");
+        assert!((width(0.25) - 1.0).abs() < 1e-3 && span(0.25).0.abs() < 1e-3, "first quarter: the right half");
+        assert!((width(0.75) - 1.0).abs() < 1e-3 && span(0.75).1.abs() < 1e-3, "last quarter: the left half");
+        let (l, r) = span(0.1);
+        assert!(r > 0.99 && l > 0.5, "a young crescent hugs the right edge: {l} {r}");
+        let (l, r) = span(0.9);
+        assert!(l < -0.99 && r < -0.5, "an old crescent hugs the left edge: {l} {r}");
+    }
+
+    #[test]
+    fn twilight_glows_at_sunrise_and_sunset_on_the_sun_side_and_not_at_noon_or_midnight() {
+        let (dawn, x_dawn) = twilight(0.0);
+        let (dusk, x_dusk) = twilight(0.5);
+        assert!(dawn > 0.99 && dusk > 0.99);
+        assert!(x_dawn < 0.2 && x_dusk > 0.8);
+        // Just before sunrise and just after sunset the glow is already, or still, there.
+        assert!(twilight(0.99).0 > 0.5 && twilight(0.99).1 < 0.2);
+        assert!(twilight(0.51).0 > 0.5 && twilight(0.51).1 > 0.8);
+        assert_eq!(twilight(0.25).0, 0.0);
+        assert_eq!(twilight(0.75).0, 0.0);
+        // The sky does not go dark the moment the sun touches the horizon.
+        assert!(daylight(0.5) < 0.05 && sky_light(0.5) > 0.5);
+        assert_eq!(sky_light(0.25), daylight(0.25));
     }
 }
