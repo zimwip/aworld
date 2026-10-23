@@ -2599,8 +2599,9 @@ impl World {
         }
         let h = (x as u32).wrapping_mul(73856093) ^ (y as u32).wrapping_mul(19349663);
         let v = ((h >> 7) & 15) as i32 - 8;
-        let f = self.frame as u32;
-        let flick = ((h ^ f.wrapping_mul(2654435761)) >> 11 & 31) as i32;
+        // A fixed speckle per cell; the shimmer of water and the flicker of embers and lava move
+        // in the shader (render.rs), so a cell that does not change keeps its colour.
+        let flick = (h >> 11 & 31) as i32;
         let t = self.temp[y * W + x];
         let (r, g, b, a): (i32, i32, i32, i32) = match c.m {
             Mat::Empty => (0, 0, 0, 0),

@@ -2,6 +2,7 @@
 
 use crate::blocks::{Block, BlockKind, Member, MemberMat, Spring, SpringKind, STUD};
 use crate::car::{Car, ModelKind};
+use crate::world::sleep::{CH, CS, CW};
 use crate::world::{Mat, World, H, W};
 use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation, PipelineParams};
 use macroquad::prelude::*;
@@ -61,6 +62,7 @@ precision highp float;
 varying vec2 uv;
 uniform sampler2D Texture;
 uniform vec2 texel;
+uniform float time;
 void main() {
     vec4 c = texture2D(Texture, uv);
     vec3 glow = vec3(0.0);
@@ -77,6 +79,13 @@ void main() {
     glow = glow / wsum;
     vec4 up = texture2D(Texture, uv - vec2(0.0, texel.y));
     float edge = c.a * (1.0 - up.a);
+    // Water shimmers and embers, lava and flames flicker: a noise per cell that changes twenty
+    // times a second, so the texture itself only changes where the cells do.
+    vec2 cell = floor(uv / texel);
+    float n = fract(sin(dot(cell, vec2(12.9898, 78.233)) + floor(time * 20.0) * 3.7) * 43758.5453) - 0.5;
+    float water = step(0.78, c.a) * step(c.a, 0.83) * step(c.r, c.b);
+    float hot = step(0.93, c.r) * step(c.b, 0.3) * step(0.5, c.a);
+    c.g += n * (0.06 * water + 0.36 * hot) * c.a;
     vec3 rgb = c.rgb + vec3(0.18) * edge * c.a + glow * 2.2;
     float a = max(c.a, clamp(length(glow) * 2.0, 0.0, 1.0));
     gl_FragColor = vec4(rgb, a);
@@ -137,9 +146,20 @@ pub struct Renderer {
     /// Trees are a layer of their own so they can sway: (x, y, height above ground, colour).
     veg_image: Image,
     veg_texture: Texture2D,
-    veg_cells: Vec<(u16, u16, f32, [u8; 4])>,
-    rev_veg: u64,
+    /// The tree cells of each sleeping zone, rebuilt only for the zones that changed.
+    veg_zones: Vec<Vec<(u16, u16, f32, [u8; 4])>>,
     veg_tick: i64,
+    /// The world's step count when the landscape and the clouds were last drawn: only the zones
+    /// that changed since are recoloured (see `World::zones`).
+    drawn_stamp: u64,
+    gas_stamp: u64,
+    /// Visible gas pixels of each zone.
+    gas_zones: Vec<u32>,
+    /// Which row of zones is recoloured this frame even if it did not change (temperature tints,
+    /// soil moisture): the whole picture is refreshed every `CH` frames.
+    band: usize,
+    /// The landscape must be redrawn in full (first frame, or back from another view).
+    full: bool,
     rev_world: u64,
     rev_gas: u64,
     last_mode: u8,
@@ -158,7 +178,7 @@ impl Renderer {
             ShaderSource::Glsl { vertex: VERT, fragment: FRAG },
             MaterialParams {
                 pipeline_params: PipelineParams { color_blend: Some(blend), alpha_blend: Some(blend), ..Default::default() },
-                uniforms: vec![UniformDesc::new("texel", UniformType::Float2)],
+                uniforms: vec![UniformDesc::new("texel", UniformType::Float2), UniformDesc::new("time", UniformType::Float1)],
                 ..Default::default()
             },
         )
@@ -178,7 +198,28 @@ impl Renderer {
         let veg_image = Image::gen_image_color(W as u16, H as u16, Color::new(0.0, 0.0, 0.0, 0.0));
         let veg_texture = Texture2D::from_image(&veg_image);
         veg_texture.set_filter(FilterMode::Linear);
-        Renderer { veg_image, veg_texture, veg_cells: vec![], rev_veg: u64::MAX, veg_tick: -1, image, texture, material, gas_image, gas_texture, gas_material, rev_world: 0, rev_gas: 0, last_mode: 0, pressure: vec![], has_gas: false }
+        Renderer {
+            veg_image,
+            veg_texture,
+            veg_zones: vec![vec![]; CW * CH],
+            veg_tick: -1,
+            drawn_stamp: 0,
+            gas_stamp: 0,
+            gas_zones: vec![0; CW * CH],
+            band: 0,
+            full: true,
+            image,
+            texture,
+            material,
+            gas_image,
+            gas_texture,
+            gas_material,
+            rev_world: u64::MAX,
+            rev_gas: u64::MAX,
+            last_mode: 0,
+            pressure: vec![],
+            has_gas: false,
+        }
     }
 
     /// Fills the texture in parallel from a per-cell colour function.
@@ -221,6 +262,47 @@ impl Renderer {
         }
     }
 
+    /// Recolours one sleeping zone of the picture. Returns how many pixels are not fully transparent.
+    fn fill_zone(image: &mut Image, k: usize, color: impl Fn(usize, usize) -> [u8; 4]) -> u32 {
+        let px = image.get_image_data_mut();
+        let (x0, y0) = ((k % CW) * CS, (k / CW) * CS);
+        let mut visible = 0;
+        for y in y0..(y0 + CS).min(H) {
+            for x in x0..(x0 + CS).min(W) {
+                let c = color(x, y);
+                visible += (c[3] != 0) as u32;
+                px[y * W + x] = c;
+            }
+        }
+        visible
+    }
+
+    /// The zones whose cells may have changed since step count `since`.
+    fn changed_zones(world: &World, since: u64) -> Vec<usize> {
+        (0..CW * CH).filter(|&k| world.zones.changed_since(k, since)).collect()
+    }
+
+    /// The tree cells of zone `k`: (x, y, height above the ground, colour).
+    fn veg_of_zone(world: &World, k: usize) -> Vec<(u16, u16, f32, [u8; 4])> {
+        let (x0, y0) = ((k % CW) * CS, (k / CW) * CS);
+        let mut out = vec![];
+        for y in y0..(y0 + CS).min(H) {
+            for x in x0..(x0 + CS).min(W) {
+                if world.cell_mat(x, y).is_vegetation() {
+                    let mut h = 0usize;
+                    while h < 90 && y + h + 1 < H && {
+                        let m = world.cell_mat(x, y + h + 1);
+                        m.is_vegetation() || !m.is_hard()
+                    } {
+                        h += 1;
+                    }
+                    out.push((x as u16, y as u16, h as f32, world.color(x, y)));
+                }
+            }
+        }
+        out
+    }
+
     pub fn draw_world(&mut self, world: &World, v: View, mode: RenderMode, time: f32) {
         let size = DrawTextureParams { dest_size: Some(vec2(W as f32 * v.s, H as f32 * v.s)), ..Default::default() };
         let id = mode as u8;
@@ -241,8 +323,30 @@ impl Renderer {
                     Self::fill(&mut self.image, |x, y| world.humidity_color(field, x, y));
                 }
                 RenderMode::Normal => {
-                    Self::fill(&mut self.image, |x, y| world.color_without_trees(x, y));
+                    // Only the zones that changed, plus one row of zones in turn for the slow
+                    // changes (temperature tints) that do not wake a zone.
+                    // A fresh world (a new game, a loaded one) counts its steps from the start again.
+                    if self.full || self.last_mode != id || world.zones.stamp() < self.drawn_stamp {
+                        Self::fill(&mut self.image, |x, y| world.color_without_trees(x, y));
+                        for k in 0..CW * CH {
+                            self.veg_zones[k] = Self::veg_of_zone(world, k);
+                        }
+                        self.full = false;
+                    } else {
+                        let mut zones = Self::changed_zones(world, self.drawn_stamp);
+                        self.band = (self.band + 1) % CH;
+                        zones.extend((0..CW).map(|i| self.band * CW + i));
+                        for k in zones {
+                            Self::fill_zone(&mut self.image, k, |x, y| world.color_without_trees(x, y));
+                            self.veg_zones[k] = Self::veg_of_zone(world, k);
+                        }
+                    }
+                    self.veg_tick = -1;
+                    self.drawn_stamp = world.zones.stamp();
                 }
+            }
+            if mode != RenderMode::Normal {
+                self.full = true;
             }
             self.texture.update(&self.image);
             self.rev_world = world.revision;
@@ -254,6 +358,7 @@ impl Renderer {
         }
         self.update_trees(world, time);
         self.material.set_uniform("texel", vec2(1.0 / W as f32, 1.0 / H as f32));
+        self.material.set_uniform("time", time);
         gl_use_material(&self.material);
         draw_texture_ex(&self.texture, v.ox, v.oy, WHITE, size.clone());
         draw_texture_ex(&self.veg_texture, v.ox, v.oy, WHITE, size);
@@ -263,25 +368,6 @@ impl Renderer {
     /// Trees lean with the wind and wave about, more the higher the leaf or branch is
     /// above the ground. Purely visual: the cells themselves do not move.
     fn update_trees(&mut self, world: &World, time: f32) {
-        if self.rev_veg != world.revision {
-            self.rev_veg = world.revision;
-            self.veg_cells.clear();
-            for y in 0..H {
-                for x in 0..W {
-                    if world.cell_mat(x, y).is_vegetation() {
-                        let mut h = 0usize;
-                        while h < 90 && y + h + 1 < H && {
-                            let m = world.cell_mat(x, y + h + 1);
-                            m.is_vegetation() || !m.is_hard()
-                        } {
-                            h += 1;
-                        }
-                        self.veg_cells.push((x as u16, y as u16, h as f32, world.color(x, y)));
-                    }
-                }
-            }
-            self.veg_tick = -1;
-        }
         let tick = (time * 12.0) as i64;
         if tick == self.veg_tick {
             return;
@@ -290,7 +376,7 @@ impl Renderer {
         let px = self.veg_image.get_image_data_mut();
         px.fill([0; 4]);
         let w = world.wind;
-        for &(x, y, h, col) in &self.veg_cells {
+        for &(x, y, h, col) in self.veg_zones.iter().flatten() {
             let hf = (h / 40.0).powf(1.4).min(2.5);
             let wave = (time * 1.9 + x as f32 * 0.07 + h * 0.03).sin() + 0.5 * (time * 3.3 + y as f32 * 0.11).sin();
             let dx = (w * 1.4 + wave * (0.35 + 0.9 * w.abs())) * hf;
@@ -303,11 +389,18 @@ impl Renderer {
     /// Clouds and steam as soft blobs, drawn over the landscape.
     pub fn draw_gas(&mut self, world: &World, v: View) {
         if self.rev_gas != world.revision {
-            self.has_gas = Self::fill(&mut self.gas_image, |x, y| world.gas_color(x, y)) > 0;
-            if self.has_gas {
+            // The gas picture depends only on the cells: recolour the zones that changed.
+            let zones = if self.rev_gas == u64::MAX || world.zones.stamp() < self.gas_stamp { (0..CW * CH).collect() } else { Self::changed_zones(world, self.gas_stamp) };
+            let was = self.has_gas;
+            for k in zones {
+                self.gas_zones[k] = Self::fill_zone(&mut self.gas_image, k, |x, y| world.gas_color(x, y));
+            }
+            self.has_gas = self.gas_zones.iter().any(|&n| n > 0);
+            if self.has_gas || was {
                 self.gas_texture.update(&self.gas_image);
             }
             self.rev_gas = world.revision;
+            self.gas_stamp = world.zones.stamp();
         }
         // No clouds, steam or smoke: skip the expensive blur pass altogether.
         if !self.has_gas {
