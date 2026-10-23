@@ -512,6 +512,7 @@ pub struct Matter {
     fuel: Vec<Fuel>,
     growth: Vec<u8>,
     jet: Vec<u8>,
+    log: Vec<u16>,
 }
 
 pub struct World {
@@ -525,6 +526,12 @@ pub struct World {
     released_list: Vec<usize>,
     falling: Vec<Piece>,
     ticks: u32,
+    /// Which log each cell of wood belongs to: every stroke of the wood brush is one log, a rigid
+    /// body of its own that rests on what is under it but never sticks to anything else (see
+    /// `same_body`). 0 for every other cell, and for wood that came from elsewhere.
+    pub log: Vec<u16>,
+    /// The log the wood brush is painting now (see `new_log`).
+    pub paint_log: u16,
     /// Temperature in °C of every cell (air included).
     pub temp: Vec<f32>,
     /// Steps since the world began; drives the day and night cycle.
@@ -631,6 +638,8 @@ impl World {
             released_list: Vec::new(),
             falling: Vec::new(),
             ticks: 0,
+            log: vec![0; W * H],
+            paint_log: 0,
             temp: vec![15.0; W * H],
             clock: DAY_STEPS / 5,
             day_cycle: true,
@@ -697,6 +706,7 @@ impl World {
         self.revision += 1;
         self.charge.fill(0.0);
         self.cells.fill(EMPTY);
+        self.log.fill(0);
         self.ejecta.clear();
         self.latent.fill(0.0);
         self.vel.fill(0);
@@ -807,7 +817,7 @@ impl World {
     }
 
     pub fn snapshot(&self) -> Matter {
-        Matter { cells: self.cells.clone(), moisture: self.moisture.clone(), fuel: self.fuel.clone(), growth: self.growth.clone(), jet: self.jet.clone() }
+        Matter { cells: self.cells.clone(), moisture: self.moisture.clone(), fuel: self.fuel.clone(), growth: self.growth.clone(), jet: self.jet.clone(), log: self.log.clone() }
     }
 
     pub fn restore(&mut self, snap: &Matter) {
@@ -817,6 +827,7 @@ impl World {
         self.fuel.copy_from_slice(&snap.fuel);
         self.growth.copy_from_slice(&snap.growth);
         self.jet.copy_from_slice(&snap.jet);
+        self.log.copy_from_slice(&snap.log);
         self.latent.fill(0.0);
         self.vel.fill(0);
         self.zones.wake_all();
@@ -990,6 +1001,7 @@ impl World {
         self.fuel.swap(i, j);
         self.growth.swap(i, j);
         self.jet.swap(i, j);
+        self.log.swap(i, j);
     }
 
     /// Clears the states of cell `i` that only some matters carry (heat stays: every matter has one).
@@ -998,6 +1010,7 @@ impl World {
         self.fuel[i] = Fuel::default();
         self.growth[i] = 0;
         self.jet[i] = 0;
+        self.log[i] = 0;
     }
 
     fn states(&self, i: usize) -> States {
@@ -1128,6 +1141,9 @@ impl World {
                 }
                 let i = Self::idx(x, y);
                 if self.cells[i].m == m {
+                    if m == Mat::Wood {
+                        self.log[i] = self.paint_log;
+                    }
                     if let Some(t) = thermal::paint_temp(m) {
                         self.temp[i] = t;
                     }
@@ -1955,6 +1971,47 @@ impl World {
                 }
             }
         }
+    }
+
+    /// Plants a grown tree where the player clicked: its trunk stands on the first ground under
+    /// `(x, y)` (or on the surface, if the click is in the ground) and ends in a crown, like the
+    /// trees of the landscape. `size` (0 to 1) makes it taller. Returns false if there is no
+    /// ground to stand on, or no room for it.
+    pub fn plant_tree(&mut self, x: i32, y: i32, size: f32) -> bool {
+        let ground = |m: Mat| matches!(m.kind(), Kind::Static | Kind::Powder) && !m.is_vegetation();
+        let mut y = y.clamp(0, H as i32 - 1);
+        if ground(self.raw(x, y)) {
+            while y > 0 && ground(self.raw(x, y - 1)) {
+                y -= 1;
+            }
+        } else {
+            while y < H as i32 && !ground(self.raw(x, y)) {
+                y += 1;
+            }
+            if y >= H as i32 {
+                return false;
+            }
+        }
+        // A trunk in a lake would drown: it needs its feet out of the water.
+        let base = y;
+        if self.raw(x, base - 1).kind() == Kind::Liquid {
+            return false;
+        }
+        let hgt = ((8.0 + size.clamp(0.0, 1.0) * 6.0) as i32 + (self.rand() % 3) as i32) * K;
+        let left = x - K / 2;
+        let blocked = |m: Mat| m.kind() == Kind::Static && !m.is_vegetation();
+        if base - hgt < 12 * K || (1..=hgt).any(|dy| (0..K).any(|dx| blocked(self.raw(left + dx, base - dy)))) {
+            return false;
+        }
+        // Ground under the trunk becomes soil, so the tree can drink and stands rooted.
+        for dx in 0..K {
+            if matches!(self.raw(left + dx, base), Mat::Sand | Mat::Snow | Mat::Grass) {
+                self.set(left + dx, base, Mat::Dirt);
+            }
+        }
+        self.fill_rect(left, base - hgt, K, hgt, Mat::Trunk);
+        self.grow_crown(x, base - hgt);
+        true
     }
 
     /// A crown of leaves around a branch core, centred just above the trunk top.
@@ -2920,6 +2977,25 @@ impl World {
         }
     }
 
+    /// Are the neighbouring cells `i` and `j` parts of one body? A log (one stroke of the wood
+    /// brush) is a rigid body of its own: it is bonded only to the wood of the same stroke. It
+    /// rests on what is under it and carries what lies on it, but it never sticks to the side of
+    /// anything, so it falls as a whole and lands as a log instead of melting into the ground.
+    fn same_body(&self, i: usize, j: usize) -> bool {
+        let (a, b) = (self.cells[i].m == Mat::Wood, self.cells[j].m == Mat::Wood);
+        if a || b {
+            a && b && self.log[i] == self.log[j]
+        } else {
+            true
+        }
+    }
+
+    /// A new log for the wood brush: the next strokes of wood are a body of their own.
+    pub fn new_log(&mut self) -> u16 {
+        self.paint_log = self.paint_log.wrapping_add(1).max(1);
+        self.paint_log
+    }
+
     /// Finds solid cells that are not connected to rock resting on the base of
     /// the world and lists them, grouped by connected piece, so they can fall.
     fn structure_pass(&mut self) {
@@ -2948,7 +3024,10 @@ impl World {
             for (nx, ny) in Self::neighbors(x, y) {
                 if Self::inb(nx, ny) {
                     let j = Self::idx(nx, ny);
-                    if !seen[j] && Self::structural(self.cells[j].m) && Self::holds(from, self.cells[j].m, ny - y) {
+                    // Between two bodies (a log and what it touches) support only goes up: from
+                    // what is under to what rests on it.
+                    let bonded = self.same_body(i, j) || ny - y == -1;
+                    if !seen[j] && Self::structural(self.cells[j].m) && Self::holds(from, self.cells[j].m, ny - y) && bonded {
                         seen[j] = true;
                         stack.push(j);
                     }
@@ -2978,7 +3057,7 @@ impl World {
                 for (nx, ny) in Self::neighbors(x, y) {
                     if Self::inb(nx, ny) {
                         let j = Self::idx(nx, ny);
-                        if !seen[j] && Self::structural(self.cells[j].m) {
+                        if !seen[j] && Self::structural(self.cells[j].m) && self.same_body(i, j) {
                             seen[j] = true;
                             stack.push(j);
                         }
@@ -3003,6 +3082,10 @@ impl World {
         let mut pieces = std::mem::take(&mut self.falling);
         for piece in &mut pieces {
             piece.cells.sort_unstable_by(|a, b| b.cmp(a));
+        }
+        // The lowest piece first: a log lying on another falling one follows it down.
+        pieces.sort_by_key(|p| std::cmp::Reverse(p.cells.first().copied().unwrap_or(0)));
+        for piece in &mut pieces {
             if piece.vy >= 0.0 {
                 // Falling: gravity builds up speed; move one cell at a time while it is free.
                 piece.vy = (piece.vy + 0.35).min(3.0);
@@ -3086,11 +3169,12 @@ impl World {
             in_piece(target)
                 || (self.mask[target] == 0
                     && match self.cells[target].m.kind() {
-                        Kind::Empty | Kind::Gas | Kind::Powder | Kind::Flame => true,
+                        Kind::Empty | Kind::Gas | Kind::Flame => true,
                         // Archimedes: a piece heavier than the liquid (rock, iron) sinks through
                         // it, pushing it aside; a lighter one (ice, wood) floats on a body of it,
                         // but a stray drop or a puff of liquid in mid-air does not hold it up.
-                        Kind::Liquid => {
+                        // Settled sand or earth holds up a log the same way.
+                        Kind::Liquid | Kind::Powder => {
                             if piece.density >= density(self.cells[target].m) {
                                 true
                             } else {
@@ -4553,6 +4637,118 @@ mod tests {
         let wood = rows(Mat::Wood, 200, 290);
         assert!(rock.iter().min().is_some_and(|&y| y > 400), "the rock sank: rows {:?}", rock.first());
         assert!(wood.iter().max().is_some_and(|&y| y < 350), "the log floats: rows {:?}", wood.last());
+    }
+
+    /// A floor of rock on the base of the world, `top` rows thick.
+    fn rock_floor(w: &mut World, top: i32) {
+        for x in 0..W as i32 {
+            for y in H as i32 - top..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+    }
+
+    #[test]
+    fn a_log_painted_against_a_cliff_falls_as_one_piece() {
+        let mut w = World::new();
+        w.climate_fixed = Some(15.0);
+        w.reset_temps();
+        rock_floor(&mut w, 10);
+        for x in 190..=210 {
+            for y in 200..H as i32 - 10 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        // A stroke of wood that touches the side of the cliff: it does not stick to it.
+        w.new_log();
+        w.line((217, 150), (240, 150), 5, Mat::Wood);
+        let cells = |w: &World| (0..W * H).filter(|&i| w.cells[i].m == Mat::Wood).collect::<Vec<_>>();
+        let before = cells(&w);
+        let rows = |c: &[usize]| (c.iter().map(|i| i / W).min().unwrap(), c.iter().map(|i| i / W).max().unwrap());
+        for _ in 0..400 {
+            w.step();
+        }
+        let after = cells(&w);
+        assert_eq!(after.len(), before.len(), "the log keeps all its wood");
+        let ((t0, b0), (t1, b1)) = (rows(&before), rows(&after));
+        assert_eq!(b1 - t1, b0 - t0, "it keeps its shape");
+        assert_eq!(b1, H - 11, "it lies on the floor");
+    }
+
+    #[test]
+    fn two_logs_side_by_side_are_two_bodies() {
+        let mut w = World::new();
+        w.climate_fixed = Some(15.0);
+        w.reset_temps();
+        rock_floor(&mut w, 10);
+        // A pit in the floor, right of x = 300.
+        for x in 300..350 {
+            for y in H as i32 - 10..H as i32 - 2 {
+                w.set(x, y, Mat::Empty);
+            }
+        }
+        let floor = H as i32 - 10;
+        w.new_log();
+        w.line((262, floor - 4), (297, floor - 4), 3, Mat::Wood);
+        // The second log touches the end of the first one, over the pit.
+        w.new_log();
+        w.line((304, floor - 4), (335, floor - 4), 3, Mat::Wood);
+        for _ in 0..300 {
+            w.step();
+        }
+        let lowest = |x0: i32, x1: i32| (0..H as i32).rev().find(|&y| (x0..x1).any(|x| w.raw(x, y) == Mat::Wood)).unwrap();
+        assert_eq!(lowest(255, 300), floor - 1, "the first log stays on the floor");
+        assert!(lowest(302, 345) > floor + 4, "the second one fell into the pit: {}", lowest(302, 345));
+    }
+
+    #[test]
+    fn a_light_log_rests_on_sand() {
+        let mut w = World::new();
+        w.climate_fixed = Some(15.0);
+        w.reset_temps();
+        rock_floor(&mut w, 10);
+        let sand = H as i32 - 40;
+        for x in 0..W as i32 {
+            for y in sand..H as i32 - 10 {
+                w.set(x, y, Mat::Sand);
+            }
+        }
+        w.new_log();
+        w.line((300, 300), (330, 300), 3, Mat::Wood);
+        for _ in 0..400 {
+            w.step();
+        }
+        let lowest = (0..H as i32).rev().find(|&y| (295..335).any(|x| w.raw(x, y) == Mat::Wood)).unwrap();
+        assert!(lowest < sand + 2, "the log lies on the sand, not buried in it: {lowest}");
+    }
+
+    #[test]
+    fn a_planted_tree_stands_on_the_ground() {
+        let mut w = World::new();
+        w.climate_fixed = Some(15.0);
+        w.reset_temps();
+        rock_floor(&mut w, 10);
+        let ground = H as i32 - 30;
+        for x in 0..W as i32 {
+            for y in ground..H as i32 - 10 {
+                w.set(x, y, Mat::Dirt);
+            }
+        }
+        // A click in the sky plants it on the ground below; one in the water does not.
+        assert!(w.plant_tree(400, 80, 0.5));
+        let trunk = |w: &World| (0..H as i32).filter(|&y| w.raw(400, y) == Mat::Trunk).collect::<Vec<_>>();
+        let t = trunk(&w);
+        assert_eq!(*t.last().unwrap(), ground - 1, "the trunk stands on the soil");
+        assert!(t.len() as i32 >= 8 * K);
+        assert!(w.cells.iter().filter(|c| c.m == Mat::Leaf).count() > 100, "it has a crown");
+        for _ in 0..200 {
+            w.step();
+        }
+        assert_eq!(trunk(&w), t, "it stays standing");
+        for y in ground - 6..ground {
+            w.set(600, y, Mat::Water);
+        }
+        assert!(!w.plant_tree(600, 80, 0.5), "no tree in a lake");
     }
 
     #[test]

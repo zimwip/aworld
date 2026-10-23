@@ -4,6 +4,7 @@
 //! the cells is plenty and costs nothing).
 
 use crate::car::{Car, S};
+use crate::firetruck::{self, Truck};
 use crate::render::View;
 use crate::world::{Mat, World, H, W};
 use macroquad::prelude::*;
@@ -103,15 +104,46 @@ impl Debris {
         for k in 0..3 {
             parts.push((local(-hl * 0.3 + k as f32 * hl * 0.3, top + 1.5), Shape::Panel { w: 3.0, h: 2.0 }, (170, 225, 250)));
         }
+        self.fling(parts, car.p, car.v * 0.5, car.angle);
+    }
+
+    /// Blows a fire engine apart: wheels, red panels, the cab's windscreen and its long ladder,
+    /// thrown higher than a car's (its fuel and its tank under pressure make a bigger bang).
+    pub fn burst_truck(&mut self, t: &Truck) {
+        self.seed ^= t.age.wrapping_mul(2654435761) | 1;
+        let half = firetruck::LENGTH * 0.5;
+        let h = firetruck::BODY_HEIGHT;
+        let base = vec2(t.x, t.y);
+        let local = |lx: f32, ly: f32| base + Vec2::from_angle(t.tilt).rotate(vec2(lx * t.dir, -ly));
+        let (red, dark) = ((214, 36, 36), (120, 16, 20));
+        let mut parts: Vec<(Vec2, Shape, (u8, u8, u8))> = vec![];
+        for wx in firetruck::WHEELS {
+            parts.push((local(wx * half, firetruck::WHEEL_R), Shape::Wheel { r: firetruck::WHEEL_R }, (26, 26, 32)));
+        }
+        let (pw, ph) = (2.0 * half / 4.0, (h - 5.0) / 2.0);
+        for row in 0..2 {
+            for col in 0..4 {
+                let c = local(-half + pw * (col as f32 + 0.5), 3.0 + ph * (row as f32 + 0.5));
+                parts.push((c, Shape::Panel { w: pw * 0.9, h: ph * 0.9 }, if row == 0 { dark } else { red }));
+            }
+        }
+        parts.push((local(half * 0.7, h - 7.0), Shape::Panel { w: 6.0, h: 3.5 }, (170, 220, 250)));
+        parts.push((local(-half * 0.3, h + 0.5), Shape::Panel { w: half * 1.1, h: 1.6 }, (200, 204, 214)));
+        parts.push((local(-half * 0.2, h + 1.5), Shape::Panel { w: half * 0.6, h: 1.6 }, (200, 204, 214)));
+        self.fling(parts, local(0.0, h * 0.4), vec2(t.dir * 0.4, -0.8), t.tilt);
+    }
+
+    /// Throws `parts` out of a blast at `centre`, on top of the speed `v` they already had.
+    fn fling(&mut self, parts: Vec<(Vec2, Shape, (u8, u8, u8))>, centre: Vec2, v0: Vec2, angle: f32) {
         for (p, shape, color) in parts {
-            // Away from the centre of the blast, but the ground under the car sends everything up.
-            let d = p - car.p;
+            // Away from the centre of the blast, but the ground under it sends everything up.
+            let d = p - centre;
             let away = vec2(d.x, d.y.min(0.0)).normalize_or(vec2(0.0, -1.0));
             let speed = 0.9 + 1.4 * self.rand();
             let lift = 1.0 + 1.6 * self.rand();
-            let v = car.v * 0.5 + away * speed + vec2((self.rand() - 0.5) * 1.2, -lift);
+            let v = v0 + away * speed + vec2((self.rand() - 0.5) * 1.2, -lift);
             let spin = (self.rand() - 0.5) * 0.7;
-            self.pieces.push(Piece { p, v, angle: car.angle, spin, shape, color, hot: 1.0, age: 0, contact: false, rest: false });
+            self.pieces.push(Piece { p, v, angle, spin, shape, color, hot: 1.0, age: 0, contact: false, rest: false });
         }
         if self.pieces.len() > MAX_PIECES {
             let extra = self.pieces.len() - MAX_PIECES;

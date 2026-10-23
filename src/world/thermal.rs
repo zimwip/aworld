@@ -299,18 +299,6 @@ fn takes_heat(m: Mat) -> bool {
     matches!(m, Mat::Empty | Mat::Steam | Mat::Cloud | Mat::Smoke)
 }
 
-/// Solid and liquid states of one matter, the temperature where one turns into the other, and the
-/// latent heat between them. Water boils as well (see `latent_heat`).
-fn fusion(m: Mat) -> Option<(Mat, Mat, f32, f32)> {
-    match m {
-        Mat::Ice | Mat::Snow | Mat::Hail => Some((m, Mat::Water, MELT_C, LATENT_FUSION)),
-        Mat::Water => Some((Mat::Ice, Mat::Water, FREEZE_C, LATENT_FUSION)),
-        Mat::Stone | Mat::Lava => Some((Mat::Stone, Mat::Lava, ROCK_MELT_C, LATENT_ROCK)),
-        Mat::Iron | Mat::Molten => Some((Mat::Iron, Mat::Molten, METAL_MELT_C, LATENT_METAL)),
-        Mat::Steel | Mat::MoltenSteel => Some((Mat::Steel, Mat::MoltenSteel, METAL_MELT_C, LATENT_METAL)),
-        _ => None,
-    }
-}
 
 /// How warm a vapour can get before it no longer condenses: its dew point. `share` is how much
 /// of the air around it is vapour (0 to 1); a cell of steam on its own is damp air (saturated at
@@ -652,7 +640,7 @@ impl World {
     }
 
     /// `chance(n)` for a thermal rate: with a simplified (less frequent) pass the odds are scaled up.
-    fn chance_t(&mut self, n: u32) -> bool {
+    pub(super) fn chance_t(&mut self, n: u32) -> bool {
         let n = (n as f32 / self.thermal_scale()).round().max(1.0) as u32;
         self.chance(n)
     }
@@ -1142,7 +1130,7 @@ impl World {
     /// fire, melting ice at 0 °C, setting lava at its melting point. Heat that went in and was not
     /// enough is given back if the cell cools again. Returns true when the cell changed state.
     fn latent_heat(&mut self, i: usize, x: i32, y: i32, m: Mat, t: f32) -> bool {
-        let Some((solid, liquid, at, lat)) = fusion(m) else { return false };
+        let Some(&super::matter::Fusion { solid, liquid, at, latent: lat }) = super::matter::fusion(m) else { return false };
         if m == Mat::Water {
             // Water boils later under pressure (a pressure cooker, the deep of a lake) and earlier
             // in a partial vacuum.
@@ -1285,7 +1273,10 @@ impl World {
     /// Material changes driven by temperature. Transformations consume their
     /// inputs: water that boils is gone, steam that condenses is a cloud.
     fn react(&mut self, i: usize, x: i32, y: i32, m: Mat, t: f32) {
-        if fusion(m).is_some() && self.latent_heat(i, x, y, m, t) {
+        if super::matter::fusion(m).is_some() && self.latent_heat(i, x, y, m, t) {
+            return;
+        }
+        if self.heat_change(i, x, y, m) {
             return;
         }
         let t = self.temp[i];
@@ -1317,12 +1308,6 @@ impl World {
                     }
                 }
             }
-            Mat::Sand | Mat::Shard => {
-                // Sand fuses into glass (which does not melt back in a fire).
-                if t >= GLASS_C && self.chance_t(15) {
-                    self.turn(x, y, Mat::Glass);
-                }
-            }
             Mat::Glass => {
                 // Thermal shock: neighbours at very different temperatures crack it.
                 let mut worst = 0.0f32;
@@ -1333,11 +1318,6 @@ impl World {
                 }
                 if worst > SHOCK_C && self.chance_t(6) {
                     self.shatter(x, y);
-                }
-            }
-            Mat::Clay => {
-                if t >= KILN_C && self.chance_t(12) {
-                    self.set(x, y, Mat::Terracotta);
                 }
             }
             Mat::Rust => {
@@ -1362,18 +1342,6 @@ impl World {
                     if let Some((cx, cy)) = self.find_near(x, y, 3, Mat::Charcoal).or_else(|| self.find_near(x, y, 3, Mat::Ember)) {
                         self.set(cx, cy, Mat::Empty);
                         self.set(x, y, Mat::Steel);
-                    }
-                }
-            }
-            Mat::Wood | Mat::Trunk | Mat::Leaf | Mat::Branch | Mat::DeadLeaf => {
-                // With air it burns; shut away from the air it only chars (pyrolysis): the
-                // water and the tars leave and almost pure carbon stays, charcoal.
-                if t >= WOOD_IGNITE_C {
-                    let air = self.breathes(x, y);
-                    if air && self.chance_t(10) {
-                        self.set(x, y, Mat::Ember);
-                    } else if !air && self.chance_t(40) {
-                        self.set(x, y, Mat::Charcoal);
                     }
                 }
             }
