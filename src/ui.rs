@@ -51,9 +51,50 @@ pub enum Icon {
 pub struct Ui {
     pub font: Font,
     pub mouse: Vec2,
+    /// A click for what is being drawn now: false when a window in front of it is under the pointer.
     pub pressed: bool,
     /// When set, buttons use this text size (so that a row of tabs reads evenly).
     pub force_size: Option<u16>,
+    /// Under a modal window nothing else answers a click.
+    pub muted: bool,
+    /// The click of this frame, whoever it goes to, and where the pointer is on the screen.
+    click: bool,
+    screen_mouse: Vec2,
+    layers: Layers,
+}
+
+/// The windows (menus, bars, pills) in the order they are drawn, back first, so that a click goes
+/// to the frontmost one under the pointer and to nothing beneath it, neither a window nor the world.
+#[derive(Default)]
+pub struct Layers {
+    /// This frame's windows.
+    now: Vec<(&'static str, Rect)>,
+    /// Last frame's: what was on the screen when the player clicked.
+    seen: Vec<(&'static str, Rect)>,
+}
+
+impl Layers {
+    pub fn next_frame(&mut self) {
+        self.seen = std::mem::take(&mut self.now);
+    }
+
+    /// `id` covers `r` (a window may claim several rectangles).
+    pub fn claim(&mut self, id: &'static str, r: Rect) {
+        self.now.push((id, r));
+    }
+
+    /// Is `p` on a window drawn in front of `id`? A window that was not there is in front of all.
+    pub fn covered(&self, id: &'static str, p: Vec2) -> bool {
+        match self.seen.iter().rposition(|(n, _)| *n == id) {
+            Some(i) => self.seen[i + 1..].iter().any(|(n, r)| *n != id && r.contains(p)),
+            None => false,
+        }
+    }
+
+    /// Is `p` on any window (so not on the world)?
+    pub fn any(&self, p: Vec2) -> bool {
+        self.seen.iter().any(|(_, r)| r.contains(p))
+    }
 }
 
 pub fn rrect(r: Rect, rad: f32, c: Color) {
@@ -278,10 +319,42 @@ pub fn draw_icon(icon: Icon, c: Vec2, s: f32, col: Color) {
 }
 
 impl Ui {
+    pub fn new(font: Font) -> Ui {
+        Ui { font, mouse: Vec2::ZERO, pressed: false, force_size: None, muted: false, click: false, screen_mouse: Vec2::ZERO, layers: Layers::default() }
+    }
+
     pub fn begin(&mut self) {
         let (x, y) = mouse_position();
         self.mouse = vec2(x, y);
-        self.pressed = is_mouse_button_pressed(MouseButton::Left);
+        self.screen_mouse = self.mouse;
+        self.click = is_mouse_button_pressed(MouseButton::Left);
+        self.pressed = self.click;
+        self.muted = false;
+        self.layers.next_frame();
+    }
+
+    /// No click this frame (and the pointer at `at`), for screenshots.
+    pub fn freeze(&mut self, at: Vec2) {
+        self.click = false;
+        self.pressed = false;
+        self.mouse = at;
+        self.screen_mouse = at;
+    }
+
+    /// What follows is drawn in the window `id`: it gets the click only if no window in front of
+    /// it is under the pointer.
+    pub fn layer(&mut self, id: &'static str) {
+        self.pressed = self.click && !self.muted && !self.layers.covered(id, self.screen_mouse);
+    }
+
+    /// The window `id` is at `r` on the screen: clicks there are its own.
+    pub fn claim(&mut self, id: &'static str, r: Rect) {
+        self.layers.claim(id, r);
+    }
+
+    /// Is the pointer on a window rather than on the world?
+    pub fn over_ui(&self) -> bool {
+        self.layers.any(self.screen_mouse)
     }
 
     pub fn text(&self, s: &str, x: f32, y: f32, size: u16, c: Color) {
@@ -472,7 +545,39 @@ impl Drawer {
 
 #[cfg(test)]
 mod tests {
-    use super::Drawer;
+    use super::{Drawer, Layers};
+    use macroquad::prelude::{vec2, Rect};
+
+    /// The palette (at the left) is drawn after the day pill, which it overlaps when it is out.
+    fn pill_under_palette() -> Layers {
+        let mut l = Layers::default();
+        l.claim("hud", Rect::new(0.0, 0.0, 300.0, 26.0));
+        l.claim("panel", Rect::new(0.0, 0.0, 200.0, 600.0));
+        l.next_frame();
+        l
+    }
+
+    #[test]
+    fn a_click_on_a_window_does_not_reach_the_one_under_it() {
+        let l = pill_under_palette();
+        let on_both = vec2(100.0, 10.0);
+        assert!(l.covered("hud", on_both), "the pill must not open the world's menu under the palette");
+        assert!(!l.covered("panel", on_both), "the palette's buttons get the click");
+        assert!(!l.covered("hud", vec2(250.0, 10.0)), "the pill still answers beside the palette");
+    }
+
+    #[test]
+    fn a_click_on_a_window_does_not_reach_the_world() {
+        let l = pill_under_palette();
+        assert!(l.any(vec2(100.0, 300.0)));
+        assert!(!l.any(vec2(400.0, 300.0)));
+    }
+
+    #[test]
+    fn a_window_that_just_opened_is_in_front() {
+        let l = pill_under_palette();
+        assert!(!l.covered("climate", vec2(100.0, 10.0)));
+    }
 
     fn run(d: &mut Drawer, hovering: bool, frames: usize) {
         for _ in 0..frames {
