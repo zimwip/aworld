@@ -843,8 +843,9 @@ impl World {
                 self.latent[i] += (t - boil) * C_WATER;
                 self.temp[i] = boil;
                 if self.latent[i] >= LATENT_VAPOUR {
-                    self.set(x, y, Mat::Steam);
+                    // It swells into several cells of steam (see `vaporize`).
                     self.temp[i] = boil + 1.0;
+                    self.vaporize(x, y);
                     return true;
                 }
             } else if t < FREEZE_C {
