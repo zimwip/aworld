@@ -2631,7 +2631,7 @@ impl Game {
             self.hover_info = Some(("Tester (Espace)".to_string(), "Lance la simulation pour voir ce qui se passe. Tu peux encore bricoler pendant le test, même en pause, mais rien de tout ça n'est gardé : Réessayer revient au monde construit.".to_string()));
         }
         let r = place(2, &mut x);
-        if ui.button(r, "Défi", Icon::Flag, self.challenge, !self.challenge, RED) {
+        if ui.button(r, "Défi", Icon::Flag, self.challenge, true, RED) && !self.challenge {
             self.start_challenge();
         }
         if ui.hover(r) {
@@ -3548,8 +3548,8 @@ impl Game {
                 ui.wrapped(text, r.x + 8.0, r.y + 33.0, r.w - 16.0, 13, TEXT);
             }
             None => {
-                ui.text("Espace : jouer / pause", r.x + 8.0, r.y + 19.0, 13, DIM);
-                ui.text("R retour · C voiture · Z annuler", r.x + 8.0, r.y + 36.0, 13, DIM);
+                ui.text("Espace : tester / pause", r.x + 8.0, r.y + 19.0, 13, DIM);
+                ui.text("R réessayer · C voiture · Z annuler", r.x + 8.0, r.y + 36.0, 13, DIM);
                 ui.text("H thermique · X efforts · V vent", r.x + 8.0, r.y + 53.0, 13, DIM);
                 ui.text("Ctrl + molette/glisser : zoom", r.x + 8.0, r.y + 70.0, 13, DIM);
                 ui.text("Survole une case pour apprendre", r.x + 8.0, r.y + 90.0, 13, DIM);
