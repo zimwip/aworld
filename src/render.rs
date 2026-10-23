@@ -75,7 +75,7 @@ void main() {
     // Heat haze: hot air shifts what is seen through it, in ripples that rise with the warm air.
     float heat = texture2D(Light, uv).g;
     vec2 cellf = uv / texel;
-    vec2 p = uv + vec2(sin(cellf.y * 0.45 + time * 9.0 + cellf.x * 0.08), 0.5 * cos(cellf.x * 0.3 - time * 6.0)) * texel * heat * 1.8;
+    vec2 p = uv + vec2(sin(cellf.y * 0.45 + time * 6.0 + cellf.x * 0.08), 0.4 * cos(cellf.x * 0.3 - time * 4.0)) * texel * heat * 0.7;
     vec4 c = texture2D(Texture, p);
     vec3 glow = vec3(0.0);
     float wsum = 0.0;
@@ -117,7 +117,7 @@ void main() {
     }
     float a = max(c.a, clamp(length(glow) * 2.0, 0.0, 1.0));
     // In clear air the haze shows itself as faint bright and dark ripples.
-    float rip = sin(cellf.y * 0.5 + time * 10.0 + cellf.x * 0.11) * heat * 0.07 * (1.0 - a);
+    float rip = sin(cellf.y * 0.5 + time * 7.0 + cellf.x * 0.11) * heat * 0.025 * (1.0 - a);
     gl_FragColor = vec4(rgb + vec3(max(rip, 0.0)), a + max(-rip, 0.0));
 }";
 
@@ -249,14 +249,14 @@ pub fn light_map(world: &World, out: &mut [[u8; 4]]) {
                         Mat::Fire => glow += 1.0,
                         Mat::Lava => glow += 1.3,
                         Mat::Ember => glow += 0.5,
-                        Mat::Empty | Mat::Steam | Mat::Smoke => heat += ((world.temp[i] - 40.0) / 160.0).clamp(0.0, 1.0),
+                        Mat::Empty | Mat::Steam | Mat::Smoke => heat += ((world.temp[i] - 60.0) / 160.0).clamp(0.0, 1.0),
                         _ => {}
                     }
                 }
             }
             let soft = |v: f32, k: f32| (255.0 * (1.0 - (-v / k).exp())) as u8;
             // Above a flame the air is hot too, even before the simulation has warmed it.
-            out[ty * LW + tx] = [soft(glow, 5.0), soft(heat + glow * 0.5, 6.0), 0, 255];
+            out[ty * LW + tx] = [soft(glow, 5.0), soft(heat + glow * 0.5, 10.0), 0, 255];
         }
     }
 }
