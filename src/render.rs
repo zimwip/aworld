@@ -58,7 +58,8 @@ void main() {
 // The texture is premultiplied RGBA. Bright orange cells (fire, lava, embers)
 // bloom into their surroundings; every solid gets a light top edge.
 // `Light` is the light map (see `light_map`): its green channel is the hot air, which bends the
-// light passing through it, so everything seen through it wobbles (heat haze).
+// light passing through it, so everything seen through it wobbles (heat haze); its blue channel
+// is the shadow of the clouds, which dims the sunlit world under them.
 // `sky` is (sun x, sun strength, moon x, moon strength), x from 0 to 1 across the world.
 const FRAG: &str = "#version 100
 precision highp float;
@@ -127,6 +128,9 @@ void main() {
     float hot = step(0.93, c.r) * step(c.b, 0.3) * step(0.5, c.a);
     c.g += n * (0.06 * water + 0.36 * hot) * c.a;
     vec3 rgb = c.rgb + vec3(0.18) * edge * c.a + glow * 2.2;
+    // Cloud shadow: by day, what lies under a cloud (seen from the sun) is in the shade.
+    float shade = texture2D(Light, uv).b * sky.y;
+    rgb *= 1.0 - 0.45 * shade;
     // Glints: the little waves of the top few rows of water catch the sun (or the moon) and flash,
     // most of all under the sun, the way a lake sparkles.
     float a1 = texture2D(Texture, p - vec2(0.0, texel.y)).a;
@@ -134,7 +138,7 @@ void main() {
     float a3 = texture2D(Texture, p - vec2(0.0, texel.y * 6.0)).a;
     float surf = water * max(max(step(a1, 0.05), 0.75 * step(a2, 0.05)), 0.4 * step(a3, 0.05));
     if (surf > 0.0) {
-        float lit = sky.y * (0.35 + 0.65 * exp(-abs(uv.x - sky.x) * 4.0)) + 0.6 * sky.w * exp(-abs(uv.x - sky.z) * 6.0);
+        float lit = sky.y * (1.0 - shade) * (0.35 + 0.65 * exp(-abs(uv.x - sky.x) * 4.0)) + 0.6 * sky.w * exp(-abs(uv.x - sky.z) * 6.0);
         // A glint is a short horizontal streak: a wave face a few cells wide catching the light.
         vec2 facet = vec2(floor(cell.x / 3.0), cell.y);
         float t = time * 3.0 + hash(facet) * 9.0;
@@ -277,10 +281,16 @@ pub const LS: usize = 6;
 const LW: usize = W / LS;
 const LH: usize = H / LS;
 
-/// The light map: for each `LS`×`LS` square, how much it glows (fire, embers, lava) in red and how
-/// hot its air is (for the heat haze) in green. Both saturate softly, so a big blaze is not
-/// blinding and a single ember still shows.
+/// Fully cloudy, one square of the light map lets this fraction of the sunlight through, as the
+/// simulation does (it takes 20 % per cell of cloud).
+const CLOUD_PASS: f32 = 0.26;
+
+/// The light map: for each `LS`×`LS` square, how much it glows (fire, embers, lava) in red, how
+/// hot its air is (for the heat haze) in green, and how much of the sunlight the clouds, steam
+/// and smoke between it and the sun hold back (their shadow) in blue. Glow and heat saturate
+/// softly, so a big blaze is not blinding and a single ember still shows.
 pub fn light_map(world: &World, out: &mut [[u8; 4]]) {
+    let shadow = cloud_shadow(world);
     for ty in 0..LH {
         for tx in 0..LW {
             let (mut glow, mut heat) = (0.0f32, 0.0f32);
@@ -298,9 +308,52 @@ pub fn light_map(world: &World, out: &mut [[u8; 4]]) {
             }
             let soft = |v: f32, k: f32| (255.0 * (1.0 - (-v / k).exp())) as u8;
             // Above a flame the air is hot too, even before the simulation has warmed it.
-            out[ty * LW + tx] = [soft(glow, 5.0), soft(heat + glow * 0.5, 10.0), 0, 255];
+            out[ty * LW + tx] = [soft(glow, 5.0), soft(heat + glow * 0.5, 10.0), (shadow[ty * LW + tx] * 255.0) as u8, 255];
         }
     }
+}
+
+/// For each square of the light map, the share of the sunlight that clouds, steam and smoke stop
+/// before it gets there (0: full sun, 1: deep shade). The light comes along the sun's rays, so a
+/// cloud's shadow falls to the side of it in the morning and the evening. Worked out row by row
+/// from the top, each square takes the shade of the square the ray came from, plus that square's
+/// own cloud.
+pub fn cloud_shadow(world: &World) -> Vec<f32> {
+    let mut depth = vec![0.0f32; LW * LH];
+    if world.sun() <= 0.0 {
+        return depth;
+    }
+    // How much of each square is cloud (smoke is darker).
+    let mut cloud = vec![0.0f32; LW * LH];
+    for y in 0..H {
+        for x in 0..W {
+            let k = match world.cells[y * W + x].m {
+                Mat::Cloud | Mat::Steam => 1.0,
+                Mat::Smoke => 2.0,
+                _ => continue,
+            };
+            cloud[(y / LS) * LW + x / LS] += k / (LS * LS) as f32;
+        }
+    }
+    let (dx, dy) = world.sun_ray_dir();
+    // Squares the ray moves sideways per row (a very low sun is taken as a slanted one).
+    let slope = (dx / dy.max(0.05)).clamp(-3.0, 3.0);
+    let k = -CLOUD_PASS.ln();
+    for ty in 1..LH {
+        for tx in 0..LW {
+            let from = tx as f32 - slope;
+            let (i0, f) = (from.floor(), from - from.floor());
+            let at = |i: f32| {
+                let i = i as i32;
+                if i < 0 || i >= LW as i32 { 0.0 } else {
+                    let j = (ty - 1) * LW + i as usize;
+                    depth[j] + cloud[j] * k
+                }
+            };
+            depth[ty * LW + tx] = at(i0) * (1.0 - f) + at(i0 + 1.0) * f;
+        }
+    }
+    depth.iter().map(|d| 1.0 - (-d).exp()).collect()
 }
 
 impl Renderer {
@@ -1014,6 +1067,32 @@ pub fn draw_spring(sp: &Spring, v: View, stress: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cloud_casts_a_shadow_by_day_along_the_sun_rays_and_none_at_night() {
+        let mut w = World::new_static();
+        w.day_cycle = false;
+        for y in 120..150 {
+            for x in 420..540 {
+                w.set(x, y, Mat::Cloud);
+            }
+        }
+        let at = |sh: &[f32], x: usize, y: usize| sh[(y / LS) * LW + x / LS];
+        // Noon: the sun is high, the shadow falls straight down.
+        w.set_phase(0.25);
+        let sh = cloud_shadow(&w);
+        assert!(at(&sh, 480, 300) > 0.9, "deep shade under a thick cloud: {}", at(&sh, 480, 300));
+        assert!(at(&sh, 480, 100) < 0.01, "above the cloud the sun shines");
+        assert!(at(&sh, 150, 300) < 0.01, "far beside it, full sun");
+        // Morning: the sun is low in the east (left), the shadow falls to the right of the cloud.
+        w.set_phase(0.06);
+        let sh = cloud_shadow(&w);
+        let (left, right) = (at(&sh, 360, 300), at(&sh, 640, 300));
+        assert!(right > left + 0.5, "in the morning the shadow lies to the right: left {left}, right {right}");
+        // Night: no sun, no shadow.
+        w.set_phase(0.75);
+        assert!(cloud_shadow(&w).iter().all(|&v| v == 0.0));
+    }
 
     #[test]
     fn fire_lights_its_square_and_hot_air_makes_haze() {

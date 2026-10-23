@@ -23,6 +23,62 @@ const MOON_START_DAYS: f32 = 1.25;
 /// Row considered "ground level" for the air temperature profile.
 const GROUND_Y: f32 = 360.0;
 
+// The atmosphere is drawn on a logarithmic scale: near the ground a row is 10 m of air, but the
+// rows above `ALT_LINEAR_Y` stand for more and more altitude, so the top of the screen reaches
+// about 31 km (the stratosphere) while the valley keeps its human scale. Pressure and density
+// fall with altitude (`air_pressure_atm`), the air cools with height up to the tropopause
+// (`CEILING_Y`, about 13 km) and warms again above it.
+/// Up to this row (from the ground) the rows are evenly spaced.
+const ALT_LINEAR_Y: i32 = 280;
+/// Metres of air in one row near the ground.
+const ROW_M: f32 = 10.0;
+/// Above `ALT_LINEAR_Y`, the altitude a row stands for grows e-fold every this many rows.
+const ALT_E_ROWS: f32 = 75.0;
+/// Scale height of the air: pressure falls e-fold every this many metres.
+const SCALE_HEIGHT_M: f32 = 8400.0;
+/// How much colder the tropopause is than the very top of the sky.
+const TROP_DIP_C: f32 = 10.0;
+/// Rising steam and clouds cool as they expand (the adiabatic lapse rate, °C per km); sinking
+/// ones warm up. Moist air (a cloud, where droplets condense) cools more slowly than dry vapour.
+const LAPSE_STEAM_C_PER_KM: f32 = 9.8;
+const LAPSE_CLOUD_C_PER_KM: f32 = 6.0;
+
+fn altitude_table() -> &'static [f32; H] {
+    static T: std::sync::OnceLock<[f32; H]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [0.0; H];
+        for (y, z) in t.iter_mut().enumerate() {
+            let y = y as i32;
+            *z = if y >= ALT_LINEAR_Y {
+                (GROUND_Y - y as f32) * ROW_M
+            } else {
+                (GROUND_Y - ALT_LINEAR_Y as f32) * ROW_M + ROW_M * ALT_E_ROWS * (((ALT_LINEAR_Y - y) as f32 / ALT_E_ROWS).exp() - 1.0)
+            };
+        }
+        t
+    })
+}
+
+/// Altitude above the valley floor (m) that a row stands for (negative underground).
+pub fn altitude_m(y: i32) -> f32 {
+    altitude_table()[y.clamp(0, H as i32 - 1) as usize]
+}
+
+/// Pressure of the open air at a row (atm): 1 at the valley floor, thinning out with altitude.
+pub fn air_pressure_atm(y: i32) -> f32 {
+    (-altitude_m(y) / SCALE_HEIGHT_M).exp()
+}
+
+/// How much a gas cell of `m` cools (°C) when it rises from row `from` to row `to`.
+pub fn adiabatic_cooling_c(m: Mat, from: i32, to: i32) -> f32 {
+    let rate = match m {
+        Mat::Steam => LAPSE_STEAM_C_PER_KM,
+        Mat::Cloud => LAPSE_CLOUD_C_PER_KM,
+        _ => return 0.0,
+    };
+    rate * (altitude_m(to) - altitude_m(from)) / 1000.0
+}
+
 pub const FIRE_C: f32 = 650.0;
 pub const EMBER_C: f32 = 500.0;
 /// How much hotter burning charcoal glows than burning wood.
@@ -453,16 +509,20 @@ impl World {
         2.5 * (self.phase() * std::f32::consts::TAU).sin() + self.climate.sky_dev
     }
 
-    /// Air temperature at a row: it gets colder with altitude.
+    /// Air temperature at a row: it gets colder with altitude up to the tropopause
+    /// (`CEILING_Y`), then warmer again up to the top of the screen (the stratosphere).
     pub fn ambient_c(&self, y: i32) -> f32 {
         if let Some(t) = self.climate_fixed {
             return t;
         }
-        // The gradient starts at the top of the screen (around 0 °C) and runs down to
-        // the air temperature at ground level.
-        let f = (y as f32 / GROUND_Y).clamp(0.0, 1.0);
         let top = self.sky_top_c();
-        top + (self.surface_temp_c() - top) * f
+        let trop = top - TROP_DIP_C;
+        let (z, zt, z0) = (altitude_m(y), altitude_m(CEILING_Y), altitude_m(0));
+        if z <= zt {
+            trop + (self.surface_temp_c() - trop) * (1.0 - z.max(0.0) / zt)
+        } else {
+            trop + (top - trop) * ((z - zt) / (z0 - zt)).min(1.0)
+        }
     }
 
     /// Which way the sunlight travels (a unit vector, y down): from the sun towards the middle of
@@ -803,7 +863,9 @@ impl World {
                             break true;
                         }
                         Mat::Cloud | Mat::Steam => {
-                            let target = surf + 12.0 * here * 0.5;
+                            // The sun warms a cloud a little above the air at its height (not up
+                            // to the warmth of the valley floor, or high clouds would climb on).
+                            let target = row_amb[y] + 2.0 * here;
                             if target > self.temp[i] {
                                 let d = (target - self.temp[i]) * 0.04 * ts;
                                 self.temp[i] += d;
@@ -1921,5 +1983,27 @@ mod energy_probe {
             for _ in 0..DAY_STEPS / 8 { w.step(); }
             report(&w, &format!("d{}", d / 8));
         }
+    }
+}
+
+#[cfg(test)]
+mod atmosphere_tests {
+    use super::*;
+
+    #[test]
+    fn the_sky_is_drawn_on_a_logarithmic_scale_with_a_tropopause() {
+        // Near the ground a row is 10 m; up high a row stands for hundreds of metres.
+        assert_eq!(altitude_m(GROUND_Y as i32), 0.0);
+        assert!((altitude_m(ALT_LINEAR_Y) - 800.0).abs() < 1e-3);
+        assert!((10..=13).contains(&((altitude_m(CEILING_Y) / 1000.0) as i32)), "tropopause {} m", altitude_m(CEILING_Y));
+        assert!(altitude_m(0) > 25_000.0, "the top of the screen is in the stratosphere: {} m", altitude_m(0));
+        assert!((1..H as i32).all(|y| altitude_m(y - 1) > altitude_m(y)));
+        assert!(air_pressure_atm(0) < 0.05 && air_pressure_atm(CEILING_Y) < 0.3);
+        // Colder with height up to the tropopause, then warmer again.
+        let w = World::new();
+        let t: Vec<f32> = (0..H as i32).map(|y| w.ambient_c(y)).collect();
+        let coldest = (0..H).min_by(|&a, &b| t[a].total_cmp(&t[b])).unwrap();
+        assert!((coldest as i32 - CEILING_Y).abs() <= 1, "coldest row {coldest}");
+        assert!(t[0] > t[coldest] + 5.0 && t[GROUND_Y as usize] > t[coldest] + 5.0);
     }
 }

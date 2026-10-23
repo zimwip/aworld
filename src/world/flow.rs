@@ -631,6 +631,10 @@ impl World {
                 continue;
             }
             let (nx, ny) = (self.edge_x(x, y, x + tx), y + ty);
+            // The wind does not carry gas up past the top of the weather.
+            if ty < 0 && !self.gas_may_rise_to(x, y, ny) {
+                continue;
+            }
             if ny >= 0 && ny < H as i32 && self.at(nx, ny) == super::Mat::Empty {
                 return Some((nx, ny));
             }
