@@ -2447,7 +2447,7 @@ impl Game {
         let handle_w = 16.0;
         let edge = PANEL_W + self.panel_shift();
         let handle = Rect::new(edge.max(0.0), TOP_H, handle_w, sh - TOP_H);
-        let hovering = (ui.mouse.x < edge.max(handle_w) && ui.mouse.y > TOP_H) || handle.contains(ui.mouse);
+        let hovering = !ui.stroke && ((ui.mouse.x < edge.max(handle_w) && ui.mouse.y > TOP_H) || handle.contains(ui.mouse));
         self.panel.update(hovering, get_frame_time());
         let shift = self.panel_shift();
         let edge = PANEL_W + shift;
@@ -2515,7 +2515,7 @@ impl Game {
         let total: f32 = widths.iter().sum::<f32>() + gap * (widths.len() as f32 - 1.0) + pad * 2.0;
         let centre = self.left() + (sw - self.left()) / 2.0;
         let rest = Rect::new(centre - total / 2.0, sh - 66.0, total, 50.0);
-        let over = rest.contains(ui.mouse);
+        let over = ui.hover(rest);
         let want = if self.idle < 2.5 || over || self.player_pin || self.quit_modal { 1.0 } else { 0.0 };
         self.player_alpha += (want - self.player_alpha) * (dt * 9.0).min(1.0);
         if (self.player_alpha - want).abs() < 0.01 {
@@ -3213,7 +3213,7 @@ impl Game {
         let px = sw - VIEWS_TAB - VIEWS_W * self.views.open;
         let panel = Rect::new(px, y, VIEWS_W, h);
         let near_edge = ui.mouse.x > sw - 8.0 && ui.mouse.y > TOP_H && ui.mouse.y < y + h;
-        let hovering = tab.contains(ui.mouse) || (self.views.open > 0.05 && panel.contains(ui.mouse)) || near_edge;
+        let hovering = !ui.stroke && (tab.contains(ui.mouse) || (self.views.open > 0.05 && panel.contains(ui.mouse)) || near_edge);
         self.views.update(hovering, get_frame_time());
         let px = sw - VIEWS_TAB - VIEWS_W * self.views.open;
         let panel = Rect::new(px, y, VIEWS_W, h);
@@ -3373,7 +3373,7 @@ impl Game {
         let tab = Rect::new(sw - VIEWS_TAB, y, VIEWS_TAB, 96.0);
         let panel = Rect::new(sw - VIEWS_TAB - VIEWS_W * self.remote_menu.open, y, VIEWS_W, h);
         let near_edge = ui.mouse.x > sw - 8.0 && ui.mouse.y >= y && ui.mouse.y < y + h;
-        let hovering = tab.contains(ui.mouse) || (self.remote_menu.open > 0.05 && panel.contains(ui.mouse)) || near_edge;
+        let hovering = !ui.stroke && (tab.contains(ui.mouse) || (self.remote_menu.open > 0.05 && panel.contains(ui.mouse)) || near_edge);
         self.remote_menu.update(hovering, get_frame_time());
         let panel = Rect::new(sw - VIEWS_TAB - VIEWS_W * self.remote_menu.open, y, VIEWS_W, h);
         ui.layer("remote");
@@ -3499,7 +3499,7 @@ impl Game {
             first -= shown as f32 - 1.0;
         }
         let track = Rect::new(area.x + area.w - 10.0, top, 8.0, view_h);
-        if max_row > 0 && is_mouse_button_down(MouseButton::Left) && Rect::new(track.x - 8.0, track.y, track.w + 16.0, track.h).contains(ui.mouse) {
+        if max_row > 0 && !ui.stroke && is_mouse_button_down(MouseButton::Left) && Rect::new(track.x - 8.0, track.y, track.w + 16.0, track.h).contains(ui.mouse) {
             first = ((ui.mouse.y - track.y) / track.h * (max_row as f32 + 1.0)).floor();
         }
         first = first.clamp(0.0, max_row as f32);
@@ -4065,7 +4065,7 @@ async fn main() {
         ui.begin();
         // Screenshots must not depend on where the real pointer happens to be.
         if shot.is_some() {
-            ui.freeze(demo_mouse.unwrap_or(vec2(-1000.0, -1000.0)));
+            ui.freeze(demo_mouse.unwrap_or(vec2(-1000.0, -1000.0)), args.iter().any(|a| a == "--stroke"));
         }
         game.handle_keys();
         game.handle_camera(base, &ui);
@@ -4221,7 +4221,9 @@ async fn main() {
             shaken.oy += (t * 83.0).cos() * game.shake;
         }
         game.draw_scene(shaken, &mut renderer, &mut ui);
+        ui.begin_windows(view.visible());
         game.draw_ui(&mut ui, sw, sh);
+        ui.end_windows();
 
         frame += 1;
         frame_time += get_frame_time();

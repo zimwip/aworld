@@ -13,6 +13,9 @@ cargo run --release
 - **Palette de droite** (Vues) : elle sort quand la souris va au bord droit et se range quand elle s'en va ; la punaise
   (ou un clic sur l'onglet) la garde ouverte, comme la palette de gauche. Normale, Température (°C de chaque cellule),
   Efforts (charge des pièces, vert → rouge), Vent.
+- **Glisser un outil** (pinceau, lance-flammes…) : tant que le bouton reste enfoncé, les menus laissent passer la
+  souris (ils ne s'ouvrent pas, ne s'allument pas, ne cliquent pas) et celui que l'outil survole devient transparent,
+  pour voir le monde dessous et continuer le tracé (`--demo out.png --palette --mouse 1400,300 --stroke`).
 - **Barre du haut** : Jouer/Pause, Retour, Annuler (plusieurs fois, même en simulation), Voiture, vitesse, Tourner,
   emplacements 1-2-3, Sauver, Charger, Monde, Vide, Science (toutes les transformations), Plein écran.
 - **Construction** : le monde est figé tant qu'on n'a pas lancé. Pause redonne la main pour un 2e tour d'édition.

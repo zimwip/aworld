@@ -304,8 +304,8 @@ const NAMED_STARS: [Star; 20] = [
 /// The pole in the sky (as fractions of the world's width and height), and how many pixels per
 /// world height one unit of the stereographic map takes. Seen facing north, as if from mid
 /// latitudes: the pole high up, the Big Dipper and Cassiopeia wheeling around it.
-const POLE: (f32, f32) = (0.5, 0.38);
-const SKY_UNIT: f32 = 0.26;
+const POLE: (f32, f32) = (0.5, 0.36);
+const SKY_UNIT: f32 = 0.42;
 
 /// Where the stars stand, in degrees (local sidereal time): which right ascension is due south
 /// right now. It goes round once a day, and a little further each day of the year, as the sun
