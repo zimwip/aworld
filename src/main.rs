@@ -3017,6 +3017,7 @@ impl Game {
                     ui.text(label, bar.x + bar.w * u - 5.0, bar.y + 25.0, 11, DIM);
                 }
                 ui.text("°C", bar.x + bar.w - 14.0, ly + 10.0, 11, DIM);
+                ui.wrapped("Chaque grain a sa température. Points clairs : grains de vapeur, nuage ou fumée portés par le vent.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
             }
             ViewMode::Stress => {
                 for i in 0..40 {
@@ -3043,7 +3044,7 @@ impl Game {
                     ui.text(label, bar.x + bar.w * u - 4.0, bar.y + 25.0, 11, DIM);
                 }
                 ui.text("atm", bar.x + bar.w - 20.0, ly + 10.0, 11, DIM);
-                ui.wrapped("Air : plus mince en altitude, plus dense dans les courants. Liquides : le poids de la colonne. Solides : le poids au-dessus. Traits sombres : frontières gaz / liquide / solide.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
+                ui.wrapped("Air : plus mince en altitude, plus dense dans les courants. Liquides : le poids de la colonne. Solides : le poids au-dessus. Traits sombres : frontières gaz / liquide / solide. Points clairs : grains de gaz, à la pression de l'air autour.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
             }
             ViewMode::Humidity => {
                 for i in 0..40 {
@@ -3057,7 +3058,7 @@ impl Game {
                 }
                 ui.text("sec", bar.x, bar.y + 25.0, 11, DIM);
                 ui.text("100 %", bar.x + bar.w - 28.0, bar.y + 25.0, 11, DIM);
-                ui.wrapped("Air : part de vapeur d'eau par rapport à ce que l'air peut tenir (l'air froid en tient peu). Liquides : toujours 100 %. Gris : solide sec ; la terre garde son humidité.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
+                ui.wrapped("Air : part de vapeur d'eau par rapport à ce que l'air peut tenir (l'air froid en tient peu). Liquides : toujours 100 %. Points clairs : vapeur et nuage, de l'air saturé (100 %). Gris : solide sec ; la terre garde son humidité.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
             }
             ViewMode::Normal => {
                 ui.wrapped("Touches : H température, X efforts, V vent, P pression, Y hygrométrie.", bar.x, bar.y + 2.0, bar.w, 11, DIM);
