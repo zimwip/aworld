@@ -545,6 +545,12 @@ pub struct State {
     clock: u32,
 }
 
+impl State {
+    pub fn clock(&self) -> u32 {
+        self.clock
+    }
+}
+
 /// A copy of the matter of every cell and of the states it carries (see `Aspect`), but its heat.
 #[derive(Clone)]
 pub struct Matter {
@@ -816,6 +822,11 @@ impl World {
         for (i, m) in mats.iter().enumerate().take(W * H) {
             self.set((i % W) as i32, (i / W) as i32, *m);
         }
+    }
+
+    /// The matter of a cell in a captured state (empty outside the world).
+    pub fn raw_in(st: &State, x: i32, y: i32) -> Mat {
+        if Self::inb(x, y) { st.matter.cells[Self::idx(x, y)].m } else { Mat::Empty }
     }
 
     pub fn capture(&self) -> State {

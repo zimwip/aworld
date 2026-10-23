@@ -24,7 +24,7 @@ mod whale;
 mod wolves;
 mod world;
 
-use blocks::{anchor_world, block_at, magnet, node_at, placement_ok, stamp_all, Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, Physics, Spring, SpringKind, MEMBER_MAX_LEN, SPRING_MAX_LEN};
+use blocks::{anchor_world, block_at, magnet, node_at, placement_ok, stamp_all, Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, MemberRole, Physics, Spring, SpringKind, MEMBER_MAX_LEN, SPRING_MAX_LEN};
 use car::{collide_cars, Car, Fate, ModelKind, Tuning};
 use macroquad::prelude::*;
 use render::{RenderMode, cable_preview, draw_block, draw_block_shape, draw_guides, draw_booms, draw_cable, draw_car, draw_flag, draw_member, draw_spring, draw_spring_between, Boom, LiveBolt, Renderer, View, BOLT_LIFE};
@@ -33,7 +33,7 @@ use mech::{GearSize, Mechanism};
 use mechgame::MechDraft;
 use sound::{Ev, Mix, Sounds};
 use ui::{draw_icon, rrect, Drawer, Icon, Ui, ACCENT, BG, BLUE, DIM, GREEN, PANEL, RED, TEXT, TILE, TILE_HOT};
-use world::{Biome, Mat, Matter, PaintRule, Season, World, H, W};
+use world::{Biome, Mat, PaintRule, Season, World, H, W};
 
 /// Simulation steps per second at speed x1 (the rigid bodies use the same 1/60 s step).
 const STEPS_PER_SECOND: f32 = 60.0;
@@ -80,7 +80,8 @@ enum Tool {
     Block(BlockKind),
     Cable(CableMat),
     Spring(SpringKind),
-    Beam(MemberMat),
+    /// A rod: its material, and whether it is deck (cars ride it) or girder (they pass through).
+    Beam(MemberMat, MemberRole),
     Gear(GearSize),
     Motor,
     Axle,
@@ -118,7 +119,8 @@ fn window_conf() -> Conf {
     }
 }
 
-/// Everything needed to put the world back as it was just before a brick was dropped.
+/// Everything needed to put the world back as it was: just before a brick was dropped (undo), or
+/// as it was built before the simulation started (the plan).
 struct Snapshot {
     state: world::State,
     blocks: Vec<Block>,
@@ -146,13 +148,15 @@ struct Game {
     heat_cells: u32,
     undo: Vec<Snapshot>,
     world: World,
-    snap_cells: Matter,
-    snap_blocks: Vec<Block>,
-    snap_cables: Vec<Cable>,
-    snap_members: Vec<Member>,
-    snap_springs: Vec<Spring>,
+    /// The world as it was built, taken when the simulation is first started from the drawing
+    /// board: Réessayer puts it back. None while building (nothing has run since the last
+    /// Réessayer). Whatever happens once it is taken, paused or not, is a test and is not kept.
+    plan: Option<Snapshot>,
+    /// How many undo steps there were when the plan was taken (later ones belong to the test).
+    plan_undo: usize,
+    /// The challenge (mode jeu): building is locked until Réessayer.
+    challenge: bool,
     mech: Mechanism,
-    snap_mech: Mechanism,
     mech_draft: Option<MechDraft>,
     /// How the next motor turns, and whether it reverses itself when overloaded.
     motor_dir: f32,
@@ -260,6 +264,10 @@ struct Game {
     /// whose states are shown under its button (the little arrow).
     matter_state: [usize; MATTERS.len()],
     matter_menu: Option<usize>,
+    /// Deck or girder, picked per rod material from the little arrow of its button.
+    beam_role: [MemberRole; MemberMat::ALL.len()],
+    /// The rod material whose deck / girder strip is open.
+    beam_menu: Option<usize>,
     /// The views on the right edge, a side menu like the palette.
     views: Drawer,
     /// The motor's remote control (or the car settings), a side menu of its own under the views:
@@ -294,13 +302,10 @@ impl Game {
             sounds: Sounds::silent(),
             heat_cells: 0,
             undo: vec![],
-            snap_cells: world.snapshot(),
-            snap_blocks: vec![],
-            snap_cables: vec![],
-            snap_members: vec![],
-            snap_springs: vec![],
+            plan: None,
+            plan_undo: 0,
+            challenge: false,
             mech: Mechanism::default(),
-            snap_mech: Mechanism::default(),
             mech_draft: None,
             motor_dir: 1.0,
             motor_reverse: false,
@@ -375,6 +380,8 @@ impl Game {
             only_target: Mat::Empty,
             matter_state: MATTERS.map(|m| m.default),
             matter_menu: None,
+            beam_role: [MemberRole::Deck; MemberMat::ALL.len()],
+            beam_menu: None,
             views: Drawer::new(false),
             remote_menu: Drawer::new(false),
             camera: camera::Camera::default(),
@@ -394,7 +401,17 @@ impl Game {
 
     /// Remember the world right now so the next edit can be undone.
     fn checkpoint(&mut self) {
-        self.undo.push(Snapshot {
+        let s = self.capture();
+        self.undo.push(s);
+        if self.undo.len() > 15 {
+            self.undo.remove(0);
+            self.plan_undo = self.plan_undo.saturating_sub(1);
+        }
+    }
+
+    /// Everything about the world right now, without the physics.
+    fn capture(&self) -> Snapshot {
+        Snapshot {
             state: self.world.capture(),
             blocks: self.blocks.iter().map(|b| Block { body: None, ..b.clone() }).collect(),
             cables: self.cables.iter().map(Cable::fresh).collect(),
@@ -404,13 +421,19 @@ impl Game {
             cars: self.cars.clone(),
             arrived: self.arrived,
             lost: self.lost,
-        });
-        if self.undo.len() > 15 {
-            self.undo.remove(0);
         }
     }
 
     fn undo(&mut self) {
+        if self.challenge {
+            self.say("Défi en cours : Réessayer pour reprendre la construction");
+            return;
+        }
+        // During a test, undo stops at the plan: the building steps come back with Réessayer.
+        if self.plan.is_some() && self.undo.len() <= self.plan_undo {
+            self.say("Rien à annuler dans ce test (Réessayer revient au départ)");
+            return;
+        }
         let Some(s) = self.undo.pop() else {
             self.say("Rien à annuler");
             return;
@@ -505,12 +528,14 @@ impl Game {
 
     fn set_running(&mut self, run: bool) {
         if run && !self.running {
-            self.snap_cells = self.world.snapshot();
-            self.snap_blocks = self.blocks.iter().map(|b| Block { body: None, ..b.clone() }).collect();
-            self.snap_cables = self.cables.iter().map(Cable::fresh).collect();
-            self.snap_members = self.members.iter().map(Member::fresh).collect();
-            self.snap_springs = self.springs.iter().map(Spring::fresh).collect();
-            self.snap_mech = self.mech.clone();
+            // Only the first start from the drawing board takes the plan: a pause and a new start
+            // go on with the same test.
+            if self.plan.is_none() {
+                self.plan = Some(self.capture());
+                self.plan_undo = self.undo.len();
+                self.arrived = 0;
+                self.lost = 0;
+            }
             if self.phys.is_none() {
                 self.build_physics();
             }
@@ -518,23 +543,54 @@ impl Game {
         self.running = run;
     }
 
+    /// Is the world being built (nothing has run since the last Réessayer)?
+    fn building(&self) -> bool {
+        self.plan.is_none()
+    }
+
+    /// The challenge: back to the plan if a test was going on, building locked, and go.
+    fn start_challenge(&mut self) {
+        if self.plan.is_some() {
+            self.reset();
+        }
+        self.set_running(true);
+        self.challenge = true;
+        self.shovel = None;
+        self.selection = None;
+        self.say("Défi lancé : la construction est verrouillée. Réessayer pour la reprendre.");
+    }
+
+    /// Réessayer: the world as it was built, the counters at zero, back to building.
     fn reset(&mut self) {
-        self.world.restore(&self.snap_cells);
+        let Some(plan) = self.plan.take() else {
+            self.say("Tu es déjà au départ");
+            return;
+        };
+        self.world.restore_state(&plan.state);
         self.sensors.clear_history(&self.world);
-        self.blocks = self.snap_blocks.clone();
-        self.cables = self.snap_cables.iter().map(Cable::fresh).collect();
-        self.members = self.snap_members.iter().map(Member::fresh).collect();
-        self.springs = self.snap_springs.iter().map(Spring::fresh).collect();
-        self.mech = self.snap_mech.clone();
+        self.blocks = plan.blocks;
+        self.cables = plan.cables;
+        self.members = plan.members;
+        self.springs = plan.springs;
+        self.mech = plan.mech;
+        self.cars = plan.cars;
+        self.undo.truncate(self.plan_undo);
         self.mech_draft = None;
         self.spring_draft = None;
         self.cable_from = None;
         self.cable_via.clear();
         self.member_from = None;
+        self.selection = None;
+        self.drag = None;
         self.phys = None;
-        self.cars.clear();
+        self.booms.clear();
+        self.bolts.clear();
+        self.thunder.clear();
         self.debris.clear();
         self.running = false;
+        self.challenge = false;
+        self.arrived = 0;
+        self.lost = 0;
         self.refresh_mask();
     }
 
@@ -545,7 +601,8 @@ impl Game {
         self.members.clear();
         self.springs.clear();
         self.mech = Mechanism::default();
-        self.snap_mech = Mechanism::default();
+        self.plan = None;
+        self.challenge = false;
         self.mech_draft = None;
         self.spring_draft = None;
         self.cable_from = None;
@@ -559,11 +616,6 @@ impl Game {
         self.arrived = 0;
         self.lost = 0;
         self.refresh_mask();
-        self.snap_cells = self.world.snapshot();
-        self.snap_blocks.clear();
-        self.snap_cables.clear();
-        self.snap_members.clear();
-        self.snap_springs.clear();
     }
 
     fn new_world(&mut self, biome: Biome) {
@@ -599,8 +651,14 @@ impl Game {
         self.set_running(true);
     }
 
+    /// Saves the plan, never a world half way through a test.
     fn save(&mut self) {
-        match save::save_slot(self.slot, &self.world, self.entry, self.exit, &self.blocks, &self.cables, &self.members, &self.springs, &self.mech) {
+        let bytes = match &self.plan {
+            Some(p) => save::encode_cells(self.world.biome, p.state.clock(), |x, y| World::raw_in(&p.state, x, y), self.entry, self.exit, &p.blocks, &p.cables, &p.members, &p.springs, &p.mech),
+            None => save::encode(&self.world, self.entry, self.exit, &self.blocks, &self.cables, &self.members, &self.springs, &self.mech),
+        };
+        match save::save_slot(self.slot, &bytes) {
+            Ok(()) if self.plan.is_some() => self.say(format!("Monde de départ sauvegardé (emplacement {})", self.slot + 1)),
             Ok(()) => self.say(format!("Monde sauvegardé (emplacement {})", self.slot + 1)),
             Err(e) => self.say(format!("Échec de la sauvegarde : {e}")),
         }
@@ -627,11 +685,6 @@ impl Game {
                     self.mech.follow_mounts(|a| anchor_world(a, blocks, members));
                 }
                 self.refresh_reel_anchors();
-                self.snap_mech = self.mech.clone();
-                self.snap_blocks = self.blocks.clone();
-                self.snap_cables = self.cables.iter().map(Cable::fresh).collect();
-                self.snap_members = self.members.iter().map(Member::fresh).collect();
-                self.snap_springs = self.springs.iter().map(Spring::fresh).collect();
                 self.refresh_mask();
                 self.say(format!("Monde chargé (emplacement {})", self.slot + 1));
             }
@@ -1090,7 +1143,7 @@ impl Game {
         (Anchor::Free(p), p)
     }
 
-    fn beam_click(&mut self, mat: MemberMat, at: Vec2) {
+    fn beam_click(&mut self, mat: MemberMat, role: MemberRole, at: Vec2) {
         match self.member_from.take() {
             None => match node_at(&self.world, &self.blocks, &self.members, at) {
                 Some(a) => {
@@ -1112,7 +1165,7 @@ impl Game {
                     self.member_from = Some((a, p0));
                     return;
                 }
-                let units = mat.cost(len);
+                let units = mat.cost(len, role);
                 let free = self.free_now();
                 if !free {
                     self.census = self.world.census();
@@ -1127,7 +1180,7 @@ impl Game {
                 if !free {
                     self.world.consume(mat.cost_from(), units, (p0.x as i32, p0.y as i32));
                 }
-                self.members.push(Member::new(mat, a, b, p0, p1));
+                self.members.push(Member::new(mat, a, b, p0, p1).with_role(role));
                 let idx = self.members.len() - 1;
                 if let Some(p) = &mut self.phys {
                     p.add_member(&self.blocks, &mut self.members, idx);
@@ -1227,7 +1280,7 @@ impl Game {
         if is_key_pressed(KeyCode::Escape) {
             self.on_escape();
         }
-        if (is_key_pressed(KeyCode::Delete) || is_key_pressed(KeyCode::Backspace)) && self.tool == Tool::Select {
+        if (is_key_pressed(KeyCode::Delete) || is_key_pressed(KeyCode::Backspace)) && self.tool == Tool::Select && !self.challenge {
             self.select_delete();
         }
         if is_key_pressed(KeyCode::M) {
@@ -1409,6 +1462,13 @@ impl Game {
             self.last = None;
             return;
         }
+        // During the challenge the world is only watched: the probes still go down.
+        if self.challenge && self.tool != Tool::Sensor {
+            if click || rclick {
+                self.say("Défi en cours : la construction est verrouillée (Réessayer pour la reprendre)");
+            }
+            return;
+        }
 
         if rclick && (self.cable_from.is_some() || self.member_from.is_some() || self.spring_draft.is_some() || self.mech_draft.is_some() || self.pipe_from.is_some()) {
             self.mech_draft = None;
@@ -1435,7 +1495,7 @@ impl Game {
                 if self.mech_erase(at) || self.fluid_erase(at) {
                     return;
                 }
-                if let Some(i) = self.members.iter().position(|m| m.distance_to(at) < m.mat.thickness() / 2.0 + 3.0) {
+                if let Some(i) = self.members.iter().position(|m| m.distance_to(at) < m.thickness() / 2.0 + 3.0) {
                     self.remove_member_at(i);
                     return;
                 }
@@ -1484,7 +1544,7 @@ impl Game {
             Tool::Block(k) if click => self.place_block(k, at),
             Tool::Cable(m) if click => self.cable_click(m, at),
             Tool::Spring(k) if click => self.spring_click(k, at),
-            Tool::Beam(m) if click => self.beam_click(m, at),
+            Tool::Beam(m, role) if click => self.beam_click(m, role, at),
             Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Screw | Tool::Winch | Tool::Pulley if click => self.mech_click(at),
             Tool::Pipe | Tool::Valve | Tool::Pump if click => self.fluid_click(at),
             Tool::Shovel => self.shovel_mouse(at, click, left),
@@ -1554,7 +1614,7 @@ impl Game {
         } else {
             self.fast_frames = 0;
         }
-        let building = matches!(self.tool, Tool::Block(_) | Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(_) | Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Screw | Tool::Winch | Tool::Pulley | Tool::Pipe | Tool::Valve | Tool::Pump);
+        let building = matches!(self.tool, Tool::Block(_) | Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(..) | Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Screw | Tool::Winch | Tool::Pulley | Tool::Pipe | Tool::Valve | Tool::Pump);
         if (self.tab == Tab::Blocks || building) && (self.time * 4.0) as u32 != ((self.time - dt) * 4.0) as u32 {
             self.census = self.world.census();
         }
@@ -2121,7 +2181,7 @@ impl Game {
                 }
             }
         }
-        if let (Tool::Beam(mat), Some((a, p0))) = (self.tool, self.member_from) {
+        if let (Tool::Beam(mat, role), Some((a, p0))) = (self.tool, self.member_from) {
             let at = if inside { view.to_world(ui.mouse) } else { p0 };
             let (_, p1) = self.beam_end(p0, at, &a);
             let len = (p1 - p0).length();
@@ -2129,13 +2189,13 @@ impl Game {
             let ok = len >= 12.0;
             let col = if ok { Color::from_rgba(cr, cg, cb, 255) } else { Color::new(1.0, 0.3, 0.3, 1.0) };
             let (sa, sb) = (view.to_screen(p0), view.to_screen(p1));
-            draw_line(sa.x, sa.y, sb.x, sb.y, mat.thickness() * view.s, Color::new(col.r, col.g, col.b, 0.6));
+            draw_line(sa.x, sa.y, sb.x, sb.y, role.thickness(mat) * view.s, Color::new(col.r, col.g, col.b, 0.6));
             draw_circle(sa.x, sa.y, 5.0, WHITE);
             draw_circle(sb.x, sb.y, 5.0, WHITE);
             let label = format!("{:.0} / {:.0}", len, MEMBER_MAX_LEN);
             ui.text(&label, (sa.x + sb.x) / 2.0 + 8.0, (sa.y + sb.y) / 2.0 - 8.0, 16, WHITE);
         }
-        if inside && matches!(self.tool, Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(_)) {
+        if inside && matches!(self.tool, Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(..)) {
             self.draw_anchor_hint(ui, view, view.to_world(ui.mouse));
         }
         if inside {
@@ -2176,7 +2236,7 @@ impl Game {
                         draw_line(ui.mouse.x + vault * a0.cos(), ui.mouse.y + vault * a0.sin(), ui.mouse.x + vault * a1.cos(), ui.mouse.y + vault * a1.sin(), 2.5, brick);
                     }
                 }
-                Tool::Beam(_) => {
+                Tool::Beam(..) => {
                     // Green: it will be pinned there. Orange: no attachment, the rod will fall.
                     if self.snap_point(at).is_none() {
                         draw_circle_lines(ui.mouse.x, ui.mouse.y, 5.0 * view.s, 2.0, ACCENT);
@@ -2294,7 +2354,13 @@ impl Game {
         rrect(sp, 12.0, Color::new(0.0, 0.0, 0.0, 0.5));
         ui.text(&stats, sp.x + 11.0, sp.y + 17.0, 14, WHITE);
 
-        let (label, col) = if self.running { ("SIMULATION", RED) } else { ("CONSTRUCTION", BLUE) };
+        let (label, col) = match (self.building(), self.challenge, self.running) {
+            (true, _, _) => ("CONSTRUCTION", BLUE),
+            (false, true, true) => ("DÉFI", RED),
+            (false, true, false) => ("DÉFI (pause)", RED),
+            (false, false, true) => ("TEST", ORANGE),
+            (false, false, false) => ("TEST (pause)", ORANGE),
+        };
         let bw = ui.text_w(label, 14) + 32.0;
         let gap = 92.0;
         rrect(Rect::new(r.x + r.w - bw - 8.0 - gap, r.y + 8.0, bw, 26.0), 13.0, Color::new(0.0, 0.0, 0.0, 0.5));
@@ -2519,7 +2585,7 @@ impl Game {
         } else {
             self.idle += dt;
         }
-        let widths = [108.0f32, 38.0, 46.0, 38.0];
+        let widths = [118.0f32, 108.0, 86.0, 38.0, 46.0, 38.0];
         let gap = 6.0;
         let pad = 12.0;
         let total: f32 = widths.iter().sum::<f32>() + gap * (widths.len() as f32 - 1.0) + pad * 2.0;
@@ -2556,18 +2622,35 @@ impl Game {
             r
         };
         let r = place(0, &mut x);
-        let (label, icon) = if self.running { ("Pause", Icon::Pause) } else { ("Jouer", Icon::Play) };
+        if ui.button(r, "Réessayer", Icon::Reset, false, !self.building(), ACCENT) {
+            self.reset();
+        }
+        if ui.hover(r) {
+            self.hover_info = Some(("Réessayer (R)".to_string(), "Remet le monde tel que tu l'avais construit avant de lancer la simulation, remet les compteurs à zéro et revient à la construction. Ce qui a été fait pendant le test ou le défi est oublié.".to_string()));
+        }
+        let r = place(1, &mut x);
+        let (label, icon) = if self.running { ("Pause", Icon::Pause) } else if self.building() { ("Tester", Icon::Play) } else { ("Reprendre", Icon::Play) };
         if ui.button(r, label, icon, !self.running, true, GREEN) {
             let run = !self.running;
             self.set_running(run);
         }
-        let r = place(1, &mut x);
+        if ui.hover(r) {
+            self.hover_info = Some(("Tester (Espace)".to_string(), "Lance la simulation pour voir ce qui se passe. Tu peux encore bricoler pendant le test, même en pause, mais rien de tout ça n'est gardé : Réessayer revient au monde construit.".to_string()));
+        }
+        let r = place(2, &mut x);
+        if ui.button(r, "Défi", Icon::Flag, self.challenge, true, RED) && !self.challenge {
+            self.start_challenge();
+        }
+        if ui.hover(r) {
+            self.hover_info = Some(("Défi".to_string(), "Repart du monde construit, compteurs à zéro, et verrouille la construction : on lance les voitures et on regarde. Réessayer pour recommencer ou reprendre la construction.".to_string()));
+        }
+        let r = place(3, &mut x);
         if ui.button(r, "", Icon::Minus, false, self.speed > 1, ACCENT) {
             self.speed -= 1;
         }
-        let r = place(2, &mut x);
+        let r = place(4, &mut x);
         ui.text_center(&format!("x{}", self.speed), r.x + r.w / 2.0, r.y + h / 2.0 + 6.0, 17, TEXT);
-        let r = place(3, &mut x);
+        let r = place(5, &mut x);
         if ui.button(r, "", Icon::Plus, false, self.speed < 6, ACCENT) {
             self.speed += 1;
         }
@@ -2612,7 +2695,7 @@ impl Game {
         if ui.hover(Rect::new(18.0 + 2.0 * half, y, pin_w, 32.0)) {
             self.hover_info = Some(("Épingler la palette".to_string(), "Épinglée, la palette reste ouverte et l'image se place à côté. Sinon elle se cache et ressort quand la souris touche le bord gauche.".to_string()));
         }
-        if ui.button(Rect::new(6.0, y, half, 32.0), "Retour", Icon::Reset, false, true, ACCENT) {
+        if ui.button(Rect::new(6.0, y, half, 32.0), "Réessayer", Icon::Reset, false, !self.building(), ACCENT) {
             self.reset();
         }
         let label = if self.undo.is_empty() { "Annuler".to_string() } else { format!("Annuler {}", self.undo.len()) };
@@ -2833,9 +2916,9 @@ impl Game {
                 let len = self.spring_draft.as_ref().map_or(60.0, |d| d.rest.map_or_else(|| drafted(d.pa).min(SPRING_MAX_LEN), |r| r.1));
                 (k.cost_from(), k.cost(len))
             }
-            Tool::Beam(m) => {
+            Tool::Beam(m, role) => {
                 let len = self.member_from.as_ref().map_or(60.0, |f| drafted(f.1).min(MEMBER_MAX_LEN));
-                (m.cost_from(), m.cost(len))
+                (m.cost_from(), m.cost(len, role))
             }
             Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Screw | Tool::Winch | Tool::Pulley => self.mech_cost(at)?,
             Tool::Pipe | Tool::Valve | Tool::Pump => self.fluid_cost(at)?,
@@ -2868,6 +2951,15 @@ impl Game {
     fn panel_blocks(&mut self, ui: &mut Ui, top: f32) {
         let angle = self.rot90 as f32 * std::f32::consts::FRAC_PI_2;
         let free = self.free_now();
+        // The deck / girder strip under a rod button is drawn over what is below it, which must
+        // not take its clicks.
+        let rods = BlockKind::PLACEABLE.len() + CableMat::ALL.len() + SpringKind::ALL.len();
+        let menu = self.beam_menu.map(|k| {
+            let r = Self::tile_rect(rods + k, 3, top, 54.0);
+            (k, Rect::new(6.0, r.y + r.h + 2.0, PANEL_W - 12.0, 50.0))
+        });
+        let menu_hover = menu.is_some_and(|(_, mr)| ui.hover(mr));
+        let pressed = ui.pressed;
         for (i, k) in BlockKind::PLACEABLE.iter().enumerate() {
             let r = Self::tile_rect(i, 3, top, 54.0);
             let spec = k.spec();
@@ -2940,48 +3032,110 @@ impl Game {
             }
         }
         let i = i + SpringKind::ALL.len();
-        // Free beams: pinned at both ends, like a bridge-building game.
+        // Free beams: pinned at both ends, like a bridge-building game. The little arrow of each
+        // button chooses deck (the cars ride it) or girder (structure the cars pass through).
+        ui.pressed = pressed && !menu_hover;
+        let mut arrow_hit = false;
         for (k, mat) in MemberMat::ALL.iter().enumerate() {
             let r = Self::tile_rect(i + k, 3, top, 54.0);
-            let (units, from) = (mat.cost(60.0), mat.cost_from());
-            if ui.hover(r) {
+            let role = self.beam_role[k];
+            let arrow = Rect::new(r.x + r.w - 25.0, r.y + 4.0, 21.0, 18.0);
+            let on_arrow = ui.hover(arrow);
+            let (units, from) = (mat.cost(60.0, role), mat.cost_from());
+            if ui.hover(r) && !menu_hover {
+                let what = match role {
+                    MemberRole::Deck => "Tablier : les voitures roulent dessus.",
+                    MemberRole::Girder => "Poutre : la structure qui porte, les voitures passent à travers (comme les arbres).",
+                };
                 self.hover_info = Some((
-                    format!("Tige {}", mat.name().to_lowercase()),
+                    format!("{} {}", role.name(), mat.name().to_lowercase()),
                     format!(
-                        "Un clic fixe un bout (sol, bloc ou nœud ; sans attache la tige tombe), tire, un second clic pour l'autre bout. Longueur max {:.0}. 60 de long coûte {units} de {}.",
+                        "{what} Petite flèche du bouton : tablier ou poutre. Un clic fixe un bout (sol, bloc ou nœud ; sans attache elle tombe), tire, un second clic pour l'autre bout. Longueur max {:.0}. 60 de long coûte {units} de {}.",
                         MEMBER_MAX_LEN,
                         info(from[0]).name.to_lowercase()
                     ),
                 ));
             }
-            let (cr, cg, cb) = mat.color();
-            let label = format!("Tige {}", mat.name().to_lowercase());
-            let short = !free && self.stock(mat.cost_from()) < mat.cost(60.0);
-            if ui.tile(r, &label, self.tool == Tool::Beam(*mat), |s| {
-                let (a, b) = (vec2(s.x + 10.0, s.y + s.h - 6.0), vec2(s.x + s.w - 10.0, s.y + 6.0));
-                draw_line(a.x, a.y, b.x, b.y, 6.0, Color::from_rgba(cr, cg, cb, 255));
-                for p in [a, b] {
-                    draw_circle(p.x, p.y, 4.5, Color::from_rgba(226, 228, 236, 255));
-                    draw_circle(p.x, p.y, 2.0, Color::from_rgba(60, 64, 78, 255));
+            let label = format!("{} {}", role.name(), mat.name().to_lowercase());
+            let short = !free && self.stock(from) < units;
+            let clicked = ui.tile(r, &label, self.tool == Tool::Beam(*mat, role), |s| draw_rod_icon(s, *mat, role));
+            let open = self.beam_menu == Some(k);
+            rrect(arrow, 5.0, if open { ACCENT } else if on_arrow { Color::new(0.0, 0.0, 0.0, 0.7) } else { Color::new(0.0, 0.0, 0.0, 0.45) });
+            let (c, h) = (vec2(arrow.x + arrow.w / 2.0, arrow.y + arrow.h / 2.0), 4.5);
+            let fg = if open { BG } else { TEXT };
+            if open {
+                draw_triangle(vec2(c.x - h, c.y + h * 0.5), vec2(c.x + h, c.y + h * 0.5), vec2(c.x, c.y - h * 0.6), fg);
+            } else {
+                draw_triangle(vec2(c.x - h, c.y - h * 0.5), vec2(c.x + h, c.y - h * 0.5), vec2(c.x, c.y + h * 0.6), fg);
+            }
+            if clicked {
+                if on_arrow {
+                    arrow_hit = true;
+                    self.beam_menu = if open { None } else { Some(k) };
+                } else {
+                    self.tool = Tool::Beam(*mat, role);
                 }
-            }) {
-                self.tool = Tool::Beam(*mat);
             }
             if short {
                 Self::mark_missing(r);
             }
         }
 
-        // Cable elasticity.
+        // Cable elasticity (the strip of a rod button may lie over it).
         let rows_used = (i + MemberMat::ALL.len() + 2) / 3;
         let sy = top + rows_used as f32 * 60.0 + 2.0;
+        ui.pressed = pressed && !menu_hover;
         ui.text("Élasticité câble", 10.0, sy + 11.0, 13, DIM);
-        ui.slider(Rect::new(110.0, sy, PANEL_W - 150.0, 18.0), &mut self.cable_soft, 0.4, 3.0, ACCENT);
+        let mut soft = self.cable_soft;
+        ui.slider(Rect::new(110.0, sy, PANEL_W - 150.0, 18.0), &mut soft, 0.4, 3.0, ACCENT);
+        if !menu_hover {
+            self.cable_soft = soft;
+        }
         ui.text(&format!("x{:.1}", self.cable_soft), PANEL_W - 34.0, sy + 11.0, 13, TEXT);
-
-        // Materials: a block uses up what it is made of from the screen.
         let y0 = sy + 26.0;
         self.unlimited_toggles(ui, y0);
+        ui.pressed = pressed;
+
+        // The deck / girder strip of the rod button whose arrow was clicked.
+        if let Some((k, mr)) = menu {
+            let mat = MemberMat::ALL[k];
+            rrect(Rect::new(mr.x, mr.y + 2.0, mr.w, mr.h), 10.0, Color::new(0.0, 0.0, 0.0, 0.45));
+            rrect(mr, 10.0, PANEL);
+            ui::rrect_lines(mr, 10.0, 2.0, ACCENT);
+            let n = MemberRole::ALL.len();
+            let w = (mr.w - 6.0 * (n as f32 + 1.0)) / n as f32;
+            for (j, role) in MemberRole::ALL.iter().enumerate() {
+                let cr = Rect::new(mr.x + 6.0 + j as f32 * (w + 6.0), mr.y + 6.0, w, mr.h - 12.0);
+                let hot = ui.hover(cr);
+                let chosen = self.beam_role[k] == *role;
+                rrect(cr, 7.0, if hot { TILE_HOT } else { TILE });
+                if chosen {
+                    ui::rrect_lines(cr, 7.0, 2.0, ACCENT);
+                }
+                draw_rod_icon(Rect::new(cr.x + cr.w / 2.0 - 30.0, cr.y + 3.0, 60.0, 20.0), mat, *role);
+                ui.text_center(role.name(), cr.x + cr.w / 2.0, cr.y + cr.h - 6.0, 14, if chosen { ACCENT } else { TEXT });
+                if hot {
+                    self.hover_info = Some((
+                        format!("{} {}", role.name(), mat.name().to_lowercase()),
+                        match role {
+                            MemberRole::Deck => "Le tablier : la chaussée du pont, épaisse, avec ses croisillons. Les voitures roulent dessus et pèsent sur lui.".into(),
+                            MemberRole::Girder => "La poutre : la charpente qui tient le tablier (diagonales, poteaux, arcs). Elle porte les efforts, mais les voitures la traversent, comme les arbres.".into(),
+                        },
+                    ));
+                    if ui.pressed {
+                        self.beam_role[k] = *role;
+                        self.tool = Tool::Beam(mat, *role);
+                        self.beam_menu = None;
+                    }
+                }
+            }
+            // A click anywhere else closes the strip.
+            if ui.pressed && !arrow_hit && !ui.hover(mr) {
+                self.beam_menu = None;
+            }
+        }
+
+        // Materials: a block uses up what it is made of from the screen.
         let rows: [(&str, &[Mat]); 6] = [
             ("Terre", &[Mat::Dirt]),
             ("Bois", &[Mat::Wood, Mat::Trunk, Mat::Branch]),
@@ -3472,8 +3626,8 @@ impl Game {
                 ui.wrapped(text, r.x + 8.0, r.y + 33.0, r.w - 16.0, 13, TEXT);
             }
             None => {
-                ui.text("Espace : jouer / pause", r.x + 8.0, r.y + 19.0, 13, DIM);
-                ui.text("R retour · C voiture · Z annuler", r.x + 8.0, r.y + 36.0, 13, DIM);
+                ui.text("Espace : tester / pause", r.x + 8.0, r.y + 19.0, 13, DIM);
+                ui.text("R réessayer · C voiture · Z annuler", r.x + 8.0, r.y + 36.0, 13, DIM);
                 ui.text("H thermique · X efforts · V vent", r.x + 8.0, r.y + 53.0, 13, DIM);
                 ui.text("Ctrl + molette/glisser : zoom", r.x + 8.0, r.y + 70.0, 13, DIM);
                 ui.text("Survole une case pour apprendre", r.x + 8.0, r.y + 90.0, 13, DIM);
@@ -3945,6 +4099,43 @@ fn draw_tree_icon(s: Rect) {
     draw_circle(cx, s.y + s.h * 0.38, s.h * 0.08, mat_color(Mat::Branch));
 }
 
+/// A rod for the palette: a deck lies flat, thick, with cross bracing; a girder is a plain bar
+/// on the slant.
+fn draw_rod_icon(s: Rect, mat: MemberMat, role: MemberRole) {
+    let (cr, cg, cb) = mat.color();
+    let col = Color::from_rgba(cr, cg, cb, 255);
+    let pin = |p: Vec2| {
+        draw_circle(p.x, p.y, 4.5, Color::from_rgba(226, 228, 236, 255));
+        draw_circle(p.x, p.y, 2.0, Color::from_rgba(60, 64, 78, 255));
+    };
+    match role {
+        MemberRole::Deck => {
+            let (x0, x1, y) = (s.x + 6.0, s.x + s.w - 6.0, s.y + s.h * 0.5);
+            let h = (s.h * 0.5).clamp(6.0, 12.0);
+            draw_rectangle(x0, y - h / 2.0, x1 - x0, h, Color::new(col.r * 0.55, col.g * 0.55, col.b * 0.55, 1.0));
+            draw_line(x0, y - h / 2.0 + 1.0, x1, y - h / 2.0 + 1.0, 2.0, col);
+            draw_line(x0, y + h / 2.0 - 1.0, x1, y + h / 2.0 - 1.0, 2.0, col);
+            let brace = Color::new(col.r * 0.95, col.g * 0.95, col.b * 0.95, 0.9);
+            let n = (((x1 - x0) / h).round() as i32).max(2);
+            let w = (x1 - x0) / n as f32;
+            for k in 0..n {
+                let xa = x0 + k as f32 * w;
+                draw_line(xa, y - h / 2.0 + 1.0, xa + w, y + h / 2.0 - 1.0, 1.0, brace);
+                draw_line(xa, y + h / 2.0 - 1.0, xa + w, y - h / 2.0 + 1.0, 1.0, brace);
+            }
+            draw_line(x0, y - h / 2.0, x1, y - h / 2.0, 1.2, Color::new(1.0, 0.95, 0.6, 0.9));
+            pin(vec2(x0, y));
+            pin(vec2(x1, y));
+        }
+        MemberRole::Girder => {
+            let (a, b) = (vec2(s.x + 10.0, s.y + s.h - 6.0), vec2(s.x + s.w - 10.0, s.y + 6.0));
+            draw_line(a.x, a.y, b.x, b.y, 5.0, col);
+            pin(a);
+            pin(b);
+        }
+    }
+}
+
 fn draw_car_icon(c: Vec2, col: Color, s: f32) {
     rrect(Rect::new(c.x - 17.0 * s, c.y - 2.0 * s, 34.0 * s, 10.0 * s), 3.0, col);
     rrect(Rect::new(c.x - 11.0 * s, c.y - 10.0 * s, 18.0 * s, 10.0 * s), 3.0, col);
@@ -4061,6 +4252,12 @@ async fn main() {
             game.matter_menu = Some(i);
             game.tool = matter_tool(MATTERS[i].states[MATTERS[i].default]);
         }
+        // `--rods N` opens the deck / girder strip of the palette's rod N (0 is wood).
+        if let Some(k) = arg("--rods").and_then(|v| v.parse::<usize>().ok()).filter(|&k| k < MemberMat::ALL.len()) {
+            game.tab = Tab::Blocks;
+            game.beam_menu = Some(k);
+            game.tool = Tool::Beam(MemberMat::ALL[k], game.beam_role[k]);
+        }
         if args.iter().any(|a| a == "--tunnel") {
             demo_tunnel(&mut game);
         }
@@ -4087,6 +4284,10 @@ async fn main() {
         // `--advance n`: the world runs n steps before the first frame.
         for _ in 0..arg("--advance").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) {
             game.world.step();
+        }
+        // `--challenge`: the challenge is on (the HUD and the player show it).
+        if args.iter().any(|a| a == "--challenge") {
+            game.start_challenge();
         }
     }
     // `--mouse x,y` pins the pointer for screenshots.
@@ -4301,6 +4502,62 @@ mod tests {
         g.launch_car();
         assert_eq!(g.cars.len(), 1);
         assert_eq!(g.selected_car, None, "a car only gets selected when the player clicks it");
+    }
+
+    #[test]
+    fn the_plan_is_taken_once_and_retry_brings_it_back() {
+        let mut g = mech_game();
+        g.world.set(200, 100, Mat::Sand);
+        g.checkpoint();
+        g.blocks.push(Block::new(BlockKind::Brick, vec2(300.0, 200.0), 0.0));
+        g.checkpoint();
+        assert!(g.building());
+        g.set_running(true);
+        for _ in 0..60 {
+            g.sim_step();
+        }
+        assert_ne!(g.world.raw(200, 100), Mat::Sand, "the sand fell during the test");
+        // A pause, a tinkering and a new start belong to the same test.
+        g.set_running(false);
+        g.world.set(10, 10, Mat::Stone);
+        g.set_running(true);
+        g.sim_step();
+        g.arrived = 3;
+        g.reset();
+        assert!(g.building() && !g.running);
+        assert_eq!(g.world.raw(200, 100), Mat::Sand, "back to the world as built");
+        assert_eq!(g.world.raw(10, 10), Mat::Empty, "the tinkering in the pause is not kept");
+        assert_eq!(g.blocks.len(), 1);
+        assert_eq!(g.arrived, 0);
+        assert_eq!(g.undo.len(), 2, "the building steps are still there to undo");
+        // Réessayer on the drawing board changes nothing.
+        g.world.set(20, 20, Mat::Stone);
+        g.reset();
+        assert_eq!(g.world.raw(20, 20), Mat::Stone);
+    }
+
+    #[test]
+    fn the_challenge_locks_building_and_saves_the_plan() {
+        let mut g = mech_game();
+        g.world.set(200, 100, Mat::Sand);
+        g.set_running(true);
+        g.world.set(30, 30, Mat::Stone);
+        g.start_challenge();
+        assert!(g.challenge && g.running);
+        assert_eq!(g.world.raw(30, 30), Mat::Empty, "the challenge starts from the plan, not the test");
+        g.checkpoint();
+        let n = g.undo.len();
+        g.undo();
+        assert_eq!(g.undo.len(), n, "no undo during the challenge");
+        for _ in 0..60 {
+            g.sim_step();
+        }
+        let plan = g.plan.as_ref().unwrap();
+        let bytes = save::encode_cells(g.world.biome, plan.state.clock(), |x, y| World::raw_in(&plan.state, x, y), None, None, &plan.blocks, &plan.cables, &plan.members, &plan.springs, &plan.mech);
+        let l = save::decode(&bytes).unwrap();
+        assert_eq!(l.mats[100 * W + 200], Mat::Sand, "the save holds the world as built");
+        g.reset();
+        assert!(!g.challenge && g.building());
     }
 
     fn click_with(g: &mut Game, tool: Tool, x: f32, y: f32) {
@@ -5104,7 +5361,7 @@ mod tests {
         g.unlimited = false;
         g.census = g.world.census();
         let at = vec2(300.0, 200.0);
-        for tool in [Tool::Block(BlockKind::Wheel), Tool::Cable(CableMat::Steel), Tool::Spring(SpringKind::Coil), Tool::Beam(MemberMat::Iron)] {
+        for tool in [Tool::Block(BlockKind::Wheel), Tool::Cable(CableMat::Steel), Tool::Spring(SpringKind::Coil), Tool::Beam(MemberMat::Iron, MemberRole::Deck)] {
             g.tool = tool;
             let m = g.missing_for_tool(at);
             assert!(m.is_some(), "an empty world has nothing to build with ({:?})", m);
