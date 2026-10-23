@@ -45,6 +45,8 @@ pub enum Ev {
     Howl,
     /// The wolf cub trying too: short, high, off-key.
     Yip,
+    /// Thunder, 0..1: loud and cracking close by, a low roll far away.
+    Thunder(f32),
 }
 
 impl Ev {
@@ -61,6 +63,7 @@ impl Ev {
             Ev::Blow => 8,
             Ev::Howl => 9,
             Ev::Yip => 10,
+            Ev::Thunder(_) => 11,
         }
     }
 }
@@ -206,6 +209,46 @@ pub fn boom(len: f32, deep: f32) -> Vec<f32> {
     let attack = secs(0.004);
     for i in 0..attack.min(n) {
         v[i] *= i as f32 / attack as f32;
+    }
+    normalize(&mut v, 0.95);
+    v
+}
+
+/// Thunder: the sharp crack of the channel (strong in `near`), then a long rumble rolling on as the
+/// sound of farther and farther parts of the bolt arrives.
+pub fn thunder(near: f32) -> Vec<f32> {
+    let mut rng = Rng(0x7a11_c0de ^ (near * 1000.0) as u32);
+    let len = 4.5;
+    let n = secs(len);
+    let mut crack = noise(&mut rng, n);
+    lowpass(&mut crack, 0.5);
+    let mut rumble = noise(&mut rng, n);
+    lowpass(&mut rumble, 0.012);
+    normalize(&mut rumble, 1.0);
+    let mut roll = noise(&mut rng, n);
+    lowpass(&mut roll, 0.04);
+    normalize(&mut roll, 1.0);
+    // Slow bursts of loudness: the rolling.
+    let mut bumps = noise(&mut rng, n);
+    lowpass(&mut bumps, 0.0004);
+    normalize(&mut bumps, 1.0);
+    let mut v: Vec<f32> = (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE as f32;
+            let snap = crack[i] * (-t * 9.0).exp() * near;
+            let body = (rumble[i] * 0.9 + roll[i] * 0.45 * (-t * 1.2).exp()) * (1.0 - (-t * 30.0).exp()) * (-t * 0.75).exp();
+            let wobble = 0.6 + 0.4 * bumps[i].abs() * 2.0;
+            snap * 1.2 + body * wobble
+        })
+        .collect();
+    let attack = secs(0.003);
+    for i in 0..attack.min(n) {
+        v[i] *= i as f32 / attack as f32;
+    }
+    // Fade out the tail.
+    let tail = secs(0.8);
+    for k in 0..tail.min(n) {
+        v[n - 1 - k] *= k as f32 / tail as f32;
     }
     normalize(&mut v, 0.95);
     v
@@ -400,6 +443,8 @@ struct Bank {
     blow: Clip,
     howl: Clip,
     yip: Clip,
+    thunder_near: Clip,
+    thunder_far: Clip,
 }
 
 pub struct Sounds {
@@ -407,7 +452,7 @@ pub struct Sounds {
     bank: Option<Bank>,
     pub muted: bool,
     queue: Vec<Ev>,
-    cooldown: [f32; 11],
+    cooldown: [f32; 12],
     /// Smoothed loop volumes: engine x4, wind, water, fire.
     level: [f32; 7],
 }
@@ -420,7 +465,7 @@ impl Sounds {
             bank: None,
             muted: true,
             queue: vec![],
-            cooldown: [0.0; 11],
+            cooldown: [0.0; 12],
             level: [0.0; 7],
         }
     }
@@ -463,6 +508,8 @@ impl Sounds {
                 blow: one(blow()).await?,
                 howl: one(howl(470.0, 2.6, 0.0)).await?,
                 yip: one(howl(820.0, 1.1, 0.06)).await?,
+                thunder_near: one(thunder(1.0)).await?,
+                thunder_far: one(thunder(0.15)).await?,
             })
         }
         .await;
@@ -527,6 +574,7 @@ impl Sounds {
                     Ev::Siren => 2.0,
                     Ev::Pop => 0.2,
                     Ev::Howl => 0.3,
+                    Ev::Thunder(_) => 0.4,
                     _ => 0.07,
                 };
                 let (s, v) = match e {
@@ -541,6 +589,7 @@ impl Sounds {
                     Ev::Blow => (&b.blow, 0.5),
                     Ev::Howl => (&b.howl, 0.45),
                     Ev::Yip => (&b.yip, 0.4),
+                    Ev::Thunder(p) => (if p > 0.55 { &b.thunder_near } else { &b.thunder_far }, (0.25 + 0.75 * p).min(1.0)),
                 };
                 b.out.play(s, false, v);
             }
@@ -566,7 +615,7 @@ mod tests {
         for hz in ENGINE_HZ {
             sane(&engine(hz));
         }
-        for v in [wind(), water(), fire(), boom(2.0, 1.0), boom(0.8, 0.4), thud(), clink(), crack(), spray(), snap(), siren(), pop(), blow(), howl(470.0, 2.6, 0.0), howl(820.0, 1.1, 0.06)] {
+        for v in [wind(), water(), fire(), boom(2.0, 1.0), boom(0.8, 0.4), thud(), clink(), crack(), spray(), snap(), siren(), pop(), blow(), howl(470.0, 2.6, 0.0), howl(820.0, 1.1, 0.06), thunder(1.0), thunder(0.15)] {
             sane(&v);
         }
     }

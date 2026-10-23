@@ -58,7 +58,8 @@ void main() {
 // The texture is premultiplied RGBA. Bright orange cells (fire, lava, embers)
 // bloom into their surroundings; every solid gets a light top edge.
 // `Light` is the light map (see `light_map`): its green channel is the hot air, which bends the
-// light passing through it, so everything seen through it wobbles (heat haze).
+// light passing through it, so everything seen through it wobbles (heat haze); its blue channel
+// is the shadow of the clouds, which dims the sunlit world under them.
 // `sky` is (sun x, sun strength, moon x, moon strength), x from 0 to 1 across the world.
 const FRAG: &str = "#version 100
 precision highp float;
@@ -127,6 +128,9 @@ void main() {
     float hot = step(0.93, c.r) * step(c.b, 0.3) * step(0.5, c.a);
     c.g += n * (0.06 * water + 0.36 * hot) * c.a;
     vec3 rgb = c.rgb + vec3(0.18) * edge * c.a + glow * 2.2;
+    // Cloud shadow: by day, what lies under a cloud (seen from the sun) is in the shade.
+    float shade = texture2D(Light, uv).b * sky.y;
+    rgb *= 1.0 - 0.45 * shade;
     // Glints: the little waves of the top few rows of water catch the sun (or the moon) and flash,
     // most of all under the sun, the way a lake sparkles.
     float a1 = texture2D(Texture, p - vec2(0.0, texel.y)).a;
@@ -134,7 +138,7 @@ void main() {
     float a3 = texture2D(Texture, p - vec2(0.0, texel.y * 6.0)).a;
     float surf = water * max(max(step(a1, 0.05), 0.75 * step(a2, 0.05)), 0.4 * step(a3, 0.05));
     if (surf > 0.0) {
-        float lit = sky.y * (0.35 + 0.65 * exp(-abs(uv.x - sky.x) * 4.0)) + 0.6 * sky.w * exp(-abs(uv.x - sky.z) * 6.0);
+        float lit = sky.y * (1.0 - shade) * (0.35 + 0.65 * exp(-abs(uv.x - sky.x) * 4.0)) + 0.6 * sky.w * exp(-abs(uv.x - sky.z) * 6.0);
         // A glint is a short horizontal streak: a wave face a few cells wide catching the light.
         vec2 facet = vec2(floor(cell.x / 3.0), cell.y);
         float t = time * 3.0 + hash(facet) * 9.0;
@@ -232,6 +236,79 @@ pub enum RenderMode {
     Thermal = 1,
     Pressure = 2,
     Humidity = 3,
+    Electric = 4,
+}
+
+// Lightning: each segment of a bolt is a quad whose texcoord y runs from -1 to 1 across it. A thin
+// white-hot core, a violet-blue glow round it and a wide faint halo; the vertex colour's alpha is
+// the brightness, and the wide halo quads (texcoord x = 1) light up the air and the clouds.
+const BOLT_VERT: &str = "#version 100
+attribute vec3 position;
+attribute vec2 texcoord;
+attribute vec4 color0;
+varying lowp vec2 uv;
+varying lowp vec4 col;
+uniform mat4 Model;
+uniform mat4 Projection;
+void main() {
+    gl_Position = Projection * Model * vec4(position, 1.0);
+    uv = texcoord;
+    col = color0 / 255.0;
+}";
+
+const BOLT_FRAG: &str = "#version 100
+precision mediump float;
+varying lowp vec2 uv;
+varying lowp vec4 col;
+void main() {
+    float d = abs(uv.y);
+    vec3 c;
+    if (uv.x > 0.5) {
+        // Halo: the air and the clouds round the channel lit up.
+        float h = exp(-d * d * 3.5) * (1.0 - d);
+        c = vec3(0.45, 0.5, 0.95) * h * 0.5;
+    } else {
+        float core = exp(-d * d * 120.0);
+        float glow = exp(-d * d * 9.0) * 0.6 + exp(-d * 3.5) * 0.3;
+        c = vec3(1.0, 0.98, 1.0) * core * 1.6 + vec3(0.62, 0.55, 1.0) * glow;
+    }
+    c *= col.a * col.rgb;
+    gl_FragColor = vec4(c, 0.0);
+}";
+
+/// A bolt of lightning being shown: its shape and how long ago it struck (seconds).
+pub struct LiveBolt {
+    pub bolt: crate::world::Bolt,
+    pub age: f32,
+    /// Per-bolt random number: when its return strokes come.
+    pub seed: f32,
+}
+
+/// How long a bolt stays on the screen (seconds).
+pub const BOLT_LIFE: f32 = 0.75;
+
+impl LiveBolt {
+    /// Brightness at its age: lightning flickers, two to four return strokes down the same
+    /// channel, each a bright flash that fades in a few hundredths of a second.
+    pub fn brightness(&self) -> f32 {
+        let strokes = [0.0, 0.07 + 0.05 * self.seed, 0.19 + 0.1 * self.seed, 0.36 + 0.12 * self.seed];
+        let n = 2 + (self.seed * 2.99) as usize;
+        let mut b = 0.0f32;
+        for (k, t0) in strokes.iter().take(n).enumerate() {
+            let t = self.age - t0;
+            if t >= 0.0 {
+                b += (-t * 22.0).exp() * if k == 0 { 1.0 } else { 0.75 };
+            }
+        }
+        // The fading channel glows a little longer.
+        (b + 0.25 * (-self.age * 5.0).exp()).min(1.6) * (1.0 - (self.age / BOLT_LIFE).clamp(0.0, 1.0)).sqrt()
+    }
+
+    /// How much the whole scene is lit by it (the flash).
+    pub fn flash(&self) -> f32 {
+        let s = if self.bolt.ground { 1.0 } else { 0.55 };
+        (self.brightness() * self.bolt.power.max(0.4) * s).min(1.0)
+    }
 }
 
 pub struct Renderer {
@@ -270,6 +347,7 @@ pub struct Renderer {
     light_texture: Texture2D,
     night_material: Material,
     light_tick: i64,
+    bolt_material: Material,
 }
 
 /// Cells per texel of the light map.
@@ -277,10 +355,16 @@ pub const LS: usize = 6;
 const LW: usize = W / LS;
 const LH: usize = H / LS;
 
-/// The light map: for each `LS`×`LS` square, how much it glows (fire, embers, lava) in red and how
-/// hot its air is (for the heat haze) in green. Both saturate softly, so a big blaze is not
-/// blinding and a single ember still shows.
+/// Fully cloudy, one square of the light map lets this fraction of the sunlight through, as the
+/// simulation does (it takes 20 % per cell of cloud).
+const CLOUD_PASS: f32 = 0.26;
+
+/// The light map: for each `LS`×`LS` square, how much it glows (fire, embers, lava) in red, how
+/// hot its air is (for the heat haze) in green, and how much of the sunlight the clouds, steam
+/// and smoke between it and the sun hold back (their shadow) in blue. Glow and heat saturate
+/// softly, so a big blaze is not blinding and a single ember still shows.
 pub fn light_map(world: &World, out: &mut [[u8; 4]]) {
+    let shadow = cloud_shadow(world);
     for ty in 0..LH {
         for tx in 0..LW {
             let (mut glow, mut heat) = (0.0f32, 0.0f32);
@@ -298,9 +382,52 @@ pub fn light_map(world: &World, out: &mut [[u8; 4]]) {
             }
             let soft = |v: f32, k: f32| (255.0 * (1.0 - (-v / k).exp())) as u8;
             // Above a flame the air is hot too, even before the simulation has warmed it.
-            out[ty * LW + tx] = [soft(glow, 5.0), soft(heat + glow * 0.5, 10.0), 0, 255];
+            out[ty * LW + tx] = [soft(glow, 5.0), soft(heat + glow * 0.5, 10.0), (shadow[ty * LW + tx] * 255.0) as u8, 255];
         }
     }
+}
+
+/// For each square of the light map, the share of the sunlight that clouds, steam and smoke stop
+/// before it gets there (0: full sun, 1: deep shade). The light comes along the sun's rays, so a
+/// cloud's shadow falls to the side of it in the morning and the evening. Worked out row by row
+/// from the top, each square takes the shade of the square the ray came from, plus that square's
+/// own cloud.
+pub fn cloud_shadow(world: &World) -> Vec<f32> {
+    let mut depth = vec![0.0f32; LW * LH];
+    if world.sun() <= 0.0 {
+        return depth;
+    }
+    // How much of each square is cloud (smoke is darker).
+    let mut cloud = vec![0.0f32; LW * LH];
+    for y in 0..H {
+        for x in 0..W {
+            let k = match world.cells[y * W + x].m {
+                Mat::Cloud | Mat::Steam => 1.0,
+                Mat::Smoke => 2.0,
+                _ => continue,
+            };
+            cloud[(y / LS) * LW + x / LS] += k / (LS * LS) as f32;
+        }
+    }
+    let (dx, dy) = world.sun_ray_dir();
+    // Squares the ray moves sideways per row (a very low sun is taken as a slanted one).
+    let slope = (dx / dy.max(0.05)).clamp(-3.0, 3.0);
+    let k = -CLOUD_PASS.ln();
+    for ty in 1..LH {
+        for tx in 0..LW {
+            let from = tx as f32 - slope;
+            let (i0, f) = (from.floor(), from - from.floor());
+            let at = |i: f32| {
+                let i = i as i32;
+                if i < 0 || i >= LW as i32 { 0.0 } else {
+                    let j = (ty - 1) * LW + i as usize;
+                    depth[j] + cloud[j] * k
+                }
+            };
+            depth[ty * LW + tx] = at(i0) * (1.0 - f) + at(i0 + 1.0) * f;
+        }
+    }
+    depth.iter().map(|d| 1.0 - (-d).exp()).collect()
 }
 
 impl Renderer {
@@ -343,6 +470,13 @@ impl Renderer {
         let light_image = Image::gen_image_color(LW as u16, LH as u16, Color::new(0.0, 0.0, 0.0, 1.0));
         let light_texture = Texture2D::from_image(&light_image);
         light_texture.set_filter(FilterMode::Linear);
+        // Lightning adds its light to what is under it.
+        let add = BlendState::new(Equation::Add, BlendFactor::One, BlendFactor::One);
+        let bolt_material = load_material(
+            ShaderSource::Glsl { vertex: BOLT_VERT, fragment: BOLT_FRAG },
+            MaterialParams { pipeline_params: PipelineParams { color_blend: Some(add), alpha_blend: Some(add), ..Default::default() }, ..Default::default() },
+        )
+        .expect("bolt shader");
         let veg_image = Image::gen_image_color(W as u16, H as u16, Color::new(0.0, 0.0, 0.0, 0.0));
         let veg_texture = Texture2D::from_image(&veg_image);
         veg_texture.set_filter(FilterMode::Linear);
@@ -371,6 +505,7 @@ impl Renderer {
             light_texture,
             night_material,
             light_tick: -1,
+            bolt_material,
         }
     }
 
@@ -474,6 +609,9 @@ impl Renderer {
                     let field = &self.pressure;
                     Self::fill(&mut self.image, |x, y| world.humidity_color(field, x, y));
                 }
+                RenderMode::Electric => {
+                    Self::fill(&mut self.image, |x, y| world.electric_color(x, y));
+                }
                 RenderMode::Normal => {
                     // Only the zones that changed, plus one row of zones in turn for the slow
                     // changes (temperature tints) that do not wake a zone.
@@ -559,6 +697,58 @@ impl Renderer {
         gl_use_material(&self.night_material);
         let r = v.rect();
         draw_texture_ex(&self.light_texture, r.x, r.y, WHITE, DrawTextureParams { dest_size: Some(vec2(r.w, r.h)), ..Default::default() });
+        gl_use_default_material();
+    }
+
+    /// Bolts of lightning and the flash that lights the whole picture.
+    pub fn draw_bolts(&self, bolts: &[LiveBolt], v: View) {
+        if bolts.is_empty() {
+            return;
+        }
+        let flash = bolts.iter().map(|b| b.flash()).fold(0.0f32, f32::max);
+        if flash > 0.01 {
+            let r = v.rect();
+            draw_rectangle(r.x, r.y, r.w, r.h, Color::new(0.8, 0.84, 1.0, 0.22 * flash));
+        }
+        gl_use_material(&self.bolt_material);
+        for b in bolts {
+            let light = b.brightness() * (0.55 + 0.45 * b.bolt.power);
+            if light < 0.01 {
+                continue;
+            }
+            let mut verts: Vec<Vertex> = vec![];
+            let mut idx: Vec<u16> = vec![];
+            let px = |p: (f32, f32)| vec2(v.ox + p.0 * v.s, v.oy + p.1 * v.s);
+            let s = v.s.max(0.6);
+            let mut line = |pts: &[(f32, f32)], w: f32, a: f32, halo: bool| {
+                for seg in pts.windows(2) {
+                    if verts.len() > 60_000 {
+                        return;
+                    }
+                    let (p, q) = (px(seg[0]), px(seg[1]));
+                    let d = q - p;
+                    let len = d.length().max(1e-3);
+                    let dir = d / len;
+                    let n = vec2(-dir.y, dir.x) * w;
+                    // Stretch each piece a little so the joints have no gaps.
+                    let (p, q) = (p - dir * w * 0.3, q + dir * w * 0.3);
+                    let col = Color::new(1.0, 1.0, 1.0, a.clamp(0.0, 1.0));
+                    let u = if halo { 1.0 } else { 0.0 };
+                    let k = verts.len() as u16;
+                    verts.push(Vertex::new(p.x + n.x, p.y + n.y, 0.0, u, -1.0, col));
+                    verts.push(Vertex::new(p.x - n.x, p.y - n.y, 0.0, u, 1.0, col));
+                    verts.push(Vertex::new(q.x - n.x, q.y - n.y, 0.0, u, 1.0, col));
+                    verts.push(Vertex::new(q.x + n.x, q.y + n.y, 0.0, u, -1.0, col));
+                    idx.extend_from_slice(&[k, k + 1, k + 2, k, k + 2, k + 3]);
+                }
+            };
+            line(&b.bolt.path, 34.0 * s, light * 0.8, true);
+            line(&b.bolt.path, (2.6 + 2.4 * b.bolt.power) * s, light, false);
+            for br in &b.bolt.branches {
+                line(br, 1.8 * s, light * 0.6, false);
+            }
+            draw_mesh(&Mesh { vertices: verts, indices: idx, texture: None });
+        }
         gl_use_default_material();
     }
 
@@ -1014,6 +1204,32 @@ pub fn draw_spring(sp: &Spring, v: View, stress: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cloud_casts_a_shadow_by_day_along_the_sun_rays_and_none_at_night() {
+        let mut w = World::new_static();
+        w.day_cycle = false;
+        for y in 120..150 {
+            for x in 420..540 {
+                w.set(x, y, Mat::Cloud);
+            }
+        }
+        let at = |sh: &[f32], x: usize, y: usize| sh[(y / LS) * LW + x / LS];
+        // Noon: the sun is high, the shadow falls straight down.
+        w.set_phase(0.25);
+        let sh = cloud_shadow(&w);
+        assert!(at(&sh, 480, 300) > 0.9, "deep shade under a thick cloud: {}", at(&sh, 480, 300));
+        assert!(at(&sh, 480, 100) < 0.01, "above the cloud the sun shines");
+        assert!(at(&sh, 150, 300) < 0.01, "far beside it, full sun");
+        // Morning: the sun is low in the east (left), the shadow falls to the right of the cloud.
+        w.set_phase(0.06);
+        let sh = cloud_shadow(&w);
+        let (left, right) = (at(&sh, 360, 300), at(&sh, 640, 300));
+        assert!(right > left + 0.5, "in the morning the shadow lies to the right: left {left}, right {right}");
+        // Night: no sun, no shadow.
+        w.set_phase(0.75);
+        assert!(cloud_shadow(&w).iter().all(|&v| v == 0.0));
+    }
 
     #[test]
     fn fire_lights_its_square_and_hot_air_makes_haze() {

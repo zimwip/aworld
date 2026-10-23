@@ -92,7 +92,13 @@ pub fn read(world: &World, x: i32, y: i32) -> Reading {
     let (cx, cy) = (x.clamp(0, W as i32 - 1), y.clamp(0, H as i32 - 1));
     let temp = world.temp[cy as usize * W + cx as usize];
     let liquid = matches!(world.raw(cx, cy).kind(), world::Kind::Liquid);
-    let press = if liquid { world.liquid_pressure(cx, cy) } else { world.gas_pressure(cx, cy) };
+    let press = if liquid {
+        world.liquid_pressure(cx, cy)
+    } else if world.pocket_at(cx, cy).is_some() {
+        world.gas_pressure(cx, cy)
+    } else {
+        crate::world::air_pressure_atm(cy)
+    };
     let hum = if liquid { if world.raw(cx, cy) == Mat::Water { 1.0 } else { 0.0 } } else { world.flow.moisture_at(cx, cy) };
     Reading { temp, press, hum }
 }
@@ -233,6 +239,8 @@ mod tests {
         }
         assert_eq!(s.list.len(), MAX_SENSORS);
         assert_eq!(s.list[0].x, 150);
-        assert_eq!(read(&w, 100, 100).press, 1.0, "open air is at 1 atm");
+        let (high, low) = (read(&w, 100, 100).press, read(&w, 100, 355).press);
+        assert!((low - 1.0).abs() < 0.01, "open air on the valley floor is at 1 atm: {low}");
+        assert!(high > 0.2 && high < 0.6, "the air thins out with altitude, 8 km up: {high}");
     }
 }

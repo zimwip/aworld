@@ -12,7 +12,10 @@ mod hydro;
 pub mod sleep;
 pub use pockets::boil_c;
 mod thermal;
-pub use thermal::{Season, DAY_STEPS};
+mod storm;
+pub use storm::{Bolt, BREAKDOWN, QS, QW, QH};
+pub use thermal::{air_pressure_atm, Season, DAY_STEPS};
+use thermal::adiabatic_cooling_c;
 
 /// How the brush treats what is already there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -68,6 +71,12 @@ pub const K: i32 = 3;
 pub const TUNNEL_LINING: i32 = 3;
 /// Above this row the air is cold: steam condenses into clouds.
 const COLD_Y: i32 = (H as i32) * 3 / 10;
+/// The top of the weather (the tropopause, about 13 km up on the logarithmic altitude scale of
+/// `thermal::altitude_m`): above this row the air gets warmer again with height (an inversion).
+/// Rising steam and clouds cool as they climb, so past it they are soon colder and denser than
+/// the air around them: they stop under it and spread out sideways, the way a storm cloud
+/// flattens into an anvil.
+pub const CEILING_Y: i32 = (H as i32) / 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -541,6 +550,11 @@ pub struct World {
     pub zones: sleep::Zones,
     /// Walls that gave way under the pressure of a pocket this step: (x, y, pressure in atm).
     pub bursts: Vec<(i32, i32, f32)>,
+    /// Electric charge of the clouds, one value per `QS`×`QS` square (see `storm.rs`).
+    pub charge: Vec<f32>,
+    /// Bolts of lightning since they were last read. For the picture and the thunder.
+    pub bolts: Vec<Bolt>,
+    storm_rng: storm::StormRng,
 }
 
 impl World {
@@ -601,6 +615,9 @@ impl World {
             liq_w: vec![0.0; W * H],
             bursts: Vec::new(),
             zones: sleep::Zones::new(),
+            charge: vec![0.0; QW * QH],
+            bolts: Vec::new(),
+            storm_rng: storm::StormRng(0x9e37_79b9),
         }
     }
 
@@ -616,6 +633,7 @@ impl World {
 
     pub fn clear(&mut self) {
         self.revision += 1;
+        self.charge.fill(0.0);
         self.cells.fill(EMPTY);
         self.ejecta.clear();
         self.latent.fill(0.0);
@@ -880,6 +898,11 @@ impl World {
             self.water_flow += 1;
         }
         self.carry(ia, ib);
+        if a.1 != b.1 {
+            // Vapour and clouds cool as they rise into thinner air, and warm as they sink.
+            self.temp[ib] -= adiabatic_cooling_c(self.cells[ib].m, a.1, b.1);
+            self.temp[ia] -= adiabatic_cooling_c(self.cells[ia].m, b.1, a.1);
+        }
         self.cells[ia].stamp = self.frame;
         self.cells[ib].stamp = self.frame;
     }
@@ -1380,6 +1403,7 @@ impl World {
         if self.ticks % (thermal::THERMAL_EVERY * self.thermal_scale() as u32) == 0 {
             self.thermal_pass();
         }
+        self.storm_step();
         if self.day_cycle {
             self.clock = self.clock.wrapping_add(1);
         }
@@ -2062,15 +2086,53 @@ impl World {
     /// cold gas draws together. Returns true if the cell moved.
     fn buoyancy(&mut self, x: i32, y: i32) -> bool {
         let i = Self::idx(x, y);
+        // Foliage is no lid: gas under leaves and branches slips up through them to the open air
+        // above (a tree breathes; the steam of a pond under it does not stay trapped).
+        if matches!(self.at(x, y - 1), Mat::Leaf | Mat::Branch | Mat::Sapling) && self.chance(2) {
+            let mut k = 2;
+            while k <= 12 * K && matches!(self.at(x, y - k), Mat::Leaf | Mat::Branch | Mat::Sapling) {
+                k += 1;
+            }
+            if self.gas_may_rise_to(x, y, y - k) && self.at(x, y - k) == Mat::Empty {
+                self.swap((x, y), (x, y - k));
+                return true;
+            }
+        }
+        // Above the top of the weather, vapour or cloud that cannot rise any more (painted there,
+        // or an updraft that overshot) settles back down: its ice crystals slowly fall out of the
+        // thin air, and it ends up spread under the tropopause.
+        if y < CEILING_Y && !self.gas_may_rise_to(x, y, y - 1) && self.chance(3) {
+            let d = self.dir();
+            for dx in [0, d, -d] {
+                let t = (self.edge_x(x, y, x + dx), y + 1);
+                if self.at(t.0, t.1) == Mat::Empty {
+                    self.swap((x, y), t);
+                    return true;
+                }
+            }
+        }
         let lift = ((self.temp[i] - self.ambient_c(y)) / 25.0).clamp(-1.0, 1.0);
         let roll = (self.rand() % 100) as f32 / 100.0;
         let d = self.dir();
         if lift > 0.05 && roll < lift * 0.7 {
             for (dx, dy) in [(0, -1), (d, -1), (-d, -1)] {
                 let t = (self.edge_x(x, y, x + dx), y + dy);
-                if self.at(t.0, t.1) == Mat::Empty {
+                if self.gas_may_rise_to(x, y, t.1) && self.at(t.0, t.1) == Mat::Empty {
                     self.swap((x, y), t);
                     return true;
+                }
+            }
+            // Pressed against the ceiling, rising gas spreads out under it, mostly downwind (the
+            // jet stream drags the top of a storm cloud out into an anvil).
+            if !self.gas_may_rise_to(x, y, y - 1) {
+                let vx = self.flow.sample(x, y).0;
+                let down = if vx.abs() > 0.1 && roll < 0.8 * lift.min(1.0) * 0.7 { vx.signum() as i32 } else { d };
+                for dx in [down, -down] {
+                    let t = (self.edge_x(x, y, x + dx), y);
+                    if self.at(t.0, t.1) == Mat::Empty {
+                        self.swap((x, y), t);
+                        return true;
+                    }
                 }
             }
         } else if lift < -0.05 && roll < -lift * 0.8 {
@@ -2098,6 +2160,19 @@ impl World {
             }
         }
         false
+    }
+
+    /// Whether the gas at (x, y) may rise into row `to`. Under the top of the weather steam and
+    /// clouds rise freely; above it, in the warm thin air of the stratosphere, only if, once
+    /// cooled by the climb, they would still be warmer (lighter) than the air there, which they
+    /// soon are not. (Smoke is left free: it thins out in the open air by itself.)
+    pub(super) fn gas_may_rise_to(&self, x: i32, y: i32, to: i32) -> bool {
+        if to >= CEILING_Y || !Self::inb(x, y) || !matches!(self.raw(x, y), Mat::Steam | Mat::Cloud) {
+            return true;
+        }
+        // The air it would rise into (open air there, else the usual air of that height).
+        let air = if Self::inb(x, to) && self.raw(x, to) == Mat::Empty { self.temp[Self::idx(x, to)] } else { self.ambient_c(to) };
+        self.temp[Self::idx(x, y)] - adiabatic_cooling_c(self.raw(x, y), y, to) > air + 0.5
     }
 
     /// Where the gas at (x, y) moving to column `to` ends up. Vapour and clouds blown past the
@@ -2194,7 +2269,7 @@ impl World {
         let order: [(i32, i32); 3] = if hot && self.rand() % 10 < 6 { [(0, -1), (d, -1), (d, 0)] } else { [(d, 0), (-d, 0), (d, 0)] };
         for (dx, dy) in order {
             let t = (self.edge_x(x, y, x + dx), y + dy);
-            if self.at(t.0, t.1) == Mat::Empty {
+            if (dy >= 0 || self.gas_may_rise_to(x, y, t.1)) && self.at(t.0, t.1) == Mat::Empty {
                 self.swap((x, y), t);
                 return;
             }
@@ -2363,7 +2438,7 @@ impl World {
         };
         for (dx, dy) in order {
             let t = (x + dx, y + dy);
-            if self.at(t.0, t.1) == Mat::Empty {
+            if (dy >= 0 || self.gas_may_rise_to(x, y, t.1)) && self.at(t.0, t.1) == Mat::Empty {
                 self.swap((x, y), t);
                 return;
             }
@@ -2384,6 +2459,8 @@ impl World {
         self.temp[i] = t;
         let mut left = VAPOUR_PER_WATER - 1;
         let mut made = 1.0;
+        // (Not upward where the vapour could not rise: a drop evaporating above the top of the
+        // weather would otherwise ratchet its water up a row each time.)
         'out: for r in 1..=2 {
             for dy in -r..=r {
                 for dx in -r..=r {
@@ -2396,7 +2473,11 @@ impl World {
                     let (nx, ny) = (x + dx, y + dy);
                     // The second ring only through the first: never through a wall.
                     let via = (nx - dx.signum() * (r - 1), ny - dy.signum() * (r - 1));
-                    if Self::inb(nx, ny) && self.at(nx, ny) == Mat::Empty && (r == 1 || matches!(self.at(via.0, via.1), Mat::Empty | Mat::Steam)) {
+                    if Self::inb(nx, ny)
+                        && self.at(nx, ny) == Mat::Empty
+                        && (r == 1 || matches!(self.at(via.0, via.1), Mat::Empty | Mat::Steam))
+                        && (dy >= 0 || self.gas_may_rise_to(x, y, ny))
+                    {
                         let j = Self::idx(nx, ny);
                         q += thermal::heat_of(Mat::Empty, self.temp[j]);
                         self.set(nx, ny, Mat::Steam);
@@ -2513,6 +2594,16 @@ impl World {
         if (self.chance(600) && self.above_dew_point(x, y)) || (near == 0 && self.chance(3000)) {
             self.evaporate_cloud(x, y);
             return;
+        }
+        // Up at the top of the weather the jet stream sweeps the cloud along before anything
+        // else: the top of a storm cloud is dragged downwind into an anvil.
+        if y < CEILING_Y + 10 {
+            if let Some(t) = self.wind_target(x, y) {
+                if self.at(t.0, t.1) == Mat::Empty {
+                    self.swap((x, y), t);
+                    return;
+                }
+            }
         }
         if self.buoyancy(x, y) {
             return;
@@ -3804,7 +3895,7 @@ mod tests {
             w.set(519, y, Mat::Stone);
         }
         for x in 340..480 {
-            for y in 60..60 + rows {
+            for y in 80..80 + rows {
                 w.set(x, y, Mat::Cloud);
             }
         }
@@ -3854,7 +3945,7 @@ mod tests {
             (cloud0 - cloud_cells(&w)) as f32 / cloud0 as f32
         };
         let (thin, thick) = (rain(2), rain(16));
-        assert!(thin < 0.01, "a thin veil of cloud hardly rains: lost {thin}");
+        assert!(thin < 0.02, "a thin veil of cloud hardly rains (a drop or so): lost {thin}");
         assert!(thick > 4.0 * thin.max(0.005), "a thick cloud rains far more: {thick} against {thin}");
     }
 
@@ -4658,6 +4749,98 @@ mod tests {
         assert!(under > far + 1.5, "ground under the sun {under} vs far {far}");
         // Away from the sun's halo, the air gets colder toward the top of the screen.
         assert!(w.temp_c(40, 80) < w.temp_c(40, 290) - 5.0, "air should cool with altitude");
+    }
+
+    #[test]
+    fn the_ground_in_the_shade_of_a_cloud_warms_less() {
+        let run = |cloudy: bool| {
+            let mut w = World::new();
+            w.set_phase(0.25);
+            w.day_cycle = false;
+            w.flow.pin_uniform(0.0, 0.0);
+            // Rock down to the base of the world (only that holds it up).
+            for x in 0..W as i32 {
+                for y in 300..H as i32 {
+                    w.set(x, y, Mat::Stone);
+                }
+            }
+            if cloudy {
+                for x in 380..580 {
+                    for y in 150..170 {
+                        w.set(x, y, Mat::Cloud);
+                    }
+                }
+            }
+            w.reset_temps();
+            // Ground chilled by the night: the morning sun warms it up, where it reaches it.
+            for x in 0..W {
+                for y in 300..320 {
+                    w.temp[y * W + x] = 0.0;
+                }
+            }
+            for _ in 0..600 {
+                w.step();
+            }
+            w.temp_c(480, 300)
+        };
+        let (sunny, shaded) = (run(false), run(true));
+        assert!(shaded < sunny - 1.0, "ground under a cloud {shaded} vs in the sun {sunny}");
+    }
+
+    #[test]
+    fn clouds_and_steam_stop_under_the_top_of_the_weather() {
+        let mut w = World::new();
+        w.structures_fall = false;
+        w.clear();
+        w.flow.pin_uniform(0.0, -2.0);
+        // Hot steam low down, a very warm cloud high up, and a puff of cloud painted in the
+        // stratosphere. (A real atmosphere: the air cools up to the tropopause, then warms.)
+        for x in 300..340 {
+            for y in 250..260 {
+                w.set(x, y, Mat::Steam);
+                w.temp[y as usize * W + x as usize] = 90.0;
+            }
+            for y in 80..90 {
+                w.set(x + 200, y, Mat::Cloud);
+                w.temp[y as usize * W + x as usize + 200] = 40.0;
+            }
+            w.set(x + 400, 10, Mat::Cloud);
+        }
+        // A strong updraft may push the top of a storm cloud a little past the tropopause (an
+        // overshooting top), but cooling as it climbs it is soon heavier than the warm air there.
+        let mut highest = H;
+        for _ in 0..800 {
+            w.step();
+            highest = (0..W * H).filter(|&i| matches!(w.cells[i].m, Mat::Steam | Mat::Cloud) && (i % W) < 640).map(|i| i / W).min().unwrap_or(H).min(highest);
+        }
+        assert!(highest as i32 >= CEILING_Y - 20, "rising cloud overshot up to row {highest}");
+        let gas: Vec<usize> = (0..W * H).filter(|&i| matches!(w.cells[i].m, Mat::Steam | Mat::Cloud)).collect();
+        assert!(!gas.is_empty());
+        assert!(gas.iter().all(|&i| (i / W) as i32 >= CEILING_Y - 12), "gas above the tropopause settled back down to it");
+        let near_top = gas.iter().filter(|&&i| ((i / W) as i32) < CEILING_Y + 12).count();
+        assert!(near_top * 3 > gas.len(), "the rising gas gathers in a layer under the ceiling: {near_top} of {}", gas.len());
+    }
+
+    #[test]
+    fn steam_does_not_stay_trapped_under_a_tree() {
+        let mut w = World::new_static();
+        w.flow.pin_uniform(0.0, 0.0);
+        // A thick crown of leaves and branches, with steam under it.
+        for x in 380..460 {
+            for y in 200..230 {
+                w.set(x, y, if y == 229 { Mat::Branch } else { Mat::Leaf });
+            }
+            for y in 235..245 {
+                w.set(x, y, Mat::Steam);
+            }
+        }
+        for _ in 0..600 {
+            w.step();
+        }
+        let under = (0..W * H).filter(|&i| w.cells[i].m == Mat::Steam && (230..260).contains(&(i / W)) && (380..460).contains(&(i % W))).count();
+        let above = (0..W * H).filter(|&i| matches!(w.cells[i].m, Mat::Steam | Mat::Cloud) && i / W < 200).count();
+        assert!(under < 100, "steam stays trapped under the crown: {under} cells");
+        assert!(above > 300, "the steam went up through the leaves: {above} cells above");
     }
 
     #[test]
