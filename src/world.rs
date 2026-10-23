@@ -1832,9 +1832,12 @@ impl World {
                     return true;
                 }
             }
-            // Pressed against the ceiling, rising gas spreads out under it.
+            // Pressed against the ceiling, rising gas spreads out under it, mostly downwind (the
+            // jet stream drags the top of a storm cloud out into an anvil).
             if !self.gas_may_rise_to(x, y, y - 1) {
-                for dx in [d, -d] {
+                let vx = self.flow.sample(x, y).0;
+                let down = if vx.abs() > 0.1 && roll < 0.8 * lift.min(1.0) * 0.7 { vx.signum() as i32 } else { d };
+                for dx in [down, -down] {
                     let t = (self.edge_x(x, y, x + dx), y);
                     if self.at(t.0, t.1) == Mat::Empty {
                         self.swap((x, y), t);
@@ -2295,6 +2298,16 @@ impl World {
         if (self.chance(600) && self.above_dew_point(x, y)) || (near == 0 && self.chance(3000)) {
             self.evaporate_cloud(x, y);
             return;
+        }
+        // Up at the top of the weather the jet stream sweeps the cloud along before anything
+        // else: the top of a storm cloud is dragged downwind into an anvil.
+        if y < CEILING_Y + 10 {
+            if let Some(t) = self.wind_target(x, y) {
+                if self.at(t.0, t.1) == Mat::Empty {
+                    self.swap((x, y), t);
+                    return;
+                }
+            }
         }
         if self.buoyancy(x, y) {
             return;

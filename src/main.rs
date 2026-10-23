@@ -3960,6 +3960,26 @@ async fn main() {
                 c.fate = Fate::Exploded;
             }
         }
+        // `--anvil`: a plume of warm damp air off the plain, run until it has built a storm cloud
+        // whose top spreads out under the tropopause and is dragged downwind into an anvil.
+        if shot.is_some() && args.iter().any(|a| a == "--anvil") {
+            // First a long run to build the cloud, then the plume keeps feeding it until the shot.
+            let (from, to) = if frame == 1 { (0, 2600u32) } else { (2600 + frame * 4, 2604 + frame * 4) };
+            for step in from..to {
+                for k in 0..8u32 {
+                    let x = 600 + ((step * 7919 + k * 104729) % 120) as i32;
+                    let ground = (0..H as i32).find(|&y| !matches!(game.world.at(x, y), Mat::Empty | Mat::Steam | Mat::Cloud | Mat::Smoke)).unwrap_or(H as i32);
+                    let y = ground - 2 - ((step + k * 13) % 6) as i32;
+                    if game.world.at(x, y) == Mat::Empty {
+                        game.world.set(x, y, Mat::Steam);
+                        game.world.temp[y as usize * world::W + x as usize] = 32.0;
+                    }
+                }
+                if frame == 1 {
+                    game.world.step();
+                }
+            }
+        }
         // `--storm`: a big storm cloud, charged (positive top, negative base), over the valley.
         // `--lightning x`: a bolt from the sky at x, just before the shot.
         if shot.is_some() && frame == 345 && args.iter().any(|a| a == "--storm") {

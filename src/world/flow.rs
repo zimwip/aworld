@@ -13,6 +13,10 @@ pub const FH: usize = H.div_ceil(CELL);
 
 /// Base wind at full strength, in world cells per step (a gale moves gas about this fast).
 pub const GAIN: f32 = 1.2;
+/// The jet stream, as a multiple of the base wind, and the flow row it blows along (just under
+/// the tropopause, `CEILING_Y`).
+const JET: f32 = 0.8;
+const JET_ROW: f32 = super::CEILING_Y as f32 / CELL as f32 + 0.5;
 
 #[derive(Clone, Copy)]
 struct Vortex {
@@ -217,12 +221,16 @@ impl Flow {
     }
 
     /// The wind the layers of air tend towards, in coarse cells per step, at flow row `j`:
-    /// bands that blow opposite ways, drifting slowly up and down.
+    /// bands that blow opposite ways, drifting slowly up and down, and just under the tropopause
+    /// the jet stream, the strongest wind of all, always with the prevailing wind. It is what
+    /// drags the top of a storm cloud downwind into a long anvil.
     pub fn profile(wind: f32, j: usize, ticks: u32) -> f32 {
         let height = 1.0 - (j as f32 + 0.5) / FH as f32;
         let phase = ticks as f32 / 11000.0;
         let bands = (std::f32::consts::TAU * (height * 1.7 + phase)).sin();
-        wind * (GAIN / CELL as f32) * (0.75 * bands + 0.35 + 0.35 * height)
+        let layers = 0.75 * bands + 0.35 + 0.35 * height;
+        let jet = (-((j as f32 + 0.5 - JET_ROW) / 2.5).powi(2)).exp();
+        wind * (GAIN / CELL as f32) * (layers * (1.0 - jet) + JET * jet)
     }
 
     /// Adds a swirl: velocity going round `(x, y)` (coarse cell units).

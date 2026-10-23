@@ -564,3 +564,109 @@ mod tests {
         assert!(w.bolts.is_empty());
     }
 }
+
+#[cfg(test)]
+mod anvil_lab {
+    use super::*;
+
+    fn dump(w: &World, path: &str) {
+        let mut out = format!("P6\n{} {}\n255\n", W, H).into_bytes();
+        for y in 0..H {
+            for x in 0..W {
+                let i = y * W + x;
+                let c = match w.cells[i].m {
+                    Mat::Cloud => [240, 240, 250],
+                    Mat::Steam => [150, 160, 190],
+                    Mat::Water => [40, 90, 220],
+                    Mat::Snow | Mat::Hail | Mat::Ice => [200, 230, 255],
+                    Mat::Empty => if y as i32 == CEILING_Y { [90, 40, 40] } else { [20, 24, 40] },
+                    _ => [90, 80, 60],
+                };
+                out.extend_from_slice(&c);
+            }
+        }
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn anvil_over_a_warm_plain() {
+        let dir = std::env::var("LAB").unwrap_or("/tmp".into());
+        let mut w = World::new();
+        w.clear();
+        w.structures_fall = false;
+        w.set_phase(std::env::var("PHASE").map(|v| v.parse().unwrap()).unwrap_or(0.2));
+        if let Ok(v) = std::env::var("WIND") {
+            w.wind_max = v.parse().unwrap();
+        }
+        let real = std::env::var("REAL").is_ok();
+        if real {
+            w.generate_biome(2, Biome::Countryside);
+            w.set_phase(std::env::var("PHASE").map(|v| v.parse().unwrap()).unwrap_or(0.2));
+        }
+        for x in 0..W as i32 {
+            for y in 420..H as i32 {
+                if real {
+                    break;
+                }
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for x in 300..660 {
+            for y in 405..420 {
+                if !real {
+                    w.set(x, y, Mat::Water);
+                }
+            }
+        }
+        for y in (400..420).filter(|_| !real) {
+            w.set(298, y, Mat::Stone);
+            w.set(299, y, Mat::Stone);
+            w.set(660, y, Mat::Stone);
+            w.set(661, y, Mat::Stone);
+        }
+        w.reset_temps();
+        for step in 0..3001 {
+            // A hot summer lake: the water is kept warm, it steams.
+            if step % 8 == 0 {
+                for x in 300..660 {
+                    for y in 405..420 {
+                        let i = y * W + x;
+                        if w.cells[i].m == Mat::Water {
+                            w.temp[i] = w.temp[i].max(45.0);
+                        }
+                    }
+                }
+            }
+            // A strong source of damp, warm air rising off the plain.
+            if let Ok(rate) = std::env::var("SRC") {
+                let rate: u32 = rate.parse().unwrap();
+                for k in 0..rate {
+                    let x = 600 + ((step as u32 * 7919 + k * 104729) % 120) as i32;
+                    let ground = (0..H as i32).find(|&y| !matches!(w.at(x, y).kind(), Kind::Empty | Kind::Gas)).unwrap_or(H as i32);
+                    let y = ground - 2 - ((step as u32 + k * 13) % 6) as i32;
+                    if w.raw(x, y) == Mat::Empty {
+                        w.set(x, y, Mat::Steam);
+                        w.temp[y as usize * W + x as usize] = 32.0;
+                    }
+                }
+            }
+            w.step();
+            if step % 250 == 0 {
+                dump(&w, &format!("{dir}/anvil_{step:05}.ppm"));
+                let n = w.cells.iter().filter(|c| c.m == Mat::Cloud).count();
+                let top = (0..W * H).find(|&i| w.cells[i].m == Mat::Cloud).map(|i| i / W);
+                let c = |m: Mat| w.cells.iter().filter(|c| c.m == m).count();
+                let v: Vec<String> = [40, 60, 72, 100, 200, 390].iter().map(|&y| format!("{y}:{:.2}", w.flow.sample(480, y).0)).collect();
+                eprintln!("  flow vx {}", v.join(" "));
+                let anv: Vec<usize> = (0..80 * W).filter(|&i| w.cells[i].m == Mat::Cloud).map(|i| i % W).collect();
+                if !anv.is_empty() {
+                    let mean = anv.iter().sum::<usize>() as f32 / anv.len() as f32;
+                    eprintln!("  anvil n {} mean x {mean:.0} from {} to {}", anv.len(), anv.iter().min().unwrap(), anv.iter().max().unwrap());
+                }
+                eprintln!("step {step}: wind {:.2}, clouds {n}, top row {top:?}, water {} steam {} snow {} ice {}", w.wind, c(Mat::Water), c(Mat::Steam), c(Mat::Snow), c(Mat::Ice));
+            }
+        }
+        dump(&w, &format!("{dir}/anvil_end.ppm"));
+    }
+}
