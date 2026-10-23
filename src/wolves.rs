@@ -293,11 +293,11 @@ fn draw_wolf(w: &Wolf, view: View, fade: f32, howl: f32) {
     let u = w.size * SCALE;
     let pt = |p: (f32, f32)| to_screen(w, view, p);
     let head = head(howl);
-    let body = Color::new(0.06, 0.07, 0.12, fade);
-    let rim = Color::new(0.62, 0.68, 0.9, 0.85 * fade);
+    let body = Color::new(0.17, 0.19, 0.27, fade);
+    let rim = Color::new(0.78, 0.84, 1.0, 0.9 * fade);
     // The light comes from above, a little in front (the wolves face the moon).
     let light = vec2(0.45, -0.9).normalize();
-    let width = (0.15 * u * view.s).max(1.0);
+    let width = (0.2 * u * view.s).max(1.2);
     for shape in [&BODY[..], &head[..]] {
         for [a, b, c] in triangulate(shape) {
             draw_triangle(pt(shape[a]), pt(shape[b]), pt(shape[c]), body);
