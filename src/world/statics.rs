@@ -105,6 +105,7 @@ struct Part {
     y: i32,
     cell: Cell,
     temp: f32,
+    states: States,
 }
 
 /// A solid body tipping over or tumbling through the air.
@@ -168,6 +169,13 @@ struct Crack {
 }
 
 impl World {
+    fn put_states(&mut self, i: usize, st: States) {
+        self.moisture[i] = st.moisture;
+        self.fuel[i] = st.fuel;
+        self.growth[i] = st.growth;
+        self.jet[i] = st.jet;
+    }
+
     /// Checks the sections of the anchored bodies (see the top of the file); `order` lists their
     /// cells from the anchors outwards. The parts beyond a section that gives way break loose and
     /// start to tip.
@@ -428,7 +436,7 @@ impl World {
             mass += rho;
             mx += rho * (x as f32 + 0.5);
             my += rho * (y as f32 + 0.5);
-            parts.push(Part { x, y, cell: self.cells[i], temp: self.temp[i] });
+            parts.push(Part { x, y, cell: self.cells[i], temp: self.temp[i], states: self.states(i) });
             home.insert((x, y), k as u32);
             drawn.push((i, k as u32));
         }
@@ -546,15 +554,23 @@ impl World {
         }
         // What the body leaves is filled with the air (or smoke, or flames) it pushes aside.
         let now: HashSet<usize> = drawn.iter().map(|d| d.0).collect();
-        let mut pushed: Vec<(Cell, f32)> = drawn.iter().filter(|d| !own.contains(&d.0) && self.cells[d.0].m != Mat::Empty).map(|d| (self.cells[d.0], self.temp[d.0])).collect();
+        let mut pushed: Vec<(Cell, f32, States)> = drawn.iter().filter(|d| !own.contains(&d.0) && self.cells[d.0].m != Mat::Empty).map(|d| (self.cells[d.0], self.temp[d.0], self.states(d.0))).collect();
         let frame = self.frame;
         for &(i, _) in &s.drawn {
             if now.contains(&i) {
                 continue;
             }
-            let (cell, t) = pushed.pop().unwrap_or((EMPTY, self.temp[i]));
-            self.cells[i] = Cell { stamp: frame, ..cell };
-            self.temp[i] = t;
+            match pushed.pop() {
+                Some((cell, t, st)) => {
+                    self.cells[i] = Cell { stamp: frame, ..cell };
+                    self.temp[i] = t;
+                    self.put_states(i, st);
+                }
+                None => {
+                    self.cells[i] = Cell { stamp: frame, ..EMPTY };
+                    self.clear_states(i);
+                }
+            }
             self.latent[i] = 0.0;
             self.vel[i] = 0;
             self.zones.wake(i);
@@ -563,6 +579,7 @@ impl World {
             let p = s.parts[k as usize];
             self.cells[t] = Cell { stamp: frame, ..p.cell };
             self.temp[t] = p.temp;
+            self.put_states(t, p.states);
             self.latent[t] = 0.0;
             self.vel[t] = 0;
             self.zones.wake(t);

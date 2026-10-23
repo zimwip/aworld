@@ -302,36 +302,90 @@ fn density(m: Mat) -> f32 {
 #[derive(Clone, Copy)]
 pub struct Cell {
     pub m: Mat,
-    pub life: u8,
     stamp: u8,
 }
 
-const EMPTY: Cell = Cell { m: Mat::Empty, life: 0, stamp: 0 };
+const EMPTY: Cell = Cell { m: Mat::Empty, stamp: 0 };
+
+/// What a cell of matter carries besides what it is made of: one state per aspect, each in its
+/// own array of `World`, each with one meaning and one unit. When the matter moves its states go
+/// with it (`World::carry`); when it changes into another matter (`World::retype`,
+/// `World::change_state`) it keeps those the new matter can carry (`Mat::carries`) and loses the
+/// others; painting a cell (`World::set`) starts it afresh.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Aspect {
+    /// `temp` (°C) and `latent`: every matter has a temperature.
+    Heat,
+    /// `moisture`: water held in the cell on top of the matter's own, in `WATER_UNITS` per cell of
+    /// liquid water. Soil holds what it drank; packed vapour the extra cells of vapour in it.
+    Water,
+    /// `fuel`: what is left to burn in a flame or an ember, and whether it is charcoal.
+    Fuel,
+    /// `growth`: what a young tree still has to grow.
+    Growth,
+    /// `jet`: sideways speed and direction of a drop shot out of a jet (see `pockets::fly`).
+    Jet,
+}
+
+impl Mat {
+    /// Whether this matter carries a state for `a`.
+    pub fn carries(self, a: Aspect) -> bool {
+        match a {
+            Aspect::Heat => true,
+            Aspect::Water => matches!(self, Mat::Dirt | Mat::Grass | Mat::Mud | Mat::Steam | Mat::Cloud),
+            Aspect::Fuel => matches!(self, Mat::Fire | Mat::Ember),
+            Aspect::Growth => self == Mat::Sapling,
+            Aspect::Jet => self.kind() == Kind::Liquid,
+        }
+    }
+}
+
+/// What is left to burn in a flame or an ember: steps of burning (`left`), and whether it is
+/// charcoal (`carbon`), which glows hotter and burns several times longer than wood.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Fuel {
+    pub left: u8,
+    pub carbon: bool,
+}
+
+/// The states of one cell besides its heat, as `World::states` reads them.
+#[derive(Clone, Copy)]
+pub(super) struct States {
+    moisture: u16,
+    fuel: Fuel,
+    growth: u8,
+    jet: u8,
+}
+
+/// Units of `moisture` in one cell of liquid water.
+pub const WATER_UNITS: u16 = 64;
+/// Units of `moisture` in one cell of vapour (steam or cloud).
+pub const VAPOUR_UNITS: u16 = WATER_UNITS / VAPOUR_PER_WATER as u16;
 
 /// Steps for a cell of water at 40 °C under perfectly dry, still air to evaporate, on average.
 const EVAPORATE_40C: f32 = 9_000.0;
 /// A trunk cell standing on soil tries to transpire once in this many steps.
 const TRANSPIRE_EVERY: u32 = 200;
 
-/// Moisture (a soil cell's `life`) that one cell of water brings when the soil drinks it.
-pub const SOIL_WATER: u8 = 64;
+/// Moisture that one cell of water brings when the soil drinks it.
+pub const SOIL_WATER: u16 = WATER_UNITS;
 /// Moisture of saturated soil: three cells of water. Wetter than this it drinks no more, the rest
 /// stays on top as a puddle, and where there is air under it, it drips.
-pub const SOIL_FULL: u8 = 192;
+pub const SOIL_FULL: u16 = 3 * WATER_UNITS;
 /// Field capacity: above this the water is free and gravity drains it down into drier soil;
 /// below it the soil holds it, and it only creeps (capillarity) towards drier soil around.
-const SOIL_FIELD: u8 = 96;
+const SOIL_FIELD: u16 = 96;
 /// Moisture that leaves in one cell of vapour.
-const SOIL_VAPOUR: u8 = SOIL_WATER / VAPOUR_PER_WATER as u8;
+const SOIL_VAPOUR: u16 = VAPOUR_UNITS;
 /// Soil moisture moves to a neighbour once in this many steps.
 const SOIL_SEEP: u32 = 8;
 /// Saturated soil over a hole lets a drop fall once in this many steps.
 const SOIL_DRIP: u32 = 300;
 /// Grass sprouts on soil at least this moist, and stays fully green down to `GRASS_GREEN`.
-const GRASS_GROW: u8 = 40;
-const GRASS_GREEN: u8 = 48;
+const GRASS_GROW: u16 = 40;
+const GRASS_GREEN: u16 = 48;
 /// Below this the soil is dry for grass: it is straw yellow, and it wilts.
-const GRASS_DRY: u8 = SOIL_VAPOUR;
+const GRASS_DRY: u16 = SOIL_VAPOUR;
 /// Grass creeps onto a bare neighbour once in this many steps; with no grass near, a seed blown
 /// in by the wind sprouts once in `GRASS_SPROUT` steps.
 const GRASS_SPREAD: u32 = 250;
@@ -375,8 +429,6 @@ const RAIN_EVERY: f32 = 8000.0;
 /// Below this many cloud cells in the 5 x 5 around it (out of 24), a cloud is too thin to rain.
 const RAIN_MIN_WATER: f32 = 8.0;
 
-/// An ember whose life is at least this is burning charcoal: hotter and slower than wood.
-pub(crate) const COAL_LIFE: u8 = 200;
 
 /// A rigid piece of solid material that has lost its support and is falling.
 struct Piece {
@@ -392,9 +444,19 @@ struct Piece {
 /// A copy of everything that changes while the world runs (for undo).
 #[derive(Clone)]
 pub struct State {
-    cells: Vec<Cell>,
+    matter: Matter,
     temp: Vec<f32>,
     clock: u32,
+}
+
+/// A copy of the matter of every cell and of the states it carries (see `Aspect`), but its heat.
+#[derive(Clone)]
+pub struct Matter {
+    cells: Vec<Cell>,
+    moisture: Vec<u16>,
+    fuel: Vec<Fuel>,
+    growth: Vec<u8>,
+    jet: Vec<u8>,
 }
 
 pub struct World {
@@ -485,6 +547,11 @@ pub struct World {
     /// Falling speed of each grain, in eighths of a cell per step (gravity speeds a free-falling
     /// grain up; landing stops it).
     vel: Vec<u8>,
+    /// The other states a cell of matter carries, one per `Aspect`.
+    pub moisture: Vec<u16>,
+    pub fuel: Vec<Fuel>,
+    pub growth: Vec<u8>,
+    jet: Vec<u8>,
     /// Absolute pressure (atm) inside each liquid cell; 1 elsewhere.
     liq_p: Vec<f32>,
     /// Scratch for the pockets: what each cell is to the gas, and the weight of each liquid cell.
@@ -499,11 +566,14 @@ pub struct World {
     /// Bolts of lightning since they were last read. For the picture and the thunder.
     pub bolts: Vec<Bolt>,
     storm_rng: storm::StormRng,
+    /// The last pressure field read through `pressure_at_cell` (the loupe): (revision, tick, field).
+    pressure_cache: std::sync::Mutex<Option<(u64, u32, Vec<f32>)>>,
 }
 
 impl World {
     pub fn new() -> Self {
         World {
+            pressure_cache: std::sync::Mutex::new(None),
             cells: vec![EMPTY; W * H],
             frame: 0,
             rng: 0x1234_5678,
@@ -554,6 +624,10 @@ impl World {
             liq_p: vec![1.0; W * H],
             latent: vec![0.0; W * H],
             vel: vec![0; W * H],
+            moisture: vec![0; W * H],
+            fuel: vec![Fuel::default(); W * H],
+            growth: vec![0; W * H],
+            jet: vec![0; W * H],
             cls: vec![0; W * H],
             liq_w: vec![0.0; W * H],
             bursts: Vec::new(),
@@ -596,15 +670,11 @@ impl World {
     }
 
     pub fn capture(&self) -> State {
-        State { cells: self.cells.clone(), temp: self.temp.clone(), clock: self.clock }
+        State { matter: self.snapshot(), temp: self.temp.clone(), clock: self.clock }
     }
 
     pub fn restore_state(&mut self, st: &State) {
-        self.revision += 1;
-        self.cells.copy_from_slice(&st.cells);
-        self.latent.fill(0.0);
-        self.vel.fill(0);
-        self.zones.wake_all();
+        self.restore(&st.matter);
         self.temp.copy_from_slice(&st.temp);
         self.clock = st.clock;
         self.falling.clear();
@@ -651,6 +721,7 @@ impl World {
         let mut taken: Vec<usize> = found.iter().take(n).map(|&(_, i)| i).collect();
         for &i in &taken {
             self.cells[i] = EMPTY;
+            self.clear_states(i);
             self.zones.wake(i);
         }
         // The ground sinks into what was taken instead of leaving a cave under its turf: the soil
@@ -693,13 +764,17 @@ impl World {
         true
     }
 
-    pub fn snapshot(&self) -> Vec<Cell> {
-        self.cells.clone()
+    pub fn snapshot(&self) -> Matter {
+        Matter { cells: self.cells.clone(), moisture: self.moisture.clone(), fuel: self.fuel.clone(), growth: self.growth.clone(), jet: self.jet.clone() }
     }
 
-    pub fn restore(&mut self, snap: &[Cell]) {
+    pub fn restore(&mut self, snap: &Matter) {
         self.revision += 1;
-        self.cells.copy_from_slice(snap);
+        self.cells.copy_from_slice(&snap.cells);
+        self.moisture.copy_from_slice(&snap.moisture);
+        self.fuel.copy_from_slice(&snap.fuel);
+        self.growth.copy_from_slice(&snap.growth);
+        self.jet.copy_from_slice(&snap.jet);
         self.latent.fill(0.0);
         self.vel.fill(0);
         self.zones.wake_all();
@@ -807,16 +882,18 @@ impl World {
             return;
         }
         self.revision += 1;
-        let life = match m {
+        let left = match m {
             Mat::Fire => 20 + (self.rand() % 40) as u8,
             Mat::Ember => 100 + (self.rand() % 100) as u8,
             _ => 0,
         };
         let frame = self.frame;
         let i = Self::idx(x, y);
-        self.cells[i] = Cell { m, life, stamp: frame };
+        self.cells[i] = Cell { m, stamp: frame };
         self.latent[i] = 0.0;
         self.vel[i] = 0;
+        self.clear_states(i);
+        self.fuel[i].left = left;
         self.zones.wake(i);
         match m {
             Mat::Fire => self.temp[i] = thermal::FIRE_C,
@@ -830,6 +907,7 @@ impl World {
     fn swap(&mut self, a: (i32, i32), b: (i32, i32)) {
         if !Self::inb(b.0, b.1) {
             self.cells[Self::idx(a.0, a.1)] = EMPTY;
+            self.clear_states(Self::idx(a.0, a.1));
             self.zones.wake(Self::idx(a.0, a.1));
             return;
         }
@@ -839,10 +917,7 @@ impl World {
         if self.cells[ia].m == Mat::Water {
             self.water_flow += 1;
         }
-        self.cells.swap(ia, ib);
-        self.temp.swap(ia, ib);
-        self.latent.swap(ia, ib);
-        self.vel.swap(ia, ib);
+        self.carry(ia, ib);
         if a.1 != b.1 {
             // Vapour and clouds cool as they rise into thinner air, and warm as they sink.
             self.temp[ib] -= adiabatic_cooling_c(self.cells[ib].m, a.1, b.1);
@@ -850,6 +925,58 @@ impl World {
         }
         self.cells[ia].stamp = self.frame;
         self.cells[ib].stamp = self.frame;
+    }
+
+    /// Swaps the matter of cells `i` and `j` with every state it carries (see `Aspect`).
+    fn carry(&mut self, i: usize, j: usize) {
+        self.cells.swap(i, j);
+        self.temp.swap(i, j);
+        self.latent.swap(i, j);
+        self.vel.swap(i, j);
+        self.moisture.swap(i, j);
+        self.fuel.swap(i, j);
+        self.growth.swap(i, j);
+        self.jet.swap(i, j);
+    }
+
+    /// Clears the states of cell `i` that only some matters carry (heat stays: every matter has one).
+    fn clear_states(&mut self, i: usize) {
+        self.moisture[i] = 0;
+        self.fuel[i] = Fuel::default();
+        self.growth[i] = 0;
+        self.jet[i] = 0;
+    }
+
+    fn states(&self, i: usize) -> States {
+        States { moisture: self.moisture[i], fuel: self.fuel[i], growth: self.growth[i], jet: self.jet[i] }
+    }
+
+    /// Cell `i`, which was `from` and has just been set to a new matter, takes back the states of
+    /// `kept` that both matters carry; the others stay as `set` left them.
+    pub(super) fn keep_states(&mut self, i: usize, kept: States, from: Mat) {
+        let to = self.cells[i].m;
+        let both = |a| from.carries(a) && to.carries(a);
+        if both(Aspect::Water) {
+            self.moisture[i] = kept.moisture;
+        }
+        if both(Aspect::Fuel) {
+            self.fuel[i] = kept.fuel;
+        }
+        if both(Aspect::Growth) {
+            self.growth[i] = kept.growth;
+        }
+        if both(Aspect::Jet) {
+            self.jet[i] = kept.jet;
+        }
+    }
+
+    /// Extra cells of vapour packed in a cell of steam or cloud, on top of its own.
+    fn packed(&self, i: usize) -> u32 {
+        (self.moisture[i] / VAPOUR_UNITS) as u32
+    }
+
+    fn set_packed(&mut self, i: usize, n: u32) {
+        self.moisture[i] = n as u16 * VAPOUR_UNITS;
     }
 
     // ----- rigid block mask -------------------------------------------------
@@ -883,17 +1010,23 @@ impl World {
                 continue;
             }
             let (x, y) = ((i % W) as i32, (i / W) as i32);
-            self.cells[i] = EMPTY;
+            let mut moved = false;
             for dy in 1..=30 {
                 let j = (y - dy) as usize * W + x as usize;
                 if y - dy < 0 {
                     break;
                 }
                 if self.mask[j] == 0 && self.cells[j].m == Mat::Empty {
-                    self.cells[j] = Cell { stamp: self.frame, ..c };
+                    self.carry(i, j);
+                    self.cells[j].stamp = self.frame;
                     self.zones.wake(j);
+                    moved = true;
                     break;
                 }
+            }
+            if !moved {
+                self.cells[i] = EMPTY;
+                self.clear_states(i);
             }
         }
     }
@@ -1136,7 +1269,7 @@ impl World {
                 self.set(x as i32, y, m);
                 if matches!(m, Mat::Dirt | Mat::Grass) {
                     // Moist soil, below field capacity: it holds its water until the sun dries it.
-                    self.cells[Self::idx(x as i32, y)].life = 72;
+                    self.moisture[Self::idx(x as i32, y)] = 72;
                 }
             }
             for y in sea..top {
@@ -1475,7 +1608,7 @@ impl World {
             return;
         }
         self.step_soil(x, y);
-        if (!self.turf_open(x, y) && self.chance(GRASS_SMOTHER)) || (self.cells[i].life < GRASS_DRY && self.chance(GRASS_WILT)) {
+        if (!self.turf_open(x, y) && self.chance(GRASS_SMOTHER)) || (self.moisture[i] < GRASS_DRY && self.chance(GRASS_WILT)) {
             self.retype(x, y, Mat::Dirt);
         }
     }
@@ -1490,13 +1623,14 @@ impl World {
         k <= K && matches!(self.at(x, y - k).kind(), Kind::Empty | Kind::Gas)
     }
 
-    /// Changes what a cell is made of, keeping its moisture and its heat.
-    fn retype(&mut self, x: i32, y: i32, m: Mat) {
+    /// Changes what a cell is made of, keeping its temperature and the states `m` carries (see
+    /// `Aspect`).
+    pub(super) fn retype(&mut self, x: i32, y: i32, m: Mat) {
         let i = Self::idx(x, y);
-        let (life, t) = (self.cells[i].life, self.temp[i]);
+        let (from, t, kept) = (self.cells[i].m, self.temp[i], self.states(i));
         self.set(x, y, m);
-        self.cells[i].life = life;
         self.temp[i] = t;
+        self.keep_states(i, kept, from);
     }
 
     /// Bare soil washes away under flowing water (grass roots protect it), and grass grows on it
@@ -1511,7 +1645,7 @@ impl World {
             return;
         }
         self.step_soil(x, y);
-        if self.cells[i].life >= GRASS_GROW && self.temp[i] > 5.0 && matches!(self.at(x, y - 1), Mat::Empty | Mat::Grass) && self.turf_open(x, y) {
+        if self.moisture[i] >= GRASS_GROW && self.temp[i] > 5.0 && matches!(self.at(x, y - 1), Mat::Empty | Mat::Grass) && self.turf_open(x, y) {
             // Grass creeps sideways along the ground, and its roots thicken the turf downwards.
             let near = self.raw(x, y - 1) == Mat::Grass || (-1..=1).any(|dy| self.raw(x - 1, y + dy) == Mat::Grass || self.raw(x + 1, y + dy) == Mat::Grass);
             if self.chance(if near { GRASS_SPREAD } else { GRASS_SPROUT }) && self.lit(x, y) {
@@ -1520,7 +1654,7 @@ impl World {
             }
         }
         if self.chance(30) && self.flowing_water_near(x, y) && self.chance(8) {
-            // Mud keeps the soil's water (in its `life`) and gives it back when it settles.
+            // Mud keeps the soil's water (its `moisture`) and gives it back when it settles.
             self.retype(x, y, Mat::Mud);
         }
     }
@@ -1528,15 +1662,15 @@ impl World {
     /// How much moisture soil at (x, y) passes to the soil at `n` now: free water above field
     /// capacity drains down into drier soil below, and moisture creeps from wetter to drier soil
     /// in every direction (capillarity), a quarter of the difference at a time.
-    fn soil_seep(&self, x: i32, y: i32, n: (i32, i32)) -> u8 {
+    fn soil_seep(&self, x: i32, y: i32, n: (i32, i32)) -> u16 {
         if !matches!(self.at(n.0, n.1), Mat::Dirt | Mat::Grass | Mat::Mud) {
             return 0;
         }
-        let (a, b) = (self.cells[Self::idx(x, y)].life as i32, self.cells[Self::idx(n.0, n.1)].life as i32);
+        let (a, b) = (self.moisture[Self::idx(x, y)] as i32, self.moisture[Self::idx(n.0, n.1)] as i32);
         let room = (SOIL_FULL as i32 - b).max(0);
         let creep = (a - b) / 4;
         let drain = if n.1 > y { a - SOIL_FIELD as i32 } else { 0 };
-        creep.max(drain).clamp(0, room) as u8
+        creep.max(drain).clamp(0, room) as u16
     }
 
     /// Water in the soil: it seeps through the ground, drips out of saturated soil into a hole
@@ -1544,7 +1678,7 @@ impl World {
     /// soil dries. A little moisture (less than one cell of vapour's worth) always stays.
     fn step_soil(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
-        if self.cells[i].life == 0 {
+        if self.moisture[i] == 0 {
             return;
         }
         if self.chance(SOIL_SEEP) {
@@ -1552,27 +1686,27 @@ impl World {
             let k = self.soil_seep(x, y, n);
             if k > 0 {
                 let j = Self::idx(n.0, n.1);
-                self.cells[i].life -= k;
-                self.cells[j].life += k;
+                self.moisture[i] -= k;
+                self.moisture[j] += k;
                 self.zones.wake(j);
             }
         }
-        if self.cells[i].life >= SOIL_FULL && self.at(x, y + 1) == Mat::Empty && self.mask_free(x, y + 1) && self.chance(SOIL_DRIP) {
+        if self.moisture[i] >= SOIL_FULL && self.at(x, y + 1) == Mat::Empty && self.mask_free(x, y + 1) && self.chance(SOIL_DRIP) {
             let (j, t) = (Self::idx(x, y + 1), self.temp[i]);
             self.set(x, y + 1, Mat::Water);
             self.temp[j] = t;
-            self.cells[i].life -= SOIL_WATER;
+            self.moisture[i] -= SOIL_WATER;
             return;
         }
         // Evaporation, as for open water (see `step_water`): warmer, drier and windier is faster.
         // Wet soil dries about as fast as a puddle, drier soil slower; grass breathes out the
         // water its roots draw up, so a lawn dries faster than bare earth.
         let t = self.temp[i];
-        if self.cells[i].life >= SOIL_VAPOUR && t > 0.0 && self.at(x, y - 1) == Mat::Empty && self.mask_free(x, y - 1) {
+        if self.moisture[i] >= SOIL_VAPOUR && t > 0.0 && self.at(x, y - 1) == Mat::Empty && self.mask_free(x, y - 1) {
             let dry = 1.0 - self.flow.moisture_at(x, y - 1);
             let (wx, wy) = self.flow.sample(x, y - 1);
             let breeze = 1.0 + 2.0 * ((wx * wx + wy * wy).sqrt() / flow::GAIN).min(1.0);
-            let wet = (self.cells[i].life as f32 / SOIL_WATER as f32).min(1.0);
+            let wet = (self.moisture[i] as f32 / SOIL_WATER as f32).min(1.0);
             let leaves = if self.cells[i].m == Mat::Grass { 1.5 } else { 1.0 };
             let rate = VAPOUR_PER_WATER as f32 * wet * leaves * dry * breeze * vapour_pressure(t) / vapour_pressure(40.0) / EVAPORATE_40C;
             if self.chance_f(rate) {
@@ -1580,7 +1714,7 @@ impl World {
                 // soil and the air over it cool.
                 let j = Self::idx(x, y - 1);
                 let q = thermal::heat_of(Mat::Empty, self.temp[j]) + thermal::heat_of(Mat::Water, t) / VAPOUR_PER_WATER as f32 - thermal::heat_of(Mat::Steam, t);
-                self.cells[i].life -= SOIL_VAPOUR;
+                self.moisture[i] -= SOIL_VAPOUR;
                 self.set(x, y - 1, Mat::Steam);
                 self.temp[j] = t;
                 self.release_heat(x, y, q);
@@ -1596,7 +1730,7 @@ impl World {
                 let i = Self::idx(x, y);
                 if matches!(self.cells[i].m, Mat::Dirt | Mat::Grass) {
                     let f = (1.0 - (x as f32 - W as f32 * 0.3) / (W as f32 * 0.4)).clamp(0.0, 1.0);
-                    self.cells[i].life = (f * 170.0) as u8;
+                    self.moisture[i] = (f * 170.0) as u16;
                 }
             }
         }
@@ -1606,16 +1740,17 @@ impl World {
     }
 
     /// Can the soil at (x, y) still change by itself (seep, drip, dry out)?
-    pub(super) fn soil_restless(&self, x: i32, y: i32, life: u8) -> bool {
-        life > 0
+    pub(super) fn soil_restless(&self, x: i32, y: i32) -> bool {
+        let wet = self.moisture[Self::idx(x, y)];
+        wet > 0
             && (Self::neighbors(x, y).iter().any(|&n| self.soil_seep(x, y, n) > 0)
-                || (life >= SOIL_FULL && self.at(x, y + 1) == Mat::Empty)
-                || (life >= SOIL_VAPOUR && self.at(x, y - 1) == Mat::Empty))
+                || (wet >= SOIL_FULL && self.at(x, y + 1) == Mat::Empty)
+                || (wet >= SOIL_VAPOUR && self.at(x, y - 1) == Mat::Empty))
     }
 
     /// Can the water at (x, y) soak into the soil at `n`?
     fn soil_drinks(&self, n: (i32, i32)) -> bool {
-        matches!(self.at(n.0, n.1), Mat::Dirt | Mat::Grass | Mat::Mud) && self.cells[Self::idx(n.0, n.1)].life <= SOIL_FULL - SOIL_WATER
+        matches!(self.at(n.0, n.1), Mat::Dirt | Mat::Grass | Mat::Mud) && self.moisture[Self::idx(n.0, n.1)] <= SOIL_FULL - SOIL_WATER
     }
 
     /// Snowflakes drift on the wind while they fall, slowly (they are light and catch the air).
@@ -1712,7 +1847,7 @@ impl World {
         for dy in 0..=depth {
             for dx in -reach..=reach {
                 let (sx, sy) = (x + dx, y + dy);
-                if Self::inb(sx, sy) && matches!(self.cells[Self::idx(sx, sy)].m, Mat::Dirt | Mat::Grass) && self.cells[Self::idx(sx, sy)].life >= 30 {
+                if Self::inb(sx, sy) && matches!(self.cells[Self::idx(sx, sy)].m, Mat::Dirt | Mat::Grass) && self.moisture[Self::idx(sx, sy)] >= 30 {
                     return Some((sx, sy));
                 }
             }
@@ -1732,7 +1867,7 @@ impl World {
         }
         if let Some((sx, sy)) = self.find_moist_soil(x, y, reach, depth) {
             let i = Self::idx(sx, sy);
-            self.cells[i].life -= 30;
+            self.moisture[i] -= 30;
             return true;
         }
         false
@@ -1775,7 +1910,7 @@ impl World {
                 if self.raw(x + dx, y) == Mat::Empty {
                     self.set(x + dx, y, Mat::Sapling);
                     let i = Self::idx(x + dx, y);
-                    self.cells[i].life = budget;
+                    self.growth[i] = budget;
                 }
             }
         }
@@ -1807,7 +1942,7 @@ impl World {
     /// finishes with a crown of leaves.
     fn step_sapling(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
-        let life = self.cells[i].life;
+        let left = self.growth[i];
         if self.at(x, y - 1) != Mat::Empty {
             // Not a tip: it is trunk now.
             if self.at(x, y - 1) != Mat::Sapling {
@@ -1815,7 +1950,7 @@ impl World {
             }
             return;
         }
-        if life == 0 {
+        if left == 0 {
             self.set(x, y, Mat::Trunk);
             self.grow_crown(x, y);
             return;
@@ -1824,7 +1959,7 @@ impl World {
             self.set(x, y, Mat::Trunk);
             self.set(x, y - 1, Mat::Sapling);
             let j = Self::idx(x, y - 1);
-            self.cells[j].life = life - 1;
+            self.growth[j] = left - 1;
         }
     }
 
@@ -2135,7 +2270,7 @@ impl World {
     pub(super) fn ignite_oil(&mut self, x: i32, y: i32) {
         self.set(x, y, Mat::Fire);
         let i = Self::idx(x, y);
-        self.cells[i].life = 150 + (self.rand() % 100) as u8;
+        self.fuel[i].left = 150 + (self.rand() % 100) as u8;
         if self.at(x, y - 1) == Mat::Empty {
             self.set(x, y - 1, Mat::Fire);
         }
@@ -2182,7 +2317,7 @@ impl World {
             let n = soils[(self.rand() % 3) as usize];
             if self.soil_drinks(n) {
                 let j = Self::idx(n.0, n.1);
-                self.cells[j].life += SOIL_WATER;
+                self.moisture[j] += SOIL_WATER;
                 self.zones.wake(j);
                 self.set(x, y, Mat::Empty);
                 return;
@@ -2301,12 +2436,12 @@ impl World {
         let i = Self::idx(x, y);
         let hot = self.temp[i] > self.ambient_c(y) + 8.0;
         // Packed vapour (a full boiler) spreads into any room it finds.
-        if self.cells[i].life > 0 {
+        if self.packed(i) > 0 {
             let n = Self::neighbors(x, y)[(self.rand() % 4) as usize];
             if self.at(n.0, n.1) == Mat::Empty {
                 let (j, t) = (Self::idx(n.0, n.1), self.temp[i]);
                 let q = thermal::heat_of(Mat::Empty, self.temp[j]) - thermal::cap(Mat::Steam) * t;
-                self.cells[i].life -= 1;
+                self.moisture[i] -= VAPOUR_UNITS;
                 self.set(n.0, n.1, Mat::Steam);
                 self.temp[j] = t;
                 self.release_heat(x, y, q);
@@ -2344,7 +2479,7 @@ impl World {
 
     /// Water at (x, y) turns to vapour and swells: the cell becomes steam, and the rest of its
     /// `VAPOUR_PER_WATER` cells of steam go into the nearest free cells around it. Shut in with no
-    /// room left (a full boiler), the rest of the vapour stays packed in the cell (its `life`
+    /// room left (a full boiler), the rest of the vapour stays packed in the cell (its `moisture`
     /// counts the extra cells' worth): no water is lost, and the packed vapour pushes harder
     /// (see `pockets.rs`) until it finds room to spread. The heat it takes beyond what the water
     /// held (all of it when the water boiled, less when it evaporates cold) comes from around.
@@ -2385,7 +2520,7 @@ impl World {
                 }
             }
         }
-        self.cells[i].life = left as u8;
+        self.set_packed(i, left as u32);
         q -= made * thermal::cap(Mat::Steam) * t + VAPOUR_PER_WATER as f32 * thermal::latent0(Mat::Steam);
         self.release_heat(x, y, q);
     }
@@ -2393,7 +2528,7 @@ impl World {
     /// Cells' worth of vapour in a cell of steam or cloud (more than one when packed).
     pub fn vapour_units(&self, i: usize) -> u32 {
         match self.cells[i].m {
-            Mat::Steam | Mat::Cloud => 1 + self.cells[i].life as u32,
+            Mat::Steam | Mat::Cloud => 1 + self.packed(i),
             _ => 0,
         }
     }
@@ -2429,13 +2564,13 @@ impl World {
         for (cx, cy, take) in found {
             let j = Self::idx(cx, cy);
             if take >= self.vapour_units(j) {
-                q += thermal::heat_of(Mat::Cloud, self.temp[j]) + self.cells[j].life as f32 * thermal::latent0(Mat::Cloud) - thermal::heat_of(Mat::Empty, self.temp[j]);
+                q += thermal::heat_of(Mat::Cloud, self.temp[j]) + self.packed(j) as f32 * thermal::latent0(Mat::Cloud) - thermal::heat_of(Mat::Empty, self.temp[j]);
                 let t = self.temp[j];
                 self.set(cx, cy, Mat::Empty);
                 self.temp[j] = t;
             } else {
                 q += take as f32 * thermal::latent0(Mat::Cloud);
-                self.cells[j].life -= take as u8;
+                self.moisture[j] -= take as u16 * VAPOUR_UNITS;
             }
         }
         self.release_heat(x, y, q);
@@ -2478,7 +2613,7 @@ impl World {
             if self.chance_f(thick * thick / RAIN_EVERY) && self.gather_vapour(x, y) {
                 // The drop holds the cloud's water; freezing into snow or hail, it gives off
                 // the heat of freezing (counted by `heat_of`).
-                let own = thermal::heat_of(Mat::Cloud, t) + self.cells[i].life as f32 * thermal::latent0(Mat::Cloud);
+                let own = thermal::heat_of(Mat::Cloud, t) + self.packed(i) as f32 * thermal::latent0(Mat::Cloud);
                 let (to, tt) = if t > 2.0 { (Mat::Water, t.max(4.0)) } else if t > -12.0 { (Mat::Snow, t) } else { (Mat::Hail, t) };
                 self.set(x, y, to);
                 self.temp[i] = tt;
@@ -2527,11 +2662,11 @@ impl World {
 
     fn step_fire(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
-        if self.cells[i].life == 0 {
+        if self.fuel[i].left == 0 {
             self.set(x, y, Mat::Empty);
             return;
         }
-        self.cells[i].life -= 1;
+        self.fuel[i].left -= 1;
         // A flame burns the oxygen of the air touching it. With no air around (only smoke,
         // steam or walls) it chokes within a few steps: that is why a glass over a candle
         // puts it out.
@@ -2541,7 +2676,7 @@ impl World {
             _ => false,
         });
         if !air {
-            self.cells[i].life = self.cells[i].life.saturating_sub(6);
+            self.fuel[i].left = self.fuel[i].left.saturating_sub(6);
         }
         for (nx, ny) in Self::neighbors(x, y) {
             match self.at(nx, ny) {
@@ -2580,9 +2715,9 @@ impl World {
 
     fn step_ember(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
-        // Burning charcoal (life from COAL_LIFE up) lasts several times longer than burning wood.
-        let coal = self.cells[i].life >= COAL_LIFE;
-        if self.cells[i].life == 0 || self.cells[i].life == COAL_LIFE {
+        // Burning charcoal lasts several times longer than burning wood.
+        let coal = self.fuel[i].carbon;
+        if self.fuel[i].left == 0 {
             let m = if self.chance(2) { Mat::Ash } else { Mat::Empty };
             self.set(x, y, m);
             return;
@@ -2598,7 +2733,7 @@ impl World {
         };
         let slow = if coal { slow * 12 } else { slow };
         if slow == 1 || self.chance(slow) {
-            self.cells[i].life -= 1;
+            self.fuel[i].left -= 1;
         }
         // Only an ember that air reaches can light the wood beside it. Under a cover of soil the
         // coals keep their heat, and the wood they warm chars into charcoal instead of burning
@@ -2650,7 +2785,7 @@ impl World {
         }
         self.set(x, y, Mat::Ember);
         let i = Self::idx(x, y);
-        self.cells[i].life = COAL_LIFE + 30 + (self.rand() % 26) as u8;
+        self.fuel[i] = Fuel { left: 30 + (self.rand() % 26) as u8, carbon: true };
     }
 
     /// Lava and molten metal: they flow slowly, set wood alight, and when quenched
@@ -2979,15 +3114,13 @@ impl World {
             self.zones.wake(i);
             if target as usize >= W * H {
                 self.cells[i] = EMPTY;
+                self.clear_states(i);
                 gone.push(k);
                 continue;
             }
             let t = target as usize;
             self.zones.wake(t);
-            self.cells.swap(i, t);
-            self.temp.swap(i, t);
-            self.latent.swap(i, t);
-            self.vel.swap(i, t);
+            self.carry(i, t);
             self.cells[i].stamp = self.frame;
             self.cells[t].stamp = self.frame;
             piece.cells[k] = t;
@@ -3040,31 +3173,10 @@ impl World {
     /// The pressure everywhere, in atmospheres (absolute): the air thins with height and moves with the
     /// flow, liquids add their weight with depth, and solids carry the weight of everything above them.
     pub fn pressure_field(&self) -> Vec<f32> {
-        let mut out = vec![0.0f32; W * H];
-        for x in 0..W {
-            self.pressure_column(x, H - 1, |y, p| out[y * W + x] = p);
-        }
-        // Liquid and rock are smoothed sideways (never across the air), so the layers of each
-        // column do not show as stripes.
-        let src = out.clone();
+        let raw = self.pressure_rows(H - 1);
+        let mut out = raw.clone();
         for y in 0..H {
-            let mut x = 0;
-            while x < W {
-                if matches!(self.cells[y * W + x].m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) {
-                    x += 1;
-                    continue;
-                }
-                let mut end = x;
-                while end < W && !matches!(self.cells[y * W + end].m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) {
-                    end += 1;
-                }
-                for xx in x..end {
-                    let (lo, hi) = (xx.saturating_sub(6).max(x), (xx + 6).min(end - 1));
-                    let sum: f32 = (lo..=hi).map(|q| src[y * W + q]).sum();
-                    out[y * W + xx] = sum / (hi - lo + 1) as f32;
-                }
-                x = end;
-            }
+            self.smooth_pressure_row(&raw, y, &mut out[y * W..(y + 1) * W]);
         }
         out
     }
@@ -3074,55 +3186,111 @@ impl World {
         if !Self::inb(x, y) {
             return 0.0;
         }
-        let mut p = 0.0;
-        self.pressure_column(x as usize, y as usize, |_, v| p = v);
-        p
+        // The load of the ground spreads, so a cell depends on a wide cone above it: the whole field
+        // is worked out, and while the game runs kept for a few ticks.
+        let mut cache = self.pressure_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = matches!(&*cache, Some((rev, tick, _)) if *rev == self.revision || (1..8).contains(&self.ticks.wrapping_sub(*tick)));
+        if !fresh {
+            *cache = Some((self.revision, self.ticks, self.pressure_field()));
+        }
+        cache.as_ref().map_or(0.0, |(_, _, f)| f[Self::idx(x, y)])
     }
 
-    /// Walks down a column to row `until`, handing each cell's pressure to `put`.
-    fn pressure_column(&self, x: usize, until: usize, mut put: impl FnMut(usize, f32)) {
+    /// Liquid and rock are smoothed sideways (never across the air), so the layers of each column do
+    /// not show as stripes.
+    fn smooth_pressure_row(&self, raw: &[f32], y: usize, out: &mut [f32]) {
+        let open = |x: usize| matches!(self.at(x as i32, y as i32).kind(), Kind::Empty | Kind::Gas | Kind::Flame);
+        let mut x = 0;
+        while x < W {
+            if open(x) {
+                out[x] = raw[y * W + x];
+                x += 1;
+                continue;
+            }
+            let mut end = x;
+            while end < W && !open(end) {
+                end += 1;
+            }
+            for xx in x..end {
+                let (lo, hi) = (xx.saturating_sub(6).max(x), (xx + 6).min(end - 1));
+                let sum: f32 = (lo..=hi).map(|q| raw[y * W + q]).sum();
+                out[xx] = sum / (hi - lo + 1) as f32;
+            }
+            x = end;
+        }
+    }
+
+    /// The pressure of every cell of rows `0..=until`, row by row from the top.
+    ///
+    /// Air: thinner with height, moved by the flow, or that of its closed pocket. Liquid: the weight
+    /// of the column above it (hydrostatic), plus the excess pressure the liquid has passed on.
+    /// Solid and loose ground: the weight above as well, but rock and sand do not carry it straight
+    /// down in a column as a liquid does: each row spreads the load of the row above over its
+    /// neighbours, so the weight of a tree, a pillar or the walls of a crater fans out with depth
+    /// (as stress does in the ground) instead of running down to the bottom as a stripe.
+    fn pressure_rows(&self, until: usize) -> Vec<f32> {
         // About one atmosphere for 60 cells of water.
         const PER_CELL: f32 = 1.0 / 60.0;
-        let mut weight = 0.0f32;
-        // The pressure at the top of the liquid or solid column the cell below feels.
-        let mut top_p: Option<f32> = None;
-        // The pressure of the closed pocket just above, if the liquid lies in one.
-        let mut pocket_top: Option<f32> = None;
+        // How far each row spreads the load of the row above, either side.
+        const SPREAD: usize = 2;
+        let mut out = vec![0.0f32; W * (until + 1)];
+        // The pressure of the closed pocket just above each column, if a liquid lies in one.
+        let mut pocket_top: Vec<Option<f32>> = vec![None; W];
+        // Pressure carried down from the row above, without the excess (which is added once, per cell).
+        let mut prev = vec![0.0f32; W];
+        let mut cur = vec![0.0f32; W];
+        let mut prev_dense = vec![false; W];
+        let mut dense = vec![false; W];
         for y in 0..=until {
-            let m = self.at(x as i32, y as i32);
             let air = 1.05 * (-((H - y) as f32) / 700.0).exp();
-            let dynamic = 1.0 + (self.flow.pressure_at(x as i32, y as i32) * 0.08).clamp(-0.08, 0.08);
-            // Ideal gas, P V = n R T. With compressible air the wind solver keeps density and
-            // temperature together and gives the pressure directly; otherwise the pressure follows
-            // the absolute temperature at fixed volume, so warm air reads as higher pressure.
-            let closed = self.pocket_at(x as i32, y as i32).map(|k| self.pockets[k]).filter(|p| !p.open);
-            let p_air = if let Some(p) = closed {
-                // A closed pocket (a boiler, a sealed room) has its own pressure.
-                air * p.pressure
-            } else { match self.flow.air_pressure(x as i32, y as i32) {
-                Some(p) => air * p.clamp(0.3, 4.0),
-                None => {
-                    let kelvin = (self.temp[y * W + x] + 273.15).max(1.0) / (self.ambient_c(y as i32) + 273.15).max(1.0);
-                    air * dynamic * kelvin.clamp(0.5, 3.0)
-                }
-            } };
-            match m.kind() {
-                Kind::Empty | Kind::Gas | Kind::Flame => {
-                    put(y, p_air);
-                    weight = 0.0;
-                    top_p = None;
-                    pocket_top = closed.map(|_| p_air);
-                }
-                _ => {
-                    // Below the surface: the hydrostatic weight of what is above, from the still-air
-                    // pressure at the top, plus the excess pressure the liquid has passed on from the
-                    // air (continuous with the air above, and the same all through a connected liquid).
-                    let base = *top_p.get_or_insert(pocket_top.unwrap_or(air));
-                    weight += density(m) * PER_CELL;
-                    put(y, base + weight + self.excess_pressure_at(x as f32 + 0.5, y as f32 + 0.5));
+            for x in 0..W {
+                let m = self.at(x as i32, y as i32);
+                match m.kind() {
+                    Kind::Empty | Kind::Gas | Kind::Flame => {
+                        let dynamic = 1.0 + (self.flow.pressure_at(x as i32, y as i32) * 0.08).clamp(-0.08, 0.08);
+                        // Ideal gas, P V = n R T. With compressible air the wind solver keeps density
+                        // and temperature together and gives the pressure directly; otherwise the
+                        // pressure follows the absolute temperature at fixed volume, so warm air
+                        // reads as higher pressure.
+                        let closed = self.pocket_at(x as i32, y as i32).map(|k| self.pockets[k]).filter(|p| !p.open);
+                        let p_air = if let Some(p) = closed {
+                            // A closed pocket (a boiler, a sealed room) has its own pressure.
+                            air * p.pressure
+                        } else {
+                            match self.flow.air_pressure(x as i32, y as i32) {
+                                Some(p) => air * p.clamp(0.3, 4.0),
+                                None => {
+                                    let kelvin = (self.temp[y * W + x] + 273.15).max(1.0) / (self.ambient_c(y as i32) + 273.15).max(1.0);
+                                    air * dynamic * kelvin.clamp(0.5, 3.0)
+                                }
+                            }
+                        };
+                        out[y * W + x] = p_air;
+                        dense[x] = false;
+                        pocket_top[x] = closed.map(|_| p_air);
+                    }
+                    kind => {
+                        // From the still-air pressure at the top of the column (or of the pocket it
+                        // lies in), plus the weight above.
+                        let above = if !prev_dense[x] {
+                            pocket_top[x].unwrap_or(air)
+                        } else if kind == Kind::Liquid {
+                            prev[x]
+                        } else {
+                            let (lo, hi) = (x.saturating_sub(SPREAD), (x + SPREAD).min(W - 1));
+                            let (sum, n) = (lo..=hi).filter(|&q| prev_dense[q]).fold((0.0, 0.0), |(s, n), q| (s + prev[q], n + 1.0));
+                            sum / n
+                        };
+                        cur[x] = above + density(m) * PER_CELL;
+                        out[y * W + x] = cur[x] + self.excess_pressure_at(x as f32 + 0.5, y as f32 + 0.5);
+                        dense[x] = true;
+                    }
                 }
             }
+            std::mem::swap(&mut prev, &mut cur);
+            std::mem::swap(&mut prev_dense, &mut dense);
         }
+        out
     }
 
     /// The pressure view's colour of a cell, with the borders between gas, liquid and solid marked.
@@ -3217,7 +3385,7 @@ impl World {
             _ => match m {
                 // Soil holds moisture of its own.
                 Mat::Mud => Some(1.0),
-                Mat::Dirt | Mat::Grass => Some((self.cells[y * W + x].life as f32 / SOIL_FULL as f32).clamp(0.0, 1.0) * 0.8 + 0.1),
+                Mat::Dirt | Mat::Grass => Some((self.moisture[y * W + x] as f32 / SOIL_FULL as f32).clamp(0.0, 1.0) * 0.8 + 0.1),
                 _ => None,
             },
         };
@@ -3268,7 +3436,7 @@ impl World {
                 let warm = ((t - 30.0).max(0.0) * 1.3) as i32;
                 (44 + v / 2 + warm, 124 + v + flick / 4 + warm / 3, (224 + v - warm).max(0), 205)
             }
-            Mat::Fire => (255, (80 + c.life as i32 * 3).min(235), 30, 235),
+            Mat::Fire => (255, (80 + self.fuel[y * W + x].left as i32 * 3).min(235), 30, 235),
             Mat::Steam | Mat::Cloud => (0, 0, 0, 0),
             Mat::Iron => glow((146 + v, 156 + v, 174 + v), t),
             Mat::Wood => (146 + v / 2 + (y as i32 % 3) * 6, 98 + v / 2, 54, 255),
@@ -3304,12 +3472,12 @@ impl World {
             Mat::Dynamite => if y % 6 == 0 { (226 + v / 2, 214 + v / 2, 190, 255) } else { (196 + v, 46 + v / 2, 38, 255) },
             Mat::Dirt => {
                 // Wet earth is darker.
-                let k = 256 - 96 * (c.life.min(SOIL_FULL) as i32) / SOIL_FULL as i32;
+                let k = 256 - 96 * (self.moisture[y * W + x].min(SOIL_FULL) as i32) / SOIL_FULL as i32;
                 ((112 + v) * k / 256, (78 + v / 2) * k / 256, (52 + v / 2) * k / 256, 255)
             }
             Mat::Grass => {
                 // Green on moist soil, turning straw yellow as the soil dries.
-                let d = ((GRASS_GREEN as i32 - c.life as i32) * 256 / (GRASS_GREEN - GRASS_DRY) as i32).clamp(0, 256);
+                let d = ((GRASS_GREEN as i32 - self.moisture[y * W + x] as i32) * 256 / (GRASS_GREEN - GRASS_DRY) as i32).clamp(0, 256);
                 let (r, g, b) = self.grass_rgb;
                 let mix = |a: i32, s: i32| a + (s - a) * d / 256;
                 (mix(r, 200) + v / 2, mix(g, 178) + v, mix(b, 84) + v / 2, 255)
@@ -3650,6 +3818,29 @@ mod tests {
     }
 
     #[test]
+    fn the_weight_of_a_pillar_fans_out_in_the_ground_instead_of_running_down_as_a_stripe() {
+        let mut w = World::new_static();
+        for x in 0..W as i32 {
+            for y in 300..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for x in 397..403 {
+            for y in 240..300 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        let f = w.pressure_field();
+        let load = 60.0 * density(Mat::Stone) / 60.0;
+        let (under, aside) = (|y: usize| f[y * W + 400], |y: usize| f[y * W + 480]);
+        assert!(under(302) - aside(302) > 0.3 * load, "right under the pillar its weight is felt: {} vs {}", under(302), aside(302));
+        assert!(under(500) - aside(500) < 0.15 * load, "deep down it has spread out: {} vs {}", under(500), aside(500));
+        // And the ground still gets steadily heavier with depth.
+        assert!(aside(500) > aside(400) && aside(400) > aside(320));
+        assert_eq!(w.pressure_at_cell(400, 450), f[450 * W + 400], "the loupe reads the same pressure as the view");
+    }
+
+    #[test]
     fn a_grain_of_steam_shows_as_a_dot_in_every_science_view() {
         let mut w = World::new_static();
         w.set(400, 200, Mat::Steam);
@@ -3923,7 +4114,7 @@ mod tests {
         w.set(130, 299, Mat::Seed);
         for x in 126..135 {
             let i = 300 * W + x;
-            w.cells[i].life = 220;
+            w.moisture[i] = 220;
         }
         // Dark and cold enough that the damp seed cannot sprout: it just has to survive.
         w.set_phase(0.75);
@@ -5506,7 +5697,7 @@ mod science {
             for y in 310..330 {
                 w.set(x, y, Mat::Dirt);
                 let i = World::idx(x, y);
-                w.cells[i].life = 200;
+                w.moisture[i] = 200;
             }
         }
         // A trunk and a crown of leaves.
@@ -5521,7 +5712,7 @@ mod science {
                 }
             }
         }
-        let soil = |w: &World| (130..190).flat_map(|x| (310..320).map(move |y| (x, y))).map(|(x, y)| w.cells[World::idx(x, y)].life as u32).sum::<u32>();
+        let soil = |w: &World| (130..190).flat_map(|x| (310..320).map(move |y| (x, y))).map(|(x, y)| w.moisture[World::idx(x, y)] as u32).sum::<u32>();
         let wet = soil(&w);
         let mut vapour = 0;
         for _ in 0..3000 {
@@ -5941,7 +6132,7 @@ fn flowing_water_erodes_bare_soil() {
 
     /// A tray of earth `depth` cells deep between x 100 and 200, on a stone floor at y 320, with
     /// stone walls 40 cells high.
-    fn soil_tray(w: &mut World, depth: i32, life: u8) {
+    fn soil_tray(w: &mut World, depth: i32, moisture: u16) {
         floor(w, 320, 99, 201);
         for y in 280..320 {
             w.set(99, y, Mat::Stone);
@@ -5950,7 +6141,7 @@ fn flowing_water_erodes_bare_soil() {
         for x in 100..200 {
             for y in 320 - depth..320 {
                 w.set(x, y, Mat::Dirt);
-                w.cells[World::idx(x, y)].life = life;
+                w.moisture[World::idx(x, y)] = moisture;
             }
         }
     }
@@ -5960,7 +6151,7 @@ fn flowing_water_erodes_bare_soil() {
     fn all_water(w: &World) -> u32 {
         (0..W * H)
             .map(|i| match w.cells[i].m {
-                Mat::Dirt | Mat::Grass | Mat::Mud => w.cells[i].life as u32,
+                Mat::Dirt | Mat::Grass | Mat::Mud => w.moisture[i] as u32,
                 Mat::Water => SOIL_WATER as u32,
                 _ => w.vapour_units(i) * SOIL_VAPOUR as u32,
             })
@@ -5969,7 +6160,7 @@ fn flowing_water_erodes_bare_soil() {
 
     /// Mean moisture of the soil on row `y` of the tray.
     fn soil_row(w: &World, y: i32) -> u32 {
-        (100..200).map(|x| w.cells[World::idx(x, y)].life as u32).sum::<u32>() / 100
+        (100..200).map(|x| w.moisture[World::idx(x, y)] as u32).sum::<u32>() / 100
     }
 
     #[test]
@@ -5991,7 +6182,7 @@ fn flowing_water_erodes_bare_soil() {
                 assert_eq!(all_water(&w), before, "the water is kept, in the ground, in the puddle or in the air");
             }
         }
-        assert!(w.cells.iter().all(|c| !matches!(c.m, Mat::Dirt | Mat::Grass) || c.life <= SOIL_FULL), "no soil holds more than saturated");
+        assert!(w.cells.iter().zip(&w.moisture).all(|(c, &m)| !matches!(c.m, Mat::Dirt | Mat::Grass) || m <= SOIL_FULL), "no soil holds more than saturated");
         for y in 316..320 {
             assert!(soil_row(&w, y) > SOIL_FULL as u32 - SOIL_WATER as u32, "row {y} soaked through: {}", soil_row(&w, y));
         }
@@ -6006,7 +6197,7 @@ fn flowing_water_erodes_bare_soil() {
         soil_tray(&mut w, 12, 0);
         // A soaking at the top.
         for x in 100..200 {
-            w.cells[World::idx(x, 308)].life = 180;
+            w.moisture[World::idx(x, 308)] = 180;
         }
         let before = all_water(&w);
         for _ in 0..3000 {
@@ -6022,7 +6213,7 @@ fn flowing_water_erodes_bare_soil() {
         soil_tray(&mut w, 12, 0);
         for x in 100..200 {
             for y in 316..320 {
-                w.cells[World::idx(x, y)].life = SOIL_FIELD;
+                w.moisture[World::idx(x, y)] = SOIL_FIELD;
             }
         }
         for _ in 0..6000 {
@@ -6040,7 +6231,7 @@ fn flowing_water_erodes_bare_soil() {
         for x in 100..200 {
             for y in 296..300 {
                 w.set(x, y, Mat::Dirt);
-                w.cells[World::idx(x, y)].life = SOIL_FULL;
+                w.moisture[World::idx(x, y)] = SOIL_FULL;
             }
         }
         let mut drops = 0;
@@ -6078,13 +6269,13 @@ fn flowing_water_erodes_bare_soil() {
 
     #[test]
     fn grass_grows_by_itself_on_moist_soil_and_dies_on_dry_soil() {
-        let tray = |life: u8| {
+        let tray = |moisture: u16| {
             let mut w = World::new_static();
             w.clock = thermal::DAY_STEPS * thermal::SEASON_DAYS + thermal::DAY_STEPS / 8;
             w.flow.pin_moisture(1.0);
-            soil_tray(&mut w, 6, life);
+            soil_tray(&mut w, 6, moisture);
             w.set(150, 314, Mat::Grass);
-            w.cells[World::idx(150, 314)].life = life;
+            w.moisture[World::idx(150, 314)] = moisture;
             for _ in 0..8000 {
                 w.step();
             }
@@ -6100,8 +6291,8 @@ fn flowing_water_erodes_bare_soil() {
         let mut w = World::new_static();
         w.set(100, 300, Mat::Grass);
         w.set(102, 300, Mat::Grass);
-        w.cells[World::idx(100, 300)].life = 80;
-        w.cells[World::idx(102, 300)].life = 0;
+        w.moisture[World::idx(100, 300)] = 80;
+        w.moisture[World::idx(102, 300)] = 0;
         let (green, straw) = (w.color(100, 300), w.color(102, 300));
         assert!(green[1] > green[0] + 40, "moist: green {green:?}");
         assert!(straw[0] > green[0] + 60 && straw[0] + 40 > straw[1], "dry: straw yellow {straw:?}");
@@ -6279,4 +6470,5 @@ mod glass {
         assert!(booms > 0);
     }
 }
+
 

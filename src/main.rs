@@ -33,7 +33,7 @@ use mech::{GearSize, Mechanism};
 use mechgame::MechDraft;
 use sound::{Ev, Mix, Sounds};
 use ui::{draw_icon, rrect, Drawer, Icon, Ui, ACCENT, BG, BLUE, DIM, GREEN, PANEL, RED, TEXT, TILE, TILE_HOT};
-use world::{Biome, Cell, Mat, PaintRule, Season, World, H, W};
+use world::{Biome, Mat, Matter, PaintRule, Season, World, H, W};
 
 /// Simulation steps per second at speed x1 (the rigid bodies use the same 1/60 s step).
 const STEPS_PER_SECOND: f32 = 60.0;
@@ -144,7 +144,7 @@ struct Game {
     heat_cells: u32,
     undo: Vec<Snapshot>,
     world: World,
-    snap_cells: Vec<Cell>,
+    snap_cells: Matter,
     snap_blocks: Vec<Block>,
     snap_cables: Vec<Cable>,
     snap_members: Vec<Member>,
@@ -3664,6 +3664,27 @@ fn demo_crater(g: &mut Game, dynamite: bool) {
     g.set_running(true);
 }
 
+/// `--demo --lava`: underground pockets of lava, a big one and a small one, to see the light they
+/// cast at night.
+fn demo_lava(g: &mut Game) {
+    g.empty_world();
+    for x in 0..W as i32 {
+        g.world.set(x, 330, Mat::Grass);
+        for y in 331..H as i32 {
+            g.world.set(x, y, Mat::Stone);
+        }
+    }
+    for (cx, cy, r) in [(400i32, 380i32, 30i32), (620, 390, 3)] {
+        for x in cx - r..=cx + r {
+            for y in cy - r..=cy + r {
+                if (x - cx).pow(2) + (y - cy).pow(2) <= r * r {
+                    g.world.set(x, y, Mat::Lava);
+                }
+            }
+        }
+    }
+}
+
 fn demo_bridge(g: &mut Game) {
     g.empty_world();
     for x in 0..W as i32 {
@@ -3868,6 +3889,9 @@ async fn main() {
         }
         if args.iter().any(|a| a == "--siphon") {
             demo_siphon(&mut game);
+        }
+        if args.iter().any(|a| a == "--lava") {
+            demo_lava(&mut game);
         }
         // `--advance n`: the world runs n steps before the first frame.
         for _ in 0..arg("--advance").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) {
