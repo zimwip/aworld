@@ -115,7 +115,9 @@ impl World {
                 let rolls = Self::grain_pick(x, y) < self.repose(x, y, c.m).1
                     && ((sinks_into(self.at(x - 1, y)) && sinks_into(self.at(x - 2, y + 1))) || (sinks_into(self.at(x + 1, y)) && sinks_into(self.at(x + 2, y + 1))));
                 let floats = self.at(x, y - 1).kind() == Kind::Liquid && density(self.at(x, y - 1)) > density(c.m);
-                let can_fall = can_fall || rolls || floats;
+                // Deep snow creeps sideways onto free ground (see `step_snow`).
+                let creeps = c.m == Mat::Snow && self.snow_creep_target(x, y).is_some();
+                let can_fall = can_fall || rolls || floats || creeps;
                 let wet = c.m == Mat::Ash && Self::neighbors(x, y).iter().any(|&(nx, ny)| self.at(nx, ny) == Mat::Water);
                 // Saltpetre dissolves in water and turns to powder against charcoal.
                 let wet = wet || c.m == Mat::Saltpeter && Self::neighbors(x, y).iter().any(|&(nx, ny)| matches!(self.at(nx, ny), Mat::Water | Mat::Charcoal));

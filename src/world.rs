@@ -239,6 +239,13 @@ const GRAIN_ACCEL: u8 = 2;
 /// The fastest a grain falls through air (eighths of a cell per step).
 const GRAIN_TERMINAL: u8 = 32;
 
+/// Snowflakes fall gently: at most this many eighths of a cell per step.
+const SNOW_TERMINAL: u8 = 6;
+/// How far along a cell of snow can ooze before dropping a cell (a slope of 1 in this many).
+const SNOW_RUN: i32 = 5;
+/// A cell of snow at rest oozes once in this many steps: a very viscous liquid.
+const SNOW_CREEP: u32 = 8;
+
 /// An ember whose life is at least this is burning charcoal: hotter and slower than wood.
 pub(crate) const COAL_LIFE: u8 = 200;
 
@@ -1248,7 +1255,8 @@ impl World {
         // Free fall: the grain gathers speed (gravity) up to a terminal speed (air drag), and
         // covers several cells in a step once it is fast.
         if matches!(self.at(x, y + 1).kind(), Kind::Empty | Kind::Gas) && self.mask_free(x, y + 1) {
-            let v = self.vel[i].saturating_add(GRAIN_ACCEL).min(GRAIN_TERMINAL);
+            let terminal = if m == Mat::Snow { SNOW_TERMINAL } else { GRAIN_TERMINAL };
+            let v = self.vel[i].saturating_add(GRAIN_ACCEL).min(terminal);
             let mut k = 1;
             while k < 1 + v as i32 / 8 && matches!(self.at(x, y + k + 1).kind(), Kind::Empty | Kind::Gas) && self.mask_free(x, y + k + 1) {
                 k += 1;
@@ -1310,7 +1318,6 @@ impl World {
                     (0, 50)
                 }
             }
-            Mat::Snow => (75, 0),
             Mat::Hail => (0, 70),
             Mat::Mud => (0, 90),
             Mat::Ash => (30, 0),
@@ -1387,7 +1394,9 @@ impl World {
         }
     }
 
-    /// Snowflakes drift on the wind while they fall.
+    /// Snowflakes drift on the wind while they fall, slowly (they are light and catch the air).
+    /// On the ground snow is a very thick, viscous paste: a heap slumps and spreads out little by
+    /// little, but a thin layer (one or two cells) stays where it fell instead of running off.
     fn step_snow(&mut self, x: i32, y: i32) {
         if self.at(x, y + 1) == Mat::Empty && self.wind.abs() > 0.1 && (self.rand() % 100) as f32 <= self.wind.abs() * 60.0 {
             let w = if self.wind > 0.0 { 1 } else { -1 };
@@ -1396,7 +1405,35 @@ impl World {
                 return;
             }
         }
-        self.step_powder(x, y);
+        if self.step_powder(x, y) {
+            return;
+        }
+        // Creep: now and then a cell oozes a few cells sideways and one down, so a heap keeps
+        // slumping flatter than a heap of grains. Where the ground is flat it needs a drop to
+        // flow into, so a thin layer stays put.
+        if self.chance(SNOW_CREEP) {
+            if let Some(to) = self.snow_creep_target(x, y) {
+                self.swap((x, y), to);
+            }
+        }
+    }
+
+    /// Where a cell of snow at rest can ooze to: up to `SNOW_RUN` cells along its row through
+    /// free air, then one down into free air.
+    pub(super) fn snow_creep_target(&self, x: i32, y: i32) -> Option<(i32, i32)> {
+        let d = if (x + y + self.frame as i32) & 1 == 0 { 1 } else { -1 };
+        let free = |x: i32, y: i32| self.at(x, y) == Mat::Empty && self.mask_free(x, y);
+        for dx in [d, -d] {
+            for k in 1..=SNOW_RUN {
+                if !free(x + dx * k, y) {
+                    break;
+                }
+                if k >= 2 && free(x + dx * k, y + 1) {
+                    return Some((x + dx * k, y + 1));
+                }
+            }
+        }
+        None
     }
 
     /// Glass shards pile up like sand and, given time, turn back into sand.
@@ -2204,6 +2241,22 @@ impl World {
         m.kind() == Kind::Static && m != Mat::Grass
     }
 
+    /// Can solid `from` hold up the solid `to` lying `dy` rows away (-1: `to` sits on top of it,
+    /// 0: beside it, 1: hangs under it)? Ice is a heavy slab: it holds to more ice, rests on what
+    /// is under it and sticks to the side of rock or soil, but it never hangs under anything and a
+    /// tree does not carry it (only a trunk right under it does). That way ice that froze on
+    /// leaves, on a branch or on whatever lies on them does not stay hanging in the sky.
+    fn holds(from: Mat, to: Mat, dy: i32) -> bool {
+        if to != Mat::Ice || from == Mat::Ice {
+            return true;
+        }
+        match from {
+            Mat::Leaf | Mat::Branch | Mat::Sapling => false,
+            Mat::Trunk => dy == -1,
+            _ => dy <= 0,
+        }
+    }
+
     /// Finds solid cells that are not connected to rock resting on the base of
     /// the world and lists them, grouped by connected piece, so they can fall.
     fn structure_pass(&mut self) {
@@ -2221,10 +2274,11 @@ impl World {
         }
         while let Some(i) = stack.pop() {
             let (x, y) = ((i % W) as i32, (i / W) as i32);
+            let from = self.cells[i].m;
             for (nx, ny) in Self::neighbors(x, y) {
                 if Self::inb(nx, ny) {
                     let j = Self::idx(nx, ny);
-                    if !seen[j] && Self::structural(self.cells[j].m) {
+                    if !seen[j] && Self::structural(self.cells[j].m) && Self::holds(from, self.cells[j].m, ny - y) {
                         seen[j] = true;
                         stack.push(j);
                     }
@@ -2283,7 +2337,7 @@ impl World {
                 // Falling: gravity builds up speed; move one cell at a time while it is free.
                 piece.vy = (piece.vy + 0.35).min(3.0);
                 for _ in 0..(piece.vy.max(1.0) as i32) {
-                    if !self.piece_can_move(piece, 1) {
+                    if !self.piece_can_move(piece, 1) && !self.crush_foliage(piece) {
                         break;
                     }
                     self.piece_move(piece, 1);
@@ -2307,6 +2361,31 @@ impl World {
         }
         pieces.retain(|p| !p.cells.is_empty());
         self.falling = pieces;
+    }
+
+    /// A falling piece held up only by leaves, twigs or saplings breaks them: they fall as dead
+    /// leaves and the piece goes on falling. Returns true if it is free to move down now.
+    fn crush_foliage(&mut self, piece: &Piece) -> bool {
+        let in_piece = |i: usize| piece.cells.binary_search_by(|p| i.cmp(p)).is_ok();
+        let mut foliage = vec![];
+        for &i in &piece.cells {
+            let t = i + W;
+            if t >= W * H || in_piece(t) || self.mask[t] != 0 {
+                continue;
+            }
+            match self.cells[t].m {
+                Mat::Leaf | Mat::Branch | Mat::Sapling => foliage.push(t),
+                m if m.kind() == Kind::Static => return false,
+                _ => {}
+            }
+        }
+        if foliage.is_empty() {
+            return false;
+        }
+        for t in foliage {
+            self.set((t % W) as i32, (t / W) as i32, Mat::DeadLeaf);
+        }
+        self.piece_can_move(piece, 1)
     }
 
     /// The upward part of a bounce.
@@ -4431,7 +4510,100 @@ mod science {
         let (sand, snow, rust) = (angle(Mat::Sand), angle(Mat::Snow), angle(Mat::Rust));
         eprintln!("HEAP sand {sand:.0} snow {snow:.0} rust {rust:.0}");
         assert!(sand < rust - 4.0, "dry sand runs flatter: {sand:.0} / {rust:.0}");
-        assert!(snow > rust + 4.0, "snow holds steeper: {snow:.0} / {rust:.0}");
+        assert!(snow < sand, "snow is a viscous paste: given time a heap spreads flatter than sand: {snow:.0} / {sand:.0}");
+    }
+
+    /// Height of the snow standing at x = 300 on the floor at row 300.
+    fn snow_height(w: &World) -> i32 {
+        (0..300).rev().take_while(|&y| w.raw(300, y) == Mat::Snow).count() as i32
+    }
+
+    #[test]
+    fn a_heap_of_snow_slumps_slowly_and_a_thin_layer_stays() {
+        let mut w = World::new_static();
+        w.climate_fixed = Some(-1.0);
+        w.reset_temps();
+        floor(&mut w, 300, 0, W as i32);
+        for x in 290..310 {
+            for y in 220..300 {
+                w.set(x, y, Mat::Snow);
+            }
+        }
+        // A thin layer further along.
+        for x in 600..660 {
+            w.set(x, 299, Mat::Snow);
+        }
+        for _ in 0..150 {
+            w.step();
+        }
+        let early = snow_height(&w);
+        for _ in 0..6000 {
+            w.step();
+        }
+        let late = snow_height(&w);
+        assert!(early >= 20, "snow is thick: it does not run like water ({early} cells high after 150 steps)");
+        assert!(late * 4 <= early * 3, "but a heap keeps spreading out ({early} then {late})");
+        let layer = (560..700).flat_map(|x| (200..300).map(move |y| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Snow).collect::<Vec<_>>();
+        assert!(layer.len() >= 55 && layer.iter().all(|&(x, y)| y == 299 && (597..663).contains(&x)), "a thin layer stays where it fell: {layer:?}");
+    }
+
+    #[test]
+    fn snowflakes_fall_gently() {
+        let mut w = World::new_static();
+        w.climate_fixed = Some(-5.0);
+        w.reset_temps();
+        w.flow.pin_uniform(0.0, 0.0);
+        w.set(400, 20, Mat::Snow);
+        for _ in 0..40 {
+            w.step();
+        }
+        let y = (0..H as i32).find(|&y| (370..430).any(|x| w.raw(x, y) == Mat::Snow)).unwrap_or(H as i32);
+        assert!(y > 40 && y <= 20 + 45, "a flake falls about a cell a step: it is at {y}");
+    }
+
+    #[test]
+    fn ice_frozen_on_a_tree_falls_and_breaks_the_branches() {
+        let mut w = World::new_static();
+        w.structures_fall = true;
+        w.climate_fixed = Some(-5.0);
+        w.reset_temps();
+        // Ground resting on the base of the world (only that holds things up).
+        for x in 0..W as i32 {
+            for y in 400..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        // A tree: trunk on the floor, a crown of branches and leaves.
+        for y in 300..400 {
+            w.set(380, y, Mat::Trunk);
+        }
+        for x in 360..480 {
+            w.set(x, 300, Mat::Branch);
+            for y in 285..300 {
+                w.set(x, y, Mat::Leaf);
+            }
+        }
+        // Ice that froze on the crown, and a sheet of it stuck to the side of the leaves.
+        for x in 400..470 {
+            for y in 275..285 {
+                w.set(x, y, Mat::Ice);
+            }
+        }
+        for x in 480..520 {
+            for y in 288..292 {
+                w.set(x, y, Mat::Ice);
+            }
+        }
+        let n = w.cells.iter().filter(|c| c.m == Mat::Ice).count();
+        for _ in 0..800 {
+            w.step();
+        }
+        let ice: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Ice).collect();
+        let highest = ice.iter().map(|i| i / W).min().unwrap_or(0);
+        assert_eq!(ice.len(), n, "the ice is still there");
+        assert!(highest > 375, "the ice fell to the ground through the crown (highest ice row {highest})");
+        assert!(w.cells.iter().any(|c| c.m == Mat::DeadLeaf), "it broke leaves on its way down");
+        assert_eq!(w.raw(380, 350), Mat::Trunk, "the trunk still stands");
     }
 
     #[test]
@@ -4852,3 +5024,4 @@ mod glass {
         assert!(booms > 0);
     }
 }
+
