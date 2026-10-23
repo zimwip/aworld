@@ -1987,6 +1987,7 @@ impl Game {
             ViewMode::Pressure => RenderMode::Pressure,
             ViewMode::Humidity => RenderMode::Humidity,
             ViewMode::Electric => RenderMode::Electric,
+            ViewMode::Stress => RenderMode::Stress,
             _ => RenderMode::Normal,
         };
         if !flat {
@@ -2182,12 +2183,6 @@ impl Game {
                 Tool::Hammer => draw_circle_lines(ui.mouse.x, ui.mouse.y, 3.5 * view.s, 1.5, ACCENT),
                 Tool::Flame => draw_circle_lines(ui.mouse.x, ui.mouse.y, self.brush.max(3) as f32 * view.s, 1.5, RED),
                 Tool::Lightning => {
-                    // Where it will come down from: straight above the pointer.
-                    let top = view.oy.max(0.0);
-                    for k in 0..((ui.mouse.y - top) / 14.0) as i32 {
-                        let y = top + k as f32 * 14.0;
-                        draw_line(ui.mouse.x, y, ui.mouse.x, y + 6.0, 1.0, Color::new(1.0, 0.92, 0.4, 0.35));
-                    }
                     draw_circle_lines(ui.mouse.x, ui.mouse.y, 5.0, 1.5, Color::new(1.0, 0.92, 0.4, 0.9));
                 }
                 Tool::Loupe => self.draw_lens(ui, view, at),
@@ -3286,7 +3281,7 @@ impl Game {
                 }
                 ui.text("détendu", bar.x, bar.y + 25.0, 11, DIM);
                 ui.text("casse", bar.x + bar.w - 28.0, bar.y + 25.0, 11, DIM);
-                ui.wrapped("Rouge = chargé. Mécanique : anneau = dents, arc = couple, F = force, % = charge moteur.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
+                ui.wrapped("Rouge = chargé. Solides : part de la résistance de la section qui porte le reste (au-delà, elle casse). Mécanique : anneau = dents, arc = couple, F = force, % = charge moteur.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
             }
             ViewMode::Wind => {
                 let w = &self.world;
@@ -3294,17 +3289,29 @@ impl Game {
                 ui.wrapped("Couches de vent opposées et tourbillons : ils portent nuages, vapeur, fumée et pluie, et contournent le relief.", bar.x, bar.y + 22.0, bar.w, 11, DIM);
             }
             ViewMode::Pressure => {
+                // Two scales, both logarithmic: the air (from the thin air at the top of the sky to a
+                // boiler) and the ground and liquids (up to tens of atmospheres).
+                let air_atm = |u: f32| world::AIR_LOW_ATM * (world::AIR_TOP_ATM / world::AIR_LOW_ATM).powf(u);
+                let ground = Rect::new(bar.x, bar.y + 44.0, bar.w, bar.h);
                 for i in 0..40 {
-                    let atm = 0.35 + 6.0 * (i as f32 / 39.0).powf(2.0);
-                    let (r2, g2, b2) = world::pressure_rgb(atm);
+                    let u = i as f32 / 39.0;
+                    let (r2, g2, b2) = world::air_pressure_rgb(air_atm(u));
                     draw_rectangle(bar.x + bar.w * i as f32 / 40.0, bar.y, bar.w / 40.0 + 1.0, bar.h, Color::from_rgba(r2, g2, b2, 255));
+                    let (r2, g2, b2) = world::ground_pressure_rgb(world::GROUND_TOP_ATM.powf(u));
+                    draw_rectangle(ground.x + ground.w * i as f32 / 40.0, ground.y, ground.w / 40.0 + 1.0, ground.h, Color::from_rgba(r2, g2, b2, 255));
                 }
-                for (atm, label) in [(0.5f32, "0,5"), (1.0, "1"), (2.0, "2"), (5.0, "5")] {
-                    let u = ((atm - 0.35) / 6.0).sqrt();
+                ui.text("Air", bar.x, ly + 10.0, 11, TEXT);
+                for (atm, label) in [(0.05f32, "0,05"), (0.2, "0,2"), (1.0, "1"), (5.0, "5")] {
+                    let u = world::air_scale(atm);
                     ui.text(label, bar.x + bar.w * u - 4.0, bar.y + 25.0, 11, DIM);
                 }
                 ui.text("atm", bar.x + bar.w - 20.0, ly + 10.0, 11, DIM);
-                ui.wrapped("Air : plus mince en altitude, plus dense dans les courants. Liquides : le poids de la colonne. Solides : le poids au-dessus. Traits sombres : frontières gaz / liquide / solide. Points clairs : grains de gaz, à la pression de l'air autour.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
+                ui.text("Sol et liquides", ground.x, ground.y - 4.0, 11, TEXT);
+                for (atm, label) in [(1.0f32, "1"), (3.0, "3"), (10.0, "10"), (30.0, "30")] {
+                    let u = world::ground_scale(atm);
+                    ui.text(label, ground.x + (ground.w * u - 4.0).min(ground.w - 12.0), ground.y + 25.0, 11, DIM);
+                }
+                ui.wrapped("Air : plus mince en altitude, plus fort dans une poche fermée. Sol et liquides : le poids de ce qui est au-dessus. Traits sombres : frontières gaz / liquide / solide.", bar.x, ground.y + 42.0, bar.w, 11, DIM);
             }
             ViewMode::Humidity => {
                 for i in 0..40 {
@@ -3773,6 +3780,32 @@ fn demo_lava(g: &mut Game) {
     }
 }
 
+/// `--demo --topple`: a long stroke of ice painted from the ground up into the sky, leaning far
+/// out, as a player draws it.
+fn demo_topple(g: &mut Game) {
+    g.empty_world();
+    // Fields of earth over the rock, and a pond in a hollow.
+    for x in 0..W as i32 {
+        let top = 330 + ((x as f32 * 0.013).sin() * 8.0) as i32;
+        let bed = if (380..540).contains(&x) { top + (40.0 * (std::f32::consts::PI * (x - 380) as f32 / 160.0).sin()) as i32 } else { top };
+        for y in top..H as i32 {
+            let m = if y > 380 + (x * 7 % 5) { Mat::Stone } else if y < bed { Mat::Water } else if y == top { Mat::Grass } else { Mat::Dirt };
+            g.world.set(x, y, m);
+        }
+    }
+    let ground = |w: &World, x: i32| (0..H as i32).find(|&y| w.at(x, y).is_hard()).unwrap_or(H as i32);
+    let foot = (440, ground(&g.world, 440) - 2);
+    let stroke: [(i32, i32); 5] = [foot, (520, 140), (545, 122), (600, 150), (720, 134)];
+    for seg in stroke.windows(2) {
+        let (a, b) = (seg[0], seg[1]);
+        let n = (b.0 - a.0).abs().max((b.1 - a.1).abs()).max(1);
+        for k in 0..=n {
+            g.world.paint(a.0 + (b.0 - a.0) * k / n, a.1 + (b.1 - a.1) * k / n, 4, Mat::Ice);
+        }
+    }
+    g.set_running(true);
+}
+
 fn demo_bridge(g: &mut Game) {
     g.empty_world();
     for x in 0..W as i32 {
@@ -3995,6 +4028,9 @@ async fn main() {
         if args.iter().any(|a| a == "--crater") {
             demo_crater(&mut game, args.iter().any(|a| a == "--dynamite"));
         }
+        if args.iter().any(|a| a == "--topple") {
+            demo_topple(&mut game);
+        }
         if args.iter().any(|a| a == "--siphon") {
             demo_siphon(&mut game);
         }
@@ -4184,7 +4220,7 @@ async fn main() {
         frame += 1;
         frame_time += get_frame_time();
         if let Some(path) = &shot {
-            if frame == 360 {
+            if frame == arg("--frames").and_then(|v| v.parse().ok()).unwrap_or(360) {
                 eprintln!("average frame time: {:.1} ms", frame_time * 1000.0 / frame as f32);
                 get_screen_data().export_png(path);
                 std::process::exit(0);

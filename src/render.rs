@@ -3,7 +3,7 @@
 use crate::blocks::{Block, BlockKind, Member, MemberMat, Spring, SpringKind, STUD};
 use crate::car::{Car, ModelKind};
 use crate::world::sleep::{CH, CS, CW};
-use crate::world::{Mat, World, H, W};
+use crate::world::{Kind, Mat, World, H, W};
 use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation, PipelineParams};
 use macroquad::prelude::*;
 
@@ -255,6 +255,7 @@ pub enum RenderMode {
     Pressure = 2,
     Humidity = 3,
     Electric = 4,
+    Stress = 5,
 }
 
 // Lightning: each segment of a bolt is a quad whose texcoord y runs from -1 to 1 across it. A thin
@@ -668,6 +669,9 @@ impl Renderer {
                 RenderMode::Electric => {
                     Self::fill(&mut self.image, |x, y| world.electric_color(x, y));
                 }
+                RenderMode::Stress => {
+                    Self::fill(&mut self.image, |x, y| stress_color(world, x, y));
+                }
                 RenderMode::Normal => {
                     // Only the zones that changed, plus one row of zones in turn for the slow
                     // changes (temperature tints) that do not wake a zone.
@@ -974,6 +978,23 @@ pub fn draw_block_shape(kind: BlockKind, c: Vec2, s: f32, angle: f32, tint: Opti
         let t = (heat / 150.0).min(1.0);
         rect(0.0, 0.0, w, h, Color::new(1.0, 0.45, 0.05, 0.45 * t));
     }
+}
+
+/// The stress view of a cell: solids coloured by how loaded their section is (see
+/// `world/statics.rs`), green when it carries nothing to red when it gives way; the rest dimmed.
+fn stress_color(world: &World, x: usize, y: usize) -> [u8; 4] {
+    let c = world.color(x, y);
+    if c[3] == 0 {
+        return c;
+    }
+    let m = world.cell_mat(x, y);
+    if m.kind() != Kind::Static || matches!(m, Mat::Dirt | Mat::Grass) {
+        return [c[0] / 3, c[1] / 3, c[2] / 3, c[3] / 2];
+    }
+    let (r, g, b) = stress_rgb(world.strain[y * W + x] as f32 / 127.5);
+    let a = c[3] as f32 / 255.0;
+    let mix = |k: f32, base: u8| ((k * 255.0 * 0.75 + base as f32 * 0.25) * a) as u8;
+    [mix(r, c[0]), mix(g, c[1]), mix(b, c[2]), c[3]]
 }
 
 /// Green (relaxed) through yellow to red (about to break).

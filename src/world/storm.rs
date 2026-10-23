@@ -474,8 +474,17 @@ impl World {
         seen.insert((cx, cy));
         let mut trail = vec![(cx as f32, cy as f32)];
         let mut metal = vec![];
-        let deep = 12 + (power * 28.0) as i32;
+        let deep = 20 + (power * 40.0) as i32;
+        // Like the bolt itself, the current zigzags: it leans to one side for a few cells, then
+        // to the other.
+        let mut side = if self.storm_rng.next() % 2 == 0 { 1 } else { -1 };
+        let mut lean = 4 + self.storm_rng.next() % 9;
         for _ in 0..deep {
+            if lean == 0 {
+                side = -side;
+                lean = 4 + self.storm_rng.next() % 9;
+            }
+            lean -= 1;
             let here = self.raw(cx, cy);
             let k = conductivity(here);
             let i = Self::idx(cx, cy);
@@ -486,11 +495,11 @@ impl World {
                 Mat::Iron | Mat::Steel => metal.push((cx, cy)),
                 _ => self.lightning_burn(cx, cy, true),
             }
-            // Down first, then to the sides: every solid or liquid conducts a little at the
-            // voltage of lightning, conductors much better.
+            // Down, leaning to its side: every solid or liquid conducts a little at the voltage of
+            // lightning, conductors much better.
             let mut next = None;
             let mut ns = f32::MIN;
-            for (dx, dy, bias) in [(0, 1, 0.6), (-1, 1, 0.45), (1, 1, 0.45), (-1, 0, 0.0), (1, 0, 0.0)] {
+            for (dx, dy, bias) in [(side, 1, 0.65), (0, 1, 0.45), (side, 0, 0.3), (-side, 1, 0.15), (-side, 0, -0.2)] {
                 let (nx, ny) = (cx + dx, cy + dy);
                 if !Self::inb(nx, ny) || seen.contains(&(nx, ny)) {
                     continue;
@@ -499,7 +508,7 @@ impl World {
                 if matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) {
                     continue;
                 }
-                let s = conductivity(m) + bias + 0.15 * (self.storm_rng.f() * 0.5 + 0.5);
+                let s = conductivity(m) + bias + 0.2 * (self.storm_rng.f() * 0.5 + 0.5);
                 if s > ns {
                     ns = s;
                     next = Some((nx, ny));

@@ -13,6 +13,8 @@ pub mod sleep;
 pub use pockets::boil_c;
 mod thermal;
 mod storm;
+mod statics;
+pub use statics::Slab;
 pub use storm::{Bolt, BREAKDOWN, QS, QW, QH};
 pub use thermal::{air_pressure_atm, Season, DAY_STEPS};
 use thermal::adiabatic_cooling_c;
@@ -256,6 +258,65 @@ pub fn pressure_rgb(atm: f32) -> (u8, u8, u8) {
     (m(c0[0], c1[0]), m(c0[1], c1[1]), m(c0[2], c1[2]))
 }
 
+fn ramp(stops: &[(f32, [f32; 3])], v: f32) -> (u8, u8, u8) {
+    let v = v.clamp(stops[0].0, stops[stops.len() - 1].0);
+    let k = stops.iter().position(|s| s.0 >= v).unwrap_or(stops.len() - 1).max(1);
+    let ((p0, c0), (p1, c1)) = (stops[k - 1], stops[k]);
+    let f = ((v - p0) / (p1 - p0)).clamp(0.0, 1.0);
+    let m = |a: f32, b: f32| (a + (b - a) * f) as u8;
+    (m(c0[0], c1[0]), m(c0[1], c1[1]), m(c0[2], c1[2]))
+}
+
+/// The pressure view's scale for gas (atmospheres, logarithmic): the air thins tenfold and more
+/// from the valley to the top of the sky, and a boiler holds a few atmospheres. Violet and blue for
+/// thin air, green at 1 atm, yellow to red for a pocket under pressure, white about to burst.
+pub fn air_pressure_rgb(atm: f32) -> (u8, u8, u8) {
+    const STOPS: [(f32, [f32; 3]); 9] = [
+        (0.0, [40.0, 20.0, 90.0]),
+        (0.3, [80.0, 45.0, 170.0]),
+        (0.5, [60.0, 90.0, 230.0]),
+        (0.62, [40.0, 165.0, 215.0]),
+        (0.69, [60.0, 200.0, 120.0]),
+        (0.76, [230.0, 225.0, 70.0]),
+        (0.85, [245.0, 140.0, 40.0]),
+        (0.95, [225.0, 45.0, 40.0]),
+        (1.0, [255.0, 235.0, 235.0]),
+    ];
+    ramp(&STOPS, air_scale(atm))
+}
+
+/// Where a pressure sits on the air scale (0 at `AIR_LOW_ATM`, 1 at `AIR_TOP_ATM`).
+pub fn air_scale(atm: f32) -> f32 {
+    ((atm.max(AIR_LOW_ATM) / AIR_LOW_ATM).ln() / (AIR_TOP_ATM / AIR_LOW_ATM).ln()).clamp(0.0, 1.0)
+}
+
+/// The ends of the air pressure scale.
+pub const AIR_LOW_ATM: f32 = 0.02;
+pub const AIR_TOP_ATM: f32 = 6.0;
+
+/// The pressure view's scale for liquids and the ground (atmospheres, logarithmic): from about
+/// 1 atm at the surface to tens of atmospheres deep down, in colours of their own (dark plum,
+/// through crimson and orange, to pale yellow) so that they never read as air.
+pub fn ground_pressure_rgb(atm: f32) -> (u8, u8, u8) {
+    const STOPS: [(f32, [f32; 3]); 6] = [
+        (0.0, [45.0, 30.0, 70.0]),
+        (0.2, [95.0, 40.0, 115.0]),
+        (0.4, [165.0, 50.0, 110.0]),
+        (0.6, [225.0, 85.0, 60.0]),
+        (0.8, [250.0, 165.0, 50.0]),
+        (1.0, [255.0, 245.0, 190.0]),
+    ];
+    ramp(&STOPS, ground_scale(atm))
+}
+
+/// Where a pressure sits on the ground scale (0 at 1 atm, 1 at `GROUND_TOP_ATM`).
+pub fn ground_scale(atm: f32) -> f32 {
+    (atm.max(1.0).ln() / GROUND_TOP_ATM.ln()).clamp(0.0, 1.0)
+}
+
+/// The top of the ground pressure scale.
+pub const GROUND_TOP_ATM: f32 = 30.0;
+
 /// Hot metal glows: dull red from about 500 °C, then orange, then yellow-white as it nears its
 /// melting point (the colours a smith reads off the iron in the forge).
 fn glow((r, g, b): (i32, i32, i32), t: f32) -> (i32, i32, i32, i32) {
@@ -294,6 +355,30 @@ fn density(m: Mat) -> f32 {
         Mat::Diamond => 3.5,
         Mat::Dynamite => 1.4,
         _ => 1.0,
+    }
+}
+
+/// How thick a liquid is, as `World::step_liquid` reads it: it stays still once in `rest` steps
+/// (0: never), and it spreads sideways up to `reach` cells at a time, once in `spread` steps.
+pub fn viscosity(m: Mat) -> (u32, i32, u32) {
+    match m {
+        Mat::Water => (0, 4 * K, 1),
+        Mat::Oil => (3, 2 * K, 1),
+        // Melts barely run: lava and molten metal creep a cell at a time.
+        _ => (2, 1, 3),
+    }
+}
+
+/// How a gas drifts when neither its buoyancy nor the wind moves it, as `World::step_gas` reads
+/// it: (in how many steps out of 10 it climbs while warm, and while cooled, whether a cooled one
+/// still climbs when it cannot go sideways, whether it leaves by the sides of the world).
+pub fn drift(m: Mat) -> (u32, u32, bool, bool) {
+    match m {
+        // Even cooled, vapour keeps drifting up a little: damp air is lighter than dry air (a
+        // water molecule weighs 18, air 29), which is how the vapour of a lake reaches the clouds.
+        Mat::Steam => (7, 3, true, false),
+        // Only warm smoke keeps climbing by itself; cooled smoke just drifts.
+        _ => (6, 0, false, true),
     }
 }
 
@@ -433,6 +518,8 @@ struct Piece {
     cells: Vec<usize>,
     /// Downward speed in cells per drop (negative while bouncing up).
     vy: f32,
+    /// How far it has fallen since it last rested, cells: how hard it lands.
+    fallen: f32,
     /// Mean density relative to water: lighter than a liquid, it floats on it (ice, wood).
     density: f32,
 }
@@ -466,6 +553,16 @@ pub struct World {
     released: Vec<bool>,
     released_list: Vec<usize>,
     falling: Vec<Piece>,
+    /// Solid bodies tipping over or tumbling down as they fall (see `statics.rs`).
+    pub slabs: Vec<Slab>,
+    /// Scratch for the supports: how many cells each one is from what holds it (u32::MAX: none).
+    level: Vec<u32>,
+    /// Load on each anchored solid cell, as a share of what it can bear (0..255 for 0..2). For the
+    /// stress view.
+    pub strain: Vec<u8>,
+    /// A fingerprint of the anchored cells when their sections were last checked: they are only
+    /// checked again once something changed.
+    strain_key: u64,
     ticks: u32,
     /// Which log each cell of wood belongs to: every stroke of the wood brush is one log, a rigid
     /// body of its own that rests on what is under it but never sticks to anything else (see
@@ -578,6 +675,10 @@ impl World {
             released: vec![false; W * H],
             released_list: Vec::new(),
             falling: Vec::new(),
+            slabs: Vec::new(),
+            level: vec![u32::MAX; W * H],
+            strain: vec![0; W * H],
+            strain_key: 0,
             ticks: 0,
             log: vec![0; W * H],
             paint_log: 0,
@@ -649,6 +750,8 @@ impl World {
         self.cells.fill(EMPTY);
         self.log.fill(0);
         self.ejecta.clear();
+        self.slabs.clear();
+        self.falling.clear();
         self.latent.fill(0.0);
         self.vel.fill(0);
         self.zones.wake_all();
@@ -672,6 +775,7 @@ impl World {
         self.temp.copy_from_slice(&st.temp);
         self.clock = st.clock;
         self.falling.clear();
+        self.slabs.clear();
         self.touched.clear();
         self.blasts.clear();
         self.powder_booms.clear();
@@ -912,6 +1016,17 @@ impl World {
             self.water_flow += 1;
         }
         self.carry(ia, ib);
+        // Grains slipping past the air (or gas) between them share its warmth on the way: hot air
+        // cannot bubble up through a heap of sand and carry the heat out of the top; it gives it
+        // to the grains it touches, and the heap warms out from where it was heated.
+        let (ma, mb) = (self.cells[ia].m, self.cells[ib].m);
+        let airy = |m: Mat| matches!(m.kind(), Kind::Empty | Kind::Gas);
+        if (ma.kind() == Kind::Powder && airy(mb)) || (mb.kind() == Kind::Powder && airy(ma)) {
+            let (ca, cb) = (thermal::cap(ma), thermal::cap(mb));
+            let t = (ca * self.temp[ia] + cb * self.temp[ib]) / (ca + cb);
+            self.temp[ia] = t;
+            self.temp[ib] = t;
+        }
         if a.1 != b.1 {
             // Vapour and clouds cool as they rise into thinner air, and warm as they sink.
             self.temp[ib] -= adiabatic_cooling_c(self.cells[ib].m, a.1, b.1);
@@ -1403,6 +1518,9 @@ impl World {
         if self.structures_fall && self.ticks % 2 == 0 {
             self.drop_structures();
         }
+        if self.structures_fall {
+            self.step_slabs();
+        }
         if self.ticks % pockets::POCKETS_EVERY == pockets::POCKETS_EVERY / 2 {
             self.update_pockets();
         }
@@ -1548,6 +1666,9 @@ impl World {
                 }
             }
             Mat::Hail => (0, 70),
+            // Earth holds together: its grains only slide where the drop is two cells (a steep
+            // bank of about 60 degrees, as a cut in the ground stands).
+            Mat::Dirt => (100, 0),
             Mat::Mud => (0, 90),
             Mat::Ash => (30, 0),
             _ => (0, 0),
@@ -1631,6 +1752,12 @@ impl World {
     /// and then a seed blown in by the wind starts a new patch.
     fn step_dirt(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
+        // Earth is a cohesive granular matter, not a solid: a clod with nothing under it drops, and
+        // a bank only slumps where it is steeper than its angle of repose (see `repose`).
+        // (Worlds where nothing falls apart keep it as it lies.)
+        if self.structures_fall && self.step_powder(x, y) {
+            return;
+        }
         self.step_soil(x, y);
         if self.moisture[i] >= GRASS_GROW && self.temp[i] > 5.0 && matches!(self.at(x, y - 1), Mat::Empty | Mat::Grass) && self.turf_open(x, y) {
             // Grass creeps sideways along the ground, and its roots thicken the turf downwards.
@@ -2267,31 +2394,7 @@ impl World {
                 return;
             }
         }
-        if self.at(x, y - 1) == Mat::Water && self.chance(2) {
-            self.swap((x, y), (x, y - 1));
-            return;
-        }
-        if self.chance(3) {
-            return;
-        }
-        let d = self.dir();
-        let down: &[i32] = if self.held(x, y) { &[] } else { &[0, d, -d] };
-        for &dx in down {
-            if matches!(self.at(x + dx, y + 1).kind(), Kind::Empty | Kind::Gas) {
-                self.swap((x, y), (x + dx, y + 1));
-                return;
-            }
-        }
-        for dir in [d, -d] {
-            let mut k = 0;
-            while k < 2 * K && self.at(x + dir * (k + 1), y) == Mat::Empty {
-                k += 1;
-            }
-            if k > 0 {
-                self.swap((x, y), (x + dir * k, y));
-                return;
-            }
-        }
+        self.step_liquid(x, y);
     }
 
     /// Burning oil: a long-lived, very hot flame that sets its neighbours alight.
@@ -2314,26 +2417,44 @@ impl World {
             self.set(x, y, Mat::Empty);
             return;
         }
+        self.step_gas(x, y);
+    }
+
+    /// The one way steam and smoke move (`Kind::Gas`), the matter only setting how it drifts
+    /// (`drift`): pushed by the difference of density with the air around (`buoyancy`), then
+    /// carried by the wind, and otherwise a warm gas climbs while a cooled one wanders sideways.
+    /// (A cloud is droplets hanging in the air: it has its own, stiller wandering, see
+    /// `step_cloud`.) Returns whether it moved.
+    fn step_gas(&mut self, x: i32, y: i32) -> bool {
         if self.buoyancy(x, y) {
-            return;
+            return true;
         }
         if let Some(t) = self.wind_target(x, y) {
             if self.at(t.0, t.1) == Mat::Empty {
                 self.swap((x, y), t);
-                return;
+                return true;
             }
         }
+        let (hot_rise, cool_rise, climbs, wraps) = drift(self.at(x, y));
         let d = self.dir();
-        // Only warm smoke keeps climbing by itself; cooled smoke just drifts.
         let hot = self.temp[Self::idx(x, y)] > self.ambient_c(y) + 8.0;
-        let order: [(i32, i32); 3] = if hot && self.rand() % 10 < 6 { [(0, -1), (d, -1), (d, 0)] } else { [(d, 0), (-d, 0), (d, 0)] };
+        let r = self.rand() % 10;
+        let order: [(i32, i32); 3] = if hot && r < hot_rise {
+            [(0, -1), (d, -1), (d, 0)]
+        } else if r < cool_rise {
+            [(0, -1), (d, 0), (-d, 0)]
+        } else {
+            [(d, 0), (-d, 0), if climbs { (0, -1) } else { (d, 0) }]
+        };
         for (dx, dy) in order {
-            let t = (self.edge_x(x, y, x + dx), y + dy);
+            let tx = if wraps { self.edge_x(x, y, x + dx) } else { x + dx };
+            let t = (tx, y + dy);
             if (dy >= 0 || self.gas_may_rise_to(x, y, t.1)) && self.at(t.0, t.1) == Mat::Empty {
                 self.swap((x, y), t);
-                return;
+                return true;
             }
         }
+        false
     }
 
     fn step_water(&mut self, x: i32, y: i32) {
@@ -2403,25 +2524,47 @@ impl World {
             self.fall_drop(x, y);
             return;
         }
+        self.step_liquid(x, y);
+    }
+
+    /// The one way every liquid moves (`Kind::Liquid`), the matter only setting how thick it is
+    /// (`viscosity`): a liquid lighter than the one on top of it rises through it (oil on water),
+    /// a thick one stays still now and then, then it runs down if it can (unless it is the mouth
+    /// of a full pipe, held by the pressure behind it, see `hydro.rs`) and else spreads along.
+    /// Returns whether it moved.
+    fn step_liquid(&mut self, x: i32, y: i32) -> bool {
+        let m = self.at(x, y);
+        let (rest, reach, spread) = viscosity(m);
+        let above = self.at(x, y - 1);
+        if above.kind() == Kind::Liquid && density(above) > density(m) && self.chance(2) {
+            self.swap((x, y), (x, y - 1));
+            return true;
+        }
+        if rest > 0 && self.chance(rest) {
+            return false;
+        }
         let d = self.dir();
-        // The mouth of a full pipe: the pressure behind holds the column (see `hydro.rs`).
         let down: &[i32] = if self.held(x, y) { &[] } else { &[0, d, -d] };
         for &dx in down {
             if matches!(self.at(x + dx, y + 1).kind(), Kind::Empty | Kind::Gas) {
                 self.swap((x, y), (x + dx, y + 1));
-                return;
+                return true;
             }
+        }
+        if spread > 1 && !self.chance(spread) {
+            return false;
         }
         for dir in [d, -d] {
             let mut k = 0;
-            while k < 4 * K && self.at(x + dir * (k + 1), y) == Mat::Empty {
+            while k < reach && self.at(x + dir * (k + 1), y) == Mat::Empty {
                 k += 1;
             }
             if k > 0 {
                 self.swap((x, y), (x + dir * k, y));
-                return;
+                return true;
             }
         }
+        false
     }
 
 
@@ -2459,10 +2602,8 @@ impl World {
     }
 
     fn step_steam(&mut self, x: i32, y: i32) {
-        // Condensation is handled by temperature (see thermal.rs). Hot steam rises on
-        // its own; as it cools it stops climbing and just drifts with the wind.
+        // Condensation is handled by temperature (see thermal.rs); it moves as a gas (`step_gas`).
         let i = Self::idx(x, y);
-        let hot = self.temp[i] > self.ambient_c(y) + 8.0;
         // Packed vapour (a full boiler) spreads into any room it finds.
         if self.packed(i) > 0 {
             let n = Self::neighbors(x, y)[(self.rand() % 4) as usize];
@@ -2476,33 +2617,7 @@ impl World {
                 return;
             }
         }
-        if self.buoyancy(x, y) {
-            return;
-        }
-        if let Some(t) = self.wind_target(x, y) {
-            if self.at(t.0, t.1) == Mat::Empty {
-                self.swap((x, y), t);
-                return;
-            }
-        }
-        let d = self.dir();
-        // Even cooled, vapour keeps drifting up a little: damp air is lighter than dry air (a water
-        // molecule weighs 18, air 29), which is how the vapour of a lake reaches the clouds.
-        let r = self.rand() % 10;
-        let order: [(i32, i32); 3] = if hot && r < 7 {
-            [(0, -1), (d, -1), (d, 0)]
-        } else if r < 3 {
-            [(0, -1), (d, 0), (-d, 0)]
-        } else {
-            [(d, 0), (-d, 0), (0, -1)]
-        };
-        for (dx, dy) in order {
-            let t = (x + dx, y + dy);
-            if (dy >= 0 || self.gas_may_rise_to(x, y, t.1)) && self.at(t.0, t.1) == Mat::Empty {
-                self.swap((x, y), t);
-                return;
-            }
-        }
+        self.step_gas(x, y);
     }
 
     /// Water at (x, y) turns to vapour and swells: the cell becomes steam, and the rest of its
@@ -2853,25 +2968,7 @@ impl World {
             self.temp.swap(i, j);
             self.latent.swap(i, j);
         }
-        if self.chance(2) {
-            return;
-        }
-        let d = self.dir();
-        let down: &[i32] = if self.held(x, y) { &[] } else { &[0, d, -d] };
-        for &dx in down {
-            if matches!(self.at(x + dx, y + 1).kind(), Kind::Empty | Kind::Gas) {
-                self.swap((x, y), (x + dx, y + 1));
-                return;
-            }
-        }
-        if self.chance(3) {
-            for dir in [d, -d] {
-                if self.at(x + dir, y) == Mat::Empty {
-                    self.swap((x, y), (x + dir, y));
-                    return;
-                }
-            }
-        }
+        self.step_liquid(x, y);
     }
 
 
@@ -2886,9 +2983,10 @@ impl World {
     // ----- structures -------------------------------------------------------
 
     /// Grass is not structural: it holds nothing up and is not carried along, it
-    /// just falls (see `step_grass`) until something solid catches it.
+    /// just falls (see `step_grass`) until something solid catches it. Earth is not either: it is
+    /// a granular matter that moves grain by grain (see `step_dirt`).
     fn structural(m: Mat) -> bool {
-        m.kind() == Kind::Static && m != Mat::Grass
+        m.kind() == Kind::Static && !matches!(m, Mat::Grass | Mat::Dirt)
     }
 
     /// Can solid `from` hold up the solid `to` lying `dy` rows away (-1: `to` sits on top of it,
@@ -2907,16 +3005,17 @@ impl World {
         }
     }
 
-    /// Are the neighbouring cells `i` and `j` parts of one body? A log (one stroke of the wood
-    /// brush) is a rigid body of its own: it is bonded only to the wood of the same stroke. It
-    /// rests on what is under it and carries what lies on it, but it never sticks to the side of
-    /// anything, so it falls as a whole and lands as a log instead of melting into the ground.
+    /// Are the neighbouring cells `i` and `j` parts of one body? Touching cells of the same matter
+    /// are (a tree is one body, see `statics::same_body`). A log (one stroke of the wood brush) is
+    /// a rigid body of its own: it is bonded only to the wood of the same stroke. It rests on what
+    /// is under it and carries what lies on it, but it never sticks to the side of anything, so it
+    /// falls as a whole and lands as a log instead of melting into the ground.
     fn same_body(&self, i: usize, j: usize) -> bool {
         let (a, b) = (self.cells[i].m == Mat::Wood, self.cells[j].m == Mat::Wood);
         if a || b {
             a && b && self.log[i] == self.log[j]
         } else {
-            true
+            statics::same_body(self.cells[i].m, self.cells[j].m)
         }
     }
 
@@ -2926,53 +3025,62 @@ impl World {
         self.paint_log
     }
 
-    /// Finds solid cells that are not connected to rock resting on the base of
-    /// the world and lists them, grouped by connected piece, so they can fall.
+    /// Sorts the solids into anchored bodies and free ones. A solid body is a run of touching
+    /// cells of the same matter (a tree counts as one body, see `statics::same_body`). It is
+    /// anchored when it touches something fixed: the base of the world, a tunnel's vault, or the
+    /// ground its roots grow in. Anchored bodies are then checked for overloaded sections (see
+    /// `stress_pass`); free bodies either fall, tip over their edge (see `tip_pass`) or rest.
     fn structure_pass(&mut self) {
         let mut seen = std::mem::take(&mut self.seen);
         let mut stack = std::mem::take(&mut self.stack);
+        let mut level = std::mem::take(&mut self.level);
         seen.fill(false);
-        // There is no real ground: only rock resting on the base of the world holds
-        // everything else up. Whatever is not connected to it falls away.
-        for x in 0..W {
-            let i = (H - 1) * W + x;
-            if self.cells[i].m == Mat::Stone && self.mask[i] == 0 {
+        level.fill(u32::MAX);
+        // Bodies in flight are moved by their own physics.
+        for s in &self.slabs {
+            for &i in s.cells() {
                 seen[i] = true;
-                stack.push(i);
             }
         }
-        // A tunnel's vault is bolted into the ground around it: it holds, and holds up what it touches.
+        // Breadth first from the fixed things, so that each cell learns how far it is from them.
+        let mut order: Vec<usize> = Vec::new();
         for i in 0..W * H {
-            if self.cells[i].m == Mat::Vault && !seen[i] {
+            if !seen[i] && self.anchors(i) {
                 seen[i] = true;
-                stack.push(i);
+                level[i] = 0;
+                order.push(i);
             }
         }
-        while let Some(i) = stack.pop() {
+        let mut head = 0;
+        while head < order.len() {
+            let i = order[head];
+            head += 1;
             let (x, y) = ((i % W) as i32, (i / W) as i32);
             let from = self.cells[i].m;
             for (nx, ny) in Self::neighbors(x, y) {
                 if Self::inb(nx, ny) {
                     let j = Self::idx(nx, ny);
-                    // Between two bodies (a log and what it touches) support only goes up: from
-                    // what is under to what rests on it.
-                    let bonded = self.same_body(i, j) || ny - y == -1;
-                    if !seen[j] && Self::structural(self.cells[j].m) && Self::holds(from, self.cells[j].m, ny - y) && bonded {
+                    let to = self.cells[j].m;
+                    if !seen[j] && Self::structural(to) && self.same_body(i, j) && Self::holds(from, to, ny - y) {
                         seen[j] = true;
-                        stack.push(j);
+                        level[j] = level[i] + 1;
+                        order.push(j);
                     }
                 }
             }
         }
+        self.level = level;
+        self.stress_pass(&order, &mut seen);
         // A piece that was already falling keeps its speed (sampled cells are enough).
-        let mut speeds: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+        let mut speeds: std::collections::HashMap<usize, (f32, f32)> = std::collections::HashMap::new();
         for p in &self.falling {
             for c in p.cells.iter().step_by(5).take(400) {
-                speeds.insert(*c, p.vy);
+                speeds.insert(*c, (p.vy, p.fallen));
             }
         }
-        // Group what is left into pieces.
+        // Group what is left into bodies.
         self.falling.clear();
+        let mut free = vec![];
         let mut budget = 300_000usize;
         for start in 0..W * H {
             if seen[start] || !Self::structural(self.cells[start].m) {
@@ -2995,15 +3103,35 @@ impl World {
                 }
             }
             budget = budget.saturating_sub(cells.len());
-            let vy = cells.iter().step_by(5).filter_map(|c| speeds.get(c)).fold(0.0f32, |a, b| a.max(*b));
+            let (vy, fallen) = cells.iter().step_by(5).filter_map(|c| speeds.get(c)).fold((0.0f32, 0.0f32), |a, b| (a.0.max(b.0), a.1.max(b.1)));
             let density = cells.iter().map(|&i| density(self.cells[i].m)).sum::<f32>() / cells.len().max(1) as f32;
-            self.falling.push(Piece { cells, vy, density });
+            free.push(Piece { cells, vy, fallen, density });
             if budget == 0 {
                 break;
             }
         }
         self.seen = seen;
         self.stack = stack;
+        self.tip_pass(free);
+    }
+
+    /// Whether cell `i` is solid and held by something fixed: the base of the world, a tunnel's
+    /// vault (it is bolted into the ground around it), or, for a tree, the ground its roots grow in.
+    fn anchors(&self, i: usize) -> bool {
+        let m = self.cells[i].m;
+        if !Self::structural(m) || self.mask[i] != 0 {
+            return false;
+        }
+        if i / W == H - 1 || m == Mat::Vault {
+            return true;
+        }
+        if matches!(m, Mat::Trunk | Mat::Sapling) {
+            // Roots: a tree holds to the ground it stands on.
+            let (x, y) = ((i % W) as i32, (i / W) as i32);
+            let ground = |m: Mat| m.is_hard() && !m.is_vegetation();
+            return ground(self.raw(x, y + 1)) || Self::neighbors(x, y).iter().any(|&(nx, ny)| matches!(self.raw(nx, ny), Mat::Dirt | Mat::Grass | Mat::Mud));
+        }
+        false
     }
 
     /// Moves every unsupported piece down (accelerating) as a rigid whole. A fast
@@ -3024,9 +3152,16 @@ impl World {
                         break;
                     }
                     self.piece_move(piece, 1);
+                    piece.fallen += 1.0;
                 }
                 if !self.piece_can_move(piece, 1) {
-                    // Touched down. A hard landing bounces right away; a soft one settles.
+                    // Touched down. It may break (see `statics.rs`); if not, a hard landing
+                    // bounces right away and a soft one settles.
+                    if self.landing_breaks(piece) {
+                        piece.cells.clear();
+                        continue;
+                    }
+                    piece.fallen = 0.0;
                     if piece.vy > 1.4 {
                         if self.thuds.len() < 8 {
                             let c = piece.cells[0];
@@ -3256,7 +3391,14 @@ impl World {
         let mut prev_dense = vec![false; W];
         let mut dense = vec![false; W];
         for y in 0..=until {
-            let air = 1.05 * (-((H - y) as f32) / 700.0).exp();
+            // The still air at this height (the same atmosphere as the sensors read).
+            let air = air_pressure_atm(y as i32);
+            // The wind solver's pressure is only read for its changes along the row (a gust, the
+            // push in front of a blast): its level, row by row, is the solver's own and not the
+            // atmosphere's.
+            let row_flow: Vec<Option<f32>> = (0..W).map(|x| self.flow.air_pressure(x as i32, y as i32)).collect();
+            let (sum, n) = row_flow.iter().flatten().fold((0.0f32, 0usize), |(s, n), p| (s + p, n + 1));
+            let row_mean = if n > 0 { (sum / n as f32).max(1e-3) } else { 1.0 };
             for x in 0..W {
                 let m = self.at(x as i32, y as i32);
                 match m.kind() {
@@ -3271,8 +3413,11 @@ impl World {
                             // A closed pocket (a boiler, a sealed room) has its own pressure.
                             air * p.pressure
                         } else {
-                            match self.flow.air_pressure(x as i32, y as i32) {
-                                Some(p) => air * p.clamp(0.3, 4.0),
+                            match row_flow[x] {
+                                // Open air evens out its pressure almost at once: the solver's
+                                // swings (hot air over a fire reads three times its row) are shown a
+                                // quarter as strong, still enough to see a gust or a blast.
+                                Some(p) => air * (1.0 + (p / row_mean - 1.0) * 0.25).clamp(0.8, 1.6),
                                 None => {
                                     let kelvin = (self.temp[y * W + x] + 273.15).max(1.0) / (self.ambient_c(y as i32) + 273.15).max(1.0);
                                     air * dynamic * kelvin.clamp(0.5, 3.0)
@@ -3309,8 +3454,10 @@ impl World {
 
     /// The pressure view's colour of a cell, with the borders between gas, liquid and solid marked.
     pub fn pressure_color(&self, field: &[f32], x: usize, y: usize) -> [u8; 4] {
-        let (r, g, b) = pressure_rgb(field[y * W + x]);
         let m = self.at(x as i32, y as i32);
+        // Two scales: the air's changes are a few hundredths of an atmosphere, the ground's tens of
+        // atmospheres; on one scale either the sky or the ground would be a flat colour.
+        let (r, g, b) = if matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) { air_pressure_rgb(field[y * W + x]) } else { ground_pressure_rgb(field[y * W + x]) };
         if gas_grain(m) {
             // A grain of gas is at the pressure of the air around it (mechanical equilibrium): it
             // shows where it is, without a pressure of its own.
@@ -3657,6 +3804,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_liquid_moves_by_one_rule_the_thinner_the_further() {
+        // The same pour of each liquid on a cold floor: after the same time water has run
+        // furthest, oil less far, lava least. (Cold enough here that nothing sets or boils:
+        // the motion alone is compared.)
+        let spread = |m: Mat| {
+            let mut w = World::new_static();
+            for x in 0..W as i32 {
+                w.set(x, 300, Mat::Stone);
+            }
+            for y in 280..300 {
+                w.set(480, y, m);
+            }
+            for _ in 0..300 {
+                for y in (0..300).rev() {
+                    for x in 300..660 {
+                        if w.raw(x, y) == m {
+                            w.step_liquid(x, y);
+                        }
+                    }
+                }
+            }
+            let xs: Vec<i32> = (0..W as i32).filter(|&x| (280..300).any(|y| w.raw(x, y) == m)).collect();
+            xs.last().unwrap() - xs.first().unwrap()
+        };
+        let (water, oil, lava) = (spread(Mat::Water), spread(Mat::Oil), spread(Mat::Lava));
+        assert!(water > oil && oil > lava, "water {water}, oil {oil}, lava {lava}");
+    }
+
+    #[test]
+    fn oil_rises_through_water_by_the_liquid_rule() {
+        let mut w = World::new_static();
+        for x in 4..7 {
+            w.set(x, 11, Mat::Stone);
+            w.set(x, 10, Mat::Stone);
+        }
+        w.set(5, 10, Mat::Oil);
+        w.set(5, 9, Mat::Water);
+        while !w.step_liquid(5, 10) {}
+        assert_eq!((w.raw(5, 9), w.raw(5, 10)), (Mat::Oil, Mat::Water));
+    }
+
+    #[test]
     fn sand_falls_and_lands_on_stone() {
         let mut w = World::new_static();
         for x in 0..21 {
@@ -3832,6 +4021,44 @@ mod tests {
     }
 
     #[test]
+    fn hot_air_slipping_up_through_falling_sand_leaves_its_heat_in_the_grains() {
+        let mut w = World::new_static();
+        w.climate_fixed = Some(-5.0);
+        w.reset_temps();
+        // A grain of cold sand over a pocket of very hot air: the grain falls through it.
+        w.set(100, 100, Mat::Sand);
+        for y in 101..104 {
+            w.temp[World::idx(100, y)] = 600.0;
+        }
+        w.set(100, 104, Mat::Stone);
+        w.swap((100, 100), (100, 103));
+        let (sand, air) = (w.temp_c(100, 103), w.temp_c(100, 100));
+        assert_eq!(w.raw(100, 103), Mat::Sand);
+        assert!(sand > 50.0, "the grain took heat from the air it fell through: {sand}");
+        assert!((air - sand).abs() < 1e-3, "and the air that slipped up left at the same temperature: {air}");
+        let total = |t_sand: f32, t_air: f32| thermal::cap(Mat::Sand) * t_sand + thermal::cap(Mat::Empty) * t_air;
+        assert!((total(sand, air) - total(-5.0, 600.0)).abs() < 1e-2, "no heat made or lost");
+    }
+
+    #[test]
+    fn the_pressure_view_reads_the_real_atmosphere_on_its_own_scale() {
+        let mut w = World::new_static();
+        for x in 0..W as i32 {
+            for y in 450..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        let f = w.pressure_field();
+        let (low, high) = (f[440 * W + 300], f[10 * W + 300]);
+        assert!((low - air_pressure_atm(440)).abs() < 0.05, "air by the ground: {low}");
+        assert!(high < 0.2 * low, "the air thins with height: {high} up high, {low} below");
+        // The sky's gradient spans the air scale, and the ground has a scale of its own.
+        assert!(air_scale(low) - air_scale(high) > 0.3);
+        assert_ne!(air_pressure_rgb(1.0), ground_pressure_rgb(1.0), "air and ground never share a colour at the surface");
+        assert!(ground_scale(f[530 * W + 300]) > ground_scale(f[460 * W + 300]));
+    }
+
+    #[test]
     fn the_weight_of_a_pillar_fans_out_in_the_ground_instead_of_running_down_as_a_stripe() {
         let mut w = World::new_static();
         for x in 0..W as i32 {
@@ -3870,7 +4097,7 @@ mod tests {
             assert_ne!(grain, air, "{name}: the grain of steam should stand out from the air beside it");
         }
         // The grain is at the pressure of the air around it: only lighter, not another colour.
-        let (r, g, b) = pressure_rgb(pf[i]);
+        let (r, g, b) = air_pressure_rgb(pf[i]);
         assert_eq!(w.pressure_color(&pf, 400, 200), grain_dot([r, g, b]));
         // And it is saturated air.
         let (r, g, b) = (40, 100, 235);
@@ -4293,12 +4520,11 @@ mod tests {
     }
 
     #[test]
-    fn ice_falls_like_a_solid_bounces_a_little_and_floats_on_water() {
+    fn ice_dropped_from_high_up_shatters() {
         let mut w = World::new();
         w.day_cycle = false;
         w.climate_fixed = Some(-5.0);
         w.reset_temps();
-        // Rock on the base; a block of ice dropped from high up.
         for x in 100..300 {
             for y in 500..H as i32 {
                 w.set(x, y, Mat::Stone);
@@ -4306,6 +4532,34 @@ mod tests {
         }
         for x in 180..200 {
             for y in 200..210 {
+                w.set(x, y, Mat::Ice);
+            }
+        }
+        for _ in 0..900 {
+            w.step();
+        }
+        let tally = |m: Mat| w.cells.iter().filter(|c| c.m == m).count();
+        let (ice, hail) = (tally(Mat::Ice), tally(Mat::Hail));
+        assert!(hail > 20, "a 15 m fall crushes part of it to hail: {hail}");
+        assert!(ice + hail > 180, "nothing is lost: {ice} + {hail}");
+        assert!(w.ejecta.is_empty() && (0..W * H).filter(|&i| matches!(w.cells[i].m, Mat::Ice | Mat::Hail)).all(|i| i / W >= 470), "the pieces lie on the rock");
+    }
+
+    #[test]
+    fn ice_falls_like_a_solid_bounces_a_little_and_floats_on_water() {
+        let mut w = World::new();
+        w.day_cycle = false;
+        w.climate_fixed = Some(-5.0);
+        w.reset_temps();
+        // Rock on the base; a block of ice dropped from a little height (it would shatter from
+        // high up, see `ice_dropped_from_high_up_shatters`).
+        for x in 100..300 {
+            for y in 500..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for x in 180..200 {
+            for y in 482..492 {
                 w.set(x, y, Mat::Ice);
             }
         }
@@ -5959,10 +6213,11 @@ mod science {
         for _ in 0..800 {
             w.step();
         }
-        let ice: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Ice).collect();
+        // A 5 m fall breaks it: pieces of ice and hail.
+        let ice: Vec<usize> = (0..W * H).filter(|&i| matches!(w.cells[i].m, Mat::Ice | Mat::Hail)).collect();
         let highest = ice.iter().map(|i| i / W).min().unwrap_or(0);
-        assert_eq!(ice.len(), n, "the ice is still there");
-        assert!(highest > 375, "the ice fell to the ground through the crown (highest ice row {highest})");
+        assert!(ice.len() * 10 > n * 9, "the ice is still there: {} of {n}", ice.len());
+        assert!(highest > 350, "the ice fell to the ground through the crown (highest ice row {highest})");
         assert!(w.cells.iter().any(|c| c.m == Mat::DeadLeaf), "it broke leaves on its way down");
         assert_eq!(w.raw(380, 350), Mat::Trunk, "the trunk still stands");
     }
@@ -6568,5 +6823,7 @@ mod glass {
         assert!(booms > 0);
     }
 }
+
+
 
 

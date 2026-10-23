@@ -50,6 +50,16 @@ cargo run --release
 - **Pas de vrai sol** : seule la roche posée sur le bas du monde retient le reste ; tout ce qui n'y est pas relié tombe et
   disparaît par le fond. Sable, eau et gaz sortent aussi par les côtés (sauf les gaz, recyclés de l'autre côté) ; le ciel
   bloque les gaz. On peut donc creuser le fond pour vider un lac.
+- **Solides** : un solide est un groupe de cellules de même matière qui se touchent (un arbre compte pour un). Il a une
+  masse, un centre de gravité et un moment d'inertie (en 2D, la matrice d'inertie se réduit à I = Σ m·r²). Il est
+  **ancré** s'il touche le fond du monde, une voûte, ou s'il s'agit d'un arbre enraciné ; même ancré, chaque section doit
+  porter le moment de ce qui la dépasse (σ du matériau) : un porte-à-faux trop long casse là où il est le plus faible.
+  Un solide **libre** repose sur ce qu'il touche : si son centre de gravité sort de sa base, il **bascule** autour de
+  l'arête d'appui, la quitte quand elle ne peut plus le retenir, tombe en tournant et **se brise** à l'impact selon
+  l'énergie de rupture du matériau (la glace donne des morceaux et des grêlons, le verre des éclats, la pierre ne casse
+  qu'après une grande chute, le bois et le métal jamais). La vue **Efforts** colore chaque section selon sa charge.
+  La **terre** n'est pas un solide : c'est un granulat cohésif, elle s'éboule dans le vide et tient un talus raide
+  (`--demo out.png --topple` : un long trait de glace dessiné de travers bascule, tombe et se brise).
 
 ## Construire
 - **Blocs façon Lego** : brique, longue, planche, poutre fer, poutre acier, cube, verre, roue. Aimantés sur la grille de plots

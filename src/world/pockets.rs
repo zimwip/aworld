@@ -52,11 +52,14 @@ pub struct Pocket {
     /// Walls full of cracks (embers, charcoal, ash) round it: the gas seeps out and never
     /// builds up pressure, but no fresh air comes in either.
     leaky: bool,
+    /// Cell sides it shares with loose or porous ground (sand, soil, snow...): gas seeps through
+    /// it, so a pocket held largely by it never builds up pressure.
+    porous_edge: u32,
 }
 
 impl Pocket {
     fn settle(&mut self) {
-        self.pressure = if self.open || self.leaky || self.cells == 0 {
+        self.pressure = if self.open || self.leaky || self.cells == 0 || self.porous_edge * 5 >= self.wall_edge.max(1) {
             1.0
         } else {
             let v = self.cells as f32;
@@ -84,6 +87,16 @@ pub fn wall_strength(m: Mat) -> Option<f32> {
         _ => return None,
     })
 }
+
+/// Ground that gas seeps through: a cave dug in soil or sand, or air trapped among wet grains,
+/// does not hold pressure the way a boiler does.
+fn porous(m: Mat) -> bool {
+    matches!(m, Mat::Sand | Mat::Dirt | Mat::Grass | Mat::Mud | Mat::Snow | Mat::Hail | Mat::Shard | Mat::Seed | Mat::DeadLeaf | Mat::Gunpowder | Mat::Saltpeter | Mat::Rust)
+}
+
+/// Least energy (excess atmospheres times cells of gas) that breaks a wall: a bubble of a few
+/// cells has nowhere near enough push to crack rock, whatever its pressure.
+const BURST_ENERGY: f32 = 100.0;
 
 /// Boiling point of water (°C) under an absolute pressure in atmospheres (Clausius-Clapeyron):
 /// 100 °C at 1 atm, about 120 °C at 2 atm, 144 °C at 4 atm.
@@ -199,6 +212,7 @@ impl World {
                 } else {
                     p.wall_edge += 1;
                     p.leaky |= matches!(self.cells[i].m, Mat::Ember | Mat::Charcoal | Mat::Ash);
+                    p.porous_edge += (self.mask[i] == 0 && porous(self.cells[i].m)) as u32;
                 }
                 if let Some(s) = strength {
                     if p.weakest.map_or(true, |w| s < w.1) {
@@ -339,7 +353,7 @@ impl World {
             }
             let Some((wall, strength)) = p.weakest else { continue };
             let excess = p.pressure - 1.0;
-            if excess <= strength {
+            if excess <= strength || excess * (p.cells as f32) < BURST_ENERGY {
                 continue;
             }
             let (x, y) = ((wall % W) as i32, (wall / W) as i32);
@@ -585,6 +599,29 @@ mod tests {
     }
 
     #[test]
+    fn steam_in_a_hollow_of_sand_or_soil_seeps_out_instead_of_building_pressure() {
+        for wall in [Mat::Sand, Mat::Dirt] {
+            let mut w = World::new_static();
+            boxed(&mut w, 100, 100, 130, 120, wall);
+            fill(&mut w, 101, 101, 129, 110, Mat::Steam, 130.0);
+            w.update_pockets();
+            assert!((w.gas_pressure(115, 105) - 1.0).abs() < 1e-6, "{wall:?}: {}", w.gas_pressure(115, 105));
+            assert!(w.bursts.is_empty(), "{wall:?} wall burst");
+        }
+    }
+
+    #[test]
+    fn a_tiny_hot_bubble_in_rock_does_not_crack_it() {
+        let mut w = World::new_static();
+        boxed(&mut w, 100, 100, 103, 103, Mat::Stone);
+        fill(&mut w, 101, 101, 102, 102, Mat::Steam, 400.0);
+        w.update_pockets();
+        assert!(w.gas_pressure(101, 101) > 6.0, "the bubble is under pressure: {}", w.gas_pressure(101, 101));
+        assert!(w.bursts.is_empty(), "but four cells of gas have too little push to break stone");
+        assert!((100..=103).all(|x| w.raw(x, 100) == Mat::Stone && w.raw(x, 103) == Mat::Stone));
+    }
+
+    #[test]
     fn a_glass_boiler_bursts_but_a_steel_one_holds() {
         for (wall, bursts) in [(Mat::Glass, true), (Mat::Steel, false)] {
             let mut w = World::new_static();
@@ -700,3 +737,4 @@ mod tests {
         assert!(w.liquid_pressure(217, 295) < 1.6, "the water above it feels only its own weight: {}", w.liquid_pressure(217, 295));
     }
 }
+
