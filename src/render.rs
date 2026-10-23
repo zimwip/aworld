@@ -1049,6 +1049,22 @@ pub fn stress_rgb(t: f32) -> (f32, f32, f32) {
     }
 }
 
+/// Faint dashed lines where a block being placed lines up with its neighbours.
+pub fn draw_guides(guides: &[(Vec2, Vec2)], v: View) {
+    let col = Color::new(0.55, 0.85, 1.0, 0.55);
+    for (a, b) in guides {
+        let (sa, sb) = (v.to_screen(*a), v.to_screen(*b));
+        let len = (sb - sa).length();
+        let dir = (sb - sa) / len.max(1e-3);
+        let mut d = 0.0;
+        while d < len {
+            let (p, q) = (sa + dir * d, sa + dir * (d + 5.0).min(len));
+            draw_line(p.x, p.y, q.x, q.y, 1.0, col);
+            d += 9.0;
+        }
+    }
+}
+
 pub fn draw_block(b: &Block, v: View, stress: Option<f32>) {
     let heat = if b.kind.spec().mat == Mat::Wood { b.heat as f32 } else { 0.0 };
     draw_block_shape(b.kind, v.to_screen(b.pos), v.s, b.angle, None, heat, b.rust, stress);

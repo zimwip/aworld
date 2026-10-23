@@ -24,10 +24,10 @@ mod whale;
 mod wolves;
 mod world;
 
-use blocks::{anchor_world, block_at, clip, node_at, placement_ok, snap, stamp_all, Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, Physics, Spring, SpringKind, MEMBER_MAX_LEN, SPRING_MAX_LEN};
+use blocks::{anchor_world, block_at, magnet, node_at, placement_ok, stamp_all, Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, Physics, Spring, SpringKind, MEMBER_MAX_LEN, SPRING_MAX_LEN};
 use car::{collide_cars, Car, Fate, ModelKind, Tuning};
 use macroquad::prelude::*;
-use render::{RenderMode, cable_preview, draw_block, draw_block_shape, draw_booms, draw_cable, draw_car, draw_flag, draw_member, draw_spring, draw_spring_between, Boom, LiveBolt, Renderer, View, BOLT_LIFE};
+use render::{RenderMode, cable_preview, draw_block, draw_block_shape, draw_guides, draw_booms, draw_cable, draw_car, draw_flag, draw_member, draw_spring, draw_spring_between, Boom, LiveBolt, Renderer, View, BOLT_LIFE};
 use science::{info, mat_color, palette_info, MATTERS, RECIPES};
 use mech::{GearSize, Mechanism};
 use mechgame::MechDraft;
@@ -704,7 +704,8 @@ impl Game {
 
     fn candidate(&self, kind: BlockKind, at: Vec2) -> Block {
         let angle = self.rot90 as f32 * std::f32::consts::FRAC_PI_2;
-        let pos = if is_key_down(KeyCode::LeftShift) { at } else { clip(&self.blocks, kind, angle, snap(kind, self.rot90, at)) };
+        // Free on whole cells; pulled onto nearby blocks unless Shift is held.
+        let pos = if is_key_down(KeyCode::LeftShift) { at.round() } else { magnet(&self.blocks, kind, angle, at) };
         Block::new(kind, pos, angle)
     }
 
@@ -2144,6 +2145,7 @@ impl Game {
                     let cand = self.candidate(k, at);
                     let ok = placement_ok(&self.world, &self.blocks, &cand, None) && self.missing_for_tool(at).is_none();
                     let tint = if ok { Color::new(0.3, 1.0, 0.5, 1.0) } else { Color::new(1.0, 0.1, 0.1, 1.0) };
+                    draw_guides(&blocks::guides(&self.blocks, &cand), view);
                     draw_block_shape(k, view.to_screen(cand.pos), view.s, cand.angle, Some(tint), 0.0, 0.0, None);
                     // The studs that would grip: lit up, and counted.
                     let mut grip = 0;
@@ -3741,6 +3743,24 @@ fn demo_tunnel(g: &mut Game) {
     g.set_running(true);
 }
 
+/// A few bricks on flat rock, the brick tool in hand: with `--mouse` near them, the ghost is pulled
+/// into line and the guides show (`--magnet`).
+fn demo_magnet(g: &mut Game) {
+    g.empty_world();
+    let floor = 420;
+    for x in 0..W as i32 {
+        for y in floor..H as i32 {
+            g.world.set(x, y, Mat::Stone);
+        }
+    }
+    let f = floor as f32;
+    for (k, x, y) in [(BlockKind::Long, 400.0, f - 5.0), (BlockKind::Brick, 393.0, f - 15.0), (BlockKind::Post, 470.0, f - 20.0), (BlockKind::Cube, 540.0, f - 10.0)] {
+        g.blocks.push(Block::new(k, vec2(x, y), 0.0));
+    }
+    g.refresh_mask();
+    g.tool = Tool::Block(BlockKind::Brick);
+}
+
 /// A meadow over rock with a big charge of powder buried in it: `--crater` lights it. With
 /// `dynamite`, the charge is a stick of dynamite packed in charcoal (it leaves diamonds).
 fn demo_crater(g: &mut Game, dynamite: bool) {
@@ -4043,6 +4063,9 @@ async fn main() {
         }
         if args.iter().any(|a| a == "--tunnel") {
             demo_tunnel(&mut game);
+        }
+        if args.iter().any(|a| a == "--magnet") {
+            demo_magnet(&mut game);
         }
         if args.iter().any(|a| a == "--crater") {
             demo_crater(&mut game, args.iter().any(|a| a == "--dynamite"));

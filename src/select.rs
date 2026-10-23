@@ -219,7 +219,7 @@ impl Game {
         let Some(i) = self.blocks.iter().position(|b| b.uid == uid) else { return false };
         let others: Vec<Block> = self.blocks.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, b)| b.clone()).collect();
         let (kind, angle) = (self.blocks[i].kind, self.blocks[i].angle);
-        let pos = if shift { to } else { clip(&others, kind, angle, snap(kind, 0, to)) };
+        let pos = if shift { to } else { magnet(&others, kind, angle, to) };
         let mut cand = self.blocks[i].clone();
         cand.pos = pos;
         if pos == self.blocks[i].pos || !placement_ok(&self.world, &self.blocks, &cand, Some(i)) {
@@ -445,6 +445,10 @@ impl Game {
         match sel {
             Sel::Block(u) => {
                 if let Some(b) = self.blocks.iter().find(|b| b.uid == u) {
+                    // While it is dragged: the neighbours it lines up with.
+                    if self.drag.is_some_and(|d| d.moved) {
+                        draw_guides(&blocks::guides(&self.blocks, b), view);
+                    }
                     let h = b.half();
                     if b.spec().round {
                         outline_circle(s, (h.x + 1.5) * view.s, col);

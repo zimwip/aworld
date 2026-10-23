@@ -65,8 +65,9 @@ cargo run --release
   (`--demo out.png --topple` : un long trait de glace dessiné de travers bascule, tombe et se brise).
 
 ## Construire
-- **Blocs façon Lego** : brique, longue, planche, poutre fer, poutre acier, cube, verre, roue. Aimantés sur la grille de plots
-  et sur leurs voisins (Maj = libre), pas de superposition, molette ou Q/E pour tourner. Les blocs qui se touchent sont soudés ;
+- **Blocs façon Lego** : brique, longue, planche, poutre fer, poutre acier, cube, verre, roue. Posés librement au pixel près ;
+  près d'un autre bloc ils s'aimantent (collés contre lui, bords ou milieux alignés, sur ses plots quand on empile) et de
+  fins pointillés montrent l'alignement (Maj = sans aimant). Pas de superposition, molette ou Q/E pour tourner. Les blocs qui se touchent sont soudés ;
   bout à bout, les tiges de même matière forment une seule pièce plus rigide.
 - **Tiges** (bois, fer, acier) : un clic fixe un bout (sol, bloc ou nœud), tire, un second clic fixe l'autre. Longueur max 110.
   Elles pivotent aux nœuds : on dessine des fermes de pont. Le bois est léger et fragile, le fer lourd, l'acier lourd et solide.
