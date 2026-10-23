@@ -13,6 +13,8 @@ pub mod sleep;
 pub use pockets::boil_c;
 mod thermal;
 mod storm;
+mod statics;
+pub use statics::Slab;
 pub use storm::{Bolt, BREAKDOWN, QS, QW, QH};
 pub use thermal::{air_pressure_atm, Season, DAY_STEPS};
 use thermal::adiabatic_cooling_c;
@@ -381,6 +383,8 @@ struct Piece {
     cells: Vec<usize>,
     /// Downward speed in cells per drop (negative while bouncing up).
     vy: f32,
+    /// How far it has fallen since it last rested, cells: how hard it lands.
+    fallen: f32,
     /// Mean density relative to water: lighter than a liquid, it floats on it (ice, wood).
     density: f32,
 }
@@ -403,6 +407,13 @@ pub struct World {
     released: Vec<bool>,
     released_list: Vec<usize>,
     falling: Vec<Piece>,
+    /// Solid bodies tipping over or tumbling down as they fall (see `statics.rs`).
+    pub slabs: Vec<Slab>,
+    /// Scratch for the supports: how many cells each one is from what holds it (u32::MAX: none).
+    level: Vec<u32>,
+    /// Load on each anchored solid cell, as a share of what it can bear (0..255 for 0..2). For the
+    /// stress view.
+    pub strain: Vec<u8>,
     ticks: u32,
     /// Temperature in °C of every cell (air included).
     pub temp: Vec<f32>,
@@ -501,6 +512,9 @@ impl World {
             released: vec![false; W * H],
             released_list: Vec::new(),
             falling: Vec::new(),
+            slabs: Vec::new(),
+            level: vec![u32::MAX; W * H],
+            strain: vec![0; W * H],
             ticks: 0,
             temp: vec![15.0; W * H],
             clock: DAY_STEPS / 5,
@@ -565,6 +579,8 @@ impl World {
         self.charge.fill(0.0);
         self.cells.fill(EMPTY);
         self.ejecta.clear();
+        self.slabs.clear();
+        self.falling.clear();
         self.latent.fill(0.0);
         self.vel.fill(0);
         self.zones.wake_all();
@@ -592,6 +608,7 @@ impl World {
         self.temp.copy_from_slice(&st.temp);
         self.clock = st.clock;
         self.falling.clear();
+        self.slabs.clear();
         self.touched.clear();
         self.blasts.clear();
         self.powder_booms.clear();
@@ -1254,6 +1271,9 @@ impl World {
         if self.structures_fall && self.ticks % 2 == 0 {
             self.drop_structures();
         }
+        if self.structures_fall {
+            self.step_slabs();
+        }
         if self.ticks % pockets::POCKETS_EVERY == pockets::POCKETS_EVERY / 2 {
             self.update_pockets();
         }
@@ -1399,6 +1419,9 @@ impl World {
                 }
             }
             Mat::Hail => (0, 70),
+            // Earth holds together: its grains only slide where the drop is two cells (a steep
+            // bank of about 60 degrees, as a cut in the ground stands).
+            Mat::Dirt => (100, 0),
             Mat::Mud => (0, 90),
             Mat::Ash => (30, 0),
             _ => (0, 0),
@@ -1481,6 +1504,12 @@ impl World {
     /// and then a seed blown in by the wind starts a new patch.
     fn step_dirt(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
+        // Earth is a cohesive granular matter, not a solid: a clod with nothing under it drops, and
+        // a bank only slumps where it is steeper than its angle of repose (see `repose`).
+        // (Worlds where nothing falls apart keep it as it lies.)
+        if self.structures_fall && self.step_powder(x, y) {
+            return;
+        }
         self.step_soil(x, y);
         if self.cells[i].life >= GRASS_GROW && self.temp[i] > 5.0 && matches!(self.at(x, y - 1), Mat::Empty | Mat::Grass) && self.turf_open(x, y) {
             // Grass creeps sideways along the ground, and its roots thicken the turf downwards.
@@ -2694,9 +2723,10 @@ impl World {
     // ----- structures -------------------------------------------------------
 
     /// Grass is not structural: it holds nothing up and is not carried along, it
-    /// just falls (see `step_grass`) until something solid catches it.
+    /// just falls (see `step_grass`) until something solid catches it. Earth is not either: it is
+    /// a granular matter that moves grain by grain (see `step_dirt`).
     fn structural(m: Mat) -> bool {
-        m.kind() == Kind::Static && m != Mat::Grass
+        m.kind() == Kind::Static && !matches!(m, Mat::Grass | Mat::Dirt)
     }
 
     /// Can solid `from` hold up the solid `to` lying `dy` rows away (-1: `to` sits on top of it,
@@ -2715,50 +2745,62 @@ impl World {
         }
     }
 
-    /// Finds solid cells that are not connected to rock resting on the base of
-    /// the world and lists them, grouped by connected piece, so they can fall.
+    /// Sorts the solids into anchored bodies and free ones. A solid body is a run of touching
+    /// cells of the same matter (a tree counts as one body, see `statics::same_body`). It is
+    /// anchored when it touches something fixed: the base of the world, a tunnel's vault, or the
+    /// ground its roots grow in. Anchored bodies are then checked for overloaded sections (see
+    /// `stress_pass`); free bodies either fall, tip over their edge (see `tip_pass`) or rest.
     fn structure_pass(&mut self) {
         let mut seen = std::mem::take(&mut self.seen);
         let mut stack = std::mem::take(&mut self.stack);
+        let mut level = std::mem::take(&mut self.level);
         seen.fill(false);
-        // There is no real ground: only rock resting on the base of the world holds
-        // everything else up. Whatever is not connected to it falls away.
-        for x in 0..W {
-            let i = (H - 1) * W + x;
-            if self.cells[i].m == Mat::Stone && self.mask[i] == 0 {
+        level.fill(u32::MAX);
+        // Bodies in flight are moved by their own physics.
+        for s in &self.slabs {
+            for &i in s.cells() {
                 seen[i] = true;
-                stack.push(i);
             }
         }
-        // A tunnel's vault is bolted into the ground around it: it holds, and holds up what it touches.
+        // Breadth first from the fixed things, so that each cell learns how far it is from them.
+        let mut order: Vec<usize> = Vec::new();
         for i in 0..W * H {
-            if self.cells[i].m == Mat::Vault && !seen[i] {
+            if !seen[i] && self.anchors(i) {
                 seen[i] = true;
-                stack.push(i);
+                level[i] = 0;
+                order.push(i);
             }
         }
-        while let Some(i) = stack.pop() {
+        let mut head = 0;
+        while head < order.len() {
+            let i = order[head];
+            head += 1;
             let (x, y) = ((i % W) as i32, (i / W) as i32);
             let from = self.cells[i].m;
             for (nx, ny) in Self::neighbors(x, y) {
                 if Self::inb(nx, ny) {
                     let j = Self::idx(nx, ny);
-                    if !seen[j] && Self::structural(self.cells[j].m) && Self::holds(from, self.cells[j].m, ny - y) {
+                    let to = self.cells[j].m;
+                    if !seen[j] && Self::structural(to) && statics::same_body(from, to) && Self::holds(from, to, ny - y) {
                         seen[j] = true;
-                        stack.push(j);
+                        level[j] = level[i] + 1;
+                        order.push(j);
                     }
                 }
             }
         }
+        self.level = level;
+        self.stress_pass(&order, &mut seen);
         // A piece that was already falling keeps its speed (sampled cells are enough).
-        let mut speeds: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+        let mut speeds: std::collections::HashMap<usize, (f32, f32)> = std::collections::HashMap::new();
         for p in &self.falling {
             for c in p.cells.iter().step_by(5).take(400) {
-                speeds.insert(*c, p.vy);
+                speeds.insert(*c, (p.vy, p.fallen));
             }
         }
-        // Group what is left into pieces.
+        // Group what is left into bodies.
         self.falling.clear();
+        let mut free = vec![];
         let mut budget = 300_000usize;
         for start in 0..W * H {
             if seen[start] || !Self::structural(self.cells[start].m) {
@@ -2770,10 +2812,11 @@ impl World {
             while let Some(i) = stack.pop() {
                 cells.push(i);
                 let (x, y) = ((i % W) as i32, (i / W) as i32);
+                let from = self.cells[i].m;
                 for (nx, ny) in Self::neighbors(x, y) {
                     if Self::inb(nx, ny) {
                         let j = Self::idx(nx, ny);
-                        if !seen[j] && Self::structural(self.cells[j].m) {
+                        if !seen[j] && Self::structural(self.cells[j].m) && statics::same_body(from, self.cells[j].m) {
                             seen[j] = true;
                             stack.push(j);
                         }
@@ -2781,15 +2824,35 @@ impl World {
                 }
             }
             budget = budget.saturating_sub(cells.len());
-            let vy = cells.iter().step_by(5).filter_map(|c| speeds.get(c)).fold(0.0f32, |a, b| a.max(*b));
+            let (vy, fallen) = cells.iter().step_by(5).filter_map(|c| speeds.get(c)).fold((0.0f32, 0.0f32), |a, b| (a.0.max(b.0), a.1.max(b.1)));
             let density = cells.iter().map(|&i| density(self.cells[i].m)).sum::<f32>() / cells.len().max(1) as f32;
-            self.falling.push(Piece { cells, vy, density });
+            free.push(Piece { cells, vy, fallen, density });
             if budget == 0 {
                 break;
             }
         }
         self.seen = seen;
         self.stack = stack;
+        self.tip_pass(free);
+    }
+
+    /// Whether cell `i` is solid and held by something fixed: the base of the world, a tunnel's
+    /// vault (it is bolted into the ground around it), or, for a tree, the ground its roots grow in.
+    fn anchors(&self, i: usize) -> bool {
+        let m = self.cells[i].m;
+        if !Self::structural(m) || self.mask[i] != 0 {
+            return false;
+        }
+        if i / W == H - 1 || m == Mat::Vault {
+            return true;
+        }
+        if matches!(m, Mat::Trunk | Mat::Sapling) {
+            // Roots: a tree holds to the ground it stands on.
+            let (x, y) = ((i % W) as i32, (i / W) as i32);
+            let ground = |m: Mat| m.is_hard() && !m.is_vegetation();
+            return ground(self.raw(x, y + 1)) || Self::neighbors(x, y).iter().any(|&(nx, ny)| matches!(self.raw(nx, ny), Mat::Dirt | Mat::Grass | Mat::Mud));
+        }
+        false
     }
 
     /// Moves every unsupported piece down (accelerating) as a rigid whole. A fast
@@ -2806,9 +2869,16 @@ impl World {
                         break;
                     }
                     self.piece_move(piece, 1);
+                    piece.fallen += 1.0;
                 }
                 if !self.piece_can_move(piece, 1) {
-                    // Touched down. A hard landing bounces right away; a soft one settles.
+                    // Touched down. It may break (see `statics.rs`); if not, a hard landing
+                    // bounces right away and a soft one settles.
+                    if self.landing_breaks(piece) {
+                        piece.cells.clear();
+                        continue;
+                    }
+                    piece.fallen = 0.0;
                     if piece.vy > 1.4 {
                         if self.thuds.len() < 8 {
                             let c = piece.cells[0];
@@ -4018,12 +4088,11 @@ mod tests {
     }
 
     #[test]
-    fn ice_falls_like_a_solid_bounces_a_little_and_floats_on_water() {
+    fn ice_dropped_from_high_up_shatters() {
         let mut w = World::new();
         w.day_cycle = false;
         w.climate_fixed = Some(-5.0);
         w.reset_temps();
-        // Rock on the base; a block of ice dropped from high up.
         for x in 100..300 {
             for y in 500..H as i32 {
                 w.set(x, y, Mat::Stone);
@@ -4031,6 +4100,34 @@ mod tests {
         }
         for x in 180..200 {
             for y in 200..210 {
+                w.set(x, y, Mat::Ice);
+            }
+        }
+        for _ in 0..900 {
+            w.step();
+        }
+        let tally = |m: Mat| w.cells.iter().filter(|c| c.m == m).count();
+        let (ice, hail) = (tally(Mat::Ice), tally(Mat::Hail));
+        assert!(hail > 20, "a 15 m fall crushes part of it to hail: {hail}");
+        assert!(ice + hail > 180, "nothing is lost: {ice} + {hail}");
+        assert!(w.ejecta.is_empty() && (0..W * H).filter(|&i| matches!(w.cells[i].m, Mat::Ice | Mat::Hail)).all(|i| i / W >= 470), "the pieces lie on the rock");
+    }
+
+    #[test]
+    fn ice_falls_like_a_solid_bounces_a_little_and_floats_on_water() {
+        let mut w = World::new();
+        w.day_cycle = false;
+        w.climate_fixed = Some(-5.0);
+        w.reset_temps();
+        // Rock on the base; a block of ice dropped from a little height (it would shatter from
+        // high up, see `ice_dropped_from_high_up_shatters`).
+        for x in 100..300 {
+            for y in 500..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for x in 180..200 {
+            for y in 482..492 {
                 w.set(x, y, Mat::Ice);
             }
         }
@@ -5572,10 +5669,11 @@ mod science {
         for _ in 0..800 {
             w.step();
         }
-        let ice: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Ice).collect();
+        // A 5 m fall breaks it: pieces of ice and hail.
+        let ice: Vec<usize> = (0..W * H).filter(|&i| matches!(w.cells[i].m, Mat::Ice | Mat::Hail)).collect();
         let highest = ice.iter().map(|i| i / W).min().unwrap_or(0);
-        assert_eq!(ice.len(), n, "the ice is still there");
-        assert!(highest > 375, "the ice fell to the ground through the crown (highest ice row {highest})");
+        assert!(ice.len() * 10 > n * 9, "the ice is still there: {} of {n}", ice.len());
+        assert!(highest > 350, "the ice fell to the ground through the crown (highest ice row {highest})");
         assert!(w.cells.iter().any(|c| c.m == Mat::DeadLeaf), "it broke leaves on its way down");
         assert_eq!(w.raw(380, 350), Mat::Trunk, "the trunk still stands");
     }
