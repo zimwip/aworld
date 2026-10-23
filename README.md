@@ -32,7 +32,15 @@ cargo run --release
   à l'abri de la pluie, l'eau le dissout). Salpêtre + charbon de bois, à froid et au sec : de la poudre noire.
 - **Clins d'œil** : le Béluga (B) ; une **baleine** souffle dans les grandes étendues d'eau profonde (W pour l'appeler) ;
   un grand feu fait venir le **camion de pompiers** (pin-pon !) qui l'arrose avec de la vraie eau ; la nuit, la poudre
-  qui explose lance un **feu d'artifice** (couleurs des métaux : cuivre bleu, strontium rouge, sodium jaune, baryum vert).
+  qui explose lance un **feu d'artifice** (couleurs des métaux : cuivre bleu, strontium rouge, sodium jaune, baryum vert) ;
+  les nuits de **pleine lune**, une meute de **loups** monte sur la plus haute colline et hurle (L pour savoir dans combien
+  de nuits) ; le louveteau chante faux et la lune leur fait un clin d'œil.
+- **Phases de la lune** : un cycle de 8 jours (une année de jeu) : nouvelle lune, premier croissant, premier quartier,
+  lune gibbeuse, pleine lune, puis dernier quartier et dernier croissant. Éclairée à droite quand elle grandit, à gauche
+  quand elle décroît. Comme en vrai, elle se lève un peu plus tard chaque jour : la pleine lune se lève au coucher du
+  soleil, le premier quartier se voit dès l'après-midi, le dernier quartier ne se lève qu'à minuit et la nouvelle lune
+  traverse le ciel avec le soleil (invisible). Le reflet sur la mer et la lumière qu'elle donne suivent sa phase.
+  Le nom de la lune s'affiche la nuit dans la barre du monde (`--demo out.png --day 3 --hour 0 --wolves 4`).
 - **Plantes** : terre humide + graine + eau + lumière (jamais la nuit) = arbre ; les arbres font des graines : une forêt pousse.
   La terre nue s'érode sous l'eau qui coule (l'herbe la protège). Une graine sans eau pourrit en terre.
 - **Pas de vrai sol** : seule la roche posée sur le bas du monde retient le reste ; tout ce qui n'y est pas relié tombe et
@@ -66,7 +74,7 @@ vide ou en sortant du monde. Leur poids pèse sur les ponts. **Réglages** (ongl
 amortisseurs, adhérence, taille des roues, solidité, poids, couleur — sur la voiture choisie ou pour les suivantes.
 
 ## Raccourcis
-Espace jouer/pause · B Béluga · W baleine · R retour · Z annuler · C voiture · G monde suivant · N vide · H température · X efforts · V vent ·
+Espace jouer/pause · B Béluga · W baleine · L loups · R retour · Z annuler · C voiture · G monde suivant · N vide · H température · X efforts · V vent ·
 Q/E/T tourner · Tab onglet · [ ] pinceau · ↑/↓ vitesse · 1-0 matières · F5/F9 sauver/charger · F11 plein écran.
 
 ## Développement
@@ -112,7 +120,7 @@ Sans carte son (ALSA/PipeWire), compiler avec `cargo build --release --no-defaul
 
 ## Raccourcis
 
-Espace jouer/pause · B Béluga · W baleine · R retour · C voiture · Z annuler · H/X/V vues · M son · F ou F11 plein écran · Tab onglet. Poteau (brique haute) dans les blocs : plus besoin de tourner les blocs.
+Espace jouer/pause · B Béluga · W baleine · L loups · R retour · C voiture · Z annuler · H/X/V vues · M son · F ou F11 plein écran · Tab onglet. Poteau (brique haute) dans les blocs : plus besoin de tourner les blocs.
 **Ctrl + molette** zoome sur le pointeur (jusqu'à ×8), **Ctrl + glisser** déplace la vue.
 **Échap** recule d'un cran : page Science, tracé en cours, vue zoomée (retour à la vue standard), plein écran, puis une fenêtre « Quitter AWorld ? » qui met
 la simulation en pause ; Échap y reprend le jeu, **Entrée** quitte.
