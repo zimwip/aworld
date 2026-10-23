@@ -1819,7 +1819,7 @@ impl Game {
 
     fn draw_scene(&mut self, view: View, renderer: &mut Renderer, ui: &Ui) {
         let phase = self.world.phase();
-        let day = backdrop::daylight(phase);
+        let day = backdrop::sky_light(phase);
         let thermal = self.mode == ViewMode::Thermal;
         // The thermal and pressure views paint the whole picture themselves.
         let flat = thermal || matches!(self.mode, ViewMode::Pressure | ViewMode::Humidity);
@@ -3637,6 +3637,12 @@ async fn main() {
             }
         }
         // `--bridge`: a truck sets off over the bridge shortly before the shot.
+        // `--clouds`: a few fresh clouds across the sky shortly before the shot.
+        if shot.is_some() && frame == 330 && args.iter().any(|a| a == "--clouds") {
+            for (x, y, r) in [(150, 150, 12), (175, 158, 10), (420, 130, 14), (450, 138, 10), (700, 160, 12), (735, 152, 13), (870, 140, 11)] {
+                game.world.paint(x, y, r, Mat::Cloud);
+            }
+        }
         if shot.is_some() && frame == 245 && args.iter().any(|a| a == "--bridge") {
             game.launch_car();
         }

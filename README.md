@@ -332,4 +332,5 @@ Le nouvel outil **Capteur** (barre d'outils à gauche, icône thermomètre) pose
 - **Reflets** : la surface de l'eau scintille au soleil (paillettes plus nombreuses sous le soleil), et à la lune la nuit.
 - **Lumière du feu** : la nuit, le feu, les braises et la lave éclairent tout autour d'eux d'une lumière chaude qui vacille.
 - **Air chaud** : au-dessus d'un feu ou de la lave, l'air chaud fait onduler ce qu'on voit à travers (comme au-dessus d'une route en été).
+- **Aube et crépuscule** : quand le soleil est bas, le ciel passe à l'orange près de l'horizon, au rose au-dessus et au violet en haut, avec un halo doré du côté où il se lève ou se couche. Le ciel ne s'éteint pas d'un coup : la lueur reste un moment après le coucher. Les nuages sont éclairés par en dessous et sur la face tournée vers le soleil, en or près de lui et en rose plus loin, leur sommet dans une ombre lavande.
 - Une petite carte de lumière (une case pour 6×6 cellules) suffit : tout reste fluide.

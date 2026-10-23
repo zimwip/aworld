@@ -24,6 +24,22 @@ pub fn daylight(phase: f32) -> f32 {
     smooth(0.0, 0.3, (phase * std::f32::consts::TAU).sin())
 }
 
+/// How strongly a low sun colours the sky and the clouds (1 when it touches the horizon, fading
+/// over the hour or so either side, before sunrise and after sunset too), and where across the
+/// world (0 to 1) that light comes from: the sun itself, or the point where it rose or set.
+pub fn twilight(phase: f32) -> (f32, f32) {
+    let s = (phase * std::f32::consts::TAU).sin();
+    let g = smooth(0.0, 1.0, 1.0 - s.abs() / 0.28);
+    let x = if phase < 0.5 { 0.08 + 0.84 * phase / 0.5 } else if phase < 0.75 { 0.92 } else { 0.08 };
+    (g, x)
+}
+
+/// How bright the sky looks: the daylight, but around sunrise and sunset the glow of the low sun
+/// keeps it from going dark all at once.
+pub fn sky_light(phase: f32) -> f32 {
+    daylight(phase).max(0.55 * twilight(phase).0)
+}
+
 /// Dims a colour toward a cold blue at night.
 fn lit(c: Color, day: f32) -> Color {
     mix(rgb(14, 20, 44), c, 0.28 + 0.72 * day)
@@ -42,18 +58,32 @@ pub fn draw_sky(v: View, biome: Biome, phase: f32, wind: f32, time: f32, season:
     let r = v.rect();
     let tau = std::f32::consts::TAU;
     let s = (phase * tau).sin();
-    let day = daylight(phase);
+    let day = sky_light(phase);
     let glow = (1.0 - s.abs() / 0.28).clamp(0.0, 1.0);
 
-    // Sky gradient.
-    let top = mix(rgb(6, 10, 34), rgb(70, 120, 214), day);
-    let mid = mix(rgb(14, 22, 60), rgb(150, 200, 238), day);
-    let low = mix(mix(rgb(30, 34, 74), rgb(255, 224, 182), day), rgb(255, 140, 80), glow * 0.85);
+    // Sky gradient. At dawn and dusk the light crosses so much air that only its reds get through
+    // near the horizon: orange low down, pink above it, the zenith turning violet.
+    let (dusk, sun_x) = twilight(phase);
+    let top = mix(mix(rgb(6, 10, 34), rgb(70, 120, 214), day), rgb(62, 54, 128), dusk * 0.45);
+    let mid = mix(mix(rgb(14, 22, 60), rgb(150, 200, 238), day), rgb(226, 140, 150), dusk * 0.6);
+    let low = mix(mix(rgb(30, 34, 74), rgb(255, 224, 182), day), rgb(255, 130, 70), glow * 0.85);
     let bands = 48;
     for i in 0..bands {
         let t = i as f32 / bands as f32;
         let c = if t < 0.6 { mix(top, mid, t / 0.6) } else { mix(mid, low, (t - 0.6) / 0.4) };
         draw_rectangle(r.x, r.y + r.h * t, r.w, r.h / bands as f32 + 1.0, c);
+    }
+
+    // The glow around the low sun: a wide golden-to-rose halo lying along the horizon, on the side
+    // where the sun rises or sets (and lingering there a while after it has set).
+    if dusk > 0.01 {
+        let (hx, hy) = (r.x + r.w * sun_x, r.y + r.h * 0.56);
+        for i in 0..48 {
+            let t = i as f32 / 47.0;
+            let c = mix(rgb(236, 110, 130), rgb(255, 214, 120), t);
+            let rad = r.h * (0.95 - 0.85 * t);
+            draw_ellipse(hx, hy, rad * 1.9, rad, 0.0, Color::new(c.r, c.g, c.b, 0.027 * dusk));
+        }
     }
 
     // Stars fade in with the night. They twinkle because the air between them and us is turbulent:
@@ -231,5 +261,26 @@ fn draw_sea(v: View, day: f32, phase: f32, time: f32) {
         let spread = 6.0 + k as f32 * 2.2;
         let off = ((time * 3.0 + k as f32 * 1.3).sin()) * spread * 0.6;
         draw_line(gx + off - spread * 0.5, y, gx + off + spread * 0.5, y, 1.5, Color::new(1.0, 1.0, 0.9, 0.35 * (day.max(0.25))));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn twilight_glows_at_sunrise_and_sunset_on_the_sun_side_and_not_at_noon_or_midnight() {
+        let (dawn, x_dawn) = twilight(0.0);
+        let (dusk, x_dusk) = twilight(0.5);
+        assert!(dawn > 0.99 && dusk > 0.99);
+        assert!(x_dawn < 0.2 && x_dusk > 0.8);
+        // Just before sunrise and just after sunset the glow is already, or still, there.
+        assert!(twilight(0.99).0 > 0.5 && twilight(0.99).1 < 0.2);
+        assert!(twilight(0.51).0 > 0.5 && twilight(0.51).1 > 0.8);
+        assert_eq!(twilight(0.25).0, 0.0);
+        assert_eq!(twilight(0.75).0, 0.0);
+        // The sky does not go dark the moment the sun touches the horizon.
+        assert!(daylight(0.5) < 0.05 && sky_light(0.5) > 0.5);
+        assert_eq!(sky_light(0.25), daylight(0.25));
     }
 }
