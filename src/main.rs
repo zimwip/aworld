@@ -10,6 +10,7 @@ mod plane;
 mod render;
 mod save;
 mod select;
+mod sensors;
 mod shovel;
 mod science;
 mod sound;
@@ -86,6 +87,7 @@ enum Tool {
     Eraser,
     Hammer,
     Loupe,
+    Sensor,
     Entry,
     Exit,
 }
@@ -185,6 +187,8 @@ struct Game {
     shovel_age: f32,
     /// Seconds the shovel's button has been held (the part it will let go of grows with it).
     shovel_charge: Option<f32>,
+    /// Thermometer, barometer and hygrometer probes with their curves.
+    sensors: sensors::Sensors,
     /// The "leave the game?" window is open (the simulation is paused while it is), and whether the
     /// simulation was running before it opened.
     quit_modal: bool,
@@ -298,6 +302,7 @@ impl Game {
             shovel: None,
             shovel_age: 0.0,
             shovel_charge: None,
+            sensors: sensors::Sensors::default(),
             quit_modal: false,
             quit_resume: false,
             quit_choice: false,
@@ -472,6 +477,7 @@ impl Game {
 
     fn reset(&mut self) {
         self.world.restore(&self.snap_cells);
+        self.sensors.clear_history(&self.world);
         self.blocks = self.snap_blocks.clone();
         self.cables = self.snap_cables.iter().map(Cable::fresh).collect();
         self.members = self.snap_members.iter().map(Member::fresh).collect();
@@ -1367,6 +1373,7 @@ impl Game {
             Tool::Shovel => self.shovel_mouse(at, click, left),
             Tool::Select => self.select_mouse(at, click, left, is_key_down(KeyCode::LeftShift)),
             Tool::Hammer if click => self.hammer(at),
+            Tool::Sensor if click => self.sensor_click(at),
             Tool::Entry if click => self.entry = Some(g),
             Tool::Exit if click => self.exit = Some(g),
             _ => {}
@@ -1484,6 +1491,7 @@ impl Game {
 
     fn sim_step(&mut self) {
         self.world.step();
+        self.sensors.step(&self.world);
         let exit = self.exit;
         let was_driving: Vec<bool> = self.cars.iter().map(|c| c.fate == Fate::Driving).collect();
         for c in &mut self.cars {
@@ -1746,6 +1754,7 @@ impl Game {
         if let Some(x) = self.exit {
             draw_flag(view, x, RED, true);
         }
+        self.draw_sensors(ui, view);
         for c in &self.cars {
             draw_car(c, view);
             if self.selected_car == Some(c.id) && self.selection != Some(select::Sel::Car(c.id)) {
@@ -2181,11 +2190,12 @@ impl Game {
 
     /// The tools, always in reach on the left edge of the picture.
     fn draw_tools_strip(&mut self, ui: &mut Ui, sh: f32) {
-        let tools: [(Tool, &str, Icon, &str); 5] = [
+        let tools: [(Tool, &str, Icon, &str); 6] = [
             (Tool::Select, "Sélection", Icon::Select, "Clique un élément (bloc, tige, engrenage, câble, tuyau, rail, voiture...) : il est entouré. Glisse-le pour le déplacer ; pour une tige, un câble, un tuyau ou un rail, glisse une poignée au bout pour le retailler. Suppr l'efface. Échap désélectionne. Une voiture sélectionnée affiche ses réglages."),
             (Tool::Eraser, "Gomme", Icon::Eraser, "Efface la matière, les blocs et les câbles (clic droit aussi)."),
             (Tool::Hammer, "Marteau", Icon::Hammer, "Tape sur le verre et la glace pour les casser, secoue les autres blocs."),
             (Tool::Loupe, "Loupe", Icon::Loupe, "Le pointeur est une loupe : une vue ronde en bas à droite montre la matière sous la croix."),
+            (Tool::Sensor, "Capteur", Icon::Thermo, "Pose une sonde (jusqu'à 4) : thermomètre, baromètre et hygromètre. Ses courbes s'affichent en bas de l'image : l'eau qui chauffe puis reste à 100 °C, une chaudière qui monte en pression, l'air qui sèche à midi. Clique sur une sonde pour l'enlever."),
             (Tool::Shovel, "Pelle", Icon::Shovel, "Clique un tas (cendre, sable, eau, fer...) : la bulle se remplit. Déplace-la, elle reste pleine. Garde le clic enfoncé : plus tu attends, plus le morceau est gros (jusqu'à tout) ; relâche pour le verser. La pelle ne se remplit que si elle est vide. Clic droit : tout verser. Le pinceau règle sa taille."),
         ];
         let (bw, gap) = (38.0, 6.0);
