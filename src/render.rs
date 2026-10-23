@@ -496,12 +496,21 @@ impl Renderer {
         }
         self.update_trees(world, time);
         self.update_light(world, time);
-        // The sun and the moon follow the same arcs as in the backdrop.
+        // The sun and the moon follow the same arcs as in the backdrop. The moon lights the
+        // world at night only, and only as much as its face is lit (nothing at new moon).
         let phase = world.phase();
-        let (u, sun) = if phase < 0.5 { (phase / 0.5, true) } else { ((phase - 0.5) / 0.5, false) };
-        let x = 0.08 + 0.84 * u;
-        let height = (std::f32::consts::PI * u).sin();
-        let sky = if sun { vec4(x, height.sqrt(), 0.0, 0.0) } else { vec4(0.0, 0.0, x, height.sqrt()) };
+        let at = |u: f32| (0.08 + 0.84 * u, (std::f32::consts::PI * u).sin().sqrt());
+        let sky = match (phase < 0.5, world.moon_arc()) {
+            (true, _) => {
+                let (x, h) = at(phase / 0.5);
+                vec4(x, h, 0.0, 0.0)
+            }
+            (false, Some(u)) => {
+                let (x, h) = at(u);
+                vec4(0.0, 0.0, x, h * world.moon_light())
+            }
+            (false, None) => vec4(0.0, 0.0, 0.0, 0.0),
+        };
         self.material.set_uniform("texel", vec2(1.0 / W as f32, 1.0 / H as f32));
         self.material.set_uniform("time", time);
         self.material.set_uniform("sky", sky);
