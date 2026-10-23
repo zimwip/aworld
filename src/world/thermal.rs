@@ -1329,8 +1329,7 @@ impl World {
             }
             Mat::Gunpowder => {
                 if t >= POWDER_IGNITE_C {
-                    self.set(x, y, Mat::Fire);
-                    self.explode(x, y, 4 * K + 4);
+                    self.set_off_powder(x, y);
                 }
             }
             _ => {}

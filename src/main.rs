@@ -1955,6 +1955,12 @@ impl Game {
             }
         }
         self.debris.draw(view);
+        // Clods thrown out of a crater, in flight.
+        let size = view.s.max(1.0);
+        for p in &self.world.ejecta {
+            let s = view.to_screen(vec2(p.x, p.y));
+            draw_rectangle(s.x - size * 0.5, s.y - size * 0.5, size, size, mat_color(p.m));
+        }
         draw_booms(&self.booms, view);
         for (at, t) in &self.hammer_fx {
             let s = view.to_screen(*at);
@@ -3519,6 +3525,26 @@ fn demo_tunnel(g: &mut Game) {
     g.set_running(true);
 }
 
+/// A meadow over rock with a big charge of powder buried in it: `--crater` lights it.
+fn demo_crater(g: &mut Game) {
+    g.empty_world();
+    let ground = 330;
+    for x in 0..W as i32 {
+        let top = ground + ((x as f32 * 0.02).sin() * 4.0) as i32;
+        g.world.set(x, top, Mat::Grass);
+        for y in top + 1..H as i32 {
+            g.world.set(x, y, if y > 430 + (x * 7 % 5) { Mat::Stone } else { Mat::Dirt });
+        }
+    }
+    // 40 x 24 cells of powder, its top 30 cells under the grass.
+    for x in 460..500 {
+        for y in 360..384 {
+            g.world.set(x, y, Mat::Gunpowder);
+        }
+    }
+    g.set_running(true);
+}
+
 fn demo_bridge(g: &mut Game) {
     g.empty_world();
     for x in 0..W as i32 {
@@ -3713,6 +3739,9 @@ async fn main() {
         if args.iter().any(|a| a == "--tunnel") {
             demo_tunnel(&mut game);
         }
+        if args.iter().any(|a| a == "--crater") {
+            demo_crater(&mut game);
+        }
     }
     // `--mouse x,y` pins the pointer for screenshots.
     let demo_mouse = arg("--mouse").and_then(|v| {
@@ -3785,6 +3814,15 @@ async fn main() {
                         t.x = x - t.dir * 200.0;
                         t.y = (0..H as i32).find(|&y| game.world.hard_for_car(t.x as i32, y)).unwrap_or(400) as f32;
                     }
+                }
+            }
+        }
+        // `--crater n`: the buried powder is lit n frames before the shot.
+        if shot.is_some() {
+            if let Some(n) = arg("--crater").and_then(|v| v.parse::<u32>().ok()) {
+                if frame + n == 360 {
+                    game.world.set(480, 359, Mat::Fire);
+                    game.world.set(480, 360, Mat::Fire);
                 }
             }
         }
