@@ -539,16 +539,20 @@ impl World {
     /// it ran into is liquid.
     fn place(&mut self, s: &mut Slab, c: (f32, f32), angle: f32) -> Result<(), bool> {
         let (sn, cs) = angle.sin_cos();
-        let mut around: HashSet<usize> = HashSet::with_capacity(s.parts.len() * 2);
+        // (Sorted, not hashed: the cells are then always looked at in the same order, and the
+        // same throw lands the same way every time.)
+        let mut around: Vec<usize> = Vec::with_capacity(s.parts.len() * 3);
         for p in &s.parts {
             let d = (p.x as f32 + 0.5 - s.c0.0, p.y as f32 + 0.5 - s.c0.1);
             let (x, y) = ((c.0 + d.0 * cs - d.1 * sn).floor() as i32, (c.1 + d.0 * sn + d.1 * cs).floor() as i32);
             for (tx, ty) in [(x, y), (x + 1, y), (x, y + 1)] {
                 if Self::inb(tx, ty) {
-                    around.insert(Self::idx(tx, ty));
+                    around.push(Self::idx(tx, ty));
                 }
             }
         }
+        around.sort_unstable();
+        around.dedup();
         let own: HashSet<usize> = s.drawn.iter().map(|d| d.0).collect();
         let mut drawn = Vec::with_capacity(s.parts.len());
         let mut crushed = vec![];

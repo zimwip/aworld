@@ -14,6 +14,9 @@ pub use pockets::boil_c;
 mod thermal;
 mod storm;
 mod statics;
+pub mod prof;
+#[cfg(test)]
+mod bench;
 pub use statics::Slab;
 pub use storm::{Bolt, BREAKDOWN, QS, QW, QH};
 pub use thermal::{air_pressure_atm, Season, DAY_STEPS};
@@ -661,6 +664,22 @@ pub struct World {
     storm_rng: storm::StormRng,
     /// The last pressure field read through `pressure_at_cell` (the loupe): (revision, tick, field).
     pressure_cache: std::sync::Mutex<Option<(u64, u32, Vec<f32>)>>,
+    /// Time spent in each phase of a step, when switched on (see `prof.rs`).
+    pub prof: prof::Profile,
+    /// `ambient_c` of every row, worked out once when the cells take their turn (gas asks for it
+    /// at every move); empty outside it. During the turn only the drift of the sky can change
+    /// (heat given off as vapour condenses): the table holds while it is still `air_sky`.
+    air_rows: Vec<f32>,
+    air_sky: f32,
+}
+
+/// Runs `$e`, adding its time to phase `$p` of the profile when it is on.
+macro_rules! timed {
+    ($s:ident, $p:expr, $e:expr) => {{
+        let clock = $s.prof.start();
+        $e;
+        $s.prof.stop($p, clock);
+    }};
 }
 
 impl World {
@@ -731,6 +750,9 @@ impl World {
             charge: vec![0.0; QW * QH],
             bolts: Vec::new(),
             storm_rng: storm::StormRng(0x9e37_79b9),
+            prof: prof::Profile::default(),
+            air_rows: Vec::new(),
+            air_sky: 0.0,
         }
     }
 
@@ -1415,14 +1437,21 @@ impl World {
     pub fn step(&mut self) {
         self.revision += 1;
         self.frame = self.frame.wrapping_add(1);
-        self.step_cells();
+        let clock = self.prof.start();
+        timed!(self, 0, self.step_cells());
         self.after_cells();
+        self.prof.stop(prof::TOTAL, clock);
+        if self.prof.on {
+            self.prof.steps += 1;
+        }
     }
 
     /// Every cell of matter takes its turn, bottom row first.
     fn step_cells(&mut self) {
         let f = self.frame;
         let ltr = f & 1 == 0;
+        self.air_rows = (0..H as i32).map(|y| self.ambient_c(y)).collect();
+        self.air_sky = self.climate.sky_dev;
         self.zones.begin();
         for y in (0..H as i32).rev() {
             let zrow = y as usize / sleep::CS * sleep::CW;
@@ -1507,45 +1536,55 @@ impl World {
                 }
             }
         }
+        self.air_rows.clear();
+    }
+
+    /// `ambient_c(y)`, from the table of the cells' turn when it is on.
+    #[inline]
+    fn air_c(&self, y: i32) -> f32 {
+        match self.air_rows.get(y.clamp(0, H as i32 - 1) as usize) {
+            Some(&t) if self.climate.sky_dev.to_bits() == self.air_sky.to_bits() => t,
+            _ => self.ambient_c(y),
+        }
     }
 
     /// Everything after the cells: falling pieces, wind, pressure, heat, the clock.
     fn after_cells(&mut self) {
         self.ticks = self.ticks.wrapping_add(1);
         if self.structures_fall && self.ticks % 8 == 0 {
-            self.structure_pass();
+            timed!(self, 1, self.structure_pass());
         }
         if self.structures_fall && self.ticks % 2 == 0 {
-            self.drop_structures();
+            timed!(self, 2, self.drop_structures());
         }
         if self.structures_fall {
-            self.step_slabs();
+            timed!(self, 3, self.step_slabs());
         }
         if self.ticks % pockets::POCKETS_EVERY == pockets::POCKETS_EVERY / 2 {
-            self.update_pockets();
+            timed!(self, 4, self.update_pockets());
         }
-        self.step_ejecta();
+        timed!(self, 5, self.step_ejecta());
         if self.ticks % matter::SETTLE_EVERY == 17 {
-            self.settle_matter();
+            timed!(self, 6, self.settle_matter());
         }
-        self.update_wind();
-        self.update_flow();
+        timed!(self, 7, self.update_wind());
+        timed!(self, 8, self.update_flow());
         if self.ticks % 4 == 0 {
-            self.update_pressure();
+            timed!(self, 9, self.update_pressure());
         }
-        self.pressure_push();
+        timed!(self, 10, self.pressure_push());
         if self.ticks % 64 == 0 {
-            self.update_season_cache();
+            timed!(self, 11, self.update_season_cache());
         }
         if self.ticks % (thermal::THERMAL_EVERY * self.thermal_scale() as u32) == 0 {
-            self.thermal_pass();
+            timed!(self, 12, self.thermal_pass());
         }
-        self.storm_step();
+        timed!(self, 13, self.storm_step());
         if self.day_cycle {
             self.clock = self.clock.wrapping_add(1);
         }
         if self.ticks % hydro::LEVEL_EVERY == 0 {
-            self.level_liquids();
+            timed!(self, 14, self.level_liquids());
         }
     }
 
@@ -2298,7 +2337,7 @@ impl World {
                 }
             }
         }
-        let lift = ((self.temp[i] - self.ambient_c(y)) / 25.0).clamp(-1.0, 1.0);
+        let lift = ((self.temp[i] - self.air_c(y)) / 25.0).clamp(-1.0, 1.0);
         let roll = (self.rand() % 100) as f32 / 100.0;
         let d = self.dir();
         if lift > 0.05 && roll < lift * 0.7 {
@@ -2358,7 +2397,7 @@ impl World {
             return true;
         }
         // The air it would rise into (open air there, else the usual air of that height).
-        let air = if Self::inb(x, to) && self.raw(x, to) == Mat::Empty { self.temp[Self::idx(x, to)] } else { self.ambient_c(to) };
+        let air = if Self::inb(x, to) && self.raw(x, to) == Mat::Empty { self.temp[Self::idx(x, to)] } else { self.air_c(to) };
         self.temp[Self::idx(x, y)] - adiabatic_cooling_c(self.raw(x, y), y, to) > air + 0.5
     }
 
@@ -2437,7 +2476,7 @@ impl World {
         }
         let (hot_rise, cool_rise, climbs, wraps) = drift(self.at(x, y));
         let d = self.dir();
-        let hot = self.temp[Self::idx(x, y)] > self.ambient_c(y) + 8.0;
+        let hot = self.temp[Self::idx(x, y)] > self.air_c(y) + 8.0;
         let r = self.rand() % 10;
         let order: [(i32, i32); 3] = if hot && r < hot_rise {
             [(0, -1), (d, -1), (d, 0)]

@@ -10,6 +10,7 @@
 //! reservoir (`Climate::sky_dev`) that slowly radiates its surplus to space.
 
 use super::*;
+use rayon::prelude::*;
 
 /// Simulation steps in one full day.
 pub const DAY_STEPS: u32 = 21_600;
@@ -323,6 +324,51 @@ struct Tables {
     reactive: [bool; NMAT],
     /// Air and gases.
     airy: [bool; NMAT],
+}
+
+/// Columns of the temperature grid, shared out to the threads of the vertical conduction sweep.
+struct Columns(*mut f32);
+// SAFETY: each thread only reaches the columns of its own band (see `thermal_pass`).
+unsafe impl Sync for Columns {}
+/// Columns per band of that sweep.
+const COLUMN_BAND: usize = 64;
+
+/// Heat flowing between cells `i` and `j` of `temp` (made of `mi` and `mj`) during one pass.
+#[inline]
+fn conduct(temp: &mut [f32], i: usize, j: usize, mi: Mat, mj: Mat, ts: f32, lod3: bool, tb: &Tables) {
+    let (a, b) = temp.split_at_mut(j);
+    conduct_pair([&mut a[i], &mut b[0]], mi, mj, ts, lod3, tb);
+}
+
+#[inline]
+fn conduct_pair([ti, tj]: [&mut f32; 2], mi: Mat, mj: Mat, ts: f32, lod3: bool, tb: &Tables) {
+    let d = *tj - *ti;
+    if d.abs() < 0.02 {
+        return;
+    }
+    // Simplified: air next to air only exchanges heat where there is a real difference
+    // (a hot plume); the rest of the sky just relaxes towards its surroundings below.
+    if lod3 && mi == Mat::Empty && mj == Mat::Empty && d.abs() < 4.0 {
+        return;
+    }
+    let (mi, mj) = (mi as usize, mj as usize);
+    // Flames and embers pour heat into whatever touches them.
+    let k = if mi == Mat::Fire as usize || mi == Mat::Ember as usize || mj == Mat::Fire as usize || mj == Mat::Ember as usize {
+        0.25
+    } else if (Mat::from_u8(mi as u8).is_melt() || Mat::from_u8(mj as u8).is_melt()) && !tb.airy[mi] && !tb.airy[mj] {
+        // Lava and molten metal soak into whatever they touch. The air only takes their
+        // heat slowly: a crust sets on top and holds it in.
+        0.2
+    } else if Mat::from_u8(mi as u8).is_melt() || Mat::from_u8(mj as u8).is_melt() {
+        0.01
+    } else {
+        tb.k[mi].min(tb.k[mj])
+    };
+    // (Capped so that a longer covered time, or a cell that holds little heat, can never
+    // overshoot and oscillate: at most 90 % of the way to the same temperature.)
+    let flux = d * (k * ts).min(0.9).min(0.9 / (tb.inv_c[mi] + tb.inv_c[mj]));
+    *ti += flux * tb.inv_c[mi];
+    *tj -= flux * tb.inv_c[mj];
 }
 
 fn tables() -> &'static Tables {
@@ -655,57 +701,40 @@ impl World {
         self.thermal_flip = !self.thermal_flip;
         let horizontal = self.thermal_flip;
 
-        // 1. Conduction between neighbours (alternating direction).
+        // 1. Conduction between neighbours (alternating direction). Each row (each column) is
+        //    one sweep that no other row (column) reads, so they run side by side.
         let tb = tables();
-        for y in 0..H {
-            for x in 0..W {
-                let i = y * W + x;
-                let j = if horizontal {
-                    if x + 1 >= W {
-                        continue;
-                    }
-                    i + 1
-                } else {
-                    if y + 1 >= H {
-                        continue;
-                    }
-                    i + W
-                };
-                let (ti, tj) = (self.temp[i], self.temp[j]);
-                let d = tj - ti;
-                if d.abs() < 0.02 {
-                    continue;
+        let clock = self.prof.start();
+        let lod3 = self.lod >= 3;
+        if horizontal {
+            self.temp.par_chunks_mut(W).zip(self.cells.par_chunks(W)).for_each(|(temp, cells)| {
+                for x in 0..W - 1 {
+                    conduct(temp, x, x + 1, cells[x].m, cells[x + 1].m, ts, lod3, tb);
                 }
-                let (mi, mj) = (self.cells[i].m as usize, self.cells[j].m as usize);
-                // Simplified: air next to air only exchanges heat where there is a real difference
-                // (a hot plume); the rest of the sky just relaxes towards its surroundings below.
-                if self.lod >= 3 && mi == Mat::Empty as usize && mj == Mat::Empty as usize && d.abs() < 4.0 {
-                    continue;
+            });
+        } else {
+            let temp = Columns(self.temp.as_mut_ptr());
+            let cells = &self.cells;
+            (0..W.div_ceil(COLUMN_BAND)).into_par_iter().for_each(|band| {
+                let temp = &temp;
+                for y in 0..H - 1 {
+                    for x in band * COLUMN_BAND..((band + 1) * COLUMN_BAND).min(W) {
+                        let (i, j) = (y * W + x, (y + 1) * W + x);
+                        // SAFETY: the bands are apart, and a band only touches its own columns.
+                        let pair = unsafe { [&mut *temp.0.add(i), &mut *temp.0.add(j)] };
+                        conduct_pair(pair, cells[i].m, cells[j].m, ts, lod3, tb);
+                    }
                 }
-                // Flames and embers pour heat into whatever touches them.
-                let k = if mi == Mat::Fire as usize || mi == Mat::Ember as usize || mj == Mat::Fire as usize || mj == Mat::Ember as usize {
-                    0.25
-                } else if (Mat::from_u8(mi as u8).is_melt() || Mat::from_u8(mj as u8).is_melt()) && !tb.airy[mi] && !tb.airy[mj] {
-                    // Lava and molten metal soak into whatever they touch. The air only takes their
-                    // heat slowly: a crust sets on top and holds it in.
-                    0.2
-                } else if Mat::from_u8(mi as u8).is_melt() || Mat::from_u8(mj as u8).is_melt() {
-                    0.01
-                } else {
-                    tb.k[mi].min(tb.k[mj])
-                };
-                // (Capped so that a longer covered time, or a cell that holds little heat, can never
-                // overshoot and oscillate: at most 90 % of the way to the same temperature.)
-                let flux = d * (k * ts).min(0.9).min(0.9 / (tb.inv_c[mi] + tb.inv_c[mj]));
-                self.temp[i] = ti + flux * tb.inv_c[mi];
-                self.temp[j] = tj - flux * tb.inv_c[mj];
-            }
+            });
         }
-
+        self.prof.stop(super::prof::HEAT_CONDUCTION, clock);
         // Every other pass, with twice the reach: the wind is slow next to the thermal clock.
         if horizontal {
+            let clock = self.prof.start();
             self.carry_air_heat();
+            self.prof.stop(super::prof::HEAT_WIND, clock);
         }
+        let clock = self.prof.start();
 
         // The sun radiates: the air and the ground are warmest near it and the
         // warmth fades with distance. Up in the sky it gets colder with altitude.
@@ -769,6 +798,8 @@ impl World {
             }
         }
 
+        self.prof.stop(super::prof::HEAT_AIR, clock);
+        let clock = self.prof.start();
         // 3. Day and night, the first surface each column shows the sky radiates its excess
         //    warmth to space, less so under clouds and smoke (they hold it in, like a blanket).
         let (sun_gain, out_gain, blanket) = (self.climate.sun_gain, self.climate.space_gain, self.climate.greenhouse);
@@ -801,6 +832,8 @@ impl World {
             }
         }
 
+        self.prof.stop(super::prof::HEAT_SPACE, clock);
+        let clock = self.prof.start();
         // 4. Sunlight comes in straight lines from the sun: low in the morning from the left,
         //    from above at noon, from the right in the evening, so the slope that faces the sun
         //    warms and the other one stays in the shade. Clouds and steam soak up part of it (so
@@ -890,6 +923,7 @@ impl World {
             }
         }
 
+        self.prof.stop(super::prof::HEAT_SUN, clock);
         // 5. The rest of the sky: it takes in what the open air gave up, and drifts back to where
         //    the sun and the escape to space put it, giving its surplus to space (or making up a
         //    shortfall from the sun).
@@ -1008,21 +1042,23 @@ impl World {
         let stride = if self.lod >= 1 { 2 } else { 1 };
         let tb = tables();
         let cell = super::flow::CELL;
-        let (fw, fh) = (super::flow::FW, super::flow::FH);
-        for bj in 0..fh {
+        let fw = super::flow::FW;
+        // First the air is carried: each cell only reads the grid as it was (`old`), so the rows
+        // of flow blocks are carried side by side.
+        let (flow, cells, old_t) = (&self.flow, &self.cells, &old);
+        self.temp.par_chunks_mut(cell * W).enumerate().for_each(|(bj, band)| {
             for bi in 0..fw {
-                let (vx, vy) = self.flow.at_cell(bi, bj);
+                let (vx, vy) = flow.at_cell(bi, bj);
                 let speed = vx.abs() + vy.abs();
                 if speed < 0.05 {
                     continue;
                 }
-                let gust = speed.min(1.5) * 0.02;
                 // The wind at the four corners of the block. Where it is about the same, one upwind
                 // offset serves the whole block; where it changes across the block or blows hard
                 // (an updraft over lava, a fire), each cell reads its own wind and the air it
                 // swept on its way (see `carry_fine`).
                 let (x0, y0) = ((bi * cell) as i32, (bj * cell) as i32);
-                let corner = |dx: i32, dy: i32| self.flow.sample(x0 + dx, y0 + dy);
+                let corner = |dx: i32, dy: i32| flow.sample(x0 + dx, y0 + dy);
                 let c = [corner(0, 0), corner(cell as i32, 0), corner(0, cell as i32), corner(cell as i32, cell as i32)];
                 let spread = c.iter().map(|w| (w.0 - c[0].0).abs() + (w.1 - c[0].1).abs()).fold(0.0f32, f32::max);
                 let fine = spread * reach > 2.0 || (vx.abs().max(vy.abs()) * reach) > 10.0;
@@ -1034,7 +1070,7 @@ impl World {
                     let sy0 = (y as i32 + iy).clamp(0, H as i32 - 2) as usize;
                     for x in (bi * cell..(bi + 1) * cell).step_by(stride) {
                         let i = y * W + x;
-                        if self.cells[i].m != Mat::Empty {
+                        if cells[i].m != Mat::Empty {
                             continue;
                         }
                         let upwind = if fine {
@@ -1043,26 +1079,46 @@ impl World {
                                 let g = |w: (f32, f32)| if k == 0 { w.0 } else { w.1 };
                                 (g(c[0]) * (1.0 - u) + g(c[1]) * u) * (1.0 - v) + (g(c[2]) * (1.0 - u) + g(c[3]) * u) * v
                             };
-                            Self::carry_fine(&self.cells, &old, i, x, y, -lerp(0) * reach, -lerp(1) * reach)
+                            Self::carry_fine(cells, old_t, i, x, y, -lerp(0) * reach, -lerp(1) * reach)
                         } else {
                             let sx0 = (x as i32 + ix).rem_euclid(W as i32 - 1) as usize;
                             // Free air is read as it is; anything else counts as the cell's own temperature.
-                            let air = |j: usize| if self.cells[j].m == Mat::Empty { old[j] } else { old[i] };
+                            let air = |j: usize| if cells[j].m == Mat::Empty { old_t[j] } else { old_t[i] };
                             let top = air(sy0 * W + sx0) * (1.0 - tx) + air(sy0 * W + sx0 + 1) * tx;
                             let bot = air((sy0 + 1) * W + sx0) * (1.0 - tx) + air((sy0 + 1) * W + sx0 + 1) * tx;
                             top * (1.0 - ty) + bot * ty
                         };
-                        self.temp[i] = old[i] + (upwind - old[i]) * 0.7;
+                        let k = i - bj * cell * W;
+                        band[k] = old_t[i] + (upwind - old_t[i]) * 0.7;
                         if stride == 2 {
                             // Simplified: the other three cells of the 2 x 2 block follow.
-                            let t = self.temp[i];
+                            let t = band[k];
                             for j in [i + 1, i + W, i + W + 1] {
-                                if j < W * H && self.cells[j].m == Mat::Empty {
-                                    self.temp[j] = t;
+                                if j < W * H && cells[j].m == Mat::Empty {
+                                    band[j - bj * cell * W] = t;
                                 }
                             }
                         }
-                        // Convection: the moving air also cools or warms the solid or liquid beside it.
+                    }
+                }
+            }
+        });
+        // Then convection: the moving air also cools or warms the solid or liquid beside it.
+        // A solid cell can lie between two rows of blocks, so this part goes in order.
+        for bj in 0..super::flow::FH {
+            for bi in 0..fw {
+                let (vx, vy) = self.flow.at_cell(bi, bj);
+                let speed = vx.abs() + vy.abs();
+                if speed < 0.05 {
+                    continue;
+                }
+                let gust = speed.min(1.5) * 0.02;
+                for y in (bj * cell..((bj + 1) * cell).min(H)).step_by(stride) {
+                    for x in (bi * cell..(bi + 1) * cell).step_by(stride) {
+                        let i = y * W + x;
+                        if self.cells[i].m != Mat::Empty {
+                            continue;
+                        }
                         for j in [i + 1, i.wrapping_sub(1), i + W, i.wrapping_sub(W)] {
                             if j >= W * H {
                                 continue;

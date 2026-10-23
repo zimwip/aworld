@@ -202,6 +202,19 @@ fn settles(m: Mat) -> bool {
     })[m as usize]
 }
 
+/// The changes by heat alone that start from `m`, in the order of `TRANSITIONS`. The heat pass
+/// asks for every reactive cell, every pass: a lookup, not a walk through the whole table.
+fn by_heat(m: Mat) -> &'static [&'static Transition] {
+    static T: std::sync::OnceLock<Vec<Vec<&'static Transition>>> = std::sync::OnceLock::new();
+    &T.get_or_init(|| {
+        let mut t = vec![vec![]; 256];
+        for tr in TRANSITIONS.iter().filter(|t| t.by_heat()) {
+            t[tr.from as usize].push(tr);
+        }
+        t
+    })[m as usize]
+}
+
 /// Weight of one cell of `m`, atm.
 fn weight(m: Mat) -> f32 {
     let rho = match m.kind() {
@@ -260,7 +273,7 @@ impl World {
     pub(super) fn heat_change(&mut self, i: usize, x: i32, y: i32, m: Mat) -> bool {
         let mut here = Here { temp: self.temp[i], pressure: 1.0, shock: 0.0, above: None, air: false };
         let mut air_known = false;
-        for tr in TRANSITIONS.iter().filter(|t| t.from == m && t.by_heat()) {
+        for tr in by_heat(m) {
             if tr.needs_air() && !air_known {
                 here.air = self.breathes(x, y);
                 air_known = true;

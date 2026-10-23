@@ -17,6 +17,7 @@
 //! - a steam motor (see `mechgame.rs`) takes its power from the pocket it sits in.
 
 use super::*;
+use rayon::prelude::*;
 
 /// A pocket of gas this large is the open atmosphere, even when it is closed all round.
 pub const OPEN_POCKET: u32 = 40_000;
@@ -118,21 +119,26 @@ impl World {
         // What each cell is to the pockets: 0 a wall, 1 gas, 2 foliage (air goes through it, but
         // it is not volume), 3 liquid (neither: it is pushed, see `update_liquid_pressure`); and
         // the weight of each liquid cell (atm).
-        for i in 0..W * H {
-            let m = self.cells[i].m;
-            self.cls[i] = if self.mask[i] != 0 {
-                0
-            } else if gassy(m) {
-                1
-            } else if m.is_vegetation() {
-                2
-            } else if m.kind() == Kind::Liquid {
-                3
-            } else {
-                0
-            };
-            self.liq_w[i] = if self.cls[i] == 3 { density(m) * ATM_PER_CELL } else { 0.0 };
-        }
+        // (Row by row, side by side: each cell only reads itself.)
+        let (cells, mask) = (&self.cells, &self.mask);
+        self.cls.par_chunks_mut(W).zip(self.liq_w.par_chunks_mut(W)).enumerate().for_each(|(y, (cls, liq_w))| {
+            for x in 0..W {
+                let i = y * W + x;
+                let m = cells[i].m;
+                cls[x] = if mask[i] != 0 {
+                    0
+                } else if gassy(m) {
+                    1
+                } else if m.is_vegetation() {
+                    2
+                } else if m.kind() == Kind::Liquid {
+                    3
+                } else {
+                    0
+                };
+                liq_w[x] = if cls[x] == 3 { density(m) * ATM_PER_CELL } else { 0.0 };
+            }
+        });
         // Label the connected gas a row span at a time, adding up each pocket's volume, steam and
         // warmth on the way; the edges of the world are the open air.
         let mut stack = std::mem::take(&mut self.stack);
