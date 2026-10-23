@@ -1811,6 +1811,14 @@ impl Game {
 
     // ----- drawing ----------------------------------------------------------
 
+    /// The just-for-fun visitors (Beluga, whale, fire engine...), drawn over the world in every
+    /// view mode, not only the normal one. A new cameo is drawn here.
+    fn draw_cameos(&self, view: View) {
+        self.planes.draw(view, self.time);
+        self.whales.draw(view);
+        self.trucks.draw(view, self.time);
+    }
+
     fn draw_scene(&mut self, view: View, renderer: &mut Renderer, ui: &mut Ui) {
         let phase = self.world.phase();
         let day = backdrop::daylight(phase);
@@ -1829,11 +1837,9 @@ impl Game {
         renderer.draw_world(&self.world, view, render_mode, self.time);
         if !flat {
             renderer.draw_gas(&self.world, view);
-            self.planes.draw(view, self.time);
-            self.fireworks.draw(view, self.time);
-            self.whales.draw(view);
-            self.trucks.draw(view, self.time);
         }
+        // The cameos show in every view, the thermal, pressure and humidity ones included.
+        self.draw_cameos(view);
         let stress = if self.mode == ViewMode::Stress { self.phys.as_ref().map(|p| p.stress(&self.blocks)) } else { None };
         for b in &self.blocks {
             let st = stress.as_ref().map(|m| m.get(&b.uid).copied().unwrap_or(0.0));
@@ -1883,6 +1889,8 @@ impl Game {
         } else if thermal {
             self.draw_sun_on_thermal(view, ui);
         }
+        // Fireworks are light: drawn over the night, so they glow in the dark.
+        self.fireworks.draw(view, self.time);
         if self.mode == ViewMode::Wind {
             self.draw_wind_field(view);
         }
