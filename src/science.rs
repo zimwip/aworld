@@ -16,7 +16,7 @@ pub fn info(m: Mat) -> Info {
         Mat::Water => ("Eau", "liquide", "Bout à 100 °C à l'air libre, plus chaud sous pression (120 °C à 2 atm : la cocotte-minute). Gèle à 0 °C. Tant qu'elle bout ou gèle, sa température ne bouge plus : c'est le palier. Elle s'évapore aussi sans bouillir, plus vite au chaud, à l'air sec et au vent."),
         Mat::Fire => ("Feu", "flamme", "Environ 650 °C. Il brûle le bois et chauffe tout autour. Il lui faut de l'air : enfermé, il remplit l'air de fumée et s'étouffe."),
         Mat::Steam => ("Vapeur", "gaz", "Eau chauffée à plus de 100 °C : elle prend bien plus de place que l'eau. Enfermée, elle pousse (chaudière, moteur à vapeur). Refroidie, c'est de la vapeur d'eau : plus légère que l'air sec, elle monte former les nuages."),
-        Mat::Iron => ("Fer", "solide", "Rouille dans l'eau. Avec du carbone et de la chaleur, il devient de l'acier."),
+        Mat::Iron => ("Fer", "solide", "Rouille dans l'eau. Avec du carbone et de la chaleur, il devient de l'acier. Chauffé, il rougit vers 500 °C, jaunit, puis fond vers 900 °C."),
         Mat::Wood => ("Bois", "solide", "Brûle vers 300 °C s'il a de l'air, et laisse de la cendre. Chauffé sans air (couvert de terre), il devient du charbon de bois."),
         Mat::Stone => ("Pierre", "solide", "Fond vers 540 °C. Le gel et le dégel l'effritent en sable."),
         Mat::Brick => ("Brique", "solide", "Brique de plastique emboîtable."),
@@ -38,7 +38,8 @@ pub fn info(m: Mat) -> Info {
         Mat::Mud => ("Boue", "poudre", "Terre emportée par l'eau. En séchant, elle redevient de la terre."),
         Mat::Glass => ("Verre", "solide", "Sable fondu. Il casse sous un choc ou un choc thermique."),
         Mat::Snow => ("Neige", "liquide visqueux", "Nuage qui précipite quand il gèle. Elle tombe doucement, puis un tas s'étale lentement, comme une pâte très épaisse ; une couche fine reste en place. Elle fond à 0 °C."),
-        Mat::Molten => ("Métal fondu", "liquide", "Du fer qui a fondu dans la lave fraîche (plus de 1000 °C). Il se fige en refroidissant."),
+        Mat::Molten => ("Fer fondu", "liquide", "Du fer chauffé au-delà de 900 °C : dans la lave fraîche, ou au cœur d'une forge au charbon de bois bien fermée. Il coule comme de la lave et se fige en fer en refroidissant ; l'eau le trempe d'un coup."),
+        Mat::MoltenSteel => ("Acier fondu", "liquide", "De l'acier chauffé au-delà de 900 °C. Coulé dans un moule de terre cuite, il se fige en acier en refroidissant."),
         Mat::Oil => ("Pétrole", "liquide", "Du bois enfoui très longtemps. Plus léger que l'eau, il flotte et brûle très fort."),
         Mat::Smoke => ("Fumée", "gaz", "Produite par le feu et les explosions. Elle monte, le vent la pousse, elle se dilue à l'air libre. Dans une boîte fermée, elle reste et étouffe le feu."),
         Mat::Hail => ("Grêle", "poudre", "Petits grains de glace : il tombe de la glace quand le nuage est très froid."),
@@ -50,6 +51,46 @@ pub fn info(m: Mat) -> Info {
         Mat::Trunk => ("Tronc", "solide", "Les voitures passent à travers les arbres. Il brûle comme du bois. Il monte l'eau du sol jusqu'aux feuilles."),
     };
     Info { name, state, fact }
+}
+
+/// A matter as the palette shows it: one button, with its states (solid, powder, liquid, gas)
+/// behind a little arrow. The button paints `states[default]` until another state is picked.
+/// Heat and cold move a cell from one state to the next by themselves (see `thermal::phase`).
+pub struct Matter {
+    pub states: &'static [Mat],
+    pub default: usize,
+}
+
+const fn one(m: &'static [Mat]) -> Matter {
+    Matter { states: m, default: 0 }
+}
+
+pub const MATTERS: [Matter; 18] = [
+    one(&[Mat::Sand]),
+    Matter { states: &[Mat::Ice, Mat::Snow, Mat::Water, Mat::Steam], default: 2 },
+    one(&[Mat::Dirt]),
+    one(&[Mat::Grass]),
+    one(&[Mat::Seed]),
+    one(&[Mat::Wood]),
+    one(&[Mat::Stone, Mat::Lava]),
+    one(&[Mat::Iron, Mat::Molten]),
+    one(&[Mat::Steel, Mat::MoltenSteel]),
+    one(&[Mat::Glass]),
+    one(&[Mat::Ash]),
+    one(&[Mat::Charcoal]),
+    one(&[Mat::Rust]),
+    one(&[Mat::Fire]),
+    one(&[Mat::Saltpeter]),
+    one(&[Mat::Gunpowder]),
+    one(&[Mat::Clay]),
+    one(&[Mat::Terracotta]),
+];
+
+impl Matter {
+    /// The matter's name is that of its usual state: water for ice, snow and steam.
+    pub fn name(&self) -> &'static str {
+        info(self.states[self.default]).name
+    }
 }
 
 pub struct Recipe {
@@ -78,7 +119,7 @@ pub const RECIPES: &[Recipe] = &[
     Recipe { from: &[Mat::Glass], to: &[Mat::Shard, Mat::Sand], text: "Le verre brisé redevient du sable avec le temps." },
     Recipe { from: &[Mat::Stone, Mat::Fire], to: &[Mat::Lava], text: "La roche chauffée longtemps fond en lave." },
     Recipe { from: &[Mat::Lava, Mat::Stone], to: &[Mat::Lava], text: "La lave fraîche est très chaude : la chaleur gagne la roche voisine qui fond à son tour." },
-    Recipe { from: &[Mat::Lava, Mat::Iron], to: &[Mat::Molten], text: "Seule la lave fraîche (plus de 1000 °C) fait fondre le métal." },
+    Recipe { from: &[Mat::Iron, Mat::Charcoal, Mat::Fire], to: &[Mat::Molten], text: "Le fer fond vers 900 °C : un feu de bois (650 °C) ne suffit pas, mais la lave fraîche ou des braises de charbon de bois bien enfermées, si. Il rougit, jaunit, puis coule. En refroidissant, il se fige." },
     Recipe { from: &[Mat::Lava, Mat::Water], to: &[Mat::Stone], text: "La lave arrosée se fige en pierre." },
     Recipe { from: &[Mat::Stone, Mat::Ice], to: &[Mat::Sand], text: "Le gel et le dégel effritent la roche en sable." },
     Recipe { from: &[Mat::Dirt, Mat::Seed, Mat::Water], to: &[Mat::Trunk, Mat::Leaf], text: "Terre + graine + eau + lumière : un arbre pousse." },
@@ -120,7 +161,7 @@ pub fn mat_color(m: Mat) -> Color {
         Mat::Snow => (244, 247, 252),
         Mat::Hail => (210, 236, 252),
         Mat::Oil => (40, 34, 36),
-        Mat::Molten => (255, 210, 110),
+        Mat::Molten | Mat::MoltenSteel => (255, 210, 110),
         Mat::Smoke => (96, 96, 104),
         Mat::Cloud => (246, 248, 253),
         Mat::Ember => (255, 120, 24),
@@ -142,6 +183,25 @@ mod tests {
             let i = info(m);
             assert!(!i.name.is_empty() && !i.fact.is_empty(), "{m:?}");
         }
+    }
+
+    #[test]
+    fn each_state_belongs_to_one_matter_and_clouds_are_left_to_the_sky() {
+        let mut seen = vec![];
+        for m in &MATTERS {
+            assert!(m.default < m.states.len());
+            for s in m.states {
+                assert!(!seen.contains(s), "{s:?} is in two matters");
+                seen.push(*s);
+            }
+        }
+        // Clouds form from vapour by themselves; the palette paints vapour.
+        assert!(!seen.contains(&Mat::Cloud));
+        let water = MATTERS.iter().find(|m| m.states.contains(&Mat::Water)).unwrap();
+        assert_eq!(water.states, &[Mat::Ice, Mat::Snow, Mat::Water, Mat::Steam]);
+        assert_eq!(water.name(), "Eau");
+        // A metal and its melt are one matter.
+        assert!(MATTERS.iter().any(|m| m.states == [Mat::Iron, Mat::Molten]));
     }
 
     #[test]
