@@ -373,10 +373,10 @@ mod tests {
     fn siphon(primed: bool, crest: i32, mouth: i32) -> World {
         let mut w = World::new_static();
         rect(&mut w, 100, 200, 200, 420, Mat::Stone);
-        rect(&mut w, 110, 240, 150, 300, Mat::Empty);
+        rect(&mut w, 110, 240, 143, 300, Mat::Empty);
         rect(&mut w, 110, 200, 125, 239, Mat::Empty);
-        rect(&mut w, 110, 250, 150, 300, Mat::Water);
-        // The pipe's walls inside the tank, its inside 2 cells wide.
+        rect(&mut w, 110, 250, 143, 300, Mat::Water);
+        // The pipe's walls inside the tank (against its right side), its inside 2 cells wide.
         rect(&mut w, 141, crest - 2, 141, mouth, Mat::Stone);
         rect(&mut w, 144, crest - 2, 144, mouth, Mat::Stone);
         let fill = if primed { Mat::Water } else { Mat::Empty };
@@ -426,14 +426,18 @@ mod tests {
     #[test]
     fn the_air_cannot_push_water_over_a_crest_more_than_60_cells_up() {
         // The crest is 25 cells over the water and the mouth 69 under it: the siphon runs until the
-        // surface is 60 cells (about 10 m) under the crest, then the column breaks.
+        // surface is 60 cells (about 10 m) under the crest, then the column breaks (and what was
+        // in the pipe on the tank's side falls back into it).
         let mut w = siphon(true, 225, 294);
-        for _ in 0..5000 {
-            w.step();
+        let mut lowest = 0;
+        for _ in 0..50 {
+            for _ in 0..100 {
+                w.step();
+            }
+            lowest = lowest.max(tank_surface(&w));
         }
-        let s = tank_surface(&w);
-        eprintln!("high siphon: tank down to row {s}");
-        assert!((280..=290).contains(&s), "stopped at row {s}");
+        eprintln!("high siphon: tank down to row {lowest} at most");
+        assert!((280..=290).contains(&lowest), "stopped at row {lowest}");
     }
 }
 
