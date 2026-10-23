@@ -356,6 +356,30 @@ fn density(m: Mat) -> f32 {
     }
 }
 
+/// How thick a liquid is, as `World::step_liquid` reads it: it stays still once in `rest` steps
+/// (0: never), and it spreads sideways up to `reach` cells at a time, once in `spread` steps.
+pub fn viscosity(m: Mat) -> (u32, i32, u32) {
+    match m {
+        Mat::Water => (0, 4 * K, 1),
+        Mat::Oil => (3, 2 * K, 1),
+        // Melts barely run: lava and molten metal creep a cell at a time.
+        _ => (2, 1, 3),
+    }
+}
+
+/// How a gas drifts when neither its buoyancy nor the wind moves it, as `World::step_gas` reads
+/// it: (in how many steps out of 10 it climbs while warm, and while cooled, whether a cooled one
+/// still climbs when it cannot go sideways, whether it leaves by the sides of the world).
+pub fn drift(m: Mat) -> (u32, u32, bool, bool) {
+    match m {
+        // Even cooled, vapour keeps drifting up a little: damp air is lighter than dry air (a
+        // water molecule weighs 18, air 29), which is how the vapour of a lake reaches the clouds.
+        Mat::Steam => (7, 3, true, false),
+        // Only warm smoke keeps climbing by itself; cooled smoke just drifts.
+        _ => (6, 0, false, true),
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Cell {
     pub m: Mat,
@@ -2337,31 +2361,7 @@ impl World {
                 return;
             }
         }
-        if self.at(x, y - 1) == Mat::Water && self.chance(2) {
-            self.swap((x, y), (x, y - 1));
-            return;
-        }
-        if self.chance(3) {
-            return;
-        }
-        let d = self.dir();
-        let down: &[i32] = if self.held(x, y) { &[] } else { &[0, d, -d] };
-        for &dx in down {
-            if matches!(self.at(x + dx, y + 1).kind(), Kind::Empty | Kind::Gas) {
-                self.swap((x, y), (x + dx, y + 1));
-                return;
-            }
-        }
-        for dir in [d, -d] {
-            let mut k = 0;
-            while k < 2 * K && self.at(x + dir * (k + 1), y) == Mat::Empty {
-                k += 1;
-            }
-            if k > 0 {
-                self.swap((x, y), (x + dir * k, y));
-                return;
-            }
-        }
+        self.step_liquid(x, y);
     }
 
     /// Burning oil: a long-lived, very hot flame that sets its neighbours alight.
@@ -2384,26 +2384,44 @@ impl World {
             self.set(x, y, Mat::Empty);
             return;
         }
+        self.step_gas(x, y);
+    }
+
+    /// The one way steam and smoke move (`Kind::Gas`), the matter only setting how it drifts
+    /// (`drift`): pushed by the difference of density with the air around (`buoyancy`), then
+    /// carried by the wind, and otherwise a warm gas climbs while a cooled one wanders sideways.
+    /// (A cloud is droplets hanging in the air: it has its own, stiller wandering, see
+    /// `step_cloud`.) Returns whether it moved.
+    fn step_gas(&mut self, x: i32, y: i32) -> bool {
         if self.buoyancy(x, y) {
-            return;
+            return true;
         }
         if let Some(t) = self.wind_target(x, y) {
             if self.at(t.0, t.1) == Mat::Empty {
                 self.swap((x, y), t);
-                return;
+                return true;
             }
         }
+        let (hot_rise, cool_rise, climbs, wraps) = drift(self.at(x, y));
         let d = self.dir();
-        // Only warm smoke keeps climbing by itself; cooled smoke just drifts.
         let hot = self.temp[Self::idx(x, y)] > self.ambient_c(y) + 8.0;
-        let order: [(i32, i32); 3] = if hot && self.rand() % 10 < 6 { [(0, -1), (d, -1), (d, 0)] } else { [(d, 0), (-d, 0), (d, 0)] };
+        let r = self.rand() % 10;
+        let order: [(i32, i32); 3] = if hot && r < hot_rise {
+            [(0, -1), (d, -1), (d, 0)]
+        } else if r < cool_rise {
+            [(0, -1), (d, 0), (-d, 0)]
+        } else {
+            [(d, 0), (-d, 0), if climbs { (0, -1) } else { (d, 0) }]
+        };
         for (dx, dy) in order {
-            let t = (self.edge_x(x, y, x + dx), y + dy);
+            let tx = if wraps { self.edge_x(x, y, x + dx) } else { x + dx };
+            let t = (tx, y + dy);
             if (dy >= 0 || self.gas_may_rise_to(x, y, t.1)) && self.at(t.0, t.1) == Mat::Empty {
                 self.swap((x, y), t);
-                return;
+                return true;
             }
         }
+        false
     }
 
     fn step_water(&mut self, x: i32, y: i32) {
@@ -2473,25 +2491,47 @@ impl World {
             self.fall_drop(x, y);
             return;
         }
+        self.step_liquid(x, y);
+    }
+
+    /// The one way every liquid moves (`Kind::Liquid`), the matter only setting how thick it is
+    /// (`viscosity`): a liquid lighter than the one on top of it rises through it (oil on water),
+    /// a thick one stays still now and then, then it runs down if it can (unless it is the mouth
+    /// of a full pipe, held by the pressure behind it, see `hydro.rs`) and else spreads along.
+    /// Returns whether it moved.
+    fn step_liquid(&mut self, x: i32, y: i32) -> bool {
+        let m = self.at(x, y);
+        let (rest, reach, spread) = viscosity(m);
+        let above = self.at(x, y - 1);
+        if above.kind() == Kind::Liquid && density(above) > density(m) && self.chance(2) {
+            self.swap((x, y), (x, y - 1));
+            return true;
+        }
+        if rest > 0 && self.chance(rest) {
+            return false;
+        }
         let d = self.dir();
-        // The mouth of a full pipe: the pressure behind holds the column (see `hydro.rs`).
         let down: &[i32] = if self.held(x, y) { &[] } else { &[0, d, -d] };
         for &dx in down {
             if matches!(self.at(x + dx, y + 1).kind(), Kind::Empty | Kind::Gas) {
                 self.swap((x, y), (x + dx, y + 1));
-                return;
+                return true;
             }
+        }
+        if spread > 1 && !self.chance(spread) {
+            return false;
         }
         for dir in [d, -d] {
             let mut k = 0;
-            while k < 4 * K && self.at(x + dir * (k + 1), y) == Mat::Empty {
+            while k < reach && self.at(x + dir * (k + 1), y) == Mat::Empty {
                 k += 1;
             }
             if k > 0 {
                 self.swap((x, y), (x + dir * k, y));
-                return;
+                return true;
             }
         }
+        false
     }
 
 
@@ -2529,10 +2569,8 @@ impl World {
     }
 
     fn step_steam(&mut self, x: i32, y: i32) {
-        // Condensation is handled by temperature (see thermal.rs). Hot steam rises on
-        // its own; as it cools it stops climbing and just drifts with the wind.
+        // Condensation is handled by temperature (see thermal.rs); it moves as a gas (`step_gas`).
         let i = Self::idx(x, y);
-        let hot = self.temp[i] > self.ambient_c(y) + 8.0;
         // Packed vapour (a full boiler) spreads into any room it finds.
         if self.packed(i) > 0 {
             let n = Self::neighbors(x, y)[(self.rand() % 4) as usize];
@@ -2546,33 +2584,7 @@ impl World {
                 return;
             }
         }
-        if self.buoyancy(x, y) {
-            return;
-        }
-        if let Some(t) = self.wind_target(x, y) {
-            if self.at(t.0, t.1) == Mat::Empty {
-                self.swap((x, y), t);
-                return;
-            }
-        }
-        let d = self.dir();
-        // Even cooled, vapour keeps drifting up a little: damp air is lighter than dry air (a water
-        // molecule weighs 18, air 29), which is how the vapour of a lake reaches the clouds.
-        let r = self.rand() % 10;
-        let order: [(i32, i32); 3] = if hot && r < 7 {
-            [(0, -1), (d, -1), (d, 0)]
-        } else if r < 3 {
-            [(0, -1), (d, 0), (-d, 0)]
-        } else {
-            [(d, 0), (-d, 0), (0, -1)]
-        };
-        for (dx, dy) in order {
-            let t = (x + dx, y + dy);
-            if (dy >= 0 || self.gas_may_rise_to(x, y, t.1)) && self.at(t.0, t.1) == Mat::Empty {
-                self.swap((x, y), t);
-                return;
-            }
-        }
+        self.step_gas(x, y);
     }
 
     /// Water at (x, y) turns to vapour and swells: the cell becomes steam, and the rest of its
@@ -2923,25 +2935,7 @@ impl World {
             self.temp.swap(i, j);
             self.latent.swap(i, j);
         }
-        if self.chance(2) {
-            return;
-        }
-        let d = self.dir();
-        let down: &[i32] = if self.held(x, y) { &[] } else { &[0, d, -d] };
-        for &dx in down {
-            if matches!(self.at(x + dx, y + 1).kind(), Kind::Empty | Kind::Gas) {
-                self.swap((x, y), (x + dx, y + 1));
-                return;
-            }
-        }
-        if self.chance(3) {
-            for dir in [d, -d] {
-                if self.at(x + dir, y) == Mat::Empty {
-                    self.swap((x, y), (x + dir, y));
-                    return;
-                }
-            }
-        }
+        self.step_liquid(x, y);
     }
 
 
@@ -3737,6 +3731,48 @@ impl World {
     }
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_liquid_moves_by_one_rule_the_thinner_the_further() {
+        // The same pour of each liquid on a cold floor: after the same time water has run
+        // furthest, oil less far, lava least. (Cold enough here that nothing sets or boils:
+        // the motion alone is compared.)
+        let spread = |m: Mat| {
+            let mut w = World::new_static();
+            for x in 0..W as i32 {
+                w.set(x, 300, Mat::Stone);
+            }
+            for y in 280..300 {
+                w.set(480, y, m);
+            }
+            for _ in 0..300 {
+                for y in (0..300).rev() {
+                    for x in 300..660 {
+                        if w.raw(x, y) == m {
+                            w.step_liquid(x, y);
+                        }
+                    }
+                }
+            }
+            let xs: Vec<i32> = (0..W as i32).filter(|&x| (280..300).any(|y| w.raw(x, y) == m)).collect();
+            xs.last().unwrap() - xs.first().unwrap()
+        };
+        let (water, oil, lava) = (spread(Mat::Water), spread(Mat::Oil), spread(Mat::Lava));
+        assert!(water > oil && oil > lava, "water {water}, oil {oil}, lava {lava}");
+    }
+
+    #[test]
+    fn oil_rises_through_water_by_the_liquid_rule() {
+        let mut w = World::new_static();
+        for x in 4..7 {
+            w.set(x, 11, Mat::Stone);
+            w.set(x, 10, Mat::Stone);
+        }
+        w.set(5, 10, Mat::Oil);
+        w.set(5, 9, Mat::Water);
+        while !w.step_liquid(5, 10) {}
+        assert_eq!((w.raw(5, 9), w.raw(5, 10)), (Mat::Oil, Mat::Water));
+    }
 
     #[test]
     fn sand_falls_and_lands_on_stone() {
