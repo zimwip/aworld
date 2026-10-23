@@ -154,7 +154,8 @@ void main() {
 }";
 
 // At night a bluish veil covers the picture, except where fire, embers and lava light it: the light
-// map (one texel per `LS` cells) is blurred into a wide, flickering warm pool of light.
+// map's alpha (one texel per `LS` cells, already blurred, see `night_pool`) is a wide, flickering
+// warm pool of light.
 const NIGHT_FRAG: &str = "#version 100
 precision highp float;
 varying vec2 uv;
@@ -163,16 +164,7 @@ uniform vec2 texel;
 uniform float time;
 uniform float night;
 void main() {
-    float l = 0.0;
-    float ws = 0.0;
-    for (int i = -3; i <= 3; i++) {
-        for (int j = -3; j <= 3; j++) {
-            float w = exp(-float(i * i + j * j) / 6.0);
-            l += texture2D(Texture, uv + vec2(float(i), float(j)) * texel * 2.2).r * w;
-            ws += w;
-        }
-    }
-    l = l / ws * 4.5;
+    float l = texture2D(Texture, uv).a;
     l *= 0.88 + 0.08 * sin(time * 13.0 + uv.x * 40.0) + 0.06 * sin(time * 23.0 - uv.y * 30.0);
     l = clamp(l, 0.0, 1.0);
     float a = 0.46 * night * (1.0 - 0.9 * l);
@@ -383,6 +375,37 @@ pub fn light_map(world: &World, out: &mut [[u8; 4]]) {
             let soft = |v: f32, k: f32| (255.0 * (1.0 - (-v / k).exp())) as u8;
             // Above a flame the air is hot too, even before the simulation has warmed it.
             out[ty * LW + tx] = [soft(glow, 5.0), soft(heat + glow * 0.5, 10.0), (shadow[ty * LW + tx] * 255.0) as u8, 255];
+        }
+    }
+    night_pool(out);
+}
+
+/// Spreads the glow (red) into a wide, smooth pool of light in the alpha channel, for the night.
+/// A gaussian blur done here, in two passes over the small light map: sampling a few far-apart
+/// texels in the shader instead drew the pool as a grid of squares, like a waffle.
+fn night_pool(out: &mut [[u8; 4]]) {
+    const R: i32 = 9;
+    let weights: Vec<f32> = (-R..=R).map(|d| (-(d * d) as f32 / 29.0).exp()).collect();
+    let total: f32 = weights.iter().sum::<f32>().powi(2);
+    let mut rows = vec![0.0f32; LW * LH];
+    for y in 0..LH {
+        for x in 0..LW {
+            let mut v = 0.0;
+            for (k, w) in weights.iter().enumerate() {
+                let sx = (x as i32 + k as i32 - R).clamp(0, LW as i32 - 1) as usize;
+                v += out[y * LW + sx][0] as f32 * w;
+            }
+            rows[y * LW + x] = v;
+        }
+    }
+    for y in 0..LH {
+        for x in 0..LW {
+            let mut v = 0.0;
+            for (k, w) in weights.iter().enumerate() {
+                let sy = (y as i32 + k as i32 - R).clamp(0, LH as i32 - 1) as usize;
+                v += rows[sy * LW + x] * w;
+            }
+            out[y * LW + x][3] = (v / total * 4.5).min(255.0) as u8;
         }
     }
 }
@@ -1255,6 +1278,12 @@ mod tests {
         assert_eq!(at(300, 300)[0], 0, "no light away from the fire");
         assert!(at(122, 122)[1] > 200, "hot air makes haze: {:?}", at(122, 122));
         assert_eq!(at(122, 122)[0], 0, "hot air does not glow");
-        assert_eq!(at(400, 200), [0, 0, 0, 255], "calm cool air: nothing");
+        assert_eq!(at(400, 200), [0, 0, 0, 0], "calm cool air: nothing");
+        // At night the fire lights a smooth pool round it: brightest on the fire, then fading
+        // steadily outwards, with no gaps (a waffle) on the way.
+        let pool: Vec<u8> = (0..10).map(|k| at(601 + k * LS, 301)[3]).collect();
+        assert!(pool[0] > 0, "the fire lights the night: {pool:?}");
+        assert!(pool.windows(2).all(|p| p[1] <= p[0]), "the pool fades steadily: {pool:?}");
+        assert!(pool[6] > 0, "and reaches a few metres away: {pool:?}");
     }
 }
