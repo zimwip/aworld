@@ -768,7 +768,7 @@ impl World {
                         let open = Self::neighbors(x as i32, y as i32).iter().filter(|&&(nx, ny)| matches!(self.at(nx, ny).kind(), super::Kind::Empty | super::Kind::Gas)).count();
                         // Charcoal burns hotter than wood: nothing is left in it but carbon.
                         let glow = EMBER_C + 300.0 * (1.0 - open as f32 / 4.0);
-                        let coal = self.cells[i].life >= super::COAL_LIFE;
+                        let coal = self.fuel[i].carbon;
                         let glow = if coal { glow + COAL_EXTRA_C } else { glow };
                         flames += glow - t;
                         self.temp[i] = glow;
@@ -994,9 +994,10 @@ impl World {
             .iter()
             .zip(&self.temp)
             .zip(&self.latent)
-            .map(|((c, &t), &l)| {
+            .zip(&self.moisture)
+            .map(|(((c, &t), &l), &w)| {
                 // Packed vapour holds the latent heat of every cell of vapour in it.
-                let packed = if matches!(c.m, Mat::Steam | Mat::Cloud) { c.life as f32 * latent0(c.m) } else { 0.0 };
+                let packed = if matches!(c.m, Mat::Steam | Mat::Cloud) { (w / super::VAPOUR_UNITS) as f32 * latent0(c.m) } else { 0.0 };
                 (t / tb.inv_c[c.m as usize] + latent0(c.m) + l + packed) as f64
             })
             .sum();
@@ -1248,7 +1249,7 @@ impl World {
                 if Self::inb(x + dx, y + dy) {
                     let c = self.cells[Self::idx(x + dx, y + dy)];
                     if matches!(c.m, Mat::Steam | Mat::Cloud) {
-                        n += 1 + c.life as u32;
+                        n += 1 + self.packed(Self::idx(x + dx, y + dy));
                     }
                 }
             }
@@ -1262,11 +1263,8 @@ impl World {
     /// fog, the plume over a kettle) and gives back the heat that made it vapour.
     fn condense(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
-        let units = 1.0 + self.cells[i].life as f32;
-        let (life, t) = (self.cells[i].life, self.temp[i]);
-        self.set(x, y, Mat::Cloud);
-        self.cells[i].life = life;
-        self.temp[i] = t;
+        let units = 1.0 + self.packed(i) as f32;
+        self.retype(x, y, Mat::Cloud);
         self.release_heat(x, y, units * (latent0(Mat::Steam) - latent0(Mat::Cloud)));
     }
 
@@ -1274,11 +1272,8 @@ impl World {
     /// evaporate back into vapour, taking the heat for it from around.
     pub(super) fn evaporate_cloud(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
-        let units = 1.0 + self.cells[i].life as f32;
-        let (life, t) = (self.cells[i].life, self.temp[i]);
-        self.set(x, y, Mat::Steam);
-        self.cells[i].life = life;
-        self.temp[i] = t;
+        let units = 1.0 + self.packed(i) as f32;
+        self.retype(x, y, Mat::Steam);
         self.release_heat(x, y, units * (latent0(Mat::Cloud) - latent0(Mat::Steam)));
     }
 
@@ -1623,7 +1618,7 @@ mod latent_tests {
                     if w.raw(x, y) == Mat::Cloud && w.gather_vapour(x, y) {
                         let i = y as usize * W + x as usize;
                         let t = w.temp[i];
-                        let own = heat_of(Mat::Cloud, t) + w.cells[i].life as f32 * latent0(Mat::Cloud);
+                        let own = heat_of(Mat::Cloud, t) + w.packed(i) as f32 * latent0(Mat::Cloud);
                         let to = if t > 2.0 { Mat::Water } else { Mat::Snow };
                         w.set(x, y, to);
                         w.temp[i] = t;
