@@ -1,5 +1,8 @@
 //! Changes of matter from one kind to another, in one table: each change says from what, into
-//! what and under which conditions. The conditions read the fields of the world at the cell (its
+//! what and under which conditions. Two tables hold them all but the reactions between neighbours
+//! (rust and charcoal, iron and coals, see `thermal::react`): `FUSIONS`, the changes of state with a
+//! latent heat (melting and setting), and `TRANSITIONS`, every other change, by heat, by weight or
+//! by shock. The conditions read the fields of the world at the cell (its
 //! temperature, the weight of everything above it, the peak of a shock wave that crossed it, what
 //! lies on top of it), so one rule covers every place where those conditions are met.
 //!
@@ -15,7 +18,7 @@
 //! turns into diamond, which is how detonations make real nanodiamonds. Black powder only burns
 //! (it peaks at a few thousand atmospheres): it neither packs the soil nor makes diamond.
 
-use super::thermal::{cap, heat_of, latent0};
+use super::thermal::{cap, heat_of, latent0, GLASS_C, KILN_C, LATENT_FUSION, LATENT_METAL, LATENT_ROCK, MELT_C, METAL_MELT_C, ROCK_MELT_C, WOOD_IGNITE_C};
 use super::{density, Kind, Mat, World, H, W};
 
 /// A condition a change needs; all the conditions of a change must hold.
@@ -30,6 +33,9 @@ pub enum Cond {
     ShockAbove(f32),
     /// The cell just above is of this kind.
     Under(Kind),
+    /// Air with oxygen in it reaches the cell (see `World::breathes`), or it does not.
+    Air,
+    NoAir,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -48,7 +54,34 @@ pub struct Transition {
 
 use Cond::*;
 
+/// A change by heat alone, with no latent heat, that does not go back.
+const fn heat(from: Mat, to: Mat, when: &'static [Cond], every: u32) -> Transition {
+    Transition { from, to, when, latent: 0.0, every, reversible: false }
+}
+
+/// Every change of matter but the changes of state with a latent heat (`FUSIONS`) and the
+/// reactions between neighbours (`thermal::react`). A change whose conditions read only the heat
+/// of the cell (and the air around it) is looked at by the heat pass, the others by the slow pass
+/// (`settle_matter`) or by the shock of a blast (`shock_cell`).
 pub const TRANSITIONS: &[Transition] = &[
+    // Heat. Sand fuses into glass (which does not melt back in a fire); clay is fired into
+    // terracotta.
+    heat(Mat::Sand, Mat::Glass, &[TempAbove(GLASS_C)], 15),
+    heat(Mat::Shard, Mat::Glass, &[TempAbove(GLASS_C)], 15),
+    heat(Mat::Clay, Mat::Terracotta, &[TempAbove(KILN_C)], 12),
+    // With air wood burns; shut away from the air it only chars (pyrolysis): the water and the
+    // tars leave and almost pure carbon stays, charcoal.
+    heat(Mat::Wood, Mat::Ember, &[TempAbove(WOOD_IGNITE_C), Air], 10),
+    heat(Mat::Trunk, Mat::Ember, &[TempAbove(WOOD_IGNITE_C), Air], 10),
+    heat(Mat::Leaf, Mat::Ember, &[TempAbove(WOOD_IGNITE_C), Air], 10),
+    heat(Mat::Branch, Mat::Ember, &[TempAbove(WOOD_IGNITE_C), Air], 10),
+    heat(Mat::DeadLeaf, Mat::Ember, &[TempAbove(WOOD_IGNITE_C), Air], 10),
+    heat(Mat::Wood, Mat::Charcoal, &[TempAbove(WOOD_IGNITE_C), NoAir], 40),
+    heat(Mat::Trunk, Mat::Charcoal, &[TempAbove(WOOD_IGNITE_C), NoAir], 40),
+    heat(Mat::Leaf, Mat::Charcoal, &[TempAbove(WOOD_IGNITE_C), NoAir], 40),
+    heat(Mat::Branch, Mat::Charcoal, &[TempAbove(WOOD_IGNITE_C), NoAir], 40),
+    heat(Mat::DeadLeaf, Mat::Charcoal, &[TempAbove(WOOD_IGNITE_C), NoAir], 40),
+    // Weight.
     // Soil under standing water soaks into silt.
     Transition { from: Mat::Dirt, to: Mat::Mud, when: &[Under(Kind::Liquid)], latent: 0.0, every: 60_000, reversible: false },
     // Buried mud squeezed by the weight above it loses its water and sets into clay.
@@ -68,6 +101,33 @@ pub const TRANSITIONS: &[Transition] = &[
     Transition { from: Mat::Charcoal, to: Mat::Diamond, when: &[PressureAbove(50_000.0), TempAbove(1_500.0)], latent: 0.0, every: 1, reversible: false },
 ];
 
+/// The solid and the liquid state of one matter, the temperature where one turns into the other,
+/// and the latent heat between them: the cell takes in (or gives up) that heat at that
+/// temperature before it changes (see `thermal::latent_heat`). Water boils as well.
+#[derive(Clone, Copy, Debug)]
+pub struct Fusion {
+    pub solid: Mat,
+    pub liquid: Mat,
+    pub at: f32,
+    pub latent: f32,
+}
+
+/// Water freezes into ice (the first entry for it); snow and hail melt into water too.
+pub const FUSIONS: &[Fusion] = &[
+    Fusion { solid: Mat::Ice, liquid: Mat::Water, at: MELT_C, latent: LATENT_FUSION },
+    Fusion { solid: Mat::Snow, liquid: Mat::Water, at: MELT_C, latent: LATENT_FUSION },
+    Fusion { solid: Mat::Hail, liquid: Mat::Water, at: MELT_C, latent: LATENT_FUSION },
+    Fusion { solid: Mat::Stone, liquid: Mat::Lava, at: ROCK_MELT_C, latent: LATENT_ROCK },
+    Fusion { solid: Mat::Iron, liquid: Mat::Molten, at: METAL_MELT_C, latent: LATENT_METAL },
+    Fusion { solid: Mat::Steel, liquid: Mat::MoltenSteel, at: METAL_MELT_C, latent: LATENT_METAL },
+];
+
+/// The change of state `m` takes part in, if any: the one it melts by, or for a liquid the one
+/// it sets by.
+pub fn fusion(m: Mat) -> Option<&'static Fusion> {
+    FUSIONS.iter().find(|f| f.solid == m).or_else(|| FUSIONS.iter().find(|f| f.liquid == m))
+}
+
 /// The world's fields at a cell, as the conditions read them.
 #[derive(Clone, Copy, Default)]
 pub struct Here {
@@ -75,6 +135,7 @@ pub struct Here {
     pub pressure: f32,
     pub shock: f32,
     pub above: Option<Kind>,
+    pub air: bool,
 }
 
 impl Cond {
@@ -85,6 +146,8 @@ impl Cond {
             PressureAbove(p) => h.pressure >= p,
             ShockAbove(p) => h.shock >= p,
             Under(k) => h.above == Some(k),
+            Air => h.air,
+            NoAir => !h.air,
         }
     }
 }
@@ -98,6 +161,15 @@ impl Transition {
         self.when.iter().any(|c| matches!(c, ShockAbove(_)))
     }
 
+    /// Whether the change reads nothing but the heat of the cell and the air around it.
+    fn by_heat(&self) -> bool {
+        self.when.iter().all(|c| matches!(c, TempAbove(_) | TempBelow(_) | Air | NoAir))
+    }
+
+    fn needs_air(&self) -> bool {
+        self.when.iter().any(|c| matches!(c, Air | NoAir))
+    }
+
     /// A change of crystal needs heat; a mere packing does not, and it is undone when the matter
     /// is thrown loose.
     fn needs_heat(&self) -> bool {
@@ -108,7 +180,7 @@ impl Transition {
 /// What a shock of `shock` atm with gas at `temp` °C makes of `m`, if anything. `loose`: the
 /// matter is thrown out at once, so only the changes of crystal stay.
 pub fn shocked(m: Mat, shock: f32, temp: f32, loose: bool) -> Option<&'static Transition> {
-    let here = Here { temp, pressure: 1.0, shock, above: None };
+    let here = Here { temp, pressure: 1.0, shock, above: None, air: false };
     TRANSITIONS.iter().find(|t| t.from == m && t.by_shock() && (!loose || t.needs_heat()) && t.holds(&here))
 }
 
@@ -123,7 +195,7 @@ fn settles(m: Mat) -> bool {
     static T: std::sync::OnceLock<[bool; 256]> = std::sync::OnceLock::new();
     T.get_or_init(|| {
         let mut t = [false; 256];
-        for tr in TRANSITIONS.iter().filter(|t| !t.by_shock()) {
+        for tr in TRANSITIONS.iter().filter(|t| !t.by_shock() && !t.by_heat()) {
             t[tr.from as usize] = true;
         }
         t
@@ -174,14 +246,31 @@ impl World {
             if !settles(m) || self.mask[i] != 0 {
                 continue;
             }
-            let here = Here { temp: self.temp[i], pressure: load[i], shock: 0.0, above: (i >= W).then(|| self.cells[i - W].m.kind()) };
-            for tr in TRANSITIONS.iter().filter(|t| t.from == m && !t.by_shock()) {
+            let here = Here { temp: self.temp[i], pressure: load[i], shock: 0.0, above: (i >= W).then(|| self.cells[i - W].m.kind()), air: false };
+            for tr in TRANSITIONS.iter().filter(|t| t.from == m && !t.by_shock() && !t.by_heat()) {
                 if tr.holds(&here) && (tr.every <= SETTLE_EVERY || self.rand() % tr.every < SETTLE_EVERY) {
                     self.change_state(i, tr.to, tr.latent);
                     break;
                 }
             }
         }
+    }
+
+    /// The changes the heat pass looks at: whether cell `i` (at x, y, made of `m`) changed.
+    pub(super) fn heat_change(&mut self, i: usize, x: i32, y: i32, m: Mat) -> bool {
+        let mut here = Here { temp: self.temp[i], pressure: 1.0, shock: 0.0, above: None, air: false };
+        let mut air_known = false;
+        for tr in TRANSITIONS.iter().filter(|t| t.from == m && t.by_heat()) {
+            if tr.needs_air() && !air_known {
+                here.air = self.breathes(x, y);
+                air_known = true;
+            }
+            if tr.holds(&here) && self.chance_t(tr.every) {
+                self.change_state(i, tr.to, tr.latent);
+                return true;
+            }
+        }
+        false
     }
 
     /// A shock wave of peak `shock` atm, with gas at `temp` °C, went through cell `i`: the
@@ -284,6 +373,26 @@ mod tests {
         assert_eq!(w.moisture[j], 0);
         w.set(5, 6, Mat::Ember);
         assert!(w.fuel[j].left > 0 && !w.fuel[j].carbon, "a fresh ember of wood");
+    }
+
+    #[test]
+    fn water_sets_into_ice_and_snow_melts_into_water() {
+        assert_eq!(fusion(Mat::Water).map(|f| f.solid), Some(Mat::Ice));
+        assert_eq!(fusion(Mat::Snow).map(|f| f.liquid), Some(Mat::Water));
+        assert_eq!(fusion(Mat::Lava).map(|f| f.solid), Some(Mat::Stone));
+        assert!(fusion(Mat::Sand).is_none());
+    }
+
+    #[test]
+    fn hot_sand_turns_to_glass_in_the_heat_pass_keeping_its_heat() {
+        let mut w = World::new_static();
+        w.set(5, 5, Mat::Sand);
+        let i = 5 * W + 5;
+        w.temp[i] = 700.0;
+        let before = heat_of(Mat::Sand, 700.0);
+        while !w.heat_change(i, 5, 5, Mat::Sand) {}
+        assert_eq!(w.raw(5, 5), Mat::Glass);
+        assert!((heat_of(Mat::Glass, w.temp[i]) - before).abs() < 1e-2);
     }
 
     #[test]
