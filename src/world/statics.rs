@@ -28,6 +28,7 @@
 
 use super::blast::strength;
 use super::*;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Side of a cell, m.
@@ -44,6 +45,13 @@ const CRACK_SHARE: f32 = 0.0005;
 const MAX_SLAB: usize = 40_000;
 /// At most this many bodies start to tip in one pass.
 const MAX_TIPS: usize = 4;
+
+/// The sections of one anchored body, as `stress_pass` last worked them out: the load on each of
+/// its cells (in `World::strain`'s units) and the sections that cannot carry theirs.
+pub(super) struct BodyStress {
+    strain: Vec<u8>,
+    cracks: Vec<Crack>,
+}
 
 /// Speed in m/s of one cell per step.
 fn ms_per_cell_step() -> f32 {
@@ -161,6 +169,7 @@ fn free_for_slab(m: Mat) -> bool {
 
 /// A crack across a section that could give way: the cells of the section, its edge fibre, the
 /// distance from the anchor and how far beyond its strength it is loaded.
+#[derive(Clone)]
 struct Crack {
     load: f32,
     level: u32,
@@ -195,88 +204,82 @@ impl World {
         self.strain.fill(0);
         let n = order.len();
         if n == 0 {
+            self.stress_cache.clear();
             return;
         }
         let level = std::mem::take(&mut self.level);
-        let mut pos = vec![u32::MAX; W * H];
+        let mut pos = std::mem::take(&mut self.stress_pos);
+        pos.resize(W * H, u32::MAX);
         for (k, &i) in order.iter().enumerate() {
             pos[i] = k as u32;
         }
-        let mut up: Vec<u32> = (0..n as u32).collect();
-        let mut mass = vec![0.0f64; n];
-        let mut moment = vec![0.0f64; n];
-        fn find(up: &mut [u32], mut k: u32) -> u32 {
-            while up[k as usize] != k {
-                let next = up[up[k as usize] as usize];
-                up[k as usize] = next;
-                k = next;
+        // The anchored bodies, each the list of its places in `order` (rising). The sections of
+        // one body never lean on another's, so each is worked out on its own: side by side, and
+        // only again once the body itself changed (a tree that burns leaves the rock under it as
+        // it was).
+        let mut body_of = vec![u32::MAX; n];
+        let mut count = 0u32;
+        let mut stack: Vec<u32> = vec![];
+        for k0 in 0..n as u32 {
+            if body_of[k0 as usize] != u32::MAX {
+                continue;
             }
-            k
-        }
-        let mut cracks: Vec<Crack> = vec![];
-        let mut fibres: Vec<(u32, u32)> = vec![];
-        // From the farthest cells inwards: when the cells `d` from the anchor join, each body of
-        // cells at `d` or more hangs on its cells at `d`.
-        let mut hi = n;
-        while hi > 0 {
-            let d = level[order[hi - 1]];
-            let mut lo = hi;
-            while lo > 0 && level[order[lo - 1]] == d {
-                lo -= 1;
-            }
-            for k in lo..hi {
-                let i = order[k];
-                let rho = density(self.cells[i].m) as f64;
-                mass[k] = rho;
-                moment[k] = rho * ((i % W) as f64 + 0.5);
-            }
-            for k in lo..hi {
-                let i = order[k];
+            body_of[k0 as usize] = count;
+            stack.push(k0);
+            while let Some(k) = stack.pop() {
+                let i = order[k as usize];
                 let (x, y) = ((i % W) as i32, (i / W) as i32);
                 for (nx, ny) in Self::neighbors(x, y) {
                     if !Self::inb(nx, ny) {
                         continue;
                     }
                     let j = Self::idx(nx, ny);
-                    if pos[j] == u32::MAX || level[j] < d || !self.same_body(i, j) {
-                        continue;
-                    }
-                    let (a, b) = (find(&mut up, k as u32), find(&mut up, pos[j]));
-                    if a != b {
-                        up[a as usize] = b;
-                        mass[b as usize] += mass[a as usize];
-                        moment[b as usize] += moment[a as usize];
+                    let kj = pos[j];
+                    if kj != u32::MAX && body_of[kj as usize] == u32::MAX && self.same_body(i, j) {
+                        body_of[kj as usize] = count;
+                        stack.push(kj);
                     }
                 }
             }
-            if d == 0 {
-                break;
-            }
-            fibres.clear();
-            for k in lo..hi {
-                fibres.push((find(&mut up, k as u32), k as u32));
-            }
-            fibres.sort_unstable();
-            let mut a = 0;
-            while a < fibres.len() {
-                let root = fibres[a].0;
-                let mut b = a;
-                while b < fibres.len() && fibres[b].0 == root {
-                    b += 1;
-                }
-                let cells: Vec<usize> = fibres[a..b].iter().map(|&(_, k)| order[k as usize]).collect();
-                let (load, pivot) = self.section_load(&cells, mass[root as usize], moment[root as usize]);
-                let shown = (load.clamp(0.0, 2.0) * 127.5) as u8;
-                for &i in &cells {
-                    self.strain[i] = shown;
-                }
-                if load > 1.0 {
-                    cracks.push(Crack { load, level: d, fibres: cells, pivot });
-                }
-                a = b;
-            }
-            hi = lo;
+            count += 1;
         }
+        // Each body's places, rising, and a fingerprint of its cells.
+        let mut bodies: Vec<Vec<u32>> = vec![vec![]; count as usize];
+        let mut keys: Vec<u64> = vec![0; count as usize];
+        for (k, &b) in body_of.iter().enumerate() {
+            let i = order[k];
+            keys[b as usize] = (keys[b as usize] ^ ((i as u64) << 8 | self.cells[i].m as u64)).wrapping_mul(0x100_0000_01b3);
+            bodies[b as usize].push(k as u32);
+        }
+        for (key, b) in keys.iter_mut().zip(&bodies) {
+            *key ^= b.len() as u64;
+        }
+        let results: Vec<std::sync::Arc<BodyStress>> = {
+            let (this, level, pos) = (&*self, &level, &pos);
+            bodies
+                .par_iter()
+                .zip(keys.par_iter())
+                .map(|(members, key)| match this.stress_cache.get(key) {
+                    Some(done) => done.clone(),
+                    None => std::sync::Arc::new(this.body_stress(order, members, level, pos)),
+                })
+                .collect()
+        };
+        let mut cracks: Vec<Crack> = vec![];
+        for (members, done) in bodies.iter().zip(&results) {
+            for (&k, &shown) in members.iter().zip(&done.strain) {
+                self.strain[order[k as usize]] = shown;
+            }
+            cracks.extend(done.cracks.iter().cloned());
+        }
+        self.stress_cache = keys.into_iter().zip(results).collect();
+        for &i in order {
+            pos[i] = u32::MAX;
+        }
+        self.stress_pos = pos;
+        // (The same order whatever the order of the bodies: the outermost section first, then
+        // by place, among cracks under the same load.)
+        cracks.sort_by(|a, b| b.level.cmp(&a.level).then(a.fibres[0].cmp(&b.fibres[0])));
         // The worst first; a crack whose part beyond has already broken loose waits for the
         // next pass (its load has changed).
         cracks.sort_by(|a, b| b.load.total_cmp(&a.load));
@@ -337,6 +340,91 @@ impl World {
             tips += 1;
         }
         self.level = level;
+    }
+
+    /// The load on every section of one anchored body (`members`: its places in `order`, rising),
+    /// and the sections that cannot carry it, as `stress_pass` reads them.
+    fn body_stress(&self, order: &[usize], members: &[u32], level: &[u32], pos: &[u32]) -> BodyStress {
+        let n = members.len();
+        let local = |k: u32| members.binary_search(&k).unwrap_or(0) as u32;
+        let mut up: Vec<u32> = (0..n as u32).collect();
+        let mut mass = vec![0.0f64; n];
+        let mut moment = vec![0.0f64; n];
+        let mut strain = vec![0u8; n];
+        fn find(up: &mut [u32], mut k: u32) -> u32 {
+            while up[k as usize] != k {
+                let next = up[up[k as usize] as usize];
+                up[k as usize] = next;
+                k = next;
+            }
+            k
+        }
+        let mut cracks: Vec<Crack> = vec![];
+        let mut fibres: Vec<(u32, u32)> = vec![];
+        // From the farthest cells inwards: when the cells `d` from the anchor join, each body of
+        // cells at `d` or more hangs on its cells at `d`.
+        let cell = |k: usize| order[members[k] as usize];
+        let mut hi = n;
+        while hi > 0 {
+            let d = level[cell(hi - 1)];
+            let mut lo = hi;
+            while lo > 0 && level[cell(lo - 1)] == d {
+                lo -= 1;
+            }
+            for k in lo..hi {
+                let i = cell(k);
+                let rho = density(self.cells[i].m) as f64;
+                mass[k] = rho;
+                moment[k] = rho * ((i % W) as f64 + 0.5);
+            }
+            for k in lo..hi {
+                let i = cell(k);
+                let (x, y) = ((i % W) as i32, (i / W) as i32);
+                for (nx, ny) in Self::neighbors(x, y) {
+                    if !Self::inb(nx, ny) {
+                        continue;
+                    }
+                    let j = Self::idx(nx, ny);
+                    if pos[j] == u32::MAX || level[j] < d || !self.same_body(i, j) {
+                        continue;
+                    }
+                    let (a, b) = (find(&mut up, k as u32), find(&mut up, local(pos[j])));
+                    if a != b {
+                        up[a as usize] = b;
+                        mass[b as usize] += mass[a as usize];
+                        moment[b as usize] += moment[a as usize];
+                    }
+                }
+            }
+            if d == 0 {
+                break;
+            }
+            fibres.clear();
+            for k in lo..hi {
+                fibres.push((find(&mut up, k as u32), k as u32));
+            }
+            fibres.sort_unstable();
+            let mut a = 0;
+            while a < fibres.len() {
+                let root = fibres[a].0;
+                let mut b = a;
+                while b < fibres.len() && fibres[b].0 == root {
+                    b += 1;
+                }
+                let cells: Vec<usize> = fibres[a..b].iter().map(|&(_, k)| cell(k as usize)).collect();
+                let (load, pivot) = self.section_load(&cells, mass[root as usize], moment[root as usize]);
+                let shown = (load.clamp(0.0, 2.0) * 127.5) as u8;
+                for &(_, k) in &fibres[a..b] {
+                    strain[k as usize] = shown;
+                }
+                if load > 1.0 {
+                    cracks.push(Crack { load, level: d, fibres: cells, pivot });
+                }
+                a = b;
+            }
+            hi = lo;
+        }
+        BodyStress { strain, cracks }
     }
 
     /// Whether the body `cells` (`own` tells its cells) stands on firm ground under it with its
