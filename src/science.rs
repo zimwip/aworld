@@ -28,7 +28,9 @@ pub fn info(m: Mat) -> Info {
         Mat::Ember => ("Braise", "solide", "Du bois ou du charbon qui brûle. Sans air, elle ne propage plus le feu ; elle devient de la cendre."),
         Mat::Lava => ("Lave", "liquide", "Plus de 1000 °C : de la roche fondue. Elle se fige en pierre à 540 °C, mais reste à cette température tant qu'elle n'a pas rendu toute sa chaleur latente : une croûte se forme et garde le cœur liquide. Une coulée qui continue d'arriver fait fondre son lit."),
         Mat::Ice => ("Glace", "solide", "Eau gelée : un bloc solide et lourd qui tombe s'il n'est pas posé sur quelque chose (les feuilles ne le portent pas). Elle fond à 0 °C, mais lentement : il faut beaucoup de chaleur pour la faire fondre."),
-        Mat::Gunpowder => ("Poudre", "poudre", "Explose dès 210 °C. Attention au feu !"),
+        Mat::Gunpowder => ("Poudre", "poudre", "Explose dès 210 °C. Attention au feu ! Elle déflagre : sa pression plafonne vers 3 000 atm."),
+        Mat::Dynamite => ("Dynamite", "solide", "Un explosif brisant (nitroglycérine dans de la sciure, Nobel, 1867) : il détone, son onde de choc dépasse 100 000 atm. Assez pour changer le charbon de bois voisin en diamant."),
+        Mat::Diamond => ("Diamant", "solide", "Du carbone serré au-delà de 50 000 atm et à plus de 1 500 °C : ses atomes se rangent en cristal. C'est ce qui se passe à 150 km sous terre, ou dans l'onde de choc d'une détonation (les nanodiamants). Le plus dur des matériaux, et le meilleur conducteur de chaleur."),
         Mat::Dirt => ("Terre", "solide", "Boit la pluie. Avec une graine, de l'eau et de la lumière : un arbre."),
         Mat::Grass => ("Herbe", "solide", "Ses racines retiennent la terre contre l'érosion."),
         Mat::Leaf => ("Feuille", "solide", "Verte au printemps, rousse en automne, puis elle tombe. Le jour, elle rejette de la vapeur d'eau : l'eau que les racines ont bue (la transpiration)."),
@@ -66,7 +68,7 @@ const fn one(m: &'static [Mat]) -> Matter {
     Matter { states: m, default: 0 }
 }
 
-pub const MATTERS: [Matter; 18] = [
+pub const MATTERS: [Matter; 20] = [
     one(&[Mat::Sand]),
     Matter { states: &[Mat::Ice, Mat::Snow, Mat::Water, Mat::Steam], default: 2 },
     one(&[Mat::Dirt]),
@@ -83,6 +85,8 @@ pub const MATTERS: [Matter; 18] = [
     one(&[Mat::Fire]),
     one(&[Mat::Saltpeter]),
     one(&[Mat::Gunpowder]),
+    one(&[Mat::Dynamite]),
+    one(&[Mat::Diamond]),
     one(&[Mat::Clay]),
     one(&[Mat::Terracotta]),
 ];
@@ -170,6 +174,8 @@ pub fn mat_color(m: Mat) -> Color {
         Mat::Clay => (168, 124, 98),
         Mat::Terracotta => (196, 98, 60),
         Mat::Vault => (170, 86, 58),
+        Mat::Diamond => (196, 236, 246),
+        Mat::Dynamite => (196, 46, 38),
         Mat::Empty => (30, 36, 56),
     };
     Color::from_rgba(r, g, b, 255)
