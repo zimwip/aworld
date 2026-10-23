@@ -174,18 +174,38 @@ impl Wolves {
         self.pack.as_ref().map_or(0.0, |p| bump(p.age, WINK.0, WINK.1, 0.3))
     }
 
-    pub fn draw(&self, view: View, ui: &Ui) {
-        let Some(p) = &self.pack else { return };
-        let fade = bump(p.age, 0.0, GONE, COME);
-        for w in &p.wolves {
-            let t = p.age - w.delay;
-            let howl = if w.cub() {
-                bump(t, CUB, CUB + 1.6, 0.25)
-            } else {
-                HOWLS.iter().map(|&h| bump(t, h, h + HOWL, 0.4)).fold(0.0, f32::max)
-            };
-            let snout = draw_wolf(w, view, fade, howl);
-            // The song, rising and fading from the raised muzzle (the leader's and the cub's).
+    /// How far each wolf's head is tipped back (0..1) right now.
+    fn heads(&self) -> Vec<(&Wolf, f32, f32)> {
+        let Some(p) = &self.pack else { return vec![] };
+        p.wolves
+            .iter()
+            .map(|w| {
+                let t = p.age - w.delay;
+                let howl = if w.cub() {
+                    bump(t, CUB, CUB + 1.6, 0.25)
+                } else {
+                    HOWLS.iter().map(|&h| bump(t, h, h + HOWL, 0.4)).fold(0.0, f32::max)
+                };
+                (w, t, howl)
+            })
+            .collect()
+    }
+
+    fn fade(&self) -> f32 {
+        self.pack.as_ref().map_or(0.0, |p| bump(p.age, 0.0, GONE, COME))
+    }
+
+    /// The wolves, over the world.
+    pub fn draw(&self, view: View) {
+        for (w, _, howl) in self.heads() {
+            draw_wolf(w, view, self.fade(), howl);
+        }
+    }
+
+    /// Their song, rising and fading from the raised muzzles (the leader's and the cub's). Drawn
+    /// over the night, so it stays readable.
+    pub fn draw_song(&self, view: View, ui: &Ui) {
+        for (w, t, howl) in self.heads() {
             if w.delay > 0.0 {
                 continue;
             }
@@ -196,11 +216,11 @@ impl Wolves {
             };
             let k = (t - start) / len;
             if (0.0..1.0).contains(&k) {
-                let at = snout + vec2(w.dir * 10.0 * view.s * k, -(8.0 + 26.0 * k) * view.s.max(0.6));
-                let a = fade * (1.0 - k).min(k * 6.0).min(1.0);
+                let at = muzzle(w, view, howl) + vec2(w.dir * 10.0 * view.s * k, -(8.0 + 26.0 * k) * view.s.max(0.6));
+                let a = self.fade() * (1.0 - k).min(k * 6.0).min(1.0);
                 let size = (size * view.s.max(0.7)).round() as u16;
                 let tw = ui.text_w(text, size);
-                ui.text(text, at.x - tw * 0.5, at.y, size, Color::new(1.0, 1.0, 1.0, a));
+                ui.text(text, at.x - tw * 0.5, at.y, size, Color::new(0.92, 0.95, 1.0, a));
             }
         }
     }
@@ -251,13 +271,28 @@ pub fn triangulate(poly: &[(f32, f32)]) -> Vec<[usize; 3]> {
     out
 }
 
-/// A sitting wolf in silhouette, its outline lit by the moon. `howl` 0..1 tips its head back.
-/// Returns where the tip of its muzzle is on the screen.
-fn draw_wolf(w: &Wolf, view: View, fade: f32, howl: f32) -> Vec2 {
-    let u = w.size * SCALE;
-    let pt = |p: (f32, f32)| view.to_screen(vec2(w.x + w.dir * p.0 * u, w.y + p.1 * u));
+/// The head's outline, tipped back by `howl` (0..1), in body units.
+fn head(howl: f32) -> Vec<(f32, f32)> {
     let (sin, cos) = (-HOWL_TILT * howl).sin_cos();
-    let head: Vec<(f32, f32)> = HEAD.iter().map(|&(x, y)| (NECK.0 + x * cos - y * sin, NECK.1 + x * sin + y * cos)).collect();
+    HEAD.iter().map(|&(x, y)| (NECK.0 + x * cos - y * sin, NECK.1 + x * sin + y * cos)).collect()
+}
+
+/// Where a wolf's units land on the screen.
+fn to_screen(w: &Wolf, view: View, p: (f32, f32)) -> Vec2 {
+    let u = w.size * SCALE;
+    view.to_screen(vec2(w.x + w.dir * p.0 * u, w.y + p.1 * u))
+}
+
+/// The tip of the muzzle, on the screen.
+fn muzzle(w: &Wolf, view: View, howl: f32) -> Vec2 {
+    to_screen(w, view, head(howl)[7])
+}
+
+/// A sitting wolf in silhouette, its outline lit by the moon. `howl` 0..1 tips its head back.
+fn draw_wolf(w: &Wolf, view: View, fade: f32, howl: f32) {
+    let u = w.size * SCALE;
+    let pt = |p: (f32, f32)| to_screen(w, view, p);
+    let head = head(howl);
     let body = Color::new(0.06, 0.07, 0.12, fade);
     let rim = Color::new(0.62, 0.68, 0.9, 0.85 * fade);
     // The light comes from above, a little in front (the wolves face the moon).
@@ -282,7 +317,6 @@ fn draw_wolf(w: &Wolf, view: View, fade: f32, howl: f32) -> Vec2 {
     draw_circle(n.x, n.y, 1.3 * u * view.s, body);
     let eye = pt((head[4].0 * 0.6 + head[0].0 * 0.4, head[4].1 * 0.6 + head[0].1 * 0.4 - 0.2));
     draw_circle(eye.x, eye.y, (0.3 * u * view.s).max(0.8), Color::new(0.95, 0.85, 0.4, fade * (1.0 - howl)));
-    pt(head[7])
 }
 
 #[cfg(test)]
