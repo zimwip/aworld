@@ -33,7 +33,7 @@ use mech::{GearSize, Mechanism};
 use mechgame::MechDraft;
 use sound::{Ev, Mix, Sounds};
 use ui::{draw_icon, rrect, Drawer, Icon, Ui, ACCENT, BG, BLUE, DIM, GREEN, PANEL, RED, TEXT, TILE, TILE_HOT};
-use world::{Biome, Mat, Matter, PaintRule, Season, World, H, W};
+use world::{Biome, Mat, PaintRule, Season, World, H, W};
 
 /// Simulation steps per second at speed x1 (the rigid bodies use the same 1/60 s step).
 const STEPS_PER_SECOND: f32 = 60.0;
@@ -118,7 +118,8 @@ fn window_conf() -> Conf {
     }
 }
 
-/// Everything needed to put the world back as it was just before a brick was dropped.
+/// Everything needed to put the world back as it was: just before a brick was dropped (undo), or
+/// as it was built before the simulation started (the plan).
 struct Snapshot {
     state: world::State,
     blocks: Vec<Block>,
@@ -146,13 +147,15 @@ struct Game {
     heat_cells: u32,
     undo: Vec<Snapshot>,
     world: World,
-    snap_cells: Matter,
-    snap_blocks: Vec<Block>,
-    snap_cables: Vec<Cable>,
-    snap_members: Vec<Member>,
-    snap_springs: Vec<Spring>,
+    /// The world as it was built, taken when the simulation is first started from the drawing
+    /// board: Réessayer puts it back. None while building (nothing has run since the last
+    /// Réessayer). Whatever happens once it is taken, paused or not, is a test and is not kept.
+    plan: Option<Snapshot>,
+    /// How many undo steps there were when the plan was taken (later ones belong to the test).
+    plan_undo: usize,
+    /// The challenge (mode jeu): building is locked until Réessayer.
+    challenge: bool,
     mech: Mechanism,
-    snap_mech: Mechanism,
     mech_draft: Option<MechDraft>,
     /// How the next motor turns, and whether it reverses itself when overloaded.
     motor_dir: f32,
@@ -294,13 +297,10 @@ impl Game {
             sounds: Sounds::silent(),
             heat_cells: 0,
             undo: vec![],
-            snap_cells: world.snapshot(),
-            snap_blocks: vec![],
-            snap_cables: vec![],
-            snap_members: vec![],
-            snap_springs: vec![],
+            plan: None,
+            plan_undo: 0,
+            challenge: false,
             mech: Mechanism::default(),
-            snap_mech: Mechanism::default(),
             mech_draft: None,
             motor_dir: 1.0,
             motor_reverse: false,
@@ -394,7 +394,17 @@ impl Game {
 
     /// Remember the world right now so the next edit can be undone.
     fn checkpoint(&mut self) {
-        self.undo.push(Snapshot {
+        let s = self.capture();
+        self.undo.push(s);
+        if self.undo.len() > 15 {
+            self.undo.remove(0);
+            self.plan_undo = self.plan_undo.saturating_sub(1);
+        }
+    }
+
+    /// Everything about the world right now, without the physics.
+    fn capture(&self) -> Snapshot {
+        Snapshot {
             state: self.world.capture(),
             blocks: self.blocks.iter().map(|b| Block { body: None, ..b.clone() }).collect(),
             cables: self.cables.iter().map(Cable::fresh).collect(),
@@ -404,13 +414,19 @@ impl Game {
             cars: self.cars.clone(),
             arrived: self.arrived,
             lost: self.lost,
-        });
-        if self.undo.len() > 15 {
-            self.undo.remove(0);
         }
     }
 
     fn undo(&mut self) {
+        if self.challenge {
+            self.say("Défi en cours : Réessayer pour reprendre la construction");
+            return;
+        }
+        // During a test, undo stops at the plan: the building steps come back with Réessayer.
+        if self.plan.is_some() && self.undo.len() <= self.plan_undo {
+            self.say("Rien à annuler dans ce test (Réessayer revient au départ)");
+            return;
+        }
         let Some(s) = self.undo.pop() else {
             self.say("Rien à annuler");
             return;
@@ -505,12 +521,14 @@ impl Game {
 
     fn set_running(&mut self, run: bool) {
         if run && !self.running {
-            self.snap_cells = self.world.snapshot();
-            self.snap_blocks = self.blocks.iter().map(|b| Block { body: None, ..b.clone() }).collect();
-            self.snap_cables = self.cables.iter().map(Cable::fresh).collect();
-            self.snap_members = self.members.iter().map(Member::fresh).collect();
-            self.snap_springs = self.springs.iter().map(Spring::fresh).collect();
-            self.snap_mech = self.mech.clone();
+            // Only the first start from the drawing board takes the plan: a pause and a new start
+            // go on with the same test.
+            if self.plan.is_none() {
+                self.plan = Some(self.capture());
+                self.plan_undo = self.undo.len();
+                self.arrived = 0;
+                self.lost = 0;
+            }
             if self.phys.is_none() {
                 self.build_physics();
             }
@@ -518,23 +536,54 @@ impl Game {
         self.running = run;
     }
 
+    /// Is the world being built (nothing has run since the last Réessayer)?
+    fn building(&self) -> bool {
+        self.plan.is_none()
+    }
+
+    /// The challenge: back to the plan if a test was going on, building locked, and go.
+    fn start_challenge(&mut self) {
+        if self.plan.is_some() {
+            self.reset();
+        }
+        self.set_running(true);
+        self.challenge = true;
+        self.shovel = None;
+        self.selection = None;
+        self.say("Défi lancé : la construction est verrouillée. Réessayer pour la reprendre.");
+    }
+
+    /// Réessayer: the world as it was built, the counters at zero, back to building.
     fn reset(&mut self) {
-        self.world.restore(&self.snap_cells);
+        let Some(plan) = self.plan.take() else {
+            self.say("Tu es déjà au départ");
+            return;
+        };
+        self.world.restore_state(&plan.state);
         self.sensors.clear_history(&self.world);
-        self.blocks = self.snap_blocks.clone();
-        self.cables = self.snap_cables.iter().map(Cable::fresh).collect();
-        self.members = self.snap_members.iter().map(Member::fresh).collect();
-        self.springs = self.snap_springs.iter().map(Spring::fresh).collect();
-        self.mech = self.snap_mech.clone();
+        self.blocks = plan.blocks;
+        self.cables = plan.cables;
+        self.members = plan.members;
+        self.springs = plan.springs;
+        self.mech = plan.mech;
+        self.cars = plan.cars;
+        self.undo.truncate(self.plan_undo);
         self.mech_draft = None;
         self.spring_draft = None;
         self.cable_from = None;
         self.cable_via.clear();
         self.member_from = None;
+        self.selection = None;
+        self.drag = None;
         self.phys = None;
-        self.cars.clear();
+        self.booms.clear();
+        self.bolts.clear();
+        self.thunder.clear();
         self.debris.clear();
         self.running = false;
+        self.challenge = false;
+        self.arrived = 0;
+        self.lost = 0;
         self.refresh_mask();
     }
 
@@ -545,7 +594,8 @@ impl Game {
         self.members.clear();
         self.springs.clear();
         self.mech = Mechanism::default();
-        self.snap_mech = Mechanism::default();
+        self.plan = None;
+        self.challenge = false;
         self.mech_draft = None;
         self.spring_draft = None;
         self.cable_from = None;
@@ -559,11 +609,6 @@ impl Game {
         self.arrived = 0;
         self.lost = 0;
         self.refresh_mask();
-        self.snap_cells = self.world.snapshot();
-        self.snap_blocks.clear();
-        self.snap_cables.clear();
-        self.snap_members.clear();
-        self.snap_springs.clear();
     }
 
     fn new_world(&mut self, biome: Biome) {
@@ -599,8 +644,14 @@ impl Game {
         self.set_running(true);
     }
 
+    /// Saves the plan, never a world half way through a test.
     fn save(&mut self) {
-        match save::save_slot(self.slot, &self.world, self.entry, self.exit, &self.blocks, &self.cables, &self.members, &self.springs, &self.mech) {
+        let bytes = match &self.plan {
+            Some(p) => save::encode_cells(self.world.biome, p.state.clock(), |x, y| World::raw_in(&p.state, x, y), self.entry, self.exit, &p.blocks, &p.cables, &p.members, &p.springs, &p.mech),
+            None => save::encode(&self.world, self.entry, self.exit, &self.blocks, &self.cables, &self.members, &self.springs, &self.mech),
+        };
+        match save::save_slot(self.slot, &bytes) {
+            Ok(()) if self.plan.is_some() => self.say(format!("Monde de départ sauvegardé (emplacement {})", self.slot + 1)),
             Ok(()) => self.say(format!("Monde sauvegardé (emplacement {})", self.slot + 1)),
             Err(e) => self.say(format!("Échec de la sauvegarde : {e}")),
         }
@@ -627,11 +678,6 @@ impl Game {
                     self.mech.follow_mounts(|a| anchor_world(a, blocks, members));
                 }
                 self.refresh_reel_anchors();
-                self.snap_mech = self.mech.clone();
-                self.snap_blocks = self.blocks.clone();
-                self.snap_cables = self.cables.iter().map(Cable::fresh).collect();
-                self.snap_members = self.members.iter().map(Member::fresh).collect();
-                self.snap_springs = self.springs.iter().map(Spring::fresh).collect();
                 self.refresh_mask();
                 self.say(format!("Monde chargé (emplacement {})", self.slot + 1));
             }
@@ -1227,7 +1273,7 @@ impl Game {
         if is_key_pressed(KeyCode::Escape) {
             self.on_escape();
         }
-        if (is_key_pressed(KeyCode::Delete) || is_key_pressed(KeyCode::Backspace)) && self.tool == Tool::Select {
+        if (is_key_pressed(KeyCode::Delete) || is_key_pressed(KeyCode::Backspace)) && self.tool == Tool::Select && !self.challenge {
             self.select_delete();
         }
         if is_key_pressed(KeyCode::M) {
@@ -1407,6 +1453,13 @@ impl Game {
         if click && self.kids.kid.as_ref().map_or(false, |k| k.contains(at)) {
             self.kids.ouch(kid::Hit::Click);
             self.last = None;
+            return;
+        }
+        // During the challenge the world is only watched: the probes still go down.
+        if self.challenge && self.tool != Tool::Sensor {
+            if click || rclick {
+                self.say("Défi en cours : la construction est verrouillée (Réessayer pour la reprendre)");
+            }
             return;
         }
 
@@ -2294,7 +2347,13 @@ impl Game {
         rrect(sp, 12.0, Color::new(0.0, 0.0, 0.0, 0.5));
         ui.text(&stats, sp.x + 11.0, sp.y + 17.0, 14, WHITE);
 
-        let (label, col) = if self.running { ("SIMULATION", RED) } else { ("CONSTRUCTION", BLUE) };
+        let (label, col) = match (self.building(), self.challenge, self.running) {
+            (true, _, _) => ("CONSTRUCTION", BLUE),
+            (false, true, true) => ("DÉFI", RED),
+            (false, true, false) => ("DÉFI (pause)", RED),
+            (false, false, true) => ("TEST", ORANGE),
+            (false, false, false) => ("TEST (pause)", ORANGE),
+        };
         let bw = ui.text_w(label, 14) + 32.0;
         let gap = 92.0;
         rrect(Rect::new(r.x + r.w - bw - 8.0 - gap, r.y + 8.0, bw, 26.0), 13.0, Color::new(0.0, 0.0, 0.0, 0.5));
@@ -2519,7 +2578,7 @@ impl Game {
         } else {
             self.idle += dt;
         }
-        let widths = [108.0f32, 38.0, 46.0, 38.0];
+        let widths = [118.0f32, 108.0, 86.0, 38.0, 46.0, 38.0];
         let gap = 6.0;
         let pad = 12.0;
         let total: f32 = widths.iter().sum::<f32>() + gap * (widths.len() as f32 - 1.0) + pad * 2.0;
@@ -2556,18 +2615,35 @@ impl Game {
             r
         };
         let r = place(0, &mut x);
-        let (label, icon) = if self.running { ("Pause", Icon::Pause) } else { ("Jouer", Icon::Play) };
+        if ui.button(r, "Réessayer", Icon::Reset, false, !self.building(), ACCENT) {
+            self.reset();
+        }
+        if ui.hover(r) {
+            self.hover_info = Some(("Réessayer (R)".to_string(), "Remet le monde tel que tu l'avais construit avant de lancer la simulation, remet les compteurs à zéro et revient à la construction. Ce qui a été fait pendant le test ou le défi est oublié.".to_string()));
+        }
+        let r = place(1, &mut x);
+        let (label, icon) = if self.running { ("Pause", Icon::Pause) } else if self.building() { ("Tester", Icon::Play) } else { ("Reprendre", Icon::Play) };
         if ui.button(r, label, icon, !self.running, true, GREEN) {
             let run = !self.running;
             self.set_running(run);
         }
-        let r = place(1, &mut x);
+        if ui.hover(r) {
+            self.hover_info = Some(("Tester (Espace)".to_string(), "Lance la simulation pour voir ce qui se passe. Tu peux encore bricoler pendant le test, même en pause, mais rien de tout ça n'est gardé : Réessayer revient au monde construit.".to_string()));
+        }
+        let r = place(2, &mut x);
+        if ui.button(r, "Défi", Icon::Flag, self.challenge, !self.challenge, RED) {
+            self.start_challenge();
+        }
+        if ui.hover(r) {
+            self.hover_info = Some(("Défi".to_string(), "Repart du monde construit, compteurs à zéro, et verrouille la construction : on lance les voitures et on regarde. Réessayer pour recommencer ou reprendre la construction.".to_string()));
+        }
+        let r = place(3, &mut x);
         if ui.button(r, "", Icon::Minus, false, self.speed > 1, ACCENT) {
             self.speed -= 1;
         }
-        let r = place(2, &mut x);
+        let r = place(4, &mut x);
         ui.text_center(&format!("x{}", self.speed), r.x + r.w / 2.0, r.y + h / 2.0 + 6.0, 17, TEXT);
-        let r = place(3, &mut x);
+        let r = place(5, &mut x);
         if ui.button(r, "", Icon::Plus, false, self.speed < 6, ACCENT) {
             self.speed += 1;
         }
@@ -2612,7 +2688,7 @@ impl Game {
         if ui.hover(Rect::new(18.0 + 2.0 * half, y, pin_w, 32.0)) {
             self.hover_info = Some(("Épingler la palette".to_string(), "Épinglée, la palette reste ouverte et l'image se place à côté. Sinon elle se cache et ressort quand la souris touche le bord gauche.".to_string()));
         }
-        if ui.button(Rect::new(6.0, y, half, 32.0), "Retour", Icon::Reset, false, true, ACCENT) {
+        if ui.button(Rect::new(6.0, y, half, 32.0), "Réessayer", Icon::Reset, false, !self.building(), ACCENT) {
             self.reset();
         }
         let label = if self.undo.is_empty() { "Annuler".to_string() } else { format!("Annuler {}", self.undo.len()) };
@@ -4088,6 +4164,10 @@ async fn main() {
         for _ in 0..arg("--advance").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) {
             game.world.step();
         }
+        // `--challenge`: the challenge is on (the HUD and the player show it).
+        if args.iter().any(|a| a == "--challenge") {
+            game.start_challenge();
+        }
     }
     // `--mouse x,y` pins the pointer for screenshots.
     let demo_mouse = arg("--mouse").and_then(|v| {
@@ -4301,6 +4381,62 @@ mod tests {
         g.launch_car();
         assert_eq!(g.cars.len(), 1);
         assert_eq!(g.selected_car, None, "a car only gets selected when the player clicks it");
+    }
+
+    #[test]
+    fn the_plan_is_taken_once_and_retry_brings_it_back() {
+        let mut g = mech_game();
+        g.world.set(200, 100, Mat::Sand);
+        g.checkpoint();
+        g.blocks.push(Block::new(BlockKind::Brick, vec2(300.0, 200.0), 0.0));
+        g.checkpoint();
+        assert!(g.building());
+        g.set_running(true);
+        for _ in 0..60 {
+            g.sim_step();
+        }
+        assert_ne!(g.world.raw(200, 100), Mat::Sand, "the sand fell during the test");
+        // A pause, a tinkering and a new start belong to the same test.
+        g.set_running(false);
+        g.world.set(10, 10, Mat::Stone);
+        g.set_running(true);
+        g.sim_step();
+        g.arrived = 3;
+        g.reset();
+        assert!(g.building() && !g.running);
+        assert_eq!(g.world.raw(200, 100), Mat::Sand, "back to the world as built");
+        assert_eq!(g.world.raw(10, 10), Mat::Empty, "the tinkering in the pause is not kept");
+        assert_eq!(g.blocks.len(), 1);
+        assert_eq!(g.arrived, 0);
+        assert_eq!(g.undo.len(), 2, "the building steps are still there to undo");
+        // Réessayer on the drawing board changes nothing.
+        g.world.set(20, 20, Mat::Stone);
+        g.reset();
+        assert_eq!(g.world.raw(20, 20), Mat::Stone);
+    }
+
+    #[test]
+    fn the_challenge_locks_building_and_saves_the_plan() {
+        let mut g = mech_game();
+        g.world.set(200, 100, Mat::Sand);
+        g.set_running(true);
+        g.world.set(30, 30, Mat::Stone);
+        g.start_challenge();
+        assert!(g.challenge && g.running);
+        assert_eq!(g.world.raw(30, 30), Mat::Empty, "the challenge starts from the plan, not the test");
+        g.checkpoint();
+        let n = g.undo.len();
+        g.undo();
+        assert_eq!(g.undo.len(), n, "no undo during the challenge");
+        for _ in 0..60 {
+            g.sim_step();
+        }
+        let plan = g.plan.as_ref().unwrap();
+        let bytes = save::encode_cells(g.world.biome, plan.state.clock(), |x, y| World::raw_in(&plan.state, x, y), None, None, &plan.blocks, &plan.cables, &plan.members, &plan.springs, &plan.mech);
+        let l = save::decode(&bytes).unwrap();
+        assert_eq!(l.mats[100 * W + 200], Mat::Sand, "the save holds the world as built");
+        g.reset();
+        assert!(!g.challenge && g.building());
     }
 
     fn click_with(g: &mut Game, tool: Tool, x: f32, y: f32) {

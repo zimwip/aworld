@@ -58,21 +58,26 @@ fn put_point(out: &mut Vec<u8>, p: Option<(i32, i32)>) {
 }
 
 pub fn encode(world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>, blocks: &[Block], cables: &[Cable], members: &[Member], springs: &[Spring], mech: &Mechanism) -> Vec<u8> {
+    encode_cells(world.biome, world.clock, |x, y| world.raw(x, y), entry, exit, blocks, cables, members, springs, mech)
+}
+
+/// Like `encode`, with the cells read through `raw` (a live world or a captured state).
+pub fn encode_cells(biome: Biome, clock: u32, raw: impl Fn(i32, i32) -> Mat, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>, blocks: &[Block], cables: &[Cable], members: &[Member], springs: &[Spring], mech: &Mechanism) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend(MAGIC);
     out.push(VERSION);
     out.extend((W as u16).to_le_bytes());
     out.extend((H as u16).to_le_bytes());
-    out.push(world.biome.id());
-    out.extend(world.clock.to_le_bytes());
+    out.push(biome.id());
+    out.extend(clock.to_le_bytes());
     put_point(&mut out, entry);
     put_point(&mut out, exit);
 
-    let mut run_mat = world.raw(0, 0);
+    let mut run_mat = raw(0, 0);
     let mut run = 0u32;
     for y in 0..H as i32 {
         for x in 0..W as i32 {
-            let m = world.raw(x, y);
+            let m = raw(x, y);
             if m == run_mat {
                 run += 1;
             } else {
@@ -643,9 +648,9 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn save_slot(slot: usize, world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>, blocks: &[Block], cables: &[Cable], members: &[Member], springs: &[Spring], mech: &Mechanism) -> io::Result<()> {
+pub fn save_slot(slot: usize, bytes: &[u8]) -> io::Result<()> {
     fs::create_dir_all(dir())?;
-    fs::write(slot_path(slot), encode(world, entry, exit, blocks, cables, members, springs, mech))
+    fs::write(slot_path(slot), bytes)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -654,9 +659,8 @@ pub fn load_slot(slot: usize) -> io::Result<Loaded> {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub fn save_slot(slot: usize, world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>, blocks: &[Block], cables: &[Cable], members: &[Member], springs: &[Spring], mech: &Mechanism) -> io::Result<()> {
-    let bytes = encode(world, entry, exit, blocks, cables, members, springs, mech);
-    MEMORY.with(|m| m.borrow_mut()[slot] = Some(bytes));
+pub fn save_slot(slot: usize, bytes: &[u8]) -> io::Result<()> {
+    MEMORY.with(|m| m.borrow_mut()[slot] = Some(bytes.to_vec()));
     Ok(())
 }
 
