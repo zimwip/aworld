@@ -108,14 +108,16 @@ pub enum Mat {
     /// Saltpetre (potassium nitrate): white crystals grown where leaves rot with wood ash. Ground
     /// with charcoal it makes black powder; water dissolves it.
     Saltpeter,
+    /// Steel that has melted: it sets again into steel (iron that melts sets into iron).
+    MoltenSteel,
 }
 
 impl Mat {
-    pub const ALL: [Mat; 37] = [
+    pub const ALL: [Mat; 38] = [
         Mat::Empty, Mat::Sand, Mat::Water, Mat::Fire, Mat::Steam, Mat::Iron, Mat::Wood, Mat::Stone,
         Mat::Brick, Mat::Rust, Mat::Ash, Mat::Ember, Mat::Lava, Mat::Ice, Mat::Gunpowder, Mat::Dirt, Mat::Grass,
         Mat::Leaf, Mat::Steel, Mat::Cloud, Mat::Seed, Mat::Sapling, Mat::Mud, Mat::Glass, Mat::Snow, Mat::Shard, Mat::DeadLeaf, Mat::Branch, Mat::Trunk, Mat::Hail, Mat::Oil, Mat::Smoke, Mat::Molten, Mat::Clay, Mat::Terracotta,
-        Mat::Charcoal, Mat::Saltpeter,
+        Mat::Charcoal, Mat::Saltpeter, Mat::MoltenSteel,
     ];
 
     pub fn from_u8(v: u8) -> Mat {
@@ -139,7 +141,7 @@ impl Mat {
         match self {
             Empty => Kind::Empty,
             Sand | Rust | Ash | Charcoal | Gunpowder | Saltpeter | Seed | Mud | Snow | Shard | DeadLeaf | Hail => Kind::Powder,
-            Water | Lava | Oil | Molten => Kind::Liquid,
+            Water | Lava | Oil | Molten | MoltenSteel => Kind::Liquid,
             Steam | Cloud | Smoke => Kind::Gas,
             Fire => Kind::Flame,
             Iron | Wood | Stone | Brick | Ember | Ice | Dirt | Grass | Leaf | Steel | Sapling | Glass | Branch | Trunk | Clay | Terracotta => Kind::Static,
@@ -159,6 +161,11 @@ impl Mat {
     /// Anything that burns like wood.
     pub fn is_wooden(self) -> bool {
         matches!(self, Mat::Wood | Mat::Trunk | Mat::Leaf | Mat::Branch)
+    }
+
+    /// Metal that has melted (iron or steel).
+    pub fn is_molten(self) -> bool {
+        matches!(self, Mat::Molten | Mat::MoltenSteel)
     }
 
     pub fn hot(self) -> bool {
@@ -187,12 +194,26 @@ pub fn pressure_rgb(atm: f32) -> (u8, u8, u8) {
     (m(c0[0], c1[0]), m(c0[1], c1[1]), m(c0[2], c1[2]))
 }
 
+/// Hot metal glows: dull red from about 500 °C, then orange, then yellow-white as it nears its
+/// melting point (the colours a smith reads off the iron in the forge).
+fn glow((r, g, b): (i32, i32, i32), t: f32) -> (i32, i32, i32, i32) {
+    let k = ((t - 480.0) / (thermal::METAL_MELT_C - 480.0)).clamp(0.0, 1.0);
+    if k == 0.0 {
+        return (r, g, b, 255);
+    }
+    // Red first, then the green comes in (orange, yellow), the blue last.
+    let (hr, hg, hb) = (255.0, 250.0 * k * k, 160.0 * k.powi(4));
+    let mix = (k * 2.0).min(1.0);
+    let m = |a: i32, h: f32| (a as f32 + (h - a as f32) * mix) as i32;
+    (m(r, hr), m(g, hg), m(b, hb), 255)
+}
+
 /// Weight of a cell of this material, relative to water.
 fn density(m: Mat) -> f32 {
     match m {
         Mat::Water | Mat::Oil => if m == Mat::Oil { 0.8 } else { 1.0 },
         Mat::Lava => 3.0,
-        Mat::Molten => 6.5,
+        Mat::Molten | Mat::MoltenSteel => 6.5,
         Mat::Stone => 2.7,
         Mat::Dirt | Mat::Sand | Mat::Mud => 1.6,
         Mat::Clay => 1.8,
@@ -725,11 +746,8 @@ impl World {
                 }
                 let i = Self::idx(x, y);
                 if self.cells[i].m == m {
-                    match m {
-                        Mat::Lava => self.temp[i] = thermal::LAVA_C,
-                        Mat::Ice | Mat::Snow => self.temp[i] = -15.0,
-                        Mat::Steam => self.temp[i] = 95.0,
-                        _ => {}
+                    if let Some(t) = thermal::paint_temp(m) {
+                        self.temp[i] = t;
                     }
                 }
             }
@@ -1087,6 +1105,11 @@ impl World {
                         Mat::Molten => {
                             if !self.seep(x, y) {
                                 self.step_hot_liquid(x, y, Mat::Iron);
+                            }
+                        }
+                        Mat::MoltenSteel => {
+                            if !self.seep(x, y) {
+                                self.step_hot_liquid(x, y, Mat::Steel);
                             }
                         }
                         Mat::Iron => self.step_iron(x, y, 300),
@@ -2657,7 +2680,7 @@ impl World {
             }
             Mat::Fire => (255, (80 + c.life as i32 * 3).min(235), 30, 235),
             Mat::Steam | Mat::Cloud => (0, 0, 0, 0),
-            Mat::Iron => (146 + v, 156 + v, 174 + v, 255),
+            Mat::Iron => glow((146 + v, 156 + v, 174 + v), t),
             Mat::Wood => (146 + v / 2 + (y as i32 % 3) * 6, 98 + v / 2, 54, 255),
             Mat::Stone => {
                 // Darker with depth, with soft mineral patches.
@@ -2709,10 +2732,10 @@ impl World {
             }
             Mat::Branch => (104 + v / 2, 70 + v / 2, 40, 255),
             Mat::Trunk => (112 + v / 2 + (x as i32 % 2) * 8, 78 + v / 2, 46, 255),
-            Mat::Steel => (112 + v, 134 + v, 168 + v, 255),
+            Mat::Steel => glow((112 + v, 134 + v, 168 + v), t),
             Mat::Snow => (244 + v / 3, 247 + v / 3, 252, 255),
             Mat::Hail => (210 + v, 236 + v, 252, 255),
-            Mat::Molten => (255, 196 + flick * 2 + v, 90 + flick, 255),
+            Mat::Molten | Mat::MoltenSteel => (255, 196 + flick * 2 + v, 90 + flick, 255),
             Mat::Oil => {
                 // Almost black with a rainbow sheen where it catches the light.
                 let sheen = if (x / 3 + y / 2) % 7 == 0 { 26 } else { 0 };
@@ -3486,7 +3509,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_melts_only_in_fresh_lava_and_sets_again() {
+    fn metal_melts_in_fresh_lava_but_not_at_700() {
         let mut w = World::new_static();
         for x in 100..140 {
             w.set(x, 320, Mat::Stone);
@@ -4050,6 +4073,98 @@ mod science {
             w.step();
         }
         assert!(count(&w, Mat::Lava) > 0, "rock never melted");
+    }
+
+    #[test]
+    fn a_charcoal_forge_melts_metal() {
+        // A terracotta crucible full of charcoal round a small iron ingot, lit from above.
+        let mut w = World::new_static();
+        for x in 96..124 {
+            for y in 300..303 {
+                w.set(x, y, Mat::Terracotta);
+            }
+        }
+        for y in 284..300 {
+            for x in (96..100).chain(120..124) {
+                w.set(x, y, Mat::Terracotta);
+            }
+        }
+        for x in 100..120 {
+            for y in 288..300 {
+                w.set(x, y, Mat::Charcoal);
+            }
+        }
+        for x in 108..112 {
+            for y in 293..297 {
+                w.set(x, y, Mat::Iron);
+            }
+        }
+        let mut melted = false;
+        for k in 0..6000 {
+            if k < 1500 {
+                for x in 100..120 {
+                    if let Some(y) = (280..300).find(|&y| w.raw(x, y + 1) != Mat::Empty) {
+                        if w.raw(x, y) == Mat::Empty {
+                            w.set(x, y, Mat::Fire);
+                        }
+                    }
+                }
+            }
+            w.step();
+            melted |= w.cells.iter().any(|c| c.m.is_molten());
+            if melted {
+                break;
+            }
+        }
+        assert!(melted, "glowing charcoal heaped round the metal melts it");
+    }
+
+    #[test]
+    fn molten_steel_sets_back_into_steel_and_molten_iron_into_iron() {
+        for (solid, liquid) in [(Mat::Steel, Mat::MoltenSteel), (Mat::Iron, Mat::Molten)] {
+            let mut w = World::new_static();
+            floor(&mut w, 300, 90, 130);
+            for x in 100..120 {
+                for y in 296..300 {
+                    w.set(x, y, solid);
+                    w.temp[y as usize * W + x as usize] = thermal::METAL_MELT_C + 150.0;
+                }
+            }
+            let mut seen = false;
+            for _ in 0..400 {
+                w.step();
+                seen |= count(&w, liquid) > 0;
+            }
+            assert!(seen, "{solid:?} above its melting point turns {liquid:?}");
+            // Cooled down, it sets again into what it was.
+            for k in 0..W * H {
+                if w.cells[k].m == liquid {
+                    w.temp[k] = 300.0;
+                }
+            }
+            for _ in 0..400 {
+                w.step();
+            }
+            assert_eq!(count(&w, liquid), 0, "{liquid:?} sets once cold");
+            let other = if solid == Mat::Steel { Mat::Iron } else { Mat::Steel };
+            assert_eq!(count(&w, other), 0, "{liquid:?} must not set into {other:?}");
+            assert!(count(&w, solid) > 60);
+        }
+    }
+
+    #[test]
+    fn painted_molten_metal_starts_hot_enough_to_flow() {
+        let mut w = World::new_static();
+        floor(&mut w, 300, 60, 200);
+        w.paint(130, 280, 4, Mat::Molten);
+        let cells: Vec<usize> = (0..W * H).filter(|&k| w.cells[k].m == Mat::Molten).collect();
+        assert!(!cells.is_empty());
+        assert!(cells.iter().all(|&k| w.temp[k] > thermal::METAL_MELT_C), "poured molten metal is above its melting point");
+        for _ in 0..300 {
+            w.step();
+        }
+        assert!(count(&w, Mat::Molten) > 0, "it does not set at once");
+        assert!((0..W * H).any(|k| w.cells[k].m == Mat::Molten && k / W == 299), "it ran down onto the floor");
     }
 
     #[test]
