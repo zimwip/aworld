@@ -200,7 +200,10 @@ et faire des loopings et des culbutes. S'il touche quoi que ce soit (sol, eau, b
 
 - Onglet Monde, section Vent : trois curseurs. *Force max* plafonne la vitesse du vent, *Virages* règle la fréquence des
   changements de direction (jamais … x3), *Calme-venteux* passe d'un temps calme (petite brise) à un temps venteux.
-- Cliquer sur la saison dans la pastille en haut à gauche de la simulation passe à la saison suivante.
+- Cliquer sur la saison dans la pastille en haut à gauche de la simulation passe à la saison suivante. Un clic ailleurs
+  sur la pastille ouvre le **bilan d'énergie** (un second clic le referme) : soleil entrant, sortie vers l'espace, chaleur
+  des feux, courbe de la chaleur du monde sur 24 h, et trois curseurs (*Soleil*, *Sortie vers l'espace*, *Nuages et fumée
+  gardent*) avec un bouton *Revenir au neutre*.
 - La palette de gauche se cache comme celle de droite : elle sort quand la souris va au bord gauche. La petite poignée en
   haut la garde dehors (et l'image se place à côté).
 - Les feuillages laissent passer l'eau : elle goutte à travers les arbres.
@@ -265,6 +268,24 @@ Après environ 15 s fluides, un niveau est rétabli (avec un délai de 5 minutes
 ## Zones endormies
 
 `src/world/sleep.rs` découpe le monde en zones de 32×32 cellules. Une zone où rien n'a bougé au dernier pas, et où aucune cellule ne peut changer d'elle-même (roche, sable posé, terre sèche, eau au repos sous de l'eau…), dort : la boucle des cellules la saute. Tout changement de cellule (`set`, `swap`, une pièce qui tombe, un bloc rigide qui bouge) réveille sa zone, et la voisine si la cellule est au bord. La chaleur, le vent et la pression continuent partout. Sur la campagne de `cost_of_a_tick`, une trentaine de zones sur 510 restent éveillées ; la boucle des cellules passe d'environ 0,7 ms à 0,1 ms par pas (mer : 1,8 → 0,8 ms).
+
+## Bilan d'énergie : le soleil entre, l'espace reprend
+
+Le monde est fermé sur les côtés et au fond, ouvert seulement par le haut (`thermal.rs`, `Climate`).
+
+- Le soleil arrive en rayons parallèles depuis sa position : bas et de gauche le matin, d'en haut à midi, de droite le
+  soir. Le versant qui lui fait face chauffe, l'autre reste à l'ombre. Les nuages en absorbent une partie, la fumée tout,
+  le verre le laisse passer.
+- Jour et nuit, la première surface de chaque colonne rayonne vers l'espace l'excès de chaleur qu'elle a sur l'air ; sous
+  les nuages et la fumée, moins (effet de serre) : nuits claires froides, nuits nuageuses douces.
+- L'air libre suit toujours le cycle habituel du jour et des saisons, mais ce qu'il prend aux cellules (ou leur donne) va
+  au reste du ciel, une réserve (`sky_dev`, en °C au-dessus du cycle habituel) qui rend son surplus à l'espace en
+  quelques heures. Un grand feu réchauffe donc tout le ciel d'un ou deux degrés, puis tout revient.
+- L'air enfermé dans une boîte sans fissure ne suit plus le ciel : il se mélange dans sa boîte et ne perd sa chaleur
+  qu'à travers les parois. Une boîte de verre au soleil devient une serre.
+- Sans rien faire, le cycle est neutre : sur trois jours de jeu, la réserve du ciel reste à moins de 1 °C du cycle
+  habituel. Le test ignoré `energy_probe` imprime le bilan toutes les trois heures (`BONFIRE=1` pour un grand feu,
+  `FIRE=1` pour une nappe de lave).
 
 ## Chaleur latente : les paliers
 
