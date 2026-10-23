@@ -59,7 +59,7 @@ impl Game {
         if let Some(i) = block_at(&self.blocks, at) {
             return Some(Sel::Block(self.blocks[i].uid));
         }
-        if let Some(m) = self.members.iter().find(|m| m.distance_to(at) < m.mat.thickness() / 2.0 + 3.0) {
+        if let Some(m) = self.members.iter().find(|m| m.distance_to(at) < m.thickness() / 2.0 + 3.0) {
             return Some(Sel::Member(m.uid));
         }
         if let Some((i, _)) = self.rail_at_pub(at) {

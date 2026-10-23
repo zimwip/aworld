@@ -24,7 +24,7 @@ mod whale;
 mod wolves;
 mod world;
 
-use blocks::{anchor_world, block_at, magnet, node_at, placement_ok, stamp_all, Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, Physics, Spring, SpringKind, MEMBER_MAX_LEN, SPRING_MAX_LEN};
+use blocks::{anchor_world, block_at, magnet, node_at, placement_ok, stamp_all, Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, MemberRole, Physics, Spring, SpringKind, MEMBER_MAX_LEN, SPRING_MAX_LEN};
 use car::{collide_cars, Car, Fate, ModelKind, Tuning};
 use macroquad::prelude::*;
 use render::{RenderMode, cable_preview, draw_block, draw_block_shape, draw_guides, draw_booms, draw_cable, draw_car, draw_flag, draw_member, draw_spring, draw_spring_between, Boom, LiveBolt, Renderer, View, BOLT_LIFE};
@@ -80,7 +80,8 @@ enum Tool {
     Block(BlockKind),
     Cable(CableMat),
     Spring(SpringKind),
-    Beam(MemberMat),
+    /// A rod: its material, and whether it is deck (cars ride it) or girder (they pass through).
+    Beam(MemberMat, MemberRole),
     Gear(GearSize),
     Motor,
     Axle,
@@ -260,6 +261,10 @@ struct Game {
     /// whose states are shown under its button (the little arrow).
     matter_state: [usize; MATTERS.len()],
     matter_menu: Option<usize>,
+    /// Deck or girder, picked per rod material from the little arrow of its button.
+    beam_role: [MemberRole; MemberMat::ALL.len()],
+    /// The rod material whose deck / girder strip is open.
+    beam_menu: Option<usize>,
     /// The views on the right edge, a side menu like the palette.
     views: Drawer,
     /// The motor's remote control (or the car settings), a side menu of its own under the views:
@@ -375,6 +380,8 @@ impl Game {
             only_target: Mat::Empty,
             matter_state: MATTERS.map(|m| m.default),
             matter_menu: None,
+            beam_role: [MemberRole::Deck; MemberMat::ALL.len()],
+            beam_menu: None,
             views: Drawer::new(false),
             remote_menu: Drawer::new(false),
             camera: camera::Camera::default(),
@@ -1090,7 +1097,7 @@ impl Game {
         (Anchor::Free(p), p)
     }
 
-    fn beam_click(&mut self, mat: MemberMat, at: Vec2) {
+    fn beam_click(&mut self, mat: MemberMat, role: MemberRole, at: Vec2) {
         match self.member_from.take() {
             None => match node_at(&self.world, &self.blocks, &self.members, at) {
                 Some(a) => {
@@ -1112,7 +1119,7 @@ impl Game {
                     self.member_from = Some((a, p0));
                     return;
                 }
-                let units = mat.cost(len);
+                let units = mat.cost(len, role);
                 let free = self.free_now();
                 if !free {
                     self.census = self.world.census();
@@ -1127,7 +1134,7 @@ impl Game {
                 if !free {
                     self.world.consume(mat.cost_from(), units, (p0.x as i32, p0.y as i32));
                 }
-                self.members.push(Member::new(mat, a, b, p0, p1));
+                self.members.push(Member::new(mat, a, b, p0, p1).with_role(role));
                 let idx = self.members.len() - 1;
                 if let Some(p) = &mut self.phys {
                     p.add_member(&self.blocks, &mut self.members, idx);
@@ -1435,7 +1442,7 @@ impl Game {
                 if self.mech_erase(at) || self.fluid_erase(at) {
                     return;
                 }
-                if let Some(i) = self.members.iter().position(|m| m.distance_to(at) < m.mat.thickness() / 2.0 + 3.0) {
+                if let Some(i) = self.members.iter().position(|m| m.distance_to(at) < m.thickness() / 2.0 + 3.0) {
                     self.remove_member_at(i);
                     return;
                 }
@@ -1484,7 +1491,7 @@ impl Game {
             Tool::Block(k) if click => self.place_block(k, at),
             Tool::Cable(m) if click => self.cable_click(m, at),
             Tool::Spring(k) if click => self.spring_click(k, at),
-            Tool::Beam(m) if click => self.beam_click(m, at),
+            Tool::Beam(m, role) if click => self.beam_click(m, role, at),
             Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Screw | Tool::Winch | Tool::Pulley if click => self.mech_click(at),
             Tool::Pipe | Tool::Valve | Tool::Pump if click => self.fluid_click(at),
             Tool::Shovel => self.shovel_mouse(at, click, left),
@@ -1554,7 +1561,7 @@ impl Game {
         } else {
             self.fast_frames = 0;
         }
-        let building = matches!(self.tool, Tool::Block(_) | Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(_) | Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Screw | Tool::Winch | Tool::Pulley | Tool::Pipe | Tool::Valve | Tool::Pump);
+        let building = matches!(self.tool, Tool::Block(_) | Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(..) | Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Screw | Tool::Winch | Tool::Pulley | Tool::Pipe | Tool::Valve | Tool::Pump);
         if (self.tab == Tab::Blocks || building) && (self.time * 4.0) as u32 != ((self.time - dt) * 4.0) as u32 {
             self.census = self.world.census();
         }
@@ -2121,7 +2128,7 @@ impl Game {
                 }
             }
         }
-        if let (Tool::Beam(mat), Some((a, p0))) = (self.tool, self.member_from) {
+        if let (Tool::Beam(mat, role), Some((a, p0))) = (self.tool, self.member_from) {
             let at = if inside { view.to_world(ui.mouse) } else { p0 };
             let (_, p1) = self.beam_end(p0, at, &a);
             let len = (p1 - p0).length();
@@ -2129,13 +2136,13 @@ impl Game {
             let ok = len >= 12.0;
             let col = if ok { Color::from_rgba(cr, cg, cb, 255) } else { Color::new(1.0, 0.3, 0.3, 1.0) };
             let (sa, sb) = (view.to_screen(p0), view.to_screen(p1));
-            draw_line(sa.x, sa.y, sb.x, sb.y, mat.thickness() * view.s, Color::new(col.r, col.g, col.b, 0.6));
+            draw_line(sa.x, sa.y, sb.x, sb.y, role.thickness(mat) * view.s, Color::new(col.r, col.g, col.b, 0.6));
             draw_circle(sa.x, sa.y, 5.0, WHITE);
             draw_circle(sb.x, sb.y, 5.0, WHITE);
             let label = format!("{:.0} / {:.0}", len, MEMBER_MAX_LEN);
             ui.text(&label, (sa.x + sb.x) / 2.0 + 8.0, (sa.y + sb.y) / 2.0 - 8.0, 16, WHITE);
         }
-        if inside && matches!(self.tool, Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(_)) {
+        if inside && matches!(self.tool, Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(..)) {
             self.draw_anchor_hint(ui, view, view.to_world(ui.mouse));
         }
         if inside {
@@ -2176,7 +2183,7 @@ impl Game {
                         draw_line(ui.mouse.x + vault * a0.cos(), ui.mouse.y + vault * a0.sin(), ui.mouse.x + vault * a1.cos(), ui.mouse.y + vault * a1.sin(), 2.5, brick);
                     }
                 }
-                Tool::Beam(_) => {
+                Tool::Beam(..) => {
                     // Green: it will be pinned there. Orange: no attachment, the rod will fall.
                     if self.snap_point(at).is_none() {
                         draw_circle_lines(ui.mouse.x, ui.mouse.y, 5.0 * view.s, 2.0, ACCENT);
@@ -2833,9 +2840,9 @@ impl Game {
                 let len = self.spring_draft.as_ref().map_or(60.0, |d| d.rest.map_or_else(|| drafted(d.pa).min(SPRING_MAX_LEN), |r| r.1));
                 (k.cost_from(), k.cost(len))
             }
-            Tool::Beam(m) => {
+            Tool::Beam(m, role) => {
                 let len = self.member_from.as_ref().map_or(60.0, |f| drafted(f.1).min(MEMBER_MAX_LEN));
-                (m.cost_from(), m.cost(len))
+                (m.cost_from(), m.cost(len, role))
             }
             Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Screw | Tool::Winch | Tool::Pulley => self.mech_cost(at)?,
             Tool::Pipe | Tool::Valve | Tool::Pump => self.fluid_cost(at)?,
@@ -2868,6 +2875,15 @@ impl Game {
     fn panel_blocks(&mut self, ui: &mut Ui, top: f32) {
         let angle = self.rot90 as f32 * std::f32::consts::FRAC_PI_2;
         let free = self.free_now();
+        // The deck / girder strip under a rod button is drawn over what is below it, which must
+        // not take its clicks.
+        let rods = BlockKind::PLACEABLE.len() + CableMat::ALL.len() + SpringKind::ALL.len();
+        let menu = self.beam_menu.map(|k| {
+            let r = Self::tile_rect(rods + k, 3, top, 54.0);
+            (k, Rect::new(6.0, r.y + r.h + 2.0, PANEL_W - 12.0, 50.0))
+        });
+        let menu_hover = menu.is_some_and(|(_, mr)| ui.hover(mr));
+        let pressed = ui.pressed;
         for (i, k) in BlockKind::PLACEABLE.iter().enumerate() {
             let r = Self::tile_rect(i, 3, top, 54.0);
             let spec = k.spec();
@@ -2940,48 +2956,110 @@ impl Game {
             }
         }
         let i = i + SpringKind::ALL.len();
-        // Free beams: pinned at both ends, like a bridge-building game.
+        // Free beams: pinned at both ends, like a bridge-building game. The little arrow of each
+        // button chooses deck (the cars ride it) or girder (structure the cars pass through).
+        ui.pressed = pressed && !menu_hover;
+        let mut arrow_hit = false;
         for (k, mat) in MemberMat::ALL.iter().enumerate() {
             let r = Self::tile_rect(i + k, 3, top, 54.0);
-            let (units, from) = (mat.cost(60.0), mat.cost_from());
-            if ui.hover(r) {
+            let role = self.beam_role[k];
+            let arrow = Rect::new(r.x + r.w - 25.0, r.y + 4.0, 21.0, 18.0);
+            let on_arrow = ui.hover(arrow);
+            let (units, from) = (mat.cost(60.0, role), mat.cost_from());
+            if ui.hover(r) && !menu_hover {
+                let what = match role {
+                    MemberRole::Deck => "Tablier : les voitures roulent dessus.",
+                    MemberRole::Girder => "Poutre : la structure qui porte, les voitures passent à travers (comme les arbres).",
+                };
                 self.hover_info = Some((
-                    format!("Tige {}", mat.name().to_lowercase()),
+                    format!("{} {}", role.name(), mat.name().to_lowercase()),
                     format!(
-                        "Un clic fixe un bout (sol, bloc ou nœud ; sans attache la tige tombe), tire, un second clic pour l'autre bout. Longueur max {:.0}. 60 de long coûte {units} de {}.",
+                        "{what} Petite flèche du bouton : tablier ou poutre. Un clic fixe un bout (sol, bloc ou nœud ; sans attache elle tombe), tire, un second clic pour l'autre bout. Longueur max {:.0}. 60 de long coûte {units} de {}.",
                         MEMBER_MAX_LEN,
                         info(from[0]).name.to_lowercase()
                     ),
                 ));
             }
-            let (cr, cg, cb) = mat.color();
-            let label = format!("Tige {}", mat.name().to_lowercase());
-            let short = !free && self.stock(mat.cost_from()) < mat.cost(60.0);
-            if ui.tile(r, &label, self.tool == Tool::Beam(*mat), |s| {
-                let (a, b) = (vec2(s.x + 10.0, s.y + s.h - 6.0), vec2(s.x + s.w - 10.0, s.y + 6.0));
-                draw_line(a.x, a.y, b.x, b.y, 6.0, Color::from_rgba(cr, cg, cb, 255));
-                for p in [a, b] {
-                    draw_circle(p.x, p.y, 4.5, Color::from_rgba(226, 228, 236, 255));
-                    draw_circle(p.x, p.y, 2.0, Color::from_rgba(60, 64, 78, 255));
+            let label = format!("{} {}", role.name(), mat.name().to_lowercase());
+            let short = !free && self.stock(from) < units;
+            let clicked = ui.tile(r, &label, self.tool == Tool::Beam(*mat, role), |s| draw_rod_icon(s, *mat, role));
+            let open = self.beam_menu == Some(k);
+            rrect(arrow, 5.0, if open { ACCENT } else if on_arrow { Color::new(0.0, 0.0, 0.0, 0.7) } else { Color::new(0.0, 0.0, 0.0, 0.45) });
+            let (c, h) = (vec2(arrow.x + arrow.w / 2.0, arrow.y + arrow.h / 2.0), 4.5);
+            let fg = if open { BG } else { TEXT };
+            if open {
+                draw_triangle(vec2(c.x - h, c.y + h * 0.5), vec2(c.x + h, c.y + h * 0.5), vec2(c.x, c.y - h * 0.6), fg);
+            } else {
+                draw_triangle(vec2(c.x - h, c.y - h * 0.5), vec2(c.x + h, c.y - h * 0.5), vec2(c.x, c.y + h * 0.6), fg);
+            }
+            if clicked {
+                if on_arrow {
+                    arrow_hit = true;
+                    self.beam_menu = if open { None } else { Some(k) };
+                } else {
+                    self.tool = Tool::Beam(*mat, role);
                 }
-            }) {
-                self.tool = Tool::Beam(*mat);
             }
             if short {
                 Self::mark_missing(r);
             }
         }
 
-        // Cable elasticity.
+        // Cable elasticity (the strip of a rod button may lie over it).
         let rows_used = (i + MemberMat::ALL.len() + 2) / 3;
         let sy = top + rows_used as f32 * 60.0 + 2.0;
+        ui.pressed = pressed && !menu_hover;
         ui.text("Élasticité câble", 10.0, sy + 11.0, 13, DIM);
-        ui.slider(Rect::new(110.0, sy, PANEL_W - 150.0, 18.0), &mut self.cable_soft, 0.4, 3.0, ACCENT);
+        let mut soft = self.cable_soft;
+        ui.slider(Rect::new(110.0, sy, PANEL_W - 150.0, 18.0), &mut soft, 0.4, 3.0, ACCENT);
+        if !menu_hover {
+            self.cable_soft = soft;
+        }
         ui.text(&format!("x{:.1}", self.cable_soft), PANEL_W - 34.0, sy + 11.0, 13, TEXT);
-
-        // Materials: a block uses up what it is made of from the screen.
         let y0 = sy + 26.0;
         self.unlimited_toggles(ui, y0);
+        ui.pressed = pressed;
+
+        // The deck / girder strip of the rod button whose arrow was clicked.
+        if let Some((k, mr)) = menu {
+            let mat = MemberMat::ALL[k];
+            rrect(Rect::new(mr.x, mr.y + 2.0, mr.w, mr.h), 10.0, Color::new(0.0, 0.0, 0.0, 0.45));
+            rrect(mr, 10.0, PANEL);
+            ui::rrect_lines(mr, 10.0, 2.0, ACCENT);
+            let n = MemberRole::ALL.len();
+            let w = (mr.w - 6.0 * (n as f32 + 1.0)) / n as f32;
+            for (j, role) in MemberRole::ALL.iter().enumerate() {
+                let cr = Rect::new(mr.x + 6.0 + j as f32 * (w + 6.0), mr.y + 6.0, w, mr.h - 12.0);
+                let hot = ui.hover(cr);
+                let chosen = self.beam_role[k] == *role;
+                rrect(cr, 7.0, if hot { TILE_HOT } else { TILE });
+                if chosen {
+                    ui::rrect_lines(cr, 7.0, 2.0, ACCENT);
+                }
+                draw_rod_icon(Rect::new(cr.x + cr.w / 2.0 - 30.0, cr.y + 3.0, 60.0, 20.0), mat, *role);
+                ui.text_center(role.name(), cr.x + cr.w / 2.0, cr.y + cr.h - 6.0, 14, if chosen { ACCENT } else { TEXT });
+                if hot {
+                    self.hover_info = Some((
+                        format!("{} {}", role.name(), mat.name().to_lowercase()),
+                        match role {
+                            MemberRole::Deck => "Le tablier : la chaussée du pont, épaisse, avec ses croisillons. Les voitures roulent dessus et pèsent sur lui.".into(),
+                            MemberRole::Girder => "La poutre : la charpente qui tient le tablier (diagonales, poteaux, arcs). Elle porte les efforts, mais les voitures la traversent, comme les arbres.".into(),
+                        },
+                    ));
+                    if ui.pressed {
+                        self.beam_role[k] = *role;
+                        self.tool = Tool::Beam(mat, *role);
+                        self.beam_menu = None;
+                    }
+                }
+            }
+            // A click anywhere else closes the strip.
+            if ui.pressed && !arrow_hit && !ui.hover(mr) {
+                self.beam_menu = None;
+            }
+        }
+
+        // Materials: a block uses up what it is made of from the screen.
         let rows: [(&str, &[Mat]); 6] = [
             ("Terre", &[Mat::Dirt]),
             ("Bois", &[Mat::Wood, Mat::Trunk, Mat::Branch]),
@@ -3945,6 +4023,43 @@ fn draw_tree_icon(s: Rect) {
     draw_circle(cx, s.y + s.h * 0.38, s.h * 0.08, mat_color(Mat::Branch));
 }
 
+/// A rod for the palette: a deck lies flat, thick, with cross bracing; a girder is a plain bar
+/// on the slant.
+fn draw_rod_icon(s: Rect, mat: MemberMat, role: MemberRole) {
+    let (cr, cg, cb) = mat.color();
+    let col = Color::from_rgba(cr, cg, cb, 255);
+    let pin = |p: Vec2| {
+        draw_circle(p.x, p.y, 4.5, Color::from_rgba(226, 228, 236, 255));
+        draw_circle(p.x, p.y, 2.0, Color::from_rgba(60, 64, 78, 255));
+    };
+    match role {
+        MemberRole::Deck => {
+            let (x0, x1, y) = (s.x + 6.0, s.x + s.w - 6.0, s.y + s.h * 0.5);
+            let h = (s.h * 0.5).clamp(6.0, 12.0);
+            draw_rectangle(x0, y - h / 2.0, x1 - x0, h, Color::new(col.r * 0.55, col.g * 0.55, col.b * 0.55, 1.0));
+            draw_line(x0, y - h / 2.0 + 1.0, x1, y - h / 2.0 + 1.0, 2.0, col);
+            draw_line(x0, y + h / 2.0 - 1.0, x1, y + h / 2.0 - 1.0, 2.0, col);
+            let brace = Color::new(col.r * 0.95, col.g * 0.95, col.b * 0.95, 0.9);
+            let n = (((x1 - x0) / h).round() as i32).max(2);
+            let w = (x1 - x0) / n as f32;
+            for k in 0..n {
+                let xa = x0 + k as f32 * w;
+                draw_line(xa, y - h / 2.0 + 1.0, xa + w, y + h / 2.0 - 1.0, 1.0, brace);
+                draw_line(xa, y + h / 2.0 - 1.0, xa + w, y - h / 2.0 + 1.0, 1.0, brace);
+            }
+            draw_line(x0, y - h / 2.0, x1, y - h / 2.0, 1.2, Color::new(1.0, 0.95, 0.6, 0.9));
+            pin(vec2(x0, y));
+            pin(vec2(x1, y));
+        }
+        MemberRole::Girder => {
+            let (a, b) = (vec2(s.x + 10.0, s.y + s.h - 6.0), vec2(s.x + s.w - 10.0, s.y + 6.0));
+            draw_line(a.x, a.y, b.x, b.y, 5.0, col);
+            pin(a);
+            pin(b);
+        }
+    }
+}
+
 fn draw_car_icon(c: Vec2, col: Color, s: f32) {
     rrect(Rect::new(c.x - 17.0 * s, c.y - 2.0 * s, 34.0 * s, 10.0 * s), 3.0, col);
     rrect(Rect::new(c.x - 11.0 * s, c.y - 10.0 * s, 18.0 * s, 10.0 * s), 3.0, col);
@@ -4060,6 +4175,12 @@ async fn main() {
             game.tab = Tab::Matter;
             game.matter_menu = Some(i);
             game.tool = matter_tool(MATTERS[i].states[MATTERS[i].default]);
+        }
+        // `--rods N` opens the deck / girder strip of the palette's rod N (0 is wood).
+        if let Some(k) = arg("--rods").and_then(|v| v.parse::<usize>().ok()).filter(|&k| k < MemberMat::ALL.len()) {
+            game.tab = Tab::Blocks;
+            game.beam_menu = Some(k);
+            game.tool = Tool::Beam(MemberMat::ALL[k], game.beam_role[k]);
         }
         if args.iter().any(|a| a == "--tunnel") {
             demo_tunnel(&mut game);
@@ -5104,7 +5225,7 @@ mod tests {
         g.unlimited = false;
         g.census = g.world.census();
         let at = vec2(300.0, 200.0);
-        for tool in [Tool::Block(BlockKind::Wheel), Tool::Cable(CableMat::Steel), Tool::Spring(SpringKind::Coil), Tool::Beam(MemberMat::Iron)] {
+        for tool in [Tool::Block(BlockKind::Wheel), Tool::Cable(CableMat::Steel), Tool::Spring(SpringKind::Coil), Tool::Beam(MemberMat::Iron, MemberRole::Deck)] {
             g.tool = tool;
             let m = g.missing_for_tool(at);
             assert!(m.is_some(), "an empty world has nothing to build with ({:?})", m);

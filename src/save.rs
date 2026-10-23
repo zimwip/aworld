@@ -2,7 +2,7 @@
 
 use crate::pipes::{Driver, Pipe, Valve};
 use crate::mech::{Axle, End, Gear, GearSize, Mechanism, Motor, Pivot, Rod, Slider};
-use crate::blocks::{Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, Spring, SpringKind};
+use crate::blocks::{Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, MemberRole, Spring, SpringKind};
 use crate::world::{Biome, Mat, World, DAY_STEPS, H, W};
 use macroquad::prelude::{vec2, Vec2};
 #[cfg(not(target_arch = "wasm32"))]
@@ -11,7 +11,7 @@ use std::io::{self, Error, ErrorKind};
 use std::path::PathBuf;
 
 const MAGIC: &[u8; 4] = b"AWLD";
-const VERSION: u8 = 8;
+const VERSION: u8 = 9;
 
 pub struct Loaded {
     pub mats: Vec<Mat>,
@@ -152,6 +152,7 @@ pub fn encode(world: &World, entry: Option<(i32, i32)>, exit: Option<(i32, i32)>
     out.extend((members.len() as u16).to_le_bytes());
     for m in members {
         out.push(m.mat.id());
+        out.push(m.role.id());
         put_anchor(&mut out, &m.a);
         put_anchor(&mut out, &m.b);
         for v in [m.p0.x, m.p0.y, m.p1.x, m.p1.y] {
@@ -409,9 +410,15 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
         let count = r.u16()?;
         for _ in 0..count {
             let mat = MemberMat::from_id(r.u8()?);
+            // Before version 9 a rod's role followed its slope.
+            let role = if version >= 9 { Some(MemberRole::from_id(r.u8()?)) } else { None };
             let (a, b) = (anchor(&mut r)?, anchor(&mut r)?);
             let (p0, p1) = (vec2(r.f32()?, r.f32()?), vec2(r.f32()?, r.f32()?));
-            members.push(Member::new(mat, Anchor::Free(p0), Anchor::Free(p1), p0, p1));
+            let m = Member::new(mat, Anchor::Free(p0), Anchor::Free(p1), p0, p1);
+            members.push(match role {
+                Some(role) => m.with_role(role),
+                None => m,
+            });
             pending.push((a, b));
         }
     }
@@ -682,7 +689,7 @@ mod tests {
         let cables = vec![Cable::new(Anchor::Ground(vec2(5.0, 6.0)), Anchor::Block { uid, local: vec2(1.0, 2.0) }, 90.0).made_of(CableMat::Steel, 1.7)];
         w.set_season(crate::world::Season::Autumn);
         let m1 = Member::new(MemberMat::Iron, Anchor::Ground(vec2(10.0, 10.0)), Anchor::Free(vec2(60.0, 10.0)), vec2(10.0, 10.0), vec2(60.0, 10.0));
-        let m2 = Member::new(MemberMat::Wood, Anchor::End { uid: m1.uid, end: 1 }, Anchor::Free(vec2(90.0, 40.0)), vec2(60.0, 10.0), vec2(90.0, 40.0));
+        let m2 = Member::new(MemberMat::Wood, Anchor::End { uid: m1.uid, end: 1 }, Anchor::Free(vec2(90.0, 40.0)), vec2(60.0, 10.0), vec2(90.0, 40.0)).with_role(MemberRole::Deck);
         let members = vec![m1, m2];
         let sp = Spring::new(SpringKind::Elastic, Anchor::Ground(vec2(3.0, 4.0)), Anchor::End { uid: members[1].uid, end: 0 }, 40.0, 1.5, vec2(3.0, 4.0), vec2(9.0, 9.0));
         let bytes = encode(&w, Some(e), Some(x), &blocks, &cables, &members, &[sp], &Mechanism::default());
@@ -700,6 +707,8 @@ mod tests {
         assert!((l.springs[0].rest - 40.0).abs() < 1e-6 && (l.springs[0].soft - 1.5).abs() < 1e-6);
         assert_eq!(l.springs[0].b, Anchor::End { uid: l.members[1].uid, end: 0 });
         assert_eq!(l.members[1].mat, MemberMat::Wood);
+        assert_eq!(l.members[1].role, MemberRole::Deck, "a steep deck stays a deck");
+        assert_eq!(l.members[0].role, MemberRole::Deck);
         assert_eq!(l.members[1].a, Anchor::End { uid: l.members[0].uid, end: 1 }, "beam link survives");
         assert_eq!(l.members[0].a, Anchor::Ground(vec2(10.0, 10.0)));
         assert_eq!(l.biome, w.biome);
