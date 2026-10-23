@@ -105,14 +105,17 @@ pub enum Mat {
     /// Wood heated without air: almost pure carbon. It burns hot and slowly, and gives its
     /// carbon to iron (steel) and to rust (iron again).
     Charcoal,
+    /// Saltpetre (potassium nitrate): white crystals grown where leaves rot with wood ash. Ground
+    /// with charcoal it makes black powder; water dissolves it.
+    Saltpeter,
 }
 
 impl Mat {
-    pub const ALL: [Mat; 36] = [
+    pub const ALL: [Mat; 37] = [
         Mat::Empty, Mat::Sand, Mat::Water, Mat::Fire, Mat::Steam, Mat::Iron, Mat::Wood, Mat::Stone,
         Mat::Brick, Mat::Rust, Mat::Ash, Mat::Ember, Mat::Lava, Mat::Ice, Mat::Gunpowder, Mat::Dirt, Mat::Grass,
         Mat::Leaf, Mat::Steel, Mat::Cloud, Mat::Seed, Mat::Sapling, Mat::Mud, Mat::Glass, Mat::Snow, Mat::Shard, Mat::DeadLeaf, Mat::Branch, Mat::Trunk, Mat::Hail, Mat::Oil, Mat::Smoke, Mat::Molten, Mat::Clay, Mat::Terracotta,
-        Mat::Charcoal,
+        Mat::Charcoal, Mat::Saltpeter,
     ];
 
     pub fn from_u8(v: u8) -> Mat {
@@ -135,7 +138,7 @@ impl Mat {
         use Mat::*;
         match self {
             Empty => Kind::Empty,
-            Sand | Rust | Ash | Charcoal | Gunpowder | Seed | Mud | Snow | Shard | DeadLeaf | Hail => Kind::Powder,
+            Sand | Rust | Ash | Charcoal | Gunpowder | Saltpeter | Seed | Mud | Snow | Shard | DeadLeaf | Hail => Kind::Powder,
             Water | Lava | Oil | Molten => Kind::Liquid,
             Steam | Cloud | Smoke => Kind::Gas,
             Fire => Kind::Flame,
@@ -204,6 +207,7 @@ fn density(m: Mat) -> f32 {
         Mat::Ash => 0.5,
         Mat::Charcoal => 0.3,
         Mat::Gunpowder | Mat::Rust => 1.5,
+        Mat::Saltpeter => 2.1,
         _ => 1.0,
     }
 }
@@ -300,6 +304,8 @@ pub struct World {
     pub touched: Vec<u16>,
     /// Explosions this step: (x, y, radius).
     pub blasts: Vec<(i32, i32, i32)>,
+    /// Gunpowder that went off this step (at night it launches fireworks).
+    pub powder_booms: Vec<(i32, i32)>,
     /// Heavy landings of falling pieces: (x, y, strength). For sound.
     pub thuds: Vec<(i32, i32, f32)>,
     /// How many water cells moved since it was last read. For sound.
@@ -369,6 +375,7 @@ impl World {
             mask_pass: Vec::new(),
             touched: Vec::new(),
             blasts: Vec::new(),
+            powder_booms: Vec::new(),
             thuds: Vec::new(),
             water_flow: 0,
             flow: flow::Flow::new(),
@@ -431,6 +438,7 @@ impl World {
         self.falling.clear();
         self.touched.clear();
         self.blasts.clear();
+        self.powder_booms.clear();
         self.update_season_cache();
     }
 
@@ -1062,6 +1070,7 @@ impl World {
                         Mat::Smoke => self.step_smoke(x, y),
                         Mat::Steel => self.step_iron(x, y, 1500),
                         Mat::Gunpowder => self.step_gunpowder(x, y),
+                        Mat::Saltpeter => self.step_saltpeter(x, y),
                         Mat::Water => {
                             if !self.fly(x, y) && !self.jet(x, y) && !self.seep(x, y) {
                                 self.step_water(x, y);
@@ -1401,6 +1410,9 @@ impl World {
         for (nx, ny) in Self::neighbors(x, y) {
             if self.at(nx, ny).hot() {
                 self.set(x, y, Mat::Fire);
+                if self.powder_booms.len() < 16 {
+                    self.powder_booms.push((x, y));
+                }
                 self.explode(x, y, 4 * K + 4);
                 return;
             }
@@ -1589,8 +1601,40 @@ impl World {
         }
         let wet = Self::neighbors(x, y).iter().any(|&(nx, ny)| self.at(nx, ny) == Mat::Water);
         if self.chance(if wet { 1_500 } else { 6_000 }) {
-            self.set(x, y, Mat::Dirt);
+            // The saltpetre bed: a leaf rotting against wood ash leaves white crystals of
+            // saltpetre (the ash gives the potash, the rotting leaf the nitrate) and the ash
+            // goes into the soil.
+            let ash = Self::neighbors(x, y).into_iter().find(|&(nx, ny)| self.raw(nx, ny) == Mat::Ash);
+            match ash {
+                Some((ax, ay)) => {
+                    self.set(x, y, Mat::Saltpeter);
+                    self.set(ax, ay, Mat::Dirt);
+                }
+                None => self.set(x, y, Mat::Dirt),
+            }
         }
+    }
+
+    /// Saltpetre dissolves in water. Ground against charcoal, cold and dry, it makes black
+    /// powder (real powder also takes a little sulphur, which only makes it livelier).
+    fn step_saltpeter(&mut self, x: i32, y: i32) {
+        let n = Self::neighbors(x, y)[(self.rand() % 4) as usize];
+        match self.raw(n.0, n.1) {
+            Mat::Water if self.chance(300) => {
+                self.set(x, y, Mat::Empty);
+                return;
+            }
+            Mat::Charcoal if self.chance(40) && self.temp_c(x, y) < 80.0 => {
+                let dry = !Self::neighbors(x, y).iter().chain(Self::neighbors(n.0, n.1).iter()).any(|&(ax, ay)| self.raw(ax, ay) == Mat::Water);
+                if dry {
+                    self.set(x, y, Mat::Gunpowder);
+                    self.set(n.0, n.1, Mat::Gunpowder);
+                    return;
+                }
+            }
+            _ => {}
+        }
+        self.step_powder(x, y);
     }
 
     /// The skeleton of a crown: in spring and summer it pushes new leaves out
@@ -2630,6 +2674,7 @@ impl World {
             Mat::Rust => (156 + v, 84 + v / 2, 42, 255),
             Mat::Ash => (100 + v, 100 + v, 106 + v, 255),
             Mat::Charcoal => (34 + v / 2, 32 + v / 2, 34 + v / 2, 255),
+            Mat::Saltpeter => (236 + v / 2, 238 + v / 2, 230 + v / 2, 255),
             Mat::Ember => (255, 110 + flick * 3, 24, 255),
             Mat::Lava => (255, 78 + flick * 3 + v, 12, 255),
             Mat::Ice => (176 + v, 226 + v, 248, 225),
@@ -4721,5 +4766,87 @@ mod glass {
             w.step();
         }
         assert!(w.cells.iter().any(|c| c.m == Mat::Sand), "shards never turned back into sand");
+    }
+
+    fn tally(w: &World, m: Mat) -> usize {
+        w.cells.iter().filter(|c| c.m == m).count()
+    }
+
+    /// A stone tray across x 200..260 with its floor at row 300.
+    fn tray(w: &mut World) {
+        for x in 196..264 {
+            w.set(x, 300, Mat::Stone);
+        }
+        for y in 280..300 {
+            w.set(196, y, Mat::Stone);
+            w.set(263, y, Mat::Stone);
+        }
+    }
+
+    #[test]
+    fn leaves_rotting_on_wood_ash_make_saltpetre() {
+        let mut w = World::new_static();
+        tray(&mut w);
+        for x in 197..263 {
+            w.set(x, 299, Mat::Ash);
+            w.set(x, 298, Mat::DeadLeaf);
+        }
+        // Without ash, the same leaves only make soil.
+        let mut plain = World::new_static();
+        tray(&mut plain);
+        for x in 197..263 {
+            plain.set(x, 299, Mat::Dirt);
+            plain.set(x, 298, Mat::DeadLeaf);
+        }
+        for _ in 0..15_000 {
+            w.step();
+            plain.step();
+        }
+        let salt = tally(&w, Mat::Saltpeter);
+        assert!(salt > 25, "the saltpetre bed gave crystals: {salt}");
+        assert_eq!(tally(&plain, Mat::Saltpeter), 0, "no ash, no saltpetre");
+    }
+
+    #[test]
+    fn saltpetre_and_charcoal_make_powder_but_water_dissolves_saltpetre() {
+        let mut w = World::new_static();
+        tray(&mut w);
+        for x in 197..263 {
+            w.set(x, 299, Mat::Saltpeter);
+            w.set(x, 298, Mat::Charcoal);
+        }
+        for _ in 0..600 {
+            w.step();
+        }
+        let powder = tally(&w, Mat::Gunpowder);
+        assert!(powder > 80, "ground together they make powder: {powder}");
+        assert!(w.blasts.is_empty(), "cold powder does not go off");
+        // Saltpetre left in the rain melts away.
+        let mut wet = World::new_static();
+        tray(&mut wet);
+        for x in 197..263 {
+            wet.set(x, 299, Mat::Saltpeter);
+            wet.set(x, 298, Mat::Water);
+        }
+        for _ in 0..3_000 {
+            wet.step();
+        }
+        assert!(tally(&wet, Mat::Saltpeter) < 20, "the water dissolved it: {}", tally(&wet, Mat::Saltpeter));
+    }
+
+    #[test]
+    fn gunpowder_going_off_is_reported_for_the_fireworks() {
+        let mut w = World::new_static();
+        tray(&mut w);
+        for x in 220..230 {
+            w.set(x, 299, Mat::Gunpowder);
+        }
+        w.set(225, 298, Mat::Fire);
+        let mut booms = 0;
+        for _ in 0..10 {
+            w.step();
+            booms += std::mem::take(&mut w.powder_booms).len();
+        }
+        assert!(booms > 0);
     }
 }

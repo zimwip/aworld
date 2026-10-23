@@ -45,6 +45,7 @@ pub fn info(m: Mat) -> Info {
         Mat::Shard => ("Éclats", "poudre", "Verre brisé. Avec le temps, il redevient du sable."),
         Mat::DeadLeaf => ("Feuille morte", "poudre", "Elle pourrit doucement et devient de la terre."),
         Mat::Branch => ("Branche", "solide", "Le squelette de la couronne : au printemps, les feuilles repoussent."),
+        Mat::Saltpeter => ("Salpêtre", "poudre", "Des cristaux blancs (du nitrate de potassium) qui poussent là où des feuilles pourrissent avec de la cendre de bois. Mélangé au charbon de bois, à froid et au sec : de la poudre. L'eau le dissout."),
         Mat::Charcoal => ("Charbon de bois", "poudre", "Du bois chauffé sans air : presque du carbone pur. Il brûle lentement et très chaud, et donne son carbone au fer (acier) et à la rouille (fer)."),
         Mat::Trunk => ("Tronc", "solide", "Les voitures passent à travers les arbres. Il brûle comme du bois. Il monte l'eau du sol jusqu'aux feuilles."),
     };
@@ -82,7 +83,9 @@ pub const RECIPES: &[Recipe] = &[
     Recipe { from: &[Mat::Stone, Mat::Ice], to: &[Mat::Sand], text: "Le gel et le dégel effritent la roche en sable." },
     Recipe { from: &[Mat::Dirt, Mat::Seed, Mat::Water], to: &[Mat::Trunk, Mat::Leaf], text: "Terre + graine + eau + lumière : un arbre pousse." },
     Recipe { from: &[Mat::Wood, Mat::Dirt], to: &[Mat::Oil], text: "Du bois enterré très longtemps devient du pétrole. Il flotte sur l'eau et brûle très fort." },
-    Recipe { from: &[Mat::Gunpowder, Mat::Fire], to: &[Mat::Smoke, Mat::Fire], text: "La poudre explose : beaucoup de gaz, une onde de pression qui casse la roche et pousse tout." },
+    Recipe { from: &[Mat::DeadLeaf, Mat::Ash], to: &[Mat::Saltpeter, Mat::Dirt], text: "La nitrière : des feuilles mortes qui pourrissent contre de la cendre de bois laissent du salpêtre, des cristaux blancs. À garder à l'abri de la pluie : l'eau le dissout." },
+    Recipe { from: &[Mat::Saltpeter, Mat::Charcoal], to: &[Mat::Gunpowder], text: "Salpêtre + charbon de bois, mélangés à froid et au sec (à la pelle) : de la poudre noire. La vraie contient aussi un peu de soufre, qui la rend plus vive." },
+    Recipe { from: &[Mat::Gunpowder, Mat::Fire], to: &[Mat::Smoke, Mat::Fire], text: "La poudre explose : beaucoup de gaz, une onde de pression qui casse la roche et pousse tout. La nuit, elle lance un feu d'artifice : ses couleurs viennent de sels de métaux (cuivre bleu, strontium rouge, sodium jaune, baryum vert)." },
     Recipe { from: &[Mat::Leaf], to: &[Mat::DeadLeaf, Mat::Dirt], text: "En automne les feuilles tombent et deviennent de la terre." },
 ];
 
@@ -110,6 +113,7 @@ pub fn mat_color(m: Mat) -> Color {
         Mat::Sapling => (110, 206, 84),
         Mat::Ash => (110, 110, 116),
         Mat::Charcoal => (38, 36, 38),
+        Mat::Saltpeter => (238, 240, 232),
         Mat::Rust => (156, 84, 42),
         Mat::Glass => (190, 226, 246),
         Mat::Shard => (196, 230, 246),

@@ -72,7 +72,7 @@ pub fn wall_strength(m: Mat) -> Option<f32> {
     Some(match m {
         Mat::Ice => 0.6,
         Mat::Glass => 0.8,
-        Mat::Snow | Mat::Hail | Mat::Ash | Mat::Charcoal | Mat::Sand | Mat::Mud | Mat::Seed | Mat::Shard | Mat::Rust | Mat::Gunpowder | Mat::DeadLeaf => 0.6,
+        Mat::Snow | Mat::Hail | Mat::Ash | Mat::Charcoal | Mat::Sand | Mat::Mud | Mat::Seed | Mat::Shard | Mat::Rust | Mat::Gunpowder | Mat::Saltpeter | Mat::DeadLeaf => 0.6,
         Mat::Dirt | Mat::Grass => 2.0,
         Mat::Clay => 1.5,
         Mat::Wood | Mat::Trunk => 2.5,

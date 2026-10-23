@@ -1,6 +1,8 @@
 mod backdrop;
 mod blocks;
 mod car;
+mod fireworks;
+mod firetruck;
 mod mech;
 mod fluidgame;
 mod lens;
@@ -15,6 +17,7 @@ mod shovel;
 mod science;
 mod sound;
 mod ui;
+mod whale;
 mod world;
 
 use blocks::{anchor_world, block_at, clip, node_at, placement_ok, snap, stamp_all, Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, Physics, Spring, SpringKind, MEMBER_MAX_LEN, SPRING_MAX_LEN};
@@ -92,9 +95,9 @@ enum Tool {
     Exit,
 }
 
-const MATTER: [Mat; 22] = [
+const MATTER: [Mat; 23] = [
     Mat::Sand, Mat::Water, Mat::Dirt, Mat::Grass, Mat::Seed, Mat::Wood, Mat::Stone, Mat::Iron, Mat::Steel, Mat::Glass,
-    Mat::Ash, Mat::Charcoal, Mat::Rust, Mat::Ice, Mat::Snow, Mat::Fire, Mat::Lava, Mat::Steam, Mat::Cloud, Mat::Gunpowder, Mat::Clay, Mat::Terracotta,
+    Mat::Ash, Mat::Charcoal, Mat::Rust, Mat::Ice, Mat::Snow, Mat::Fire, Mat::Lava, Mat::Steam, Mat::Cloud, Mat::Saltpeter, Mat::Gunpowder, Mat::Clay, Mat::Terracotta,
 ];
 
 fn window_conf() -> Conf {
@@ -157,6 +160,13 @@ struct Game {
     cable_from: Option<Anchor>,
     /// The rare plane that drifts across the sky, for fun.
     planes: plane::Planes,
+    /// Whales blowing in wide seas, the fire engine called by a big fire, and the fireworks that
+    /// powder going off at night sends up.
+    whales: whale::Whales,
+    trucks: firetruck::FireTrucks,
+    fireworks: fireworks::Fireworks,
+    /// The night (day number) whose fireworks were explained already.
+    fireworks_told: u32,
     /// Where the tool strip, the corner buttons are (so that clicks on them do not paint the world).
     tools_hit: Rect,
     corner_hit: Rect,
@@ -283,6 +293,10 @@ impl Game {
             spring_draft: None,
             cable_from: None,
             planes: plane::Planes::new(),
+            whales: whale::Whales::new(),
+            trucks: firetruck::FireTrucks::new(),
+            fireworks: fireworks::Fireworks::new(),
+            fireworks_told: 0,
             tools_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             corner_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             hud_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
@@ -1221,6 +1235,13 @@ impl Game {
                 self.say("Un Béluga passe dans le ciel !");
             }
         }
+        if is_key_pressed(KeyCode::W) {
+            if self.whales.summon(&self.world) {
+                self.say("Une baleine remonte respirer !");
+            } else if self.whales.whale.is_none() {
+                self.say("Il faut une grande étendue d'eau profonde pour une baleine");
+            }
+        }
         if is_key_pressed(KeyCode::Y) {
             self.mode = if self.mode == ViewMode::Humidity { ViewMode::Normal } else { ViewMode::Humidity };
         }
@@ -1438,6 +1459,13 @@ impl Game {
             self.world.explode(at.x as i32, at.y as i32, 14);
             self.say("Le Béluga s'est écrasé !".to_string());
         }
+        if self.whales.update(dt, &self.world) {
+            self.sounds.emit(Ev::Blow);
+        }
+        self.fireworks.update(dt);
+        if self.fireworks.take_bursts() > 0 {
+            self.sounds.emit(Ev::Pop);
+        }
         for b in &mut self.booms {
             b.t += dt / 0.7;
         }
@@ -1651,6 +1679,28 @@ impl Game {
             // The pressure wave rattles the whole picture.
             self.shake = self.shake.max((r as f32 * 0.75).min(18.0));
         }
+        // Gunpowder going off at night sends up a firework.
+        let powder = std::mem::take(&mut self.world.powder_booms);
+        if !powder.is_empty() && backdrop::daylight(self.world.phase()) < 0.3 {
+            let at = powder.iter().fold(Vec2::ZERO, |a, &(x, y)| a + vec2(x as f32, y as f32)) / powder.len() as f32;
+            if self.fireworks.launch(at, 2 + powder.len().min(4)) && self.fireworks_told != self.world.day_number() {
+                self.fireworks_told = self.world.day_number();
+                self.say("Feu d'artifice ! Ses couleurs viennent de métaux : cuivre bleu, strontium rouge, sodium jaune");
+            }
+        }
+        match self.trucks.step(&mut self.world) {
+            Some(firetruck::News::Siren) => {
+                self.sounds.emit(Ev::Siren);
+                if self.trucks.truck.as_ref().map_or(false, |t| t.age == 0) {
+                    self.say("Pin-pon ! Les pompiers arrivent");
+                }
+            }
+            Some(firetruck::News::Arrived) => self.say("Les pompiers arrosent le feu"),
+            Some(firetruck::News::PutOut) => self.say("Les pompiers ont éteint le feu. Bravo !"),
+            Some(firetruck::News::TankEmpty) => self.say("Le camion de pompiers a vidé sa citerne"),
+            Some(firetruck::News::Blocked) => self.say("Le camion de pompiers ne peut pas passer !"),
+            None => {}
+        }
         // A wall gave way under the pressure of a closed pocket (a boiler): say how much it held.
         if let Some(&(_, _, atm)) = std::mem::take(&mut self.world.bursts).iter().max_by(|a, b| a.2.total_cmp(&b.2)) {
             self.say(format!("Une paroi a cédé sous la pression : {atm:.1} atm (l'air libre est à 1 atm)"));
@@ -1726,6 +1776,9 @@ impl Game {
         if !flat {
             renderer.draw_gas(&self.world, view);
             self.planes.draw(view, self.time);
+            self.fireworks.draw(view, self.time);
+            self.whales.draw(view);
+            self.trucks.draw(view, self.time);
         }
         let stress = if self.mode == ViewMode::Stress { self.phys.as_ref().map(|p| p.stress(&self.blocks)) } else { None };
         for b in &self.blocks {
@@ -3206,6 +3259,27 @@ async fn main() {
             let x = arg("--boom").and_then(|v| v.parse().ok()).unwrap_or(360);
             if let Some(top) = (0..H as i32).find(|&y| game.world.at(x, y) == Mat::Water) {
                 game.world.explode(x, top + 25, 18);
+            }
+        }
+
+        // `--fireworks`: three salvos, bursting just before the shot. `--whale`: a whale that is
+        // blowing at the shot. `--firetruck x`: a fire engine coming to a fire at x.
+        if shot.is_some() {
+            if (320..=340).contains(&frame) && frame % 10 == 0 && args.iter().any(|a| a == "--fireworks") {
+                game.fireworks.launch(vec2(260.0 + (frame - 320) as f32 * 20.0, 430.0), 3);
+                game.fireworks.update(0.4);
+            }
+            if frame == 240 && args.iter().any(|a| a == "--whale") {
+                game.whales.summon(&game.world);
+            }
+            if frame == 300 {
+                if let Some(x) = arg("--firetruck").and_then(|v| v.parse::<f32>().ok()) {
+                    game.trucks.call(&game.world, vec2(x, 300.0));
+                    if let Some(t) = &mut game.trucks.truck {
+                        t.x = x - t.dir * 200.0;
+                        t.y = (0..H as i32).find(|&y| game.world.hard_for_car(t.x as i32, y)).unwrap_or(400) as f32;
+                    }
+                }
             }
         }
 
