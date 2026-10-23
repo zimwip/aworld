@@ -401,6 +401,9 @@ pub fn block_at(blocks: &[Block], p: Vec2) -> Option<usize> {
 
 /// Longest beam that can be drawn in one go, in cells.
 pub const MEMBER_MAX_LEN: f32 = 110.0;
+/// How much a weight bends a rod: a truck (3.5) in the middle of the longest steel rod breaks it,
+/// a small car (1.5) does not.
+const BEND: f32 = 1.75;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MemberMat {
@@ -448,9 +451,9 @@ impl MemberMat {
     /// Force (impulse per step) the beam can carry before it breaks.
     pub fn limit(self) -> f32 {
         match self {
-            MemberMat::Wood => 0.8,
+            MemberMat::Wood => 1.2,
             MemberMat::Iron => 2.4,
-            MemberMat::Steel => 5.0,
+            MemberMat::Steel => 5.5,
         }
     }
 
@@ -991,6 +994,13 @@ pub struct Physics {
     reels: HashMap<u32, RigidBodyHandle>,
     /// Fixed sheaves of pulleys (by pulley id): ropes bend round them.
     pulleys: HashMap<u32, ColliderHandle>,
+    /// Rods a car weighs on this step: the weight is a force held through every substep of the
+    /// step (an impulse would be absorbed by the first substep and the joints would hardly feel it).
+    pressed: Vec<RigidBodyHandle>,
+    /// How hard each rod (by body) is bent this step by the weight on it, see `press_member`.
+    bending: HashMap<RigidBodyHandle, f32>,
+    /// The pins of the rods: they break with their rod (see `update_members`), not as welds.
+    rod_pins: std::collections::HashSet<ImpulseJointHandle>,
 }
 
 
@@ -1004,7 +1014,7 @@ impl Physics {
         w.gravity = Vector::new(0.0, 16.0);
         w.integration_parameters.dt = 1.0 / 60.0;
         let terrain = w.insert_body(RigidBodyBuilder::fixed());
-        Physics { w, terrain, tiles: HashMap::new(), welds: HashMap::new(), last_vel: HashMap::new(), impacts: vec![], bumps: vec![], pins: HashMap::new(), reels: HashMap::new(), pulleys: HashMap::new() }
+        Physics { w, terrain, tiles: HashMap::new(), welds: HashMap::new(), last_vel: HashMap::new(), impacts: vec![], bumps: vec![], pins: HashMap::new(), reels: HashMap::new(), pulleys: HashMap::new(), pressed: vec![], bending: HashMap::new(), rod_pins: Default::default() }
     }
 
     pub fn add_block(&mut self, b: &mut Block) {
@@ -1069,7 +1079,9 @@ impl Physics {
             };
             if let Some((tb, tl)) = target {
                 let j = RevoluteJointBuilder::new().local_anchor1(tl).local_anchor2(Self::member_end_local(&me, end)).contacts_enabled(false);
-                handles.push(self.w.insert_impulse_joint(tb, mb, j));
+                let h = self.w.insert_impulse_joint(tb, mb, j);
+                self.rod_pins.insert(h);
+                handles.push(h);
             }
         }
         members[idx].joints.extend(handles);
@@ -1095,7 +1107,9 @@ impl Physics {
         if let Some(h) = m.body.take() {
             self.w.remove_body(h);
         }
-        m.joints.clear();
+        for j in m.joints.drain(..) {
+            self.rod_pins.remove(&j);
+        }
     }
 
     /// Follow the physics, measure how hard each beam is loaded, and snap the
@@ -1136,6 +1150,12 @@ impl Physics {
                 }
             }
         }
+        let bending = std::mem::take(&mut self.bending);
+        for (i, m) in members.iter().enumerate() {
+            if let Some(b) = m.body.and_then(|h| bending.get(&h)) {
+                ratio[i] = ratio[i].max(BEND * b / m.mat.limit());
+            }
+        }
         let mut broke = vec![];
         for (i, m) in members.iter_mut().enumerate() {
             let Some(h) = m.body else { continue };
@@ -1163,8 +1183,15 @@ impl Physics {
     /// Weight on a beam at `point` for one step (a car driving over it).
     pub fn press_member(&mut self, m: &Member, point: Vec2, weight_kg: f32) {
         let Some(h) = m.body else { return };
-        let impulse = Vector::new(0.0, weight_kg * self.w.gravity.y * self.w.integration_parameters.dt);
-        self.w.bodies[h].apply_impulse_at_point(impulse, v2(point), true);
+        let force = Vector::new(0.0, weight_kg * self.w.gravity.y);
+        self.w.bodies[h].add_force_at_point(force, v2(point), true);
+        self.pressed.push(h);
+        // The pins only feel the weight along the rod; a long rod loaded in the middle also bends,
+        // like a plank across a stream: the bending moment is F·a·b/L, largest in the middle of a
+        // long span. That is why a long span needs a truss underneath.
+        let len = m.len().max(1.0);
+        let t = ((point - m.p0).dot(m.p1 - m.p0) / (len * len)).clamp(0.0, 1.0);
+        *self.bending.entry(h).or_insert(0.0) += weight_kg * 4.0 * t * (1.0 - t) * len / MEMBER_MAX_LEN;
     }
 
     fn anchor_body(&self, blocks: &[Block], members: &[Member], a: &Anchor) -> Option<(RigidBodyHandle, Vector)> {
@@ -1783,13 +1810,21 @@ impl Physics {
         self.refresh_tiles(world, blocks);
         self.buoyancy(world, blocks);
         self.w.step();
+        for h in std::mem::take(&mut self.pressed) {
+            if let Some(rb) = self.w.bodies.get_mut(h) {
+                rb.reset_forces(false);
+            }
+        }
         self.detect_impacts(blocks);
 
-        let welds = &self.welds;
+        let (welds, rod_pins) = (&self.welds, &self.rod_pins);
         let broken: Vec<ImpulseJointHandle> = self
             .w
             .impulse_joints()
             .filter(|(h, j)| {
+                if rod_pins.contains(h) {
+                    return false;
+                }
                 let k = welds.get(h).copied().unwrap_or(1.0);
                 let f = (j.impulses.x * j.impulses.x + j.impulses.y * j.impulses.y).sqrt();
                 f > BREAK_FORCE * k || j.impulses.z.abs() > BREAK_TORQUE * k
@@ -2321,15 +2356,15 @@ mod tests {
     #[test]
     fn beams_carry_loads_according_to_their_material() {
         let wood_light = hang_from_beam(MemberMat::Wood, 1);
-        // Clipped bricks give a little, which softens the shock: it takes four cubes to snap a wooden beam.
+        // Pulled along its length, even wood is strong: four cubes take it close to its limit.
         let wood_heavy = hang_from_beam(MemberMat::Wood, 4);
         let iron_heavy = hang_from_beam(MemberMat::Iron, 4);
         let steel_heavy = hang_from_beam(MemberMat::Steel, 4);
-        eprintln!("BEAM wood1 {wood_light:?} wood3 {wood_heavy:?} iron3 {iron_heavy:?} steel3 {steel_heavy:?}");
-        assert!(wood_light.0, "a wooden beam holds one cube");
-        assert!(!wood_heavy.0, "a wooden beam snaps under four cubes");
+        eprintln!("BEAM wood1 {wood_light:?} wood4 {wood_heavy:?} iron4 {iron_heavy:?} steel4 {steel_heavy:?}");
+        assert!(wood_light.0 && wood_light.1 < 0.4, "a wooden beam holds one cube easily");
+        assert!(wood_heavy.1 > 0.6, "four cubes load a wooden beam close to breaking (shown red)");
         assert!(iron_heavy.0 && steel_heavy.0, "iron and steel hold four cubes");
-        assert!(steel_heavy.1 < iron_heavy.1 + 0.01 || steel_heavy.1 < 1.0, "steel is less stressed than iron for the same load");
+        assert!(steel_heavy.1 < iron_heavy.1 && iron_heavy.1 < wood_heavy.1, "steel is less stressed than iron, iron than wood");
     }
 
     #[test]
@@ -2718,5 +2753,77 @@ mod tests {
         assert!(!placement_ok(&world, &[a.clone()], &overlap, None));
         let beside = Block::new(BlockKind::Brick, vec2(120.0, 295.0), 0.0);
         assert!(placement_ok(&world, &[a], &beside, None));
+    }
+
+    /// Drives a car over a gap spanned by rods: a single deck rod, or a deck in two halves held up by
+    /// a small truss underneath. Returns (made it across, peak stress, rods left).
+    fn cross_rods(kind: crate::car::ModelKind, mat: MemberMat, truss: bool) -> (bool, f32, usize) {
+        use crate::car::{Car, Fate};
+        let mut world = ground();
+        for x in 300..400 {
+            for y in 300..320 {
+                world.set(x, y, Mat::Empty);
+            }
+        }
+        let mut blocks: Vec<Block> = vec![];
+        let mut phys = Physics::build(&mut blocks);
+        let (l, r, mid, low) = (vec2(296.0, 300.0), vec2(404.0, 300.0), vec2(350.0, 300.0), vec2(350.0, 336.0));
+        let mut members = if truss {
+            let left = Member::new(mat, Anchor::Ground(l), Anchor::Free(mid), l, mid);
+            let right = Member::new(mat, Anchor::Ground(r), Anchor::End { uid: left.uid, end: 1 }, r, mid);
+            let d1 = Member::new(mat, Anchor::Ground(vec2(300.0, 306.0)), Anchor::Free(low), vec2(300.0, 306.0), low);
+            let d2 = Member::new(mat, Anchor::Ground(vec2(400.0, 306.0)), Anchor::End { uid: d1.uid, end: 1 }, vec2(400.0, 306.0), low);
+            let post = Member::new(mat, Anchor::End { uid: d1.uid, end: 1 }, Anchor::End { uid: left.uid, end: 1 }, low, mid);
+            vec![left, right, d1, d2, post]
+        } else {
+            vec![Member::new(mat, Anchor::Ground(l), Anchor::Ground(r), l, r)]
+        };
+        phys.build_members(&blocks, &mut members);
+        stamp_all(&mut world, &blocks, &members);
+        let mut car = Car::new(kind, (230, 276));
+        let mut peak = 0.0f32;
+        for _ in 0..3000 {
+            car.step(&world, None);
+            let weight = car.weight_kg();
+            for (pt, share) in car.loads.clone() {
+                if let Some(id) = world.block_at_cell(pt.x.floor() as i32, pt.y.floor() as i32) {
+                    if let Some(m) = members.get(id) {
+                        let m = m.clone();
+                        phys.press_member(&m, pt, weight * share);
+                    }
+                }
+            }
+            phys.step(&world, &mut blocks);
+            phys.update_members(&world, &mut members);
+            if car.p.x > 290.0 {
+                peak = members.iter().map(|m| m.stress).fold(peak, f32::max);
+            }
+            stamp_all(&mut world, &blocks, &members);
+            if car.p.x > 450.0 || car.fate != Fate::Driving {
+                break;
+            }
+        }
+        (car.p.x > 450.0, peak, members.len())
+    }
+
+    #[test]
+    fn a_long_span_needs_a_truss_and_the_right_metal() {
+        use crate::car::ModelKind::{Buggy, Truck};
+        // One long rod across the gap bends under the weight in its middle.
+        let steel_buggy = cross_rods(Buggy, MemberMat::Steel, false);
+        let steel_truck = cross_rods(Truck, MemberMat::Steel, false);
+        let iron_buggy = cross_rods(Buggy, MemberMat::Iron, false);
+        assert!(steel_buggy.0 && steel_buggy.2 == 1, "a steel rod holds a small car: {steel_buggy:?}");
+        assert!(steel_buggy.1 > 0.3, "and shows the load: {steel_buggy:?}");
+        assert!(!steel_truck.0 && steel_truck.2 == 0, "but a truck snaps it: {steel_truck:?}");
+        assert!(!iron_buggy.0, "an iron rod is too weak even for a small car: {iron_buggy:?}");
+        // A truss underneath halves the span and carries the weight down to the banks.
+        let iron_truss_buggy = cross_rods(Buggy, MemberMat::Iron, true);
+        let iron_truss_truck = cross_rods(Truck, MemberMat::Iron, true);
+        let steel_truss_truck = cross_rods(Truck, MemberMat::Steel, true);
+        assert!(iron_truss_buggy.0 && iron_truss_buggy.2 == 5, "an iron truss holds a small car: {iron_truss_buggy:?}");
+        assert!(!iron_truss_truck.0, "but not a truck: {iron_truss_truck:?}");
+        assert!(steel_truss_truck.0 && steel_truss_truck.2 == 5, "a steel truss holds a truck: {steel_truss_truck:?}");
+        assert!(steel_truss_truck.1 > 0.5, "working hard: {steel_truss_truck:?}");
     }
 }

@@ -682,42 +682,74 @@ pub fn cable_preview(a: Vec2, b: Vec2, len: f32) -> Vec<Vec2> {
         .collect()
 }
 
-/// A free beam: a bar with a pin at each end; coloured by load in the effort view.
-pub fn draw_member(m: &Member, v: View, stress: bool) {
-    let (a, b) = (v.to_screen(m.p0), v.to_screen(m.p1));
-    let th = m.mat.thickness() * v.s;
+/// A free beam: a bar with a pin at each end. In the effort view it is coloured by its load, with
+/// the share of what it can take written on it. In every view a loaded beam shows it: it reddens
+/// past half its strength, a floor beam sags (exaggerated, so it can be seen), and close to
+/// breaking it trembles and glows red.
+pub fn draw_member(m: &Member, v: View, stress: bool, time: f32) {
+    let load = m.stress.clamp(0.0, 1.2);
+    let (r, g, bl) = stress_rgb(m.stress);
     let (cr, cg, cb) = m.mat.color();
     let base = Color::from_rgba(cr, cg, cb, 255);
-    let (r, g, bl) = stress_rgb(m.stress);
-    let col = if stress { Color::new(r, g, bl, 1.0) } else { base };
-    let dark = Color::new(col.r * 0.55, col.g * 0.55, col.b * 0.55, 1.0);
+    let col = if stress {
+        Color::new(r, g, bl, 1.0)
+    } else {
+        // Past half its strength the beam takes on the effort colours.
+        let k = ((load - 0.5) / 0.5).clamp(0.0, 1.0) * 0.85;
+        Color::new(base.r + (r - base.r) * k, base.g + (g - base.g) * k, base.b + (bl - base.b) * k, 1.0)
+    };
+    // About to break: it shakes across its length.
+    let danger = ((load - 0.75) / 0.25).clamp(0.0, 1.0);
+    let (mut a, mut b) = (v.to_screen(m.p0), v.to_screen(m.p1));
     let d = (b - a).normalize_or_zero();
     let n = vec2(-d.y, d.x);
-    draw_line(a.x + 1.0, a.y + 2.0, b.x + 1.0, b.y + 2.0, th, Color::new(0.0, 0.0, 0.0, 0.25));
-    draw_line(a.x, a.y, b.x, b.y, th, dark);
-    draw_line(a.x, a.y, b.x, b.y, th * 0.68, col);
-    let hi = n * (-th * 0.18);
-    draw_line(a.x + hi.x, a.y + hi.y, b.x + hi.x, b.y + hi.y, (th * 0.18).max(1.0), Color::new(1.0, 1.0, 1.0, 0.28));
+    let shake = n * (time * 61.0 + m.uid as f32).sin() * danger * 1.2 * v.s;
+    a += shake;
+    b += shake;
+    let th = m.mat.thickness() * v.s;
+    let dark = Color::new(col.r * 0.55, col.g * 0.55, col.b * 0.55, 1.0);
+    // A floor beam bends down in the middle under the weight it carries.
+    let down = if n.y >= 0.0 { n } else { -n };
+    let sag = if m.is_deck() { load * load * (b - a).length() * 0.08 } else { 0.0 };
+    let pts: Vec<Vec2> = (0..=8)
+        .map(|k| {
+            let t = k as f32 / 8.0;
+            a + (b - a) * t + down * sag * 4.0 * t * (1.0 - t)
+        })
+        .collect();
+    let line = |off: Vec2, w: f32, c: Color| {
+        for s in pts.windows(2) {
+            draw_line(s[0].x + off.x, s[0].y + off.y, s[1].x + off.x, s[1].y + off.y, w, c);
+        }
+    };
+    if danger > 0.0 {
+        let pulse = 0.5 + 0.5 * (time * 14.0).sin();
+        line(Vec2::ZERO, th * 2.6, Color::new(1.0, 0.15, 0.1, 0.35 * danger * (0.5 + 0.5 * pulse)));
+    }
+    line(vec2(1.0, 2.0), th, Color::new(0.0, 0.0, 0.0, 0.25));
+    line(Vec2::ZERO, th, dark);
+    line(Vec2::ZERO, th * 0.68, col);
+    line(n * (-th * 0.18), (th * 0.18).max(1.0), Color::new(1.0, 1.0, 1.0, 0.28));
     if m.is_deck() {
         // The floor a car drives on gets a bright running surface.
-        let top = n * (-th * 0.5);
-        draw_line(a.x + top.x, a.y + top.y, b.x + top.x, b.y + top.y, (th * 0.16).max(1.2), Color::new(1.0, 0.95, 0.6, 0.9));
+        line(n * (-th * 0.5), (th * 0.16).max(1.2), Color::new(1.0, 0.95, 0.6, 0.9));
     }
+    let len = (b - a).length();
     match m.mat {
         MemberMat::Wood => {
-            let len = (b - a).length();
             let mut t = 12.0;
             while t < len - 6.0 {
-                let p = a + d * t;
+                let u = t / len;
+                let p = a + d * t + down * sag * 4.0 * u * (1.0 - u);
                 draw_line(p.x, p.y, p.x + d.x * 5.0, p.y + d.y * 5.0, 1.0, Color::new(0.35, 0.22, 0.1, 0.6));
                 t += 14.0;
             }
         }
         MemberMat::Iron | MemberMat::Steel => {
-            let len = (b - a).length();
             let mut t = 8.0;
             while t < len - 4.0 {
-                let p = a + d * t;
+                let u = t / len;
+                let p = a + d * t + down * sag * 4.0 * u * (1.0 - u);
                 draw_circle(p.x, p.y, th * 0.12 + 0.6, Color::new(1.0, 1.0, 1.0, 0.35));
                 t += 18.0;
             }
@@ -726,6 +758,14 @@ pub fn draw_member(m: &Member, v: View, stress: bool) {
     for p in [a, b] {
         draw_circle(p.x, p.y, th * 0.78, Color::from_rgba(226, 228, 236, 255));
         draw_circle(p.x, p.y, th * 0.34, Color::from_rgba(60, 64, 78, 255));
+    }
+    if stress && load > 0.2 && len > 24.0 {
+        // How much of its strength the beam uses, in the middle of it.
+        let label = format!("{}%", (m.stress * 100.0).round() as i32);
+        let c = pts[4] - down * (th + 8.0);
+        let dim = measure_text(&label, None, 14, 1.0);
+        draw_rectangle(c.x - dim.width / 2.0 - 3.0, c.y - dim.height / 2.0 - 3.0, dim.width + 6.0, dim.height + 6.0, Color::new(0.05, 0.06, 0.12, 0.75));
+        draw_text(&label, c.x - dim.width / 2.0, c.y + dim.height / 2.0, 14.0, Color::new(r, g, bl, 1.0));
     }
 }
 
