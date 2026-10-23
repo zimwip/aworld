@@ -1,4 +1,4 @@
-//! Changes of matter from one kind to another, in one table: each change says from what, into
+//! Changes of matter from one kind to another, in one place: each change says from what, into
 //! what and under which conditions. Two tables hold them all but the reactions between neighbours
 //! (rust and charcoal, iron and coals, see `thermal::react`): `FUSIONS`, the changes of state with a
 //! latent heat (melting and setting), and `TRANSITIONS`, every other change, by heat, by weight or
