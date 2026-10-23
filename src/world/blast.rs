@@ -565,7 +565,8 @@ impl World {
                 if let Some(&(x, y, d)) = rays[k].get(s.at) {
                     if let Some((m, false)) = self.blast_mat(x, y) {
                         let p = (s.e / (cell_cost(m, d) * share(d))).clamp(0.0, 1.0);
-                        for &(x, y, _) in rays[k].iter().skip(s.at).take(3) {
+                        // The ray goes on past the edge of the world: only the cells inside crack.
+                        for &(x, y, _) in rays[k].iter().skip(s.at).take(3).filter(|c| Self::inb(c.0, c.1)) {
                             if self.rand() % 100 < (p * 80.0) as u32 + 10 {
                                 mark(&mut fates, Self::idx(x, y), Fate::Crack);
                             }
@@ -870,5 +871,26 @@ mod tests {
         assert!(clay > 20, "packed soil lines the hole: {clay}");
         // What flew out was loosened: no clod of packed clay in the air.
         assert!(w.ejecta.iter().all(|p| p.m != Mat::Clay));
+    }
+
+    #[test]
+    fn a_charge_at_the_edges_of_the_world_stays_inside_it() {
+        // The cracked edge of the hole used to be looked up past the bottom and sides of the grid.
+        for (x, y) in [(480, H as i32 - 2), (1, 400), (W as i32 - 2, 400), (1, H as i32 - 2), (480, 1)] {
+            let mut w = World::new_static();
+            for xx in 0..W as i32 {
+                for yy in 0..H as i32 {
+                    w.set(xx, yy, Mat::Stone);
+                }
+            }
+            for dx in -4..=4 {
+                for dy in -4..=4 {
+                    w.set((x + dx).clamp(0, W as i32 - 1), (y + dy).clamp(0, H as i32 - 1), Mat::Dynamite);
+                }
+            }
+            w.set_off_powder(x, y);
+            w.explode(x, y, 40);
+            run(&mut w, 5);
+        }
     }
 }
