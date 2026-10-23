@@ -1481,6 +1481,9 @@ impl Game {
             Tool::Hammer if click => self.hammer(at),
             Tool::Flame => {
                 self.world.flamethrower(g.0, g.1, self.brush.max(3));
+                if self.trucks.scorch(vec2(g.0 as f32, g.1 as f32), self.brush.max(3) as f32) {
+                    self.blow_up_truck();
+                }
             }
             Tool::Lightning if click => self.world.strike(g.0, g.1),
             Tool::Sensor if click => self.sensor_click(at),
@@ -1631,6 +1634,10 @@ impl Game {
         }
         self.bolts.retain(|b| b.age < BOLT_LIFE);
         for bolt in std::mem::take(&mut self.world.bolts) {
+            // Lightning that comes down through the fire engine sets its fuel off.
+            if bolt.ground && self.trucks.truck.as_ref().map_or(false, |t| bolt.path.iter().any(|&(x, y)| t.touches(vec2(x, y), 2.0))) {
+                self.blow_up_truck();
+            }
             let end = *bolt.path.last().unwrap_or(&(0.0, 0.0));
             let far = vec2(end.0 - world::W as f32 * 0.5, end.1 - 360.0).length();
             let loud = bolt.power.max(0.3) * (1.0 - far / 900.0).clamp(0.15, 1.0) * if bolt.ground { 1.0 } else { 0.6 };
@@ -1802,6 +1809,7 @@ impl Game {
             self.sounds.emit(Ev::Thud(hard * 0.6));
         }
         let blasts = std::mem::take(&mut self.world.blasts);
+        let mut truck_hit = false;
         for (x, y, r) in blasts {
             let c = vec2(x as f32, y as f32);
             if let Some(p) = &mut self.phys {
@@ -1824,10 +1832,15 @@ impl Game {
                     car.fate = Fate::Exploded;
                 }
             }
+            truck_hit |= self.trucks.truck.as_ref().map_or(false, |t| t.touches(c, r as f32 * 0.8));
             self.sounds.emit(Ev::Boom(r as f32));
             self.booms.push(Boom { pos: c, t: 0.0, color: Color::new(1.0, 0.5, 0.1, 1.0) });
             // The pressure wave rattles the whole picture.
             self.shake = self.shake.max((r as f32 * 0.75).min(18.0));
+        }
+        // A blast that reaches the fire engine sets it off too (its own goes off next step).
+        if truck_hit {
+            self.blow_up_truck();
         }
         // Gunpowder going off at night sends up a firework.
         let powder = std::mem::take(&mut self.world.powder_booms);
@@ -1904,6 +1917,17 @@ impl Game {
                 self.selected_car = None;
             }
         }
+    }
+
+    /// The fire engine goes up: a bigger bang than a car's, its pieces and ladder flying, and the
+    /// water left in its tank bursting out all around.
+    fn blow_up_truck(&mut self) {
+        let Some(t) = self.trucks.blow_up() else { return };
+        let c = vec2(t.x, t.y - firetruck::BODY_HEIGHT * 0.5);
+        self.world.explode(c.x as i32, c.y as i32, 16);
+        self.debris.burst_truck(&t);
+        self.booms.push(Boom { pos: c, t: 0.0, color: Color::new(1.0, 0.75, 0.2, 1.0) });
+        self.say("BOUM ! Le camion de pompiers a explosé, et sa citerne arrose tout autour");
     }
 
     /// The little boy: what he can see for his remarks, and the cars that run into him.

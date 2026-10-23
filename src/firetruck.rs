@@ -28,6 +28,8 @@ const LOOK_EVERY: u32 = 60;
 const REST: u32 = 60 * 25;
 /// Side of the zones the fire is counted in.
 const ZONE: i32 = 24;
+/// Steps of flamethrower on the engine before its fuel tank goes up.
+pub const BURN: u32 = 45;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum State {
@@ -55,6 +57,17 @@ pub struct Truck {
     pub age: u32,
     /// Tilt of the body on a slope (radians).
     pub tilt: f32,
+    /// How hot the flamethrower made it, up to `BURN` (then it blows up); it cools slowly.
+    pub heat: u32,
+}
+
+impl Truck {
+    /// Whether a disc of radius `r` around `p` touches the engine (body, cab or ladder).
+    pub fn touches(&self, p: Vec2, r: f32) -> bool {
+        let d = Vec2::from_angle(-self.tilt).rotate(p - vec2(self.x, self.y));
+        let (lx, ly) = (d.x * self.dir, -d.y);
+        lx.abs() <= LENGTH * 0.5 + 2.0 + r && ly >= -r && ly <= HEIGHT + 2.0 + r
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -172,7 +185,7 @@ impl FireTrucks {
             if let Some(y) = ground_from_top(world, edge) {
                 let dir = if left { 1.0 } else { -1.0 };
                 let x = if left { -LENGTH } else { W as f32 + LENGTH };
-                self.truck = Some(Truck { x, y: y as f32, dir, state: State::Coming, tank: TANK, fire, aim: fire, age: 0, tilt: 0.0 });
+                self.truck = Some(Truck { x, y: y as f32, dir, state: State::Coming, tank: TANK, fire, aim: fire, age: 0, tilt: 0.0, heat: 0 });
                 return true;
             }
         }
@@ -196,6 +209,9 @@ impl FireTrucks {
             return None;
         };
         t.age += 1;
+        if t.age % 4 == 0 {
+            t.heat = t.heat.saturating_sub(1);
+        }
         let mut news = None;
         match t.state {
             State::Coming => {
@@ -255,6 +271,32 @@ impl FireTrucks {
         }
         self.truck = Some(t);
         news
+    }
+
+    /// The flamethrower plays on the engine around `at`: it heats up, and true once it is hot
+    /// enough to blow up.
+    pub fn scorch(&mut self, at: Vec2, r: f32) -> bool {
+        let Some(t) = &mut self.truck else { return false };
+        if !t.touches(at, r) {
+            return false;
+        }
+        t.heat += 1;
+        t.heat >= BURN
+    }
+
+    /// The engine blows up: it is gone, and the water left in its tank bursts out all around
+    /// (real water, that puts out the flames it lands on). Returns the engine, for its wreck.
+    pub fn blow_up(&mut self) -> Option<Truck> {
+        let t = self.truck.take()?;
+        let centre = vec2(t.x, t.y - HEIGHT * 0.5);
+        for _ in 0..(t.tank / 8).min(450) {
+            let a = self.between(-std::f32::consts::PI, 0.0);
+            let speed = self.between(0.6, 3.2);
+            let pos = centre + vec2(self.between(-LENGTH * 0.4, LENGTH * 0.4), self.between(-4.0, 4.0));
+            self.drops.push(Drop { pos, vel: Vec2::from_angle(a) * speed });
+        }
+        self.rest = REST;
+        Some(t)
     }
 
     /// Moves the engine one step along the road. False if the road is cut (water, wall, cliff).
@@ -370,8 +412,11 @@ fn draw_engine(t: &Truck, view: View, time: f32) {
         draw_triangle(a, b, cc, c);
         draw_triangle(a, cc, d, c);
     };
-    let red = Color::from_rgba(214, 36, 36, 255);
-    let dark = Color::from_rgba(120, 16, 20, 255);
+    // The flamethrower blackens the paint as the engine heats up.
+    let burnt = t.heat as f32 / BURN as f32;
+    let scorched = |c: Color| Color::new(c.r * (1.0 - 0.7 * burnt), c.g * (1.0 - 0.8 * burnt), c.b * (1.0 - 0.8 * burnt), c.a);
+    let red = scorched(Color::from_rgba(214, 36, 36, 255));
+    let dark = scorched(Color::from_rgba(120, 16, 20, 255));
     let half = LENGTH * 0.5;
     // Body and cab.
     quad(-half, 3.0, half * 0.45, HEIGHT - 2.0, red);
@@ -408,12 +453,27 @@ fn draw_engine(t: &Truck, view: View, time: f32) {
         draw_circle(l2.x, l2.y, 4.0 * view.s, Color::new(0.3, 0.6, 1.0, 0.25));
     }
     // Wheels.
-    for wx in [-half * 0.62, half * 0.62] {
-        let c = p(wx, 3.2);
+    for wx in WHEELS {
+        let c = p(wx * half, 3.2);
         draw_circle(c.x, c.y, 3.2 * view.s, Color::from_rgba(26, 26, 30, 255));
         draw_circle(c.x, c.y, 1.3 * view.s, Color::from_rgba(170, 170, 180, 255));
     }
+    // Hot enough, it starts to burn: flames lick the body, the closer to blowing up the taller.
+    if burnt > 0.3 {
+        for k in 0..5 {
+            let flick = (time * 13.0 + k as f32 * 2.1).sin() * 0.5 + 0.5;
+            let x = -half + 4.0 + k as f32 * LENGTH * 0.2;
+            let h = (2.0 + 6.0 * burnt) * (0.6 + 0.4 * flick);
+            let (a, b, c) = (p(x - 2.0, HEIGHT - 3.0), p(x + 2.0, HEIGHT - 3.0), p(x + flick - 0.5, HEIGHT - 3.0 + h));
+            draw_triangle(a, b, c, Color::new(1.0, 0.45 + 0.3 * flick, 0.05, 0.85));
+        }
+    }
 }
+
+/// Where the wheels are, as a share of half the engine's length from its middle.
+pub const WHEELS: [f32; 2] = [-0.62, 0.62];
+pub const WHEEL_R: f32 = 3.2;
+pub const BODY_HEIGHT: f32 = HEIGHT;
 
 #[cfg(test)]
 mod tests {
@@ -528,5 +588,52 @@ mod tests {
             }
         }
         assert!(log.contains(&News::Blocked), "{log:?}");
+    }
+
+    #[test]
+    fn the_flamethrower_and_lightning_blow_the_engine_up() {
+        let mut world = World::new_static();
+        burning(&mut world);
+        let mut trucks = FireTrucks::new();
+        assert!(trucks.call(&world, vec2(600.0, 420.0)));
+        for _ in 0..200 {
+            trucks.step(&mut world);
+        }
+        let t = trucks.truck.clone().unwrap();
+        let side = vec2(t.x, t.y - 8.0);
+        assert!(t.touches(side, 0.0) && !t.touches(side + vec2(0.0, -60.0), 3.0) && !t.touches(vec2(t.x + 60.0, t.y), 3.0));
+        // A brief lick of flame only scorches it.
+        for _ in 0..10 {
+            assert!(!trucks.scorch(side, 3.0));
+        }
+        assert!(!trucks.scorch(side + vec2(0.0, -60.0), 3.0), "flames in the sky miss it");
+        let mut steps = 10;
+        while !trucks.scorch(side, 3.0) {
+            steps += 1;
+            assert!(steps < 200, "the flamethrower never sets it off");
+        }
+        let tank = trucks.truck.as_ref().unwrap().tank;
+        let drops = trucks.drops.len();
+        let wreck = trucks.blow_up().expect("it blows up");
+        assert!(trucks.truck.is_none() && wreck.x == t.x);
+        assert!(trucks.drops.len() >= drops + (tank / 8).min(450) as usize, "its tank bursts out");
+        // It is gone for a while: no new engine straight away.
+        for _ in 0..120 {
+            trucks.step(&mut world);
+        }
+        assert!(trucks.truck.is_none());
+
+        // Lightning: the bolt down through the engine passes through its body.
+        let mut world = World::new_static();
+        burning(&mut world);
+        let mut trucks = FireTrucks::new();
+        assert!(trucks.call(&world, vec2(600.0, 420.0)));
+        for _ in 0..200 {
+            trucks.step(&mut world);
+        }
+        let t = trucks.truck.clone().unwrap();
+        world.strike(t.x as i32, (t.y - 5.0) as i32);
+        let bolt = world.bolts.last().unwrap();
+        assert!(bolt.ground && bolt.path.iter().any(|&(x, y)| t.touches(vec2(x, y), 2.0)), "the bolt goes through the engine");
     }
 }
