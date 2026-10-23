@@ -1,5 +1,6 @@
 # Rust build output
 /target
+/target-base
 **/*.rs.bk
 
 # Worlds saved by the game
