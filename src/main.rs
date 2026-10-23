@@ -249,6 +249,9 @@ struct Game {
     matter_menu: Option<usize>,
     /// The views on the right edge, a side menu like the palette.
     views: Drawer,
+    /// The motor's remote control (or the car settings), a side menu of its own under the views:
+    /// its tab shows while a motor or a car is chosen.
+    remote_menu: Drawer,
     views_hit: Rect,
     /// Ctrl + wheel / Ctrl + drag zoom and move the view; Escape brings back the whole world.
     camera: camera::Camera,
@@ -306,7 +309,7 @@ impl Game {
             corner_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             hud_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             launch_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
-            panel: Drawer { open: 1.0, pin: false },
+            panel: Drawer { open: 1.0, pin: false, peek: 0.0 },
             panel_hit: Rect::new(0.0, 0.0, PANEL_W, 10000.0),
             car_remote: false,
             selection: None,
@@ -360,6 +363,7 @@ impl Game {
             matter_state: MATTERS.map(|m| m.default),
             matter_menu: None,
             views: Drawer::new(false),
+            remote_menu: Drawer::new(false),
             views_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             camera: camera::Camera::default(),
             shake: 0.0,
@@ -2118,6 +2122,7 @@ impl Game {
                 self.model = *k;
                 self.launch_car();
                 self.car_remote = true;
+                self.remote_menu.show(2.0);
                 self.selected_motor = None;
             }
         }
@@ -2160,6 +2165,7 @@ impl Game {
         self.draw_corner_buttons(ui, sw);
         self.draw_launch_bar(ui, sw);
         self.draw_views(ui, sw, sh);
+        self.draw_remote_menu(ui, sw);
         self.draw_player(ui, sw, sh);
         if self.show_science {
             self.draw_science(ui, sw, sh);
@@ -2875,26 +2881,12 @@ impl Game {
         let tab = Rect::new(sw - VIEWS_TAB, y, VIEWS_TAB, 96.0);
         let px = sw - VIEWS_TAB - VIEWS_W * self.views.open;
         let panel = Rect::new(px, y, VIEWS_W, h);
-        let near_edge = ui.mouse.x > sw - 8.0 && ui.mouse.y > TOP_H;
+        let near_edge = ui.mouse.x > sw - 8.0 && ui.mouse.y > TOP_H && ui.mouse.y < y + h;
         let hovering = tab.contains(ui.mouse) || (self.views.open > 0.05 && panel.contains(ui.mouse)) || near_edge;
         self.views.update(hovering, get_frame_time());
         let px = sw - VIEWS_TAB - VIEWS_W * self.views.open;
         let panel = Rect::new(px, y, VIEWS_W, h);
-        // The motor's remote control and the car settings are not part of the menu: they stay in
-        // sight, where the menu's foot would be, as long as a motor or a car is chosen.
-        let rest = Rect::new(sw - VIEWS_TAB - VIEWS_W, y, VIEWS_W, h);
-        let remote = self.remote_rect(rest);
-        let car_panel = if remote.is_none() && self.car_remote { Some(Rect::new(rest.x, rest.y + rest.h + 8.0, rest.w, 286.0)) } else { None };
-        let menu = if self.views.visible() { tab.combine_with(panel) } else { tab };
-        self.views_hit = match remote.or(car_panel) {
-            Some(r) => menu.combine_with(r),
-            None => menu,
-        };
-        if let Some(r) = remote {
-            self.draw_remote(ui, r);
-        } else if let Some(r) = car_panel {
-            self.draw_car_remote(ui, r);
-        }
+        self.views_hit = if self.views.visible() { tab.combine_with(panel) } else { tab };
 
         // The tab that stays visible: click it to pin the views out (or to unpin them).
         rrect(tab, 8.0, Color::new(0.1, 0.12, 0.2, 0.92));
@@ -2997,6 +2989,65 @@ impl Game {
             }
         }
         let _ = sh;
+    }
+
+    /// The motor's remote control, or the car settings: a side menu of its own under the views,
+    /// whose tab shows while a motor or a car is chosen. It peeks out when one is chosen, then
+    /// behaves like the other side menus: out on hover, away when the mouse leaves, kept by its pin.
+    fn draw_remote_menu(&mut self, ui: &mut Ui, sw: f32) {
+        let y = TOP_H + 60.0 + 376.0 + 8.0;
+        let rest = Rect::new(sw - VIEWS_TAB - VIEWS_W, y, VIEWS_W, 0.0);
+        let h = match self.remote_rect(rest) {
+            Some(r) => r.h,
+            None if self.car_remote => 286.0,
+            None => {
+                // Nothing to show: the next motor or car chosen peeks out again.
+                self.remote_menu.open = 0.0;
+                self.remote_menu.peek = 0.0;
+                return;
+            }
+        };
+        let motor = !self.car_remote || self.remote_rect(rest).is_some();
+        let tab = Rect::new(sw - VIEWS_TAB, y, VIEWS_TAB, 96.0);
+        let panel = Rect::new(sw - VIEWS_TAB - VIEWS_W * self.remote_menu.open, y, VIEWS_W, h);
+        let near_edge = ui.mouse.x > sw - 8.0 && ui.mouse.y >= y && ui.mouse.y < y + h;
+        let hovering = tab.contains(ui.mouse) || (self.remote_menu.open > 0.05 && panel.contains(ui.mouse)) || near_edge;
+        self.remote_menu.update(hovering, get_frame_time());
+        let panel = Rect::new(sw - VIEWS_TAB - VIEWS_W * self.remote_menu.open, y, VIEWS_W, h);
+        // Clicks on it must not reach the world, like on the views.
+        let hit = if self.remote_menu.visible() { tab.combine_with(panel) } else { tab };
+        self.views_hit = self.views_hit.combine_with(hit);
+
+        // The tab that stays visible while something is chosen: click it to pin the menu.
+        rrect(tab, 8.0, Color::new(0.1, 0.12, 0.2, 0.92));
+        let c = vec2(tab.x + tab.w / 2.0, tab.y + 22.0);
+        if motor {
+            draw_icon(Icon::Rotate, c, 15.0, ACCENT);
+        } else {
+            draw_car_icon(c, ACCENT, 0.45);
+        }
+        let arrow = if self.remote_menu.pin { "›" } else { "‹" };
+        ui.text_center(arrow, tab.x + tab.w / 2.0, tab.y + 56.0, 20, if self.remote_menu.pin { ACCENT } else { TEXT });
+        if ui.pressed && tab.contains(ui.mouse) && !self.quit_modal {
+            self.remote_menu.toggle_pin();
+        }
+        if !self.remote_menu.visible() {
+            return;
+        }
+        if motor {
+            self.draw_remote(ui, panel);
+        } else {
+            self.draw_car_remote(ui, panel);
+        }
+        // The car settings have their × at the top right: the pin goes beside it.
+        let pin = Rect::new(panel.x + panel.w - if motor { 34.0 } else { 64.0 }, panel.y + 5.0, 28.0, 24.0);
+        if ui.button(pin, "", Icon::Pin, self.remote_menu.pin, true, ACCENT) {
+            self.remote_menu.toggle_pin();
+        }
+        if ui.hover(pin) {
+            let what = if motor { "la télécommande" } else { "les réglages" };
+            self.hover_info = Some(("Épingler".to_string(), format!("Épinglé, {what} reste ouvert. Sinon il se cache quand la souris s'en va et ressort au survol de son onglet.")));
+        }
     }
 
     /// Arrows showing the flow of the air, vortices and opposing layers included, where it blows.
@@ -3387,6 +3438,7 @@ async fn main() {
             if args.iter().any(|a| a == "--remote") {
                 game.selected_motor = game.mech.gears.iter().find(|g| g.motor.is_some()).map(|g| g.uid);
                 game.views = Drawer::new(true);
+                game.remote_menu = Drawer::new(true);
             }
         }
         game.show_science = args.iter().any(|a| a == "--science");

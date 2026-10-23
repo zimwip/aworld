@@ -417,16 +417,26 @@ pub struct Drawer {
     /// 0 = tucked away, 1 = fully out.
     pub open: f32,
     pub pin: bool,
+    /// Seconds it stays out on its own after `show`, so that something just chosen is seen.
+    pub peek: f32,
 }
 
 impl Drawer {
     pub fn new(pin: bool) -> Drawer {
-        Drawer { open: if pin { 1.0 } else { 0.0 }, pin }
+        Drawer { open: if pin { 1.0 } else { 0.0 }, pin, peek: 0.0 }
+    }
+
+    /// Slides out at once and stays out `secs` seconds even without the pointer, then behaves as usual.
+    pub fn show(&mut self, secs: f32) {
+        self.open = 1.0;
+        self.peek = secs;
     }
 
     /// Moves the drawer towards out (pointer over it, or pinned) or in, over `dt` seconds.
     pub fn update(&mut self, hovering: bool, dt: f32) {
-        let target = if hovering || self.pin { 1.0 } else { 0.0 };
+        // The pointer over it ends the peek: from then on, leaving closes it.
+        self.peek = if hovering { 0.0 } else { (self.peek - dt).max(0.0) };
+        let target = if hovering || self.pin || self.peek > 0.0 { 1.0 } else { 0.0 };
         self.open += (target - self.open) * (dt * 9.0).min(1.0);
         if (self.open - target).abs() < 0.01 {
             self.open = target;
@@ -473,5 +483,19 @@ mod tests {
         d.toggle_pin();
         run(&mut d, false, 60);
         assert_eq!(d.open, 0.0);
+    }
+
+    #[test]
+    fn a_shown_drawer_peeks_out_then_tucks_away() {
+        let mut d = Drawer::new(false);
+        d.show(1.0);
+        run(&mut d, false, 30);
+        assert_eq!(d.open, 1.0, "still out during the peek");
+        run(&mut d, false, 90);
+        assert_eq!(d.open, 0.0, "then it tucks away by itself");
+        d.show(5.0);
+        run(&mut d, true, 10);
+        run(&mut d, false, 60);
+        assert_eq!(d.open, 0.0, "once visited, leaving closes it at once");
     }
 }
