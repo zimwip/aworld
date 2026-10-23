@@ -2182,12 +2182,6 @@ impl Game {
                 Tool::Hammer => draw_circle_lines(ui.mouse.x, ui.mouse.y, 3.5 * view.s, 1.5, ACCENT),
                 Tool::Flame => draw_circle_lines(ui.mouse.x, ui.mouse.y, self.brush.max(3) as f32 * view.s, 1.5, RED),
                 Tool::Lightning => {
-                    // Where it will come down from: straight above the pointer.
-                    let top = view.oy.max(0.0);
-                    for k in 0..((ui.mouse.y - top) / 14.0) as i32 {
-                        let y = top + k as f32 * 14.0;
-                        draw_line(ui.mouse.x, y, ui.mouse.x, y + 6.0, 1.0, Color::new(1.0, 0.92, 0.4, 0.35));
-                    }
                     draw_circle_lines(ui.mouse.x, ui.mouse.y, 5.0, 1.5, Color::new(1.0, 0.92, 0.4, 0.9));
                 }
                 Tool::Loupe => self.draw_lens(ui, view, at),
