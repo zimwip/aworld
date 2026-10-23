@@ -495,11 +495,14 @@ pub struct World {
     /// Bolts of lightning since they were last read. For the picture and the thunder.
     pub bolts: Vec<Bolt>,
     storm_rng: storm::StormRng,
+    /// The last pressure field read through `pressure_at_cell` (the loupe): (revision, tick, field).
+    pressure_cache: std::sync::Mutex<Option<(u64, u32, Vec<f32>)>>,
 }
 
 impl World {
     pub fn new() -> Self {
         World {
+            pressure_cache: std::sync::Mutex::new(None),
             cells: vec![EMPTY; W * H],
             frame: 0,
             rng: 0x1234_5678,
@@ -3056,31 +3059,10 @@ impl World {
     /// The pressure everywhere, in atmospheres (absolute): the air thins with height and moves with the
     /// flow, liquids add their weight with depth, and solids carry the weight of everything above them.
     pub fn pressure_field(&self) -> Vec<f32> {
-        let mut out = vec![0.0f32; W * H];
-        for x in 0..W {
-            self.pressure_column(x, H - 1, |y, p| out[y * W + x] = p);
-        }
-        // Liquid and rock are smoothed sideways (never across the air), so the layers of each
-        // column do not show as stripes.
-        let src = out.clone();
+        let raw = self.pressure_rows(H - 1);
+        let mut out = raw.clone();
         for y in 0..H {
-            let mut x = 0;
-            while x < W {
-                if matches!(self.cells[y * W + x].m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) {
-                    x += 1;
-                    continue;
-                }
-                let mut end = x;
-                while end < W && !matches!(self.cells[y * W + end].m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) {
-                    end += 1;
-                }
-                for xx in x..end {
-                    let (lo, hi) = (xx.saturating_sub(6).max(x), (xx + 6).min(end - 1));
-                    let sum: f32 = (lo..=hi).map(|q| src[y * W + q]).sum();
-                    out[y * W + xx] = sum / (hi - lo + 1) as f32;
-                }
-                x = end;
-            }
+            self.smooth_pressure_row(&raw, y, &mut out[y * W..(y + 1) * W]);
         }
         out
     }
@@ -3090,55 +3072,111 @@ impl World {
         if !Self::inb(x, y) {
             return 0.0;
         }
-        let mut p = 0.0;
-        self.pressure_column(x as usize, y as usize, |_, v| p = v);
-        p
+        // The load of the ground spreads, so a cell depends on a wide cone above it: the whole field
+        // is worked out, and while the game runs kept for a few ticks.
+        let mut cache = self.pressure_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = matches!(&*cache, Some((rev, tick, _)) if *rev == self.revision || (1..8).contains(&self.ticks.wrapping_sub(*tick)));
+        if !fresh {
+            *cache = Some((self.revision, self.ticks, self.pressure_field()));
+        }
+        cache.as_ref().map_or(0.0, |(_, _, f)| f[Self::idx(x, y)])
     }
 
-    /// Walks down a column to row `until`, handing each cell's pressure to `put`.
-    fn pressure_column(&self, x: usize, until: usize, mut put: impl FnMut(usize, f32)) {
+    /// Liquid and rock are smoothed sideways (never across the air), so the layers of each column do
+    /// not show as stripes.
+    fn smooth_pressure_row(&self, raw: &[f32], y: usize, out: &mut [f32]) {
+        let open = |x: usize| matches!(self.at(x as i32, y as i32).kind(), Kind::Empty | Kind::Gas | Kind::Flame);
+        let mut x = 0;
+        while x < W {
+            if open(x) {
+                out[x] = raw[y * W + x];
+                x += 1;
+                continue;
+            }
+            let mut end = x;
+            while end < W && !open(end) {
+                end += 1;
+            }
+            for xx in x..end {
+                let (lo, hi) = (xx.saturating_sub(6).max(x), (xx + 6).min(end - 1));
+                let sum: f32 = (lo..=hi).map(|q| raw[y * W + q]).sum();
+                out[xx] = sum / (hi - lo + 1) as f32;
+            }
+            x = end;
+        }
+    }
+
+    /// The pressure of every cell of rows `0..=until`, row by row from the top.
+    ///
+    /// Air: thinner with height, moved by the flow, or that of its closed pocket. Liquid: the weight
+    /// of the column above it (hydrostatic), plus the excess pressure the liquid has passed on.
+    /// Solid and loose ground: the weight above as well, but rock and sand do not carry it straight
+    /// down in a column as a liquid does: each row spreads the load of the row above over its
+    /// neighbours, so the weight of a tree, a pillar or the walls of a crater fans out with depth
+    /// (as stress does in the ground) instead of running down to the bottom as a stripe.
+    fn pressure_rows(&self, until: usize) -> Vec<f32> {
         // About one atmosphere for 60 cells of water.
         const PER_CELL: f32 = 1.0 / 60.0;
-        let mut weight = 0.0f32;
-        // The pressure at the top of the liquid or solid column the cell below feels.
-        let mut top_p: Option<f32> = None;
-        // The pressure of the closed pocket just above, if the liquid lies in one.
-        let mut pocket_top: Option<f32> = None;
+        // How far each row spreads the load of the row above, either side.
+        const SPREAD: usize = 2;
+        let mut out = vec![0.0f32; W * (until + 1)];
+        // The pressure of the closed pocket just above each column, if a liquid lies in one.
+        let mut pocket_top: Vec<Option<f32>> = vec![None; W];
+        // Pressure carried down from the row above, without the excess (which is added once, per cell).
+        let mut prev = vec![0.0f32; W];
+        let mut cur = vec![0.0f32; W];
+        let mut prev_dense = vec![false; W];
+        let mut dense = vec![false; W];
         for y in 0..=until {
-            let m = self.at(x as i32, y as i32);
             let air = 1.05 * (-((H - y) as f32) / 700.0).exp();
-            let dynamic = 1.0 + (self.flow.pressure_at(x as i32, y as i32) * 0.08).clamp(-0.08, 0.08);
-            // Ideal gas, P V = n R T. With compressible air the wind solver keeps density and
-            // temperature together and gives the pressure directly; otherwise the pressure follows
-            // the absolute temperature at fixed volume, so warm air reads as higher pressure.
-            let closed = self.pocket_at(x as i32, y as i32).map(|k| self.pockets[k]).filter(|p| !p.open);
-            let p_air = if let Some(p) = closed {
-                // A closed pocket (a boiler, a sealed room) has its own pressure.
-                air * p.pressure
-            } else { match self.flow.air_pressure(x as i32, y as i32) {
-                Some(p) => air * p.clamp(0.3, 4.0),
-                None => {
-                    let kelvin = (self.temp[y * W + x] + 273.15).max(1.0) / (self.ambient_c(y as i32) + 273.15).max(1.0);
-                    air * dynamic * kelvin.clamp(0.5, 3.0)
-                }
-            } };
-            match m.kind() {
-                Kind::Empty | Kind::Gas | Kind::Flame => {
-                    put(y, p_air);
-                    weight = 0.0;
-                    top_p = None;
-                    pocket_top = closed.map(|_| p_air);
-                }
-                _ => {
-                    // Below the surface: the hydrostatic weight of what is above, from the still-air
-                    // pressure at the top, plus the excess pressure the liquid has passed on from the
-                    // air (continuous with the air above, and the same all through a connected liquid).
-                    let base = *top_p.get_or_insert(pocket_top.unwrap_or(air));
-                    weight += density(m) * PER_CELL;
-                    put(y, base + weight + self.excess_pressure_at(x as f32 + 0.5, y as f32 + 0.5));
+            for x in 0..W {
+                let m = self.at(x as i32, y as i32);
+                match m.kind() {
+                    Kind::Empty | Kind::Gas | Kind::Flame => {
+                        let dynamic = 1.0 + (self.flow.pressure_at(x as i32, y as i32) * 0.08).clamp(-0.08, 0.08);
+                        // Ideal gas, P V = n R T. With compressible air the wind solver keeps density
+                        // and temperature together and gives the pressure directly; otherwise the
+                        // pressure follows the absolute temperature at fixed volume, so warm air
+                        // reads as higher pressure.
+                        let closed = self.pocket_at(x as i32, y as i32).map(|k| self.pockets[k]).filter(|p| !p.open);
+                        let p_air = if let Some(p) = closed {
+                            // A closed pocket (a boiler, a sealed room) has its own pressure.
+                            air * p.pressure
+                        } else {
+                            match self.flow.air_pressure(x as i32, y as i32) {
+                                Some(p) => air * p.clamp(0.3, 4.0),
+                                None => {
+                                    let kelvin = (self.temp[y * W + x] + 273.15).max(1.0) / (self.ambient_c(y as i32) + 273.15).max(1.0);
+                                    air * dynamic * kelvin.clamp(0.5, 3.0)
+                                }
+                            }
+                        };
+                        out[y * W + x] = p_air;
+                        dense[x] = false;
+                        pocket_top[x] = closed.map(|_| p_air);
+                    }
+                    kind => {
+                        // From the still-air pressure at the top of the column (or of the pocket it
+                        // lies in), plus the weight above.
+                        let above = if !prev_dense[x] {
+                            pocket_top[x].unwrap_or(air)
+                        } else if kind == Kind::Liquid {
+                            prev[x]
+                        } else {
+                            let (lo, hi) = (x.saturating_sub(SPREAD), (x + SPREAD).min(W - 1));
+                            let (sum, n) = (lo..=hi).filter(|&q| prev_dense[q]).fold((0.0, 0.0), |(s, n), q| (s + prev[q], n + 1.0));
+                            sum / n
+                        };
+                        cur[x] = above + density(m) * PER_CELL;
+                        out[y * W + x] = cur[x] + self.excess_pressure_at(x as f32 + 0.5, y as f32 + 0.5);
+                        dense[x] = true;
+                    }
                 }
             }
+            std::mem::swap(&mut prev, &mut cur);
+            std::mem::swap(&mut prev_dense, &mut dense);
         }
+        out
     }
 
     /// The pressure view's colour of a cell, with the borders between gas, liquid and solid marked.
@@ -3663,6 +3701,29 @@ mod tests {
         assert!(near > far + 0.15, "air over water is damper: {near} vs {far}");
         assert!(cloud > 0.95, "inside a cloud the air is saturated: {cloud}");
         assert!(far < 0.3, "dry air far from water: {far}");
+    }
+
+    #[test]
+    fn the_weight_of_a_pillar_fans_out_in_the_ground_instead_of_running_down_as_a_stripe() {
+        let mut w = World::new_static();
+        for x in 0..W as i32 {
+            for y in 300..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for x in 397..403 {
+            for y in 240..300 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        let f = w.pressure_field();
+        let load = 60.0 * density(Mat::Stone) / 60.0;
+        let (under, aside) = (|y: usize| f[y * W + 400], |y: usize| f[y * W + 480]);
+        assert!(under(302) - aside(302) > 0.3 * load, "right under the pillar its weight is felt: {} vs {}", under(302), aside(302));
+        assert!(under(500) - aside(500) < 0.15 * load, "deep down it has spread out: {} vs {}", under(500), aside(500));
+        // And the ground still gets steadily heavier with depth.
+        assert!(aside(500) > aside(400) && aside(400) > aside(320));
+        assert_eq!(w.pressure_at_cell(400, 450), f[450 * W + 400], "the loupe reads the same pressure as the view");
     }
 
     #[test]
@@ -6379,4 +6440,5 @@ mod glass {
         assert!(booms > 0);
     }
 }
+
 
