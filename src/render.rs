@@ -57,19 +57,31 @@ void main() {
 
 // The texture is premultiplied RGBA. Bright orange cells (fire, lava, embers)
 // bloom into their surroundings; every solid gets a light top edge.
+// `Light` is the light map (see `light_map`): its green channel is the hot air, which bends the
+// light passing through it, so everything seen through it wobbles (heat haze).
+// `sky` is (sun x, sun strength, moon x, moon strength), x from 0 to 1 across the world.
 const FRAG: &str = "#version 100
 precision highp float;
 varying vec2 uv;
 uniform sampler2D Texture;
+uniform sampler2D Light;
 uniform vec2 texel;
 uniform float time;
+uniform vec4 sky;
+float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
 void main() {
-    vec4 c = texture2D(Texture, uv);
+    // Heat haze: hot air shifts what is seen through it, in ripples that rise with the warm air.
+    float heat = texture2D(Light, uv).g;
+    vec2 cellf = uv / texel;
+    vec2 p = uv + vec2(sin(cellf.y * 0.45 + time * 9.0 + cellf.x * 0.08), 0.5 * cos(cellf.x * 0.3 - time * 6.0)) * texel * heat * 1.8;
+    vec4 c = texture2D(Texture, p);
     vec3 glow = vec3(0.0);
     float wsum = 0.0;
     for (int i = -3; i <= 3; i++) {
         for (int j = -3; j <= 3; j++) {
-            vec4 s = texture2D(Texture, uv + vec2(float(i), float(j)) * texel * 1.6);
+            vec4 s = texture2D(Texture, p + vec2(float(i), float(j)) * texel * 1.6);
             float e = step(0.93, s.r) * step(s.b, 0.3) * step(0.5, s.a);
             float w = 1.0 / (1.0 + float(i * i + j * j));
             glow += s.rgb * e * w;
@@ -77,18 +89,63 @@ void main() {
         }
     }
     glow = glow / wsum;
-    vec4 up = texture2D(Texture, uv - vec2(0.0, texel.y));
+    vec4 up = texture2D(Texture, p - vec2(0.0, texel.y));
     float edge = c.a * (1.0 - up.a);
     // Water shimmers and embers, lava and flames flicker: a noise per cell that changes twenty
     // times a second, so the texture itself only changes where the cells do.
-    vec2 cell = floor(uv / texel);
+    vec2 cell = floor(p / texel);
     float n = fract(sin(dot(cell, vec2(12.9898, 78.233)) + floor(time * 20.0) * 3.7) * 43758.5453) - 0.5;
     float water = step(0.78, c.a) * step(c.a, 0.83) * step(c.r, c.b);
     float hot = step(0.93, c.r) * step(c.b, 0.3) * step(0.5, c.a);
     c.g += n * (0.06 * water + 0.36 * hot) * c.a;
     vec3 rgb = c.rgb + vec3(0.18) * edge * c.a + glow * 2.2;
+    // Glints: the little waves of the top few rows of water catch the sun (or the moon) and flash,
+    // most of all under the sun, the way a lake sparkles.
+    float a1 = texture2D(Texture, p - vec2(0.0, texel.y)).a;
+    float a2 = texture2D(Texture, p - vec2(0.0, texel.y * 3.0)).a;
+    float a3 = texture2D(Texture, p - vec2(0.0, texel.y * 6.0)).a;
+    float surf = water * max(max(step(a1, 0.05), 0.75 * step(a2, 0.05)), 0.4 * step(a3, 0.05));
+    if (surf > 0.0) {
+        float lit = sky.y * (0.35 + 0.65 * exp(-abs(uv.x - sky.x) * 4.0)) + 0.6 * sky.w * exp(-abs(uv.x - sky.z) * 6.0);
+        // A glint is a short horizontal streak: a wave face a few cells wide catching the light.
+        vec2 facet = vec2(floor(cell.x / 3.0), cell.y);
+        float t = time * 3.0 + hash(facet) * 9.0;
+        float g = hash(facet + floor(t) * vec2(7.13, 3.71));
+        float flash = smoothstep(0.86, 1.0, g) * (1.0 - fract(t));
+        float wave = 0.5 + 0.5 * sin(cell.x * 0.5 + time * 3.0 + sin(cell.x * 0.13 - time));
+        rgb += vec3(1.0, 0.97, 0.86) * surf * lit * (flash * 2.4 + wave * 0.16);
+    }
     float a = max(c.a, clamp(length(glow) * 2.0, 0.0, 1.0));
-    gl_FragColor = vec4(rgb, a);
+    // In clear air the haze shows itself as faint bright and dark ripples.
+    float rip = sin(cellf.y * 0.5 + time * 10.0 + cellf.x * 0.11) * heat * 0.07 * (1.0 - a);
+    gl_FragColor = vec4(rgb + vec3(max(rip, 0.0)), a + max(-rip, 0.0));
+}";
+
+// At night a bluish veil covers the picture, except where fire, embers and lava light it: the light
+// map (one texel per `LS` cells) is blurred into a wide, flickering warm pool of light.
+const NIGHT_FRAG: &str = "#version 100
+precision highp float;
+varying vec2 uv;
+uniform sampler2D Texture;
+uniform vec2 texel;
+uniform float time;
+uniform float night;
+void main() {
+    float l = 0.0;
+    float ws = 0.0;
+    for (int i = -3; i <= 3; i++) {
+        for (int j = -3; j <= 3; j++) {
+            float w = exp(-float(i * i + j * j) / 6.0);
+            l += texture2D(Texture, uv + vec2(float(i), float(j)) * texel * 2.2).r * w;
+            ws += w;
+        }
+    }
+    l = l / ws * 4.5;
+    l *= 0.88 + 0.08 * sin(time * 13.0 + uv.x * 40.0) + 0.06 * sin(time * 23.0 - uv.y * 30.0);
+    l = clamp(l, 0.0, 1.0);
+    float a = 0.46 * night * (1.0 - 0.9 * l);
+    vec3 warm = vec3(1.0, 0.56, 0.22) * l * 0.4 * night;
+    gl_FragColor = vec4(vec3(0.02, 0.05, 0.2) * a + warm, a);
 }";
 
 // Clouds and steam are drawn from a density layer: blurred, then thresholded so
@@ -166,6 +223,42 @@ pub struct Renderer {
     /// The pressure of every cell, recomputed when the picture changes (pressure view only).
     pressure: Vec<f32>,
     has_gas: bool,
+    /// Light from fire, embers and lava (red) and hot air (green), one texel per `LS`×`LS` cells.
+    light_image: Image,
+    light_texture: Texture2D,
+    night_material: Material,
+    light_tick: i64,
+}
+
+/// Cells per texel of the light map.
+pub const LS: usize = 6;
+const LW: usize = W / LS;
+const LH: usize = H / LS;
+
+/// The light map: for each `LS`×`LS` square, how much it glows (fire, embers, lava) in red and how
+/// hot its air is (for the heat haze) in green. Both saturate softly, so a big blaze is not
+/// blinding and a single ember still shows.
+pub fn light_map(world: &World, out: &mut [[u8; 4]]) {
+    for ty in 0..LH {
+        for tx in 0..LW {
+            let (mut glow, mut heat) = (0.0f32, 0.0f32);
+            for y in ty * LS..(ty + 1) * LS {
+                for x in tx * LS..(tx + 1) * LS {
+                    let i = y * W + x;
+                    match world.cells[i].m {
+                        Mat::Fire => glow += 1.0,
+                        Mat::Lava => glow += 1.3,
+                        Mat::Ember => glow += 0.5,
+                        Mat::Empty | Mat::Steam | Mat::Smoke => heat += ((world.temp[i] - 40.0) / 160.0).clamp(0.0, 1.0),
+                        _ => {}
+                    }
+                }
+            }
+            let soft = |v: f32, k: f32| (255.0 * (1.0 - (-v / k).exp())) as u8;
+            // Above a flame the air is hot too, even before the simulation has warmed it.
+            out[ty * LW + tx] = [soft(glow, 5.0), soft(heat + glow * 0.5, 6.0), 0, 255];
+        }
+    }
 }
 
 impl Renderer {
@@ -178,7 +271,8 @@ impl Renderer {
             ShaderSource::Glsl { vertex: VERT, fragment: FRAG },
             MaterialParams {
                 pipeline_params: PipelineParams { color_blend: Some(blend), alpha_blend: Some(blend), ..Default::default() },
-                uniforms: vec![UniformDesc::new("texel", UniformType::Float2), UniformDesc::new("time", UniformType::Float1)],
+                uniforms: vec![UniformDesc::new("texel", UniformType::Float2), UniformDesc::new("time", UniformType::Float1), UniformDesc::new("sky", UniformType::Float4)],
+                textures: vec!["Light".to_string()],
                 ..Default::default()
             },
         )
@@ -195,6 +289,18 @@ impl Renderer {
             },
         )
         .expect("gas shader");
+        let night_material = load_material(
+            ShaderSource::Glsl { vertex: VERT, fragment: NIGHT_FRAG },
+            MaterialParams {
+                pipeline_params: PipelineParams { color_blend: Some(blend), alpha_blend: Some(blend), ..Default::default() },
+                uniforms: vec![UniformDesc::new("texel", UniformType::Float2), UniformDesc::new("time", UniformType::Float1), UniformDesc::new("night", UniformType::Float1)],
+                ..Default::default()
+            },
+        )
+        .expect("night shader");
+        let light_image = Image::gen_image_color(LW as u16, LH as u16, Color::new(0.0, 0.0, 0.0, 1.0));
+        let light_texture = Texture2D::from_image(&light_image);
+        light_texture.set_filter(FilterMode::Linear);
         let veg_image = Image::gen_image_color(W as u16, H as u16, Color::new(0.0, 0.0, 0.0, 0.0));
         let veg_texture = Texture2D::from_image(&veg_image);
         veg_texture.set_filter(FilterMode::Linear);
@@ -219,6 +325,10 @@ impl Renderer {
             last_mode: 0,
             pressure: vec![],
             has_gas: false,
+            light_image,
+            light_texture,
+            night_material,
+            light_tick: -1,
         }
     }
 
@@ -357,11 +467,47 @@ impl Renderer {
             return;
         }
         self.update_trees(world, time);
+        self.update_light(world, time);
+        // The sun and the moon follow the same arcs as in the backdrop.
+        let phase = world.phase();
+        let (u, sun) = if phase < 0.5 { (phase / 0.5, true) } else { ((phase - 0.5) / 0.5, false) };
+        let x = 0.08 + 0.84 * u;
+        let height = (std::f32::consts::PI * u).sin();
+        let sky = if sun { vec4(x, height.sqrt(), 0.0, 0.0) } else { vec4(0.0, 0.0, x, height.sqrt()) };
         self.material.set_uniform("texel", vec2(1.0 / W as f32, 1.0 / H as f32));
         self.material.set_uniform("time", time);
+        self.material.set_uniform("sky", sky);
+        self.material.set_texture("Light", self.light_texture.clone());
         gl_use_material(&self.material);
         draw_texture_ex(&self.texture, v.ox, v.oy, WHITE, size.clone());
         draw_texture_ex(&self.veg_texture, v.ox, v.oy, WHITE, size);
+        gl_use_default_material();
+    }
+
+    /// Rebuilds the light map, fifteen times a second at most.
+    fn update_light(&mut self, world: &World, time: f32) {
+        let tick = (time * 15.0) as i64;
+        if tick == self.light_tick {
+            return;
+        }
+        self.light_tick = tick;
+        light_map(world, self.light_image.get_image_data_mut());
+        self.light_texture.update(&self.light_image);
+    }
+
+    /// The night: a bluish veil over the whole picture, lifted around fires, embers and lava,
+    /// which cast a warm, flickering light on everything near them.
+    pub fn draw_night(&mut self, v: View, day: f32, time: f32) {
+        let night = 1.0 - day;
+        if night <= 0.02 {
+            return;
+        }
+        self.night_material.set_uniform("texel", vec2(1.0 / LW as f32, 1.0 / LH as f32));
+        self.night_material.set_uniform("time", time);
+        self.night_material.set_uniform("night", night);
+        gl_use_material(&self.night_material);
+        let r = v.rect();
+        draw_texture_ex(&self.light_texture, r.x, r.y, WHITE, DrawTextureParams { dest_size: Some(vec2(r.w, r.h)), ..Default::default() });
         gl_use_default_material();
     }
 
@@ -770,4 +916,36 @@ pub fn draw_spring_between(p0: Vec2, p1: Vec2, rest: f32, kind: SpringKind, v: V
 
 pub fn draw_spring(sp: &Spring, v: View, stress: bool) {
     draw_spring_between(sp.p0, sp.p1, sp.rest, sp.kind, v, if stress { Some(sp.stress) } else { None }, 1.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fire_lights_its_square_and_hot_air_makes_haze() {
+        let mut w = World::new_static();
+        w.climate_fixed = Some(15.0);
+        w.reset_temps();
+        for y in 300..304 {
+            for x in 600..604 {
+                w.set(x, y, Mat::Fire);
+            }
+        }
+        // A pocket of hot air far from the fire.
+        for y in 120..126 {
+            for x in 120..126 {
+                w.temp[y * W + x] = 200.0;
+            }
+        }
+        let mut px = vec![[0u8; 4]; LW * LH];
+        light_map(&w, &mut px);
+        let at = |x: usize, y: usize| px[(y / LS) * LW + x / LS];
+        assert!(at(601, 301)[0] > 150, "the fire glows: {:?}", at(601, 301));
+        assert!(at(601, 301)[1] > 50, "the air above a flame shimmers");
+        assert_eq!(at(300, 300)[0], 0, "no light away from the fire");
+        assert!(at(122, 122)[1] > 200, "hot air makes haze: {:?}", at(122, 122));
+        assert_eq!(at(122, 122)[0], 0, "hot air does not glow");
+        assert_eq!(at(400, 200), [0, 0, 0, 255], "calm cool air: nothing");
+    }
 }
