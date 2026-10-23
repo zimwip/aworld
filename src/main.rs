@@ -1807,7 +1807,7 @@ impl Game {
             draw_block(b, view, st);
         }
         for m in &self.members {
-            draw_member(m, view, self.mode == ViewMode::Stress);
+            draw_member(m, view, self.mode == ViewMode::Stress, self.time);
         }
         for sp in &self.springs {
             draw_spring(sp, view, self.mode == ViewMode::Stress);
@@ -3102,6 +3102,32 @@ fn demo_scene(g: &mut Game, biome: Biome) {
     g.launch_car();
 }
 
+/// `--demo --bridge`: a gap in a flat floor, crossed by a steel deck held up by a small truss.
+fn demo_bridge(g: &mut Game) {
+    g.empty_world();
+    for x in 0..W as i32 {
+        if (430..530).contains(&x) {
+            continue;
+        }
+        for y in 330..H as i32 {
+            g.world.set(x, y, Mat::Stone);
+        }
+    }
+    let (l, r, mid, low) = (vec2(426.0, 330.0), vec2(534.0, 330.0), vec2(480.0, 330.0), vec2(480.0, 366.0));
+    let (dl, dr) = (vec2(430.0, 336.0), vec2(530.0, 336.0));
+    let left = Member::new(MemberMat::Steel, Anchor::Ground(l), Anchor::Free(mid), l, mid);
+    let right = Member::new(MemberMat::Steel, Anchor::Ground(r), Anchor::End { uid: left.uid, end: 1 }, r, mid);
+    let d1 = Member::new(MemberMat::Steel, Anchor::Ground(dl), Anchor::Free(low), dl, low);
+    let d2 = Member::new(MemberMat::Steel, Anchor::Ground(dr), Anchor::End { uid: d1.uid, end: 1 }, dr, low);
+    let post = Member::new(MemberMat::Steel, Anchor::End { uid: d1.uid, end: 1 }, Anchor::End { uid: left.uid, end: 1 }, low, mid);
+    g.members.extend([left, right, d1, d2, post]);
+    g.entry = Some((330, 306));
+    g.exit = Some((900, 306));
+    g.refresh_mask();
+    g.model = ModelKind::Truck;
+    g.set_running(true);
+}
+
 /// A little mechanism for `--demo --mech`: a motor driving a gear train, a crank, a rail and an axle.
 fn demo_mech(g: &mut Game) {
     let gx = 450.0;
@@ -3231,6 +3257,9 @@ async fn main() {
         if args.iter().any(|a| a == "--select") {
             game.selection = game.blocks.first().map(|b| select::Sel::Block(b.uid));
         }
+        if args.iter().any(|a| a == "--bridge") {
+            demo_bridge(&mut game);
+        }
         if args.iter().any(|a| a == "--car") {
             game.entry.get_or_insert((360, 300));
             game.launch_car();
@@ -3312,6 +3341,10 @@ async fn main() {
             if let Some(c) = game.cars.last_mut() {
                 c.fate = Fate::Exploded;
             }
+        }
+        // `--bridge`: a truck sets off over the bridge shortly before the shot.
+        if shot.is_some() && frame == 245 && args.iter().any(|a| a == "--bridge") {
+            game.launch_car();
         }
 
         clear_background(BG);
