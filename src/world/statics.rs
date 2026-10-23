@@ -320,7 +320,10 @@ impl World {
                     stack.push(j);
                 }
             }
-            if !ok {
+            // A part that rests on what is under it, its centre of mass over that base, is held
+            // up in compression whatever its bonds (a crust of rock lying on earth, a roof
+            // over a short opening): only one that hangs or tips breaks off.
+            if !ok || self.rests_on_its_base(&region, |j| taken[j] == id) {
                 continue;
             }
             // It turns about the edge between the pivot fibre and the cell under it that held it.
@@ -334,6 +337,29 @@ impl World {
             tips += 1;
         }
         self.level = level;
+    }
+
+    /// Whether the body `cells` (`own` tells its cells) stands on firm ground under it with its
+    /// centre of mass over the span of what it stands on.
+    fn rests_on_its_base(&self, cells: &[usize], own: impl Fn(usize) -> bool) -> bool {
+        let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+        let (mut mass, mut mx) = (0.0f32, 0.0f32);
+        for &i in cells {
+            let rho = density(self.cells[i].m);
+            mass += rho;
+            mx += rho * ((i % W) as f32 + 0.5);
+            let t = i + W;
+            if t >= W * H || own(t) {
+                continue;
+            }
+            if self.mask[t] != 0 || matches!(self.cells[t].m.kind(), Kind::Static | Kind::Powder) {
+                let x = (i % W) as i32;
+                lo = lo.min(x);
+                hi = hi.max(x);
+            }
+        }
+        let cx = mx / mass.max(1e-6);
+        lo <= hi && cx >= lo as f32 && cx <= hi as f32 + 1.0
     }
 
     /// How loaded the section through `cells` is, as a share of what it can bear (over 1: it

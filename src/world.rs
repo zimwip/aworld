@@ -1239,8 +1239,10 @@ impl World {
 
     /// Empties a disc of radius `r`, then lines the ring just around it with masonry, from the
     /// top down to a little below the middle: a masonry vault. Sand, snow or water above can no
-    /// longer pour in, and the roof holds as long as the walls rest on something. Rock, metal and
-    /// masonry are left as they are (a tunnel through rock needs no lining), and so is the floor.
+    /// longer pour in, and the roof holds as long as the walls rest on something. Rock is lined
+    /// too: the rock over a bore is held by the vault (the world is flat: a tunnel through it
+    /// cuts the rock above from the rock below). Metal and masonry are left as they are, and so
+    /// is the floor.
     pub fn tunnel(&mut self, cx: i32, cy: i32, r: i32) {
         self.paint_rule(cx, cy, r, Mat::Empty, PaintRule::Fill);
         let outer = r + TUNNEL_LINING;
@@ -1268,7 +1270,7 @@ impl World {
             // Hot liquids would fire the masonry: they are left to the player's care.
             Kind::Liquid => !m.hot() && !matches!(m, Mat::Molten | Mat::MoltenSteel),
             Kind::Powder => true,
-            Kind::Static => !m.is_vegetation() && !matches!(m, Mat::Stone | Mat::Iron | Mat::Steel | Mat::Brick | Mat::Terracotta | Mat::Glass | Mat::Vault),
+            Kind::Static => !m.is_vegetation() && !matches!(m, Mat::Iron | Mat::Steel | Mat::Brick | Mat::Terracotta | Mat::Glass | Mat::Vault),
         }
     }
 
@@ -4542,16 +4544,31 @@ mod tests {
     }
 
     #[test]
-    fn a_tunnel_leaves_rock_bare() {
+    fn a_tunnel_through_rock_keeps_its_roof() {
+        // A hill of rock on a bed of earth, with seams of earth in it (as the mountains have):
+        // the rock over a tunnel right through it is a body of its own, held up by the vault.
         let mut w = World::new_static();
-        for x in 100..200 {
-            for y in 300..340 {
+        w.structures_fall = true;
+        for x in 100..300 {
+            for y in H as i32 - 10..H as i32 {
                 w.set(x, y, Mat::Stone);
             }
+            for y in H as i32 - 30..H as i32 - 10 {
+                w.set(x, y, Mat::Dirt);
+            }
+            for y in H as i32 - 90..H as i32 - 30 {
+                w.set(x, y, if y == H as i32 - 70 { Mat::Dirt } else { Mat::Stone });
+            }
         }
-        w.tunnel(150, 320, 6);
-        assert_eq!(w.raw(150, 320), Mat::Empty);
-        assert!(w.cells.iter().all(|c| c.m != Mat::Vault), "rock holds by itself: no lining");
+        let y = H as i32 - 50;
+        w.tunnel_line((90, y), (310, y), 6);
+        assert_eq!(w.raw(200, y), Mat::Empty);
+        assert!(w.cells.iter().any(|c| c.m == Mat::Vault), "the rock is lined");
+        for _ in 0..300 {
+            w.step();
+        }
+        assert_eq!(w.raw(200, y), Mat::Empty, "the tunnel stays open");
+        assert_eq!(w.raw(200, H as i32 - 89), Mat::Stone, "the rock over it stays up");
     }
 
     #[test]
