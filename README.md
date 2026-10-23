@@ -112,7 +112,8 @@ Sans carte son (ALSA/PipeWire), compiler avec `cargo build --release --no-defaul
 ## Raccourcis
 
 Espace jouer/pause · B Béluga · W baleine · R retour · C voiture · Z annuler · H/X/V vues · M son · F ou F11 plein écran · Tab onglet. Poteau (brique haute) dans les blocs : plus besoin de tourner les blocs.
-**Échap** recule d'un cran : page Science, tracé en cours, plein écran, puis une fenêtre « Quitter AWorld ? » qui met
+**Ctrl + molette** zoome sur le pointeur (jusqu'à ×8), **Ctrl + glisser** déplace la vue.
+**Échap** recule d'un cran : page Science, tracé en cours, vue zoomée (retour à la vue standard), plein écran, puis une fenêtre « Quitter AWorld ? » qui met
 la simulation en pause ; Échap y reprend le jeu, **Entrée** quitte.
 
 ## Mécanique (onglet Méca)

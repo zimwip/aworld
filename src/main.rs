@@ -1,5 +1,6 @@
 mod backdrop;
 mod blocks;
+mod camera;
 mod car;
 mod fireworks;
 mod firetruck;
@@ -253,6 +254,8 @@ struct Game {
     views_open: f32,
     views_pin: bool,
     views_hit: Rect,
+    /// Ctrl + wheel / Ctrl + drag zoom and move the view; Escape brings back the whole world.
+    camera: camera::Camera,
     /// Camera shake in pixels (explosions), and frame-rate watching for auto speed.
     shake: f32,
     frame_ema: f32,
@@ -363,6 +366,7 @@ impl Game {
             views_open: 0.0,
             views_pin: false,
             views_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
+            camera: camera::Camera::default(),
             shake: 0.0,
             frame_ema: 0.016,
             slow_frames: 0,
@@ -641,6 +645,9 @@ impl Game {
             self.spring_draft = None;
             self.mech_draft = None;
             self.pipe_from = None;
+        } else if !self.camera.is_standard() {
+            self.camera.reset();
+            self.say("Vue standard");
         } else if self.fullscreen {
             self.toggle_fullscreen();
         } else {
@@ -1305,8 +1312,34 @@ impl Game {
         }
     }
 
+    /// Ctrl + wheel zooms on the pointer, Ctrl + drag moves the view (`base` is the standard view).
+    fn handle_camera(&mut self, base: View, ui: &Ui) {
+        let left = is_mouse_button_down(MouseButton::Left);
+        if self.show_science || self.quit_modal {
+            self.camera.drag(base, ui.mouse, false, false);
+            return;
+        }
+        let over_ui = self.panel_hit.contains(ui.mouse) || self.views_hit.contains(ui.mouse) || self.tools_hit.contains(ui.mouse) || self.corner_hit.contains(ui.mouse) || self.hud_hit.contains(ui.mouse) || self.launch_hit.contains(ui.mouse);
+        let inside = !over_ui && base.visible().contains(ui.mouse);
+        let pressed = is_mouse_button_pressed(MouseButton::Left);
+        if self.camera.dragging() || (ctrl_down() && inside && pressed) {
+            self.camera.drag(base, ui.mouse, pressed, left);
+        }
+        let wheel = mouse_wheel().1;
+        if ctrl_down() && inside && wheel != 0.0 {
+            self.camera.zoom_at(base, ui.mouse, wheel.signum());
+            let z = self.camera.zoom();
+            self.say(if z > 1.0 { format!("Zoom ×{z:.1} (Échap : vue standard)") } else { "Vue standard".to_string() });
+        }
+    }
+
     fn handle_mouse(&mut self, view: View, ui: &Ui) {
         if self.show_science || self.quit_modal {
+            return;
+        }
+        // Ctrl belongs to the camera: no painting or building while zooming or moving the view.
+        if ctrl_down() || self.camera.dragging() {
+            self.last = None;
             return;
         }
         let over_ui = self.panel_hit.contains(ui.mouse) || self.views_hit.contains(ui.mouse) || self.tools_hit.contains(ui.mouse) || self.corner_hit.contains(ui.mouse) || self.hud_hit.contains(ui.mouse) || self.launch_hit.contains(ui.mouse);
@@ -3020,7 +3053,8 @@ impl Game {
                 ui.text("Espace : jouer / pause", r.x + 8.0, r.y + 19.0, 13, DIM);
                 ui.text("R retour · C voiture · Z annuler", r.x + 8.0, r.y + 36.0, 13, DIM);
                 ui.text("H thermique · X efforts · V vent", r.x + 8.0, r.y + 53.0, 13, DIM);
-                ui.text("Survole une case pour apprendre", r.x + 8.0, r.y + 80.0, 13, DIM);
+                ui.text("Ctrl + molette/glisser : zoom", r.x + 8.0, r.y + 70.0, 13, DIM);
+                ui.text("Survole une case pour apprendre", r.x + 8.0, r.y + 90.0, 13, DIM);
             }
         }
     }
@@ -3104,6 +3138,10 @@ impl Game {
             self.show_science = false;
         }
     }
+}
+
+fn ctrl_down() -> bool {
+    is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl)
 }
 
 fn therm(t: f32) -> (u8, u8, u8) {
@@ -3368,7 +3406,7 @@ async fn main() {
 
     loop {
         let (sw, sh) = (screen_width(), screen_height());
-        let view = View::fit(Rect::new(game.left(), TOP_H, sw - game.left(), sh - TOP_H));
+        let base = View::fit(Rect::new(game.left(), TOP_H, sw - game.left(), sh - TOP_H));
         ui.begin();
         // Screenshots must not depend on where the real pointer happens to be.
         if shot.is_some() {
@@ -3376,6 +3414,17 @@ async fn main() {
             ui.mouse = demo_mouse.unwrap_or(vec2(-1000.0, -1000.0));
         }
         game.handle_keys();
+        game.handle_camera(base, &ui);
+        // `--zoom n,x,y`: n wheel notches in, on the screen point x, y.
+        if shot.is_some() && frame == 0 {
+            if let Some((n, at)) = arg("--zoom").and_then(|v| {
+                let mut it = v.split(',').map(|t| t.parse::<f32>().ok());
+                Some((it.next()??, vec2(it.next()??, it.next()??)))
+            }) {
+                game.camera.zoom_at(base, at, n);
+            }
+        }
+        let view = game.camera.apply(base);
         game.handle_mouse(view, &ui);
         game.update(get_frame_time().min(0.05));
         // `--boom`: an explosion 25 cells under the water surface at x (default 360), shortly before the shot.
