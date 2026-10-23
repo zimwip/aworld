@@ -51,7 +51,7 @@ impl Game {
         let c = vec2(area.x + area.w - LENS_R - 26.0, area.y + area.h - LENS_R - 112.0);
         let cs = LENS_R * 2.0 / LENS_CELLS as f32;
         let half = LENS_CELLS / 2;
-        let day = backdrop::daylight(self.world.phase());
+        let day = backdrop::sky_light(self.world.phase());
         let sky = |k: f32| (22.0 + 108.0 * k, 28.0 + 152.0 * k, 50.0 + 185.0 * k);
         let (sr, sg, sb) = sky(day);
 
