@@ -236,6 +236,79 @@ pub enum RenderMode {
     Thermal = 1,
     Pressure = 2,
     Humidity = 3,
+    Electric = 4,
+}
+
+// Lightning: each segment of a bolt is a quad whose texcoord y runs from -1 to 1 across it. A thin
+// white-hot core, a violet-blue glow round it and a wide faint halo; the vertex colour's alpha is
+// the brightness, and the wide halo quads (texcoord x = 1) light up the air and the clouds.
+const BOLT_VERT: &str = "#version 100
+attribute vec3 position;
+attribute vec2 texcoord;
+attribute vec4 color0;
+varying lowp vec2 uv;
+varying lowp vec4 col;
+uniform mat4 Model;
+uniform mat4 Projection;
+void main() {
+    gl_Position = Projection * Model * vec4(position, 1.0);
+    uv = texcoord;
+    col = color0 / 255.0;
+}";
+
+const BOLT_FRAG: &str = "#version 100
+precision mediump float;
+varying lowp vec2 uv;
+varying lowp vec4 col;
+void main() {
+    float d = abs(uv.y);
+    vec3 c;
+    if (uv.x > 0.5) {
+        // Halo: the air and the clouds round the channel lit up.
+        float h = exp(-d * d * 3.5) * (1.0 - d);
+        c = vec3(0.45, 0.5, 0.95) * h * 0.5;
+    } else {
+        float core = exp(-d * d * 120.0);
+        float glow = exp(-d * d * 9.0) * 0.6 + exp(-d * 3.5) * 0.3;
+        c = vec3(1.0, 0.98, 1.0) * core * 1.6 + vec3(0.62, 0.55, 1.0) * glow;
+    }
+    c *= col.a * col.rgb;
+    gl_FragColor = vec4(c, 0.0);
+}";
+
+/// A bolt of lightning being shown: its shape and how long ago it struck (seconds).
+pub struct LiveBolt {
+    pub bolt: crate::world::Bolt,
+    pub age: f32,
+    /// Per-bolt random number: when its return strokes come.
+    pub seed: f32,
+}
+
+/// How long a bolt stays on the screen (seconds).
+pub const BOLT_LIFE: f32 = 0.75;
+
+impl LiveBolt {
+    /// Brightness at its age: lightning flickers, two to four return strokes down the same
+    /// channel, each a bright flash that fades in a few hundredths of a second.
+    pub fn brightness(&self) -> f32 {
+        let strokes = [0.0, 0.07 + 0.05 * self.seed, 0.19 + 0.1 * self.seed, 0.36 + 0.12 * self.seed];
+        let n = 2 + (self.seed * 2.99) as usize;
+        let mut b = 0.0f32;
+        for (k, t0) in strokes.iter().take(n).enumerate() {
+            let t = self.age - t0;
+            if t >= 0.0 {
+                b += (-t * 22.0).exp() * if k == 0 { 1.0 } else { 0.75 };
+            }
+        }
+        // The fading channel glows a little longer.
+        (b + 0.25 * (-self.age * 5.0).exp()).min(1.6) * (1.0 - (self.age / BOLT_LIFE).clamp(0.0, 1.0)).sqrt()
+    }
+
+    /// How much the whole scene is lit by it (the flash).
+    pub fn flash(&self) -> f32 {
+        let s = if self.bolt.ground { 1.0 } else { 0.55 };
+        (self.brightness() * self.bolt.power.max(0.4) * s).min(1.0)
+    }
 }
 
 pub struct Renderer {
@@ -274,6 +347,7 @@ pub struct Renderer {
     light_texture: Texture2D,
     night_material: Material,
     light_tick: i64,
+    bolt_material: Material,
 }
 
 /// Cells per texel of the light map.
@@ -396,6 +470,13 @@ impl Renderer {
         let light_image = Image::gen_image_color(LW as u16, LH as u16, Color::new(0.0, 0.0, 0.0, 1.0));
         let light_texture = Texture2D::from_image(&light_image);
         light_texture.set_filter(FilterMode::Linear);
+        // Lightning adds its light to what is under it.
+        let add = BlendState::new(Equation::Add, BlendFactor::One, BlendFactor::One);
+        let bolt_material = load_material(
+            ShaderSource::Glsl { vertex: BOLT_VERT, fragment: BOLT_FRAG },
+            MaterialParams { pipeline_params: PipelineParams { color_blend: Some(add), alpha_blend: Some(add), ..Default::default() }, ..Default::default() },
+        )
+        .expect("bolt shader");
         let veg_image = Image::gen_image_color(W as u16, H as u16, Color::new(0.0, 0.0, 0.0, 0.0));
         let veg_texture = Texture2D::from_image(&veg_image);
         veg_texture.set_filter(FilterMode::Linear);
@@ -424,6 +505,7 @@ impl Renderer {
             light_texture,
             night_material,
             light_tick: -1,
+            bolt_material,
         }
     }
 
@@ -527,6 +609,9 @@ impl Renderer {
                     let field = &self.pressure;
                     Self::fill(&mut self.image, |x, y| world.humidity_color(field, x, y));
                 }
+                RenderMode::Electric => {
+                    Self::fill(&mut self.image, |x, y| world.electric_color(x, y));
+                }
                 RenderMode::Normal => {
                     // Only the zones that changed, plus one row of zones in turn for the slow
                     // changes (temperature tints) that do not wake a zone.
@@ -612,6 +697,58 @@ impl Renderer {
         gl_use_material(&self.night_material);
         let r = v.rect();
         draw_texture_ex(&self.light_texture, r.x, r.y, WHITE, DrawTextureParams { dest_size: Some(vec2(r.w, r.h)), ..Default::default() });
+        gl_use_default_material();
+    }
+
+    /// Bolts of lightning and the flash that lights the whole picture.
+    pub fn draw_bolts(&self, bolts: &[LiveBolt], v: View) {
+        if bolts.is_empty() {
+            return;
+        }
+        let flash = bolts.iter().map(|b| b.flash()).fold(0.0f32, f32::max);
+        if flash > 0.01 {
+            let r = v.rect();
+            draw_rectangle(r.x, r.y, r.w, r.h, Color::new(0.8, 0.84, 1.0, 0.22 * flash));
+        }
+        gl_use_material(&self.bolt_material);
+        for b in bolts {
+            let light = b.brightness() * (0.55 + 0.45 * b.bolt.power);
+            if light < 0.01 {
+                continue;
+            }
+            let mut verts: Vec<Vertex> = vec![];
+            let mut idx: Vec<u16> = vec![];
+            let px = |p: (f32, f32)| vec2(v.ox + p.0 * v.s, v.oy + p.1 * v.s);
+            let s = v.s.max(0.6);
+            let mut line = |pts: &[(f32, f32)], w: f32, a: f32, halo: bool| {
+                for seg in pts.windows(2) {
+                    if verts.len() > 60_000 {
+                        return;
+                    }
+                    let (p, q) = (px(seg[0]), px(seg[1]));
+                    let d = q - p;
+                    let len = d.length().max(1e-3);
+                    let dir = d / len;
+                    let n = vec2(-dir.y, dir.x) * w;
+                    // Stretch each piece a little so the joints have no gaps.
+                    let (p, q) = (p - dir * w * 0.3, q + dir * w * 0.3);
+                    let col = Color::new(1.0, 1.0, 1.0, a.clamp(0.0, 1.0));
+                    let u = if halo { 1.0 } else { 0.0 };
+                    let k = verts.len() as u16;
+                    verts.push(Vertex::new(p.x + n.x, p.y + n.y, 0.0, u, -1.0, col));
+                    verts.push(Vertex::new(p.x - n.x, p.y - n.y, 0.0, u, 1.0, col));
+                    verts.push(Vertex::new(q.x - n.x, q.y - n.y, 0.0, u, 1.0, col));
+                    verts.push(Vertex::new(q.x + n.x, q.y + n.y, 0.0, u, -1.0, col));
+                    idx.extend_from_slice(&[k, k + 1, k + 2, k, k + 2, k + 3]);
+                }
+            };
+            line(&b.bolt.path, 34.0 * s, light * 0.8, true);
+            line(&b.bolt.path, (2.6 + 2.4 * b.bolt.power) * s, light, false);
+            for br in &b.bolt.branches {
+                line(br, 1.8 * s, light * 0.6, false);
+            }
+            draw_mesh(&Mesh { vertices: verts, indices: idx, texture: None });
+        }
         gl_use_default_material();
     }
 

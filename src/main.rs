@@ -27,7 +27,7 @@ mod world;
 use blocks::{anchor_world, block_at, clip, node_at, placement_ok, snap, stamp_all, Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, Physics, Spring, SpringKind, MEMBER_MAX_LEN, SPRING_MAX_LEN};
 use car::{collide_cars, Car, Fate, ModelKind, Tuning};
 use macroquad::prelude::*;
-use render::{RenderMode, cable_preview, draw_block, draw_block_shape, draw_booms, draw_cable, draw_car, draw_flag, draw_member, draw_spring, draw_spring_between, Boom, Renderer, View};
+use render::{RenderMode, cable_preview, draw_block, draw_block_shape, draw_booms, draw_cable, draw_car, draw_flag, draw_member, draw_spring, draw_spring_between, Boom, LiveBolt, Renderer, View, BOLT_LIFE};
 use science::{info, mat_color, MATTERS, RECIPES};
 use mech::{GearSize, Mechanism};
 use mechgame::MechDraft;
@@ -62,6 +62,7 @@ enum ViewMode {
     Wind,
     Pressure,
     Humidity,
+    Electric,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -96,6 +97,7 @@ enum Tool {
     Tunnel,
     Hammer,
     Flame,
+    Lightning,
     Loupe,
     Sensor,
     Entry,
@@ -240,6 +242,9 @@ struct Game {
     last: Option<Vec2>,
     toast: Option<(String, f32)>,
     booms: Vec<Boom>,
+    /// Bolts of lightning on the screen, and thunder on its way: (seconds left, loudness).
+    bolts: Vec<LiveBolt>,
+    thunder: Vec<(f32, f32)>,
     /// Pieces of exploded cars, flying and bouncing.
     debris: debris::Debris,
     hammer_fx: Vec<(Vec2, f32)>,
@@ -357,6 +362,8 @@ impl Game {
             last: None,
             toast: None,
             booms: vec![],
+            bolts: vec![],
+            thunder: vec![],
             debris: debris::Debris::default(),
             hammer_fx: vec![],
             time: 0.0,
@@ -420,6 +427,8 @@ impl Game {
         self.cable_from = None;
         self.cable_via.clear();
         self.booms.clear();
+        self.bolts.clear();
+        self.thunder.clear();
         self.debris.clear();
         self.phys = None;
         if self.running {
@@ -1288,6 +1297,9 @@ impl Game {
         if is_key_pressed(KeyCode::P) {
             self.mode = if self.mode == ViewMode::Pressure { ViewMode::Normal } else { ViewMode::Pressure };
         }
+        if is_key_pressed(KeyCode::E) {
+            self.mode = if self.mode == ViewMode::Electric { ViewMode::Normal } else { ViewMode::Electric };
+        }
         if is_key_pressed(KeyCode::F11) || is_key_pressed(KeyCode::F) {
             self.toggle_fullscreen();
         }
@@ -1470,6 +1482,7 @@ impl Game {
             Tool::Flame => {
                 self.world.flamethrower(g.0, g.1, self.brush.max(3));
             }
+            Tool::Lightning if click => self.world.strike(g.0, g.1),
             Tool::Sensor if click => self.sensor_click(at),
             Tool::Entry if click => self.entry = Some(g),
             Tool::Exit if click => self.exit = Some(g),
@@ -1600,6 +1613,7 @@ impl Game {
             .filter(|c| c.fate == Fate::Driving)
             .map(|c| 0.12 + 0.88 * (c.v.length() / c.kind.model().top_speed).min(1.0))
             .fold(None, |a: Option<f32>, r| Some(a.map_or(r, |a| a.max(r))));
+        self.update_lightning(dt);
         let mix = Mix {
             wind: ((self.world.wind.abs() - 0.55) / 0.45).clamp(0.0, 1.0),
             water: (self.world.take_water_flow() as f32 / (dt * 3600.0 * self.speed as f32).max(1.0)).sqrt().min(1.0),
@@ -1607,6 +1621,35 @@ impl Game {
             rpm,
         };
         self.sounds.update(dt, &mix);
+    }
+
+    /// New bolts of lightning go on the screen; their thunder comes a little later, the later the
+    /// farther they struck from the middle of the valley (sound is slow, light is not).
+    fn update_lightning(&mut self, dt: f32) {
+        for b in &mut self.bolts {
+            b.age += dt;
+        }
+        self.bolts.retain(|b| b.age < BOLT_LIFE);
+        for bolt in std::mem::take(&mut self.world.bolts) {
+            let end = *bolt.path.last().unwrap_or(&(0.0, 0.0));
+            let far = vec2(end.0 - world::W as f32 * 0.5, end.1 - 360.0).length();
+            let loud = bolt.power.max(0.3) * (1.0 - far / 900.0).clamp(0.15, 1.0) * if bolt.ground { 1.0 } else { 0.6 };
+            self.thunder.push((0.15 + far / 320.0, loud));
+            if bolt.ground {
+                self.shake = self.shake.max(3.0 * loud);
+            }
+            let seed = (end.0 * 12.9898 + end.1 * 78.233).sin().abs().fract();
+            if self.bolts.len() < 8 {
+                self.bolts.push(LiveBolt { bolt, age: 0.0, seed });
+            }
+        }
+        for t in &mut self.thunder {
+            t.0 -= dt;
+        }
+        for &(_, loud) in self.thunder.iter().filter(|t| t.0 <= 0.0) {
+            self.sounds.emit(Ev::Thunder(loud));
+        }
+        self.thunder.retain(|t| t.0 > 0.0);
     }
 
     fn sim_step(&mut self) {
@@ -1903,11 +1946,12 @@ impl Game {
         let day = backdrop::sky_light(phase);
         let thermal = self.mode == ViewMode::Thermal;
         // The thermal and pressure views paint the whole picture themselves.
-        let flat = thermal || matches!(self.mode, ViewMode::Pressure | ViewMode::Humidity);
+        let flat = thermal || matches!(self.mode, ViewMode::Pressure | ViewMode::Humidity | ViewMode::Electric);
         let render_mode = match self.mode {
             ViewMode::Thermal => RenderMode::Thermal,
             ViewMode::Pressure => RenderMode::Pressure,
             ViewMode::Humidity => RenderMode::Humidity,
+            ViewMode::Electric => RenderMode::Electric,
             _ => RenderMode::Normal,
         };
         if !flat {
@@ -1975,9 +2019,10 @@ impl Game {
         } else if thermal {
             self.draw_sun_on_thermal(view, ui);
         }
-        // Fireworks are light: drawn over the night, so they glow in the dark.
+        // Fireworks and lightning are light: drawn over the night, so they glow in the dark.
         self.fireworks.draw(view, self.time);
         self.wolves.draw_song(view, ui);
+        renderer.draw_bolts(&self.bolts, view);
         if self.mode == ViewMode::Wind {
             self.draw_wind_field(view);
         }
@@ -2101,6 +2146,15 @@ impl Game {
                 Tool::Shovel => self.draw_shovel_cursor(ui, view, at),
                 Tool::Hammer => draw_circle_lines(ui.mouse.x, ui.mouse.y, 3.5 * view.s, 1.5, ACCENT),
                 Tool::Flame => draw_circle_lines(ui.mouse.x, ui.mouse.y, self.brush.max(3) as f32 * view.s, 1.5, RED),
+                Tool::Lightning => {
+                    // Where it will come down from: straight above the pointer.
+                    let top = view.oy.max(0.0);
+                    for k in 0..((ui.mouse.y - top) / 14.0) as i32 {
+                        let y = top + k as f32 * 14.0;
+                        draw_line(ui.mouse.x, y, ui.mouse.x, y + 6.0, 1.0, Color::new(1.0, 0.92, 0.4, 0.35));
+                    }
+                    draw_circle_lines(ui.mouse.x, ui.mouse.y, 5.0, 1.5, Color::new(1.0, 0.92, 0.4, 0.9));
+                }
                 Tool::Loupe => self.draw_lens(ui, view, at),
                 _ => {}
             }
@@ -2526,12 +2580,13 @@ impl Game {
 
     /// The tools, always in reach on the left edge of the picture.
     fn draw_tools_strip(&mut self, ui: &mut Ui, sh: f32) {
-        let tools: [(Tool, &str, Icon, &str); 8] = [
+        let tools: [(Tool, &str, Icon, &str); 9] = [
             (Tool::Select, "Sélection", Icon::Select, "Clique un élément (bloc, tige, engrenage, câble, tuyau, rail, voiture...) : il est entouré. Glisse-le pour le déplacer ; pour une tige, un câble, un tuyau ou un rail, glisse une poignée au bout pour le retailler. Suppr l'efface. Échap désélectionne. Une voiture sélectionnée affiche ses réglages."),
             (Tool::Eraser, "Gomme", Icon::Eraser, "Efface la matière, les blocs et les câbles (clic droit aussi)."),
             (Tool::Tunnel, "Tunnel", Icon::Tunnel, "Creuse comme la gomme, mais pose une voûte de briques au-dessus du trou : le sable, la terre ou l'eau du plafond ne s'effondrent plus dedans. La roche, elle, tient toute seule et reste telle quelle ; le sol du tunnel n'est pas touché. Le pinceau règle la largeur."),
             (Tool::Hammer, "Marteau", Icon::Hammer, "Tape sur le verre et la glace pour les casser, secoue les autres blocs."),
             (Tool::Flame, "Lance-flammes", Icon::Flame, "Garde le clic enfoncé : un jet de flammes à 1500 °C. Le bois prend feu, la pierre rougit puis fond en lave, le fer fond, l'eau bout. Ce qui est lourd (pierre, eau) chauffe plus lentement. Le pinceau règle la taille du jet."),
+            (Tool::Lightning, "Éclair", Icon::Bolt, "Clique : la foudre tombe du ciel (du nuage au-dessus s'il y en a un) sur ce qui est sous le pointeur. Elle chauffe l'air à des milliers de degrés, met le feu au bois et à l'herbe, fond le sable en tube de verre (fulgurite), fait bouillir l'eau et court dans le fer. Le tonnerre suit, d'autant plus tard que c'est loin. Les gros nuages froids font leurs propres orages : vue Électricité (E)."),
             (Tool::Loupe, "Loupe", Icon::Loupe, "Le pointeur est une loupe : une vue ronde en bas à droite montre la matière sous la croix."),
             (Tool::Sensor, "Capteur", Icon::Thermo, "Pose une sonde (jusqu'à 4) : thermomètre, baromètre et hygromètre. Ses courbes s'affichent en bas de l'image : l'eau qui chauffe puis reste à 100 °C, une chaudière qui monte en pression, l'air qui sèche à midi. Clique sur une sonde pour l'enlever."),
             (Tool::Shovel, "Pelle", Icon::Shovel, "Clique un tas (cendre, sable, eau, fer...) : la bulle se remplit. Déplace-la, elle reste pleine. Garde le clic enfoncé : plus tu attends, plus le morceau est gros (jusqu'à tout) ; relâche pour le verser. La pelle ne se remplit que si elle est vide. Clic droit : tout verser. Le pinceau règle sa taille."),
@@ -3109,7 +3164,7 @@ impl Game {
     /// edge), tucks away when the mouse leaves, and stays out when pinned, like the left palette.
     fn draw_views(&mut self, ui: &mut Ui, sw: f32, sh: f32) {
         let y = TOP_H + 60.0;
-        let h = 376.0;
+        let h = 430.0;
         let tab = Rect::new(sw - VIEWS_TAB, y, VIEWS_TAB, 96.0);
         let px = sw - VIEWS_TAB - VIEWS_W * self.views.open;
         let panel = Rect::new(px, y, VIEWS_W, h);
@@ -3145,13 +3200,14 @@ impl Game {
         if ui.hover(pin) {
             self.hover_info = Some(("Épingler les vues".to_string(), "Épinglées, les vues restent ouvertes. Sinon elles se cachent quand la souris s'en va et ressortent quand elle touche le bord droit.".to_string()));
         }
-        let modes: [(ViewMode, &str, Icon, Color); 6] = [
+        let modes: [(ViewMode, &str, Icon, Color); 7] = [
             (ViewMode::Normal, "Normale", Icon::Sun, ACCENT),
             (ViewMode::Thermal, "Température", Icon::Thermo, RED),
             (ViewMode::Stress, "Efforts", Icon::Gauge, ACCENT),
             (ViewMode::Wind, "Vent", Icon::Wind, BLUE),
             (ViewMode::Pressure, "Pression", Icon::Gauge, GREEN),
             (ViewMode::Humidity, "Hygrométrie", Icon::Drop, BLUE),
+            (ViewMode::Electric, "Électricité", Icon::Bolt, ACCENT),
         ];
         for (i, (m, label, icon, col)) in modes.iter().enumerate() {
             let r = Rect::new(panel.x + 8.0, panel.y + 32.0 + i as f32 * 31.0, panel.w - 16.0, 27.0);
@@ -3160,7 +3216,7 @@ impl Game {
             }
         }
         // Legend for the chosen view.
-        let ly = panel.y + 32.0 + 6.0 * 31.0 + 8.0;
+        let ly = panel.y + 32.0 + modes.len() as f32 * 31.0 + 8.0;
         let bar = Rect::new(panel.x + 12.0, ly + 14.0, panel.w - 24.0, 12.0);
         match self.mode {
             ViewMode::Thermal => {
@@ -3218,8 +3274,23 @@ impl Game {
                 ui.text("100 %", bar.x + bar.w - 28.0, bar.y + 25.0, 11, DIM);
                 ui.wrapped("Air : part de vapeur d'eau par rapport à ce que l'air peut tenir (l'air froid en tient peu). Liquides : toujours 100 %. Points clairs : vapeur et nuage, de l'air saturé (100 %). Gris : solide sec ; la terre garde son humidité.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
             }
+            ViewMode::Electric => {
+                for i in 0..40 {
+                    let q = i as f32 / 39.0 * 2.0 - 1.0;
+                    let a = q.abs().sqrt() * 0.85;
+                    let t = if q > 0.0 { (255.0, 70.0, 60.0) } else { (70.0, 130.0, 255.0) };
+                    let c = |b: f32, t: f32| ((b + (t - b) * a) / 255.0).min(1.0);
+                    draw_rectangle(bar.x + bar.w * i as f32 / 40.0, bar.y, bar.w / 40.0 + 1.0, bar.h, Color::new(c(26.0, t.0), c(26.0, t.1), c(32.0, t.2), 1.0));
+                }
+                ui.text("−", bar.x, bar.y + 25.0, 11, DIM);
+                ui.text("0", bar.x + bar.w * 0.5 - 3.0, bar.y + 25.0, 11, DIM);
+                ui.text("+", bar.x + bar.w - 8.0, bar.y + 25.0, 11, DIM);
+                let peak = self.world.charge.iter().fold(0.0f32, |a, q| a.max(q.abs())) / world::BREAKDOWN;
+                ui.text(&format!("Claquage : {:.0} %", peak.min(1.0) * 100.0), bar.x, bar.y + 44.0, 13, TEXT);
+                ui.wrapped("Dans un gros nuage froid et ascendant, les cristaux de glace (+) montent en haut, le grésil (−) reste en bas. Quand la charge atteint le claquage, l'éclair part : dans le nuage, ou vers le sol, sur ce qui est haut et conduit. Or : métal, cyan : eau.", bar.x, bar.y + 60.0, bar.w, 11, DIM);
+            }
             ViewMode::Normal => {
-                ui.wrapped("Touches : H température, X efforts, V vent, P pression, Y hygrométrie.", bar.x, bar.y + 2.0, bar.w, 11, DIM);
+                ui.wrapped("Touches : H température, X efforts, V vent, P pression, Y hygrométrie, E électricité.", bar.x, bar.y + 2.0, bar.w, 11, DIM);
             }
         }
         let _ = sh;
@@ -3741,6 +3812,7 @@ async fn main() {
             Some("vent") => ViewMode::Wind,
             Some("pression") => ViewMode::Pressure,
             Some("hygro") => ViewMode::Humidity,
+            Some("electricite") => ViewMode::Electric,
             _ => ViewMode::Normal,
         };
         if args.iter().any(|a| a == "--palette") {
@@ -3893,6 +3965,51 @@ async fn main() {
         if shot.is_some() && frame == 345 && args.iter().any(|a| a == "--wreck") {
             if let Some(c) = game.cars.last_mut() {
                 c.fate = Fate::Exploded;
+            }
+        }
+        // `--anvil`: a plume of warm damp air off the plain, run until it has built a storm cloud
+        // whose top spreads out under the tropopause and is dragged downwind into an anvil.
+        if shot.is_some() && args.iter().any(|a| a == "--anvil") {
+            // First a long run to build the cloud, then the plume keeps feeding it until the shot.
+            let (from, to) = if frame == 1 { (0, 2600u32) } else { (2600 + frame * 4, 2604 + frame * 4) };
+            for step in from..to {
+                for k in 0..8u32 {
+                    let x = 600 + ((step * 7919 + k * 104729) % 120) as i32;
+                    let ground = (0..H as i32).find(|&y| !matches!(game.world.at(x, y), Mat::Empty | Mat::Steam | Mat::Cloud | Mat::Smoke)).unwrap_or(H as i32);
+                    let y = ground - 2 - ((step + k * 13) % 6) as i32;
+                    if game.world.at(x, y) == Mat::Empty {
+                        game.world.set(x, y, Mat::Steam);
+                        game.world.temp[y as usize * world::W + x as usize] = 32.0;
+                    }
+                }
+                if frame == 1 {
+                    game.world.step();
+                }
+            }
+        }
+        // `--storm`: a big storm cloud, charged (positive top, negative base), over the valley.
+        // `--lightning x`: a bolt from the sky at x, just before the shot.
+        if shot.is_some() && frame == 345 && args.iter().any(|a| a == "--storm") {
+            for x in 280..680 {
+                let top = 70 + ((x as f32 * 0.05).sin() * 8.0) as i32;
+                for y in top..200 {
+                    game.world.set(x, y, Mat::Cloud);
+                }
+            }
+            for qy in 0..world::QH {
+                for qx in 0..world::QW {
+                    let (x, y) = ((qx * world::QS) as f32, (qy * world::QS) as f32);
+                    let inside = (280.0..680.0).contains(&x) && (70.0..200.0).contains(&y);
+                    if inside {
+                        let u = ((x - 480.0) / 200.0).powi(2);
+                        game.world.charge[qy * world::QW + qx] = (if y < 120.0 { 0.8 } else if y > 150.0 { -0.95 } else { 0.0 }) * (1.0 - u);
+                    }
+                }
+            }
+        }
+        if shot.is_some() && frame == 352 {
+            if let Some(x) = arg("--lightning").and_then(|v| v.parse::<i32>().ok()) {
+                game.world.strike(x, 0);
             }
         }
         // `--bridge`: a truck sets off over the bridge shortly before the shot.

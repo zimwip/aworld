@@ -323,6 +323,9 @@ pub(super) fn dew_point(share: f32) -> f32 {
     237.3 * g / (17.27 - g)
 }
 
+/// How much fully damp air adds to the share of vapour around a cell of steam (see `vapour_share`).
+const HUMID_SHARE: f32 = 0.15;
+
 /// Dew point of the vapour where a whole 3 x 3 block of cells is steam.
 const STEAM_DEW_C: f32 = 45.0;
 
@@ -1250,7 +1253,9 @@ impl World {
                 }
             }
         }
-        n as f32 / 9.0
+        // Damp air (over a lake, in a rising plume fed by it) is already part of the way to
+        // saturation: the vapour in it condenses lower, at the base of a cumulus.
+        n as f32 / 9.0 + HUMID_SHARE * self.flow.moisture_at(x, y)
     }
 
     /// The vapour at (x, y) has cooled to its dew point: it condenses into droplets (a cloud,

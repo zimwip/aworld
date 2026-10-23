@@ -46,6 +46,7 @@ pub enum Icon {
     Select,
     Drop,
     Pin,
+    Bolt,
 }
 
 pub struct Ui {
@@ -272,6 +273,12 @@ pub fn draw_icon(icon: Icon, c: Vec2, s: f32, col: Color) {
             draw_triangle(vec2(c.x - s * 0.25, c.y), vec2(c.x + s * 0.25, c.y), vec2(c.x + s * 0.05, c.y - s * 0.5), o);
             draw_circle(c.x, c.y + s * 0.12, s * 0.12, Color::new(1.0, 0.85, 0.3, col.a));
             draw_rectangle(c.x - s * 0.1, c.y + s * 0.3, s * 0.2, s * 0.16, col);
+        }
+        Icon::Bolt => {
+            // A bolt of lightning: two yellow wedges in a zigzag.
+            let y = Color::new(1.0, 0.9, 0.3, col.a);
+            draw_triangle(vec2(c.x + s * 0.12, c.y - s * 0.48), vec2(c.x - s * 0.3, c.y + s * 0.06), vec2(c.x + s * 0.05, c.y + s * 0.02), y);
+            draw_triangle(vec2(c.x - s * 0.08, c.y - s * 0.04), vec2(c.x + s * 0.3, c.y - s * 0.04), vec2(c.x - s * 0.14, c.y + s * 0.5), y);
         }
         Icon::Thermo => {
             draw_rectangle(c.x - th * 0.6, c.y - s * 0.42, th * 1.2, s * 0.6, col);

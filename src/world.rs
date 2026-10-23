@@ -12,6 +12,8 @@ mod hydro;
 pub mod sleep;
 pub use pockets::boil_c;
 mod thermal;
+mod storm;
+pub use storm::{Bolt, BREAKDOWN, QS, QW, QH};
 pub use thermal::{air_pressure_atm, Season, DAY_STEPS};
 use thermal::adiabatic_cooling_c;
 
@@ -481,6 +483,11 @@ pub struct World {
     pub zones: sleep::Zones,
     /// Walls that gave way under the pressure of a pocket this step: (x, y, pressure in atm).
     pub bursts: Vec<(i32, i32, f32)>,
+    /// Electric charge of the clouds, one value per `QS`×`QS` square (see `storm.rs`).
+    pub charge: Vec<f32>,
+    /// Bolts of lightning since they were last read. For the picture and the thunder.
+    pub bolts: Vec<Bolt>,
+    storm_rng: storm::StormRng,
 }
 
 impl World {
@@ -537,6 +544,9 @@ impl World {
             liq_w: vec![0.0; W * H],
             bursts: Vec::new(),
             zones: sleep::Zones::new(),
+            charge: vec![0.0; QW * QH],
+            bolts: Vec::new(),
+            storm_rng: storm::StormRng(0x9e37_79b9),
         }
     }
 
@@ -552,6 +562,7 @@ impl World {
 
     pub fn clear(&mut self) {
         self.revision += 1;
+        self.charge.fill(0.0);
         self.cells.fill(EMPTY);
         self.ejecta.clear();
         self.latent.fill(0.0);
@@ -1262,6 +1273,7 @@ impl World {
         if self.ticks % (thermal::THERMAL_EVERY * self.thermal_scale() as u32) == 0 {
             self.thermal_pass();
         }
+        self.storm_step();
         if self.day_cycle {
             self.clock = self.clock.wrapping_add(1);
         }
@@ -1978,9 +1990,12 @@ impl World {
                     return true;
                 }
             }
-            // Pressed against the ceiling, rising gas spreads out under it.
+            // Pressed against the ceiling, rising gas spreads out under it, mostly downwind (the
+            // jet stream drags the top of a storm cloud out into an anvil).
             if !self.gas_may_rise_to(x, y, y - 1) {
-                for dx in [d, -d] {
+                let vx = self.flow.sample(x, y).0;
+                let down = if vx.abs() > 0.1 && roll < 0.8 * lift.min(1.0) * 0.7 { vx.signum() as i32 } else { d };
+                for dx in [down, -down] {
                     let t = (self.edge_x(x, y, x + dx), y);
                     if self.at(t.0, t.1) == Mat::Empty {
                         self.swap((x, y), t);
@@ -2447,6 +2462,16 @@ impl World {
         if (self.chance(600) && self.above_dew_point(x, y)) || (near == 0 && self.chance(3000)) {
             self.evaporate_cloud(x, y);
             return;
+        }
+        // Up at the top of the weather the jet stream sweeps the cloud along before anything
+        // else: the top of a storm cloud is dragged downwind into an anvil.
+        if y < CEILING_Y + 10 {
+            if let Some(t) = self.wind_target(x, y) {
+                if self.at(t.0, t.1) == Mat::Empty {
+                    self.swap((x, y), t);
+                    return;
+                }
+            }
         }
         if self.buoyancy(x, y) {
             return;
