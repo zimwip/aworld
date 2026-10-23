@@ -21,6 +21,7 @@ pub fn info(m: Mat) -> Info {
         Mat::Stone => ("Pierre", "solide", "Fond vers 540 °C. Le gel et le dégel l'effritent en sable."),
         Mat::Brick => ("Brique", "solide", "Brique de plastique emboîtable."),
         Mat::Clay => ("Argile", "solide", "Terre grasse. Cuite dans un feu vers 550 °C, elle devient de la terre cuite."),
+        Mat::Vault => ("Voûte", "solide", "Maçonnerie posée par l'outil Tunnel au-dessus du trou, ancrée dans le terrain autour : elle tient le plafond. Les vrais tunnels font pareil (voûte en briques, puis béton projeté et boulons dans la roche)."),
         Mat::Terracotta => ("Terre cuite", "solide", "Argile cuite : elle tient la chaleur et ne brûle pas. Idéale pour un creuset sous un feu de bois."),
         Mat::Rust => ("Rouille", "poudre", "Fer abîmé par l'eau (de l'oxyde de fer). Chauffée avec du carbone (charbon de bois, ou dans les flammes d'un feu de bois), elle redonne du fer."),
         Mat::Ash => ("Cendre", "poudre", "Ce qui reste quand le bois a brûlé à l'air : des minéraux, presque plus de carbone. Avec l'eau, elle enrichit la terre."),
@@ -127,6 +128,7 @@ pub fn mat_color(m: Mat) -> Color {
         Mat::Brick => (184, 72, 56),
         Mat::Clay => (168, 124, 98),
         Mat::Terracotta => (196, 98, 60),
+        Mat::Vault => (170, 86, 58),
         Mat::Empty => (30, 36, 56),
     };
     Color::from_rgba(r, g, b, 255)

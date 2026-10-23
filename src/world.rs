@@ -60,6 +60,8 @@ pub const W: usize = 960;
 pub const H: usize = 540;
 /// Resolution factor relative to the 320x180 design grid.
 pub const K: i32 = 3;
+/// Thickness, in cells, of the masonry vault the tunnel tool leaves around its hole.
+pub const TUNNEL_LINING: i32 = 3;
 /// Above this row the air is cold: steam condenses into clouds.
 const COLD_Y: i32 = (H as i32) * 3 / 10;
 
@@ -108,14 +110,17 @@ pub enum Mat {
     /// Saltpetre (potassium nitrate): white crystals grown where leaves rot with wood ash. Ground
     /// with charcoal it makes black powder; water dissolves it.
     Saltpeter,
+    /// The masonry vault the tunnel tool leaves over its hole. It is bolted into the ground
+    /// around it, so it holds up the roof even when the tunnel cuts a hill in two.
+    Vault,
 }
 
 impl Mat {
-    pub const ALL: [Mat; 37] = [
+    pub const ALL: [Mat; 38] = [
         Mat::Empty, Mat::Sand, Mat::Water, Mat::Fire, Mat::Steam, Mat::Iron, Mat::Wood, Mat::Stone,
         Mat::Brick, Mat::Rust, Mat::Ash, Mat::Ember, Mat::Lava, Mat::Ice, Mat::Gunpowder, Mat::Dirt, Mat::Grass,
         Mat::Leaf, Mat::Steel, Mat::Cloud, Mat::Seed, Mat::Sapling, Mat::Mud, Mat::Glass, Mat::Snow, Mat::Shard, Mat::DeadLeaf, Mat::Branch, Mat::Trunk, Mat::Hail, Mat::Oil, Mat::Smoke, Mat::Molten, Mat::Clay, Mat::Terracotta,
-        Mat::Charcoal, Mat::Saltpeter,
+        Mat::Charcoal, Mat::Saltpeter, Mat::Vault,
     ];
 
     pub fn from_u8(v: u8) -> Mat {
@@ -142,7 +147,7 @@ impl Mat {
             Water | Lava | Oil | Molten => Kind::Liquid,
             Steam | Cloud | Smoke => Kind::Gas,
             Fire => Kind::Flame,
-            Iron | Wood | Stone | Brick | Ember | Ice | Dirt | Grass | Leaf | Steel | Sapling | Glass | Branch | Trunk | Clay | Terracotta => Kind::Static,
+            Iron | Wood | Stone | Brick | Ember | Ice | Dirt | Grass | Leaf | Steel | Sapling | Glass | Branch | Trunk | Clay | Terracotta | Vault => Kind::Static,
         }
     }
 
@@ -196,7 +201,7 @@ fn density(m: Mat) -> f32 {
         Mat::Stone => 2.7,
         Mat::Dirt | Mat::Sand | Mat::Mud => 1.6,
         Mat::Clay => 1.8,
-        Mat::Terracotta => 2.0,
+        Mat::Terracotta | Mat::Vault => 2.0,
         Mat::Brick => 1.2,
         Mat::Wood | Mat::Trunk | Mat::Branch => 0.6,
         Mat::Leaf | Mat::Sapling | Mat::Grass | Mat::Seed | Mat::DeadLeaf => 0.3,
@@ -749,11 +754,57 @@ impl World {
         }
     }
 
+    /// Digs a tunnel along a stroke: like the eraser, but the vault is lined with masonry as it
+    /// goes, so the roof does not cave in (see `tunnel`).
+    pub fn tunnel_line(&mut self, a: (i32, i32), b: (i32, i32), r: i32) {
+        let steps = (b.0 - a.0).abs().max((b.1 - a.1).abs()).max(1);
+        for i in 0..=steps {
+            let x = a.0 + (b.0 - a.0) * i / steps;
+            let y = a.1 + (b.1 - a.1) * i / steps;
+            self.tunnel(x, y, r);
+        }
+    }
+
+    /// Empties a disc of radius `r`, then lines the ring just around it with masonry, from the
+    /// top down to a little below the middle: a masonry vault. Sand, snow or water above can no
+    /// longer pour in, and the roof holds as long as the walls rest on something. Rock, metal and
+    /// masonry are left as they are (a tunnel through rock needs no lining), and so is the floor.
+    pub fn tunnel(&mut self, cx: i32, cy: i32, r: i32) {
+        self.paint_rule(cx, cy, r, Mat::Empty, PaintRule::Fill);
+        let outer = r + TUNNEL_LINING;
+        for dy in -outer..=r / 2 {
+            for dx in -outer..=outer {
+                let d2 = dx * dx + dy * dy;
+                if d2 <= r * r + r / 2 || d2 > outer * outer + outer / 2 {
+                    continue;
+                }
+                let (x, y) = (cx + dx, cy + dy);
+                if !Self::inb(x, y) || self.mask[Self::idx(x, y)] != 0 {
+                    continue;
+                }
+                if Self::needs_lining(self.raw(x, y)) {
+                    self.set(x, y, Mat::Vault);
+                }
+            }
+        }
+    }
+
+    /// Whether a tunnel's vault must be lined where it meets this material.
+    fn needs_lining(m: Mat) -> bool {
+        match m.kind() {
+            Kind::Empty | Kind::Gas | Kind::Flame => false,
+            // Hot liquids would fire the masonry: they are left to the player's care.
+            Kind::Liquid => !m.hot() && m != Mat::Molten,
+            Kind::Powder => true,
+            Kind::Static => !m.is_vegetation() && !matches!(m, Mat::Stone | Mat::Iron | Mat::Steel | Mat::Brick | Mat::Terracotta | Mat::Glass | Mat::Vault),
+        }
+    }
+
     /// How hard a solid material is to break (rock = 1).
     fn hardness(m: Mat) -> f32 {
         match m {
             Mat::Stone => 1.0,
-            Mat::Brick | Mat::Terracotta => 0.7,
+            Mat::Brick | Mat::Terracotta | Mat::Vault => 0.7,
             Mat::Clay => 0.3,
             Mat::Iron | Mat::Steel => 2.4,
             Mat::Glass => 0.2,
@@ -2219,6 +2270,13 @@ impl World {
                 stack.push(i);
             }
         }
+        // A tunnel's vault is bolted into the ground around it: it holds, and holds up what it touches.
+        for i in 0..W * H {
+            if self.cells[i].m == Mat::Vault && !seen[i] {
+                seen[i] = true;
+                stack.push(i);
+            }
+        }
         while let Some(i) = stack.pop() {
             let (x, y) = ((i % W) as i32, (i / W) as i32);
             for (nx, ny) in Self::neighbors(x, y) {
@@ -2671,6 +2729,12 @@ impl World {
             Mat::Brick => (184 + v, 72 + v / 2, 56, 255),
             Mat::Clay => (168 + v, 124 + v / 2, 98 + v / 2, 255),
             Mat::Terracotta => (196 + v, 98 + v / 2, 60 + v / 3, 255),
+            Mat::Vault => {
+                // Courses of bricks (3 cells high, 6 long, staggered) with pale mortar joints.
+                let row = y / 3;
+                let joint = y % 3 == 2 || (x + row * 3) % 6 == 5;
+                if joint { (196 + v / 2, 188 + v / 2, 172 + v / 2, 255) } else { (170 + v, 86 + v / 2, 58 + v / 3, 255) }
+            }
             Mat::Rust => (156 + v, 84 + v / 2, 42, 255),
             Mat::Ash => (100 + v, 100 + v, 106 + v, 255),
             Mat::Charcoal => (34 + v / 2, 32 + v / 2, 34 + v / 2, 255),
@@ -3165,6 +3229,95 @@ mod tests {
         assert_eq!(lowest(150), H as i32 - 1, "the rock slab comes to rest on the base of the world");
         assert_eq!(w.raw(150, H as i32 - 21), Mat::Dirt, "its soil rides down with it");
         assert_eq!(lowest(330), -1, "soil that nothing holds falls and disappears off the bottom");
+    }
+
+    /// A sand dune on bedrock, with walls so it does not spread out.
+    #[cfg(test)]
+    fn dune() -> World {
+        let mut w = World::new_static();
+        w.structures_fall = true;
+        let floor = H as i32 - 10;
+        for x in 60..340 {
+            for y in floor..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+            for y in floor - 60..floor {
+                w.set(x, y, if x < 62 || x >= 338 { Mat::Stone } else { Mat::Sand });
+            }
+        }
+        w
+    }
+
+    #[test]
+    fn a_tunnel_through_sand_keeps_its_roof() {
+        let y = H as i32 - 40;
+        let hole = |w: &World| (150..250).filter(|&x| w.raw(x, y) == Mat::Empty).count();
+        // With the eraser, the sand pours back in.
+        let mut w = dune();
+        w.line((100, y), (300, y), 6, Mat::Empty);
+        for _ in 0..300 {
+            w.step();
+        }
+        assert!(hole(&w) < 20, "an unlined hole in sand fills up: {} cells still empty", hole(&w));
+        // With the tunnel tool, the vault holds the sand above.
+        let mut w = dune();
+        w.tunnel_line((100, y), (300, y), 6);
+        assert_eq!(w.raw(200, y - 7), Mat::Vault, "the roof is lined");
+        assert_eq!(w.raw(200, y + 7), Mat::Sand, "the floor is left as it was");
+        let sand_above = |w: &World| (150..250).filter(|&x| w.raw(x, y - 12) == Mat::Sand).count();
+        let before = sand_above(&w);
+        for _ in 0..300 {
+            w.step();
+        }
+        assert_eq!(hole(&w), 100, "the tunnel stays open");
+        assert_eq!(sand_above(&w), before, "the sand above stays put");
+    }
+
+    #[test]
+    fn a_tunnel_right_through_a_hill_does_not_drop_its_top() {
+        // A dirt hill on bedrock, cut from one side to the other: in this flat world the top half
+        // is no longer joined to the rock. Erased, it falls; lined, the vault holds it.
+        let build = || {
+            let mut w = World::new_static();
+            w.structures_fall = true;
+            for x in 100..300 {
+                for y in H as i32 - 10..H as i32 {
+                    w.set(x, y, Mat::Stone);
+                }
+                for y in H as i32 - 70..H as i32 - 10 {
+                    w.set(x, y, Mat::Dirt);
+                }
+            }
+            w
+        };
+        let y = H as i32 - 40;
+        let top = H as i32 - 70;
+        let mut w = build();
+        w.line((90, y), (310, y), 5, Mat::Empty);
+        for _ in 0..200 {
+            w.step();
+        }
+        assert_ne!(w.raw(200, top), Mat::Dirt, "erased right through, the top of the hill falls");
+        let mut w = build();
+        w.tunnel_line((90, y), (310, y), 5);
+        for _ in 0..200 {
+            w.step();
+        }
+        assert_eq!(w.raw(200, top), Mat::Dirt, "the vault keeps the top of the hill up");
+        assert_eq!(w.raw(200, y), Mat::Empty, "and the tunnel open");
+    }
+
+    #[test]
+    fn a_tunnel_leaves_rock_bare() {
+        let mut w = World::new_static();
+        for x in 100..200 {
+            for y in 300..340 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        w.tunnel(150, 320, 6);
+        assert_eq!(w.raw(150, 320), Mat::Empty);
+        assert!(w.cells.iter().all(|c| c.m != Mat::Vault), "rock holds by itself: no lining");
     }
 
     #[test]

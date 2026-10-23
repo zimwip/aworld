@@ -67,7 +67,7 @@ fn props(m: Mat) -> (f32, f32) {
         Mat::Wood | Mat::Trunk | Mat::Leaf | Mat::Seed | Mat::Sapling | Mat::Branch | Mat::DeadLeaf => (0.04, 1.4),
         Mat::Stone | Mat::Brick => (0.05, 6.0),
         Mat::Clay => (0.1, 2.4),
-        Mat::Terracotta => (0.14, 3.0),
+        Mat::Terracotta | Mat::Vault => (0.14, 3.0),
         Mat::Iron | Mat::Steel => (0.5, 2.5),
         Mat::Glass | Mat::Shard => (0.08, 3.0),
         Mat::Lava => (0.2, 400.0),

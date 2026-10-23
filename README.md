@@ -179,6 +179,10 @@ Touche **V** pour voir les flèches.
   plus chaudes et plus durables) chauffe le fer et la cendre jusqu'à 400 °C : acier.
 - **Pelle** : un clic remplit la bulle (si elle est vide), elle reste pleine en se déplaçant, chaque clic verse une part ;
   clic droit verse tout. Elle garde la chaleur de ce qu'elle porte.
+- **Tunnel** : creuse comme la gomme, mais pose une voûte maçonnée (briques et joints) au-dessus et sur les côtés du trou.
+  La voûte est ancrée dans le terrain : le sable, la terre ou l'eau du plafond ne s'effondrent plus, et un tunnel qui
+  traverse une colline de part en part ne fait plus tomber son sommet. La roche tient seule et reste nue ; le sol du tunnel
+  n'est pas touché (`--demo out.png --tunnel` : la même dune creusée à la gomme et au tunnel).
 - **Loupe** : le pointeur est une loupe, une vue ronde agrandie en bas à droite montre la matière sous la croix.
 - **Sélection** : entoure un élément ; glisser le déplace (les blocs se clipsent), les poignées d'une tige, d'un câble, d'un
   tuyau ou d'un rail les retaillent ; Suppr efface ; Échap désélectionne.
