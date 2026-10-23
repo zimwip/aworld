@@ -409,3 +409,69 @@ impl Ui {
         hot && self.pressed
     }
 }
+
+/// A side menu that slides out while the pointer is over it (or over its edge), tucks itself
+/// away as soon as the pointer leaves, and stays out when pinned. Every side menu works this way.
+#[derive(Clone, Copy, Debug)]
+pub struct Drawer {
+    /// 0 = tucked away, 1 = fully out.
+    pub open: f32,
+    pub pin: bool,
+}
+
+impl Drawer {
+    pub fn new(pin: bool) -> Drawer {
+        Drawer { open: if pin { 1.0 } else { 0.0 }, pin }
+    }
+
+    /// Moves the drawer towards out (pointer over it, or pinned) or in, over `dt` seconds.
+    pub fn update(&mut self, hovering: bool, dt: f32) {
+        let target = if hovering || self.pin { 1.0 } else { 0.0 };
+        self.open += (target - self.open) * (dt * 9.0).min(1.0);
+        if (self.open - target).abs() < 0.01 {
+            self.open = target;
+        }
+    }
+
+    /// Whether any of it shows.
+    pub fn visible(&self) -> bool {
+        self.open > 0.02
+    }
+
+    pub fn toggle_pin(&mut self) {
+        self.pin = !self.pin;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Drawer;
+
+    fn run(d: &mut Drawer, hovering: bool, frames: usize) {
+        for _ in 0..frames {
+            d.update(hovering, 1.0 / 60.0);
+        }
+    }
+
+    #[test]
+    fn a_drawer_opens_on_hover_and_closes_when_the_pointer_leaves() {
+        let mut d = Drawer::new(false);
+        assert!(!d.visible());
+        run(&mut d, true, 60);
+        assert_eq!(d.open, 1.0);
+        run(&mut d, false, 60);
+        assert_eq!(d.open, 0.0, "it tucks away by itself");
+    }
+
+    #[test]
+    fn a_pinned_drawer_stays_out_until_unpinned() {
+        let mut d = Drawer::new(false);
+        run(&mut d, true, 60);
+        d.toggle_pin();
+        run(&mut d, false, 120);
+        assert_eq!(d.open, 1.0, "pinned, it stays out");
+        d.toggle_pin();
+        run(&mut d, false, 60);
+        assert_eq!(d.open, 0.0);
+    }
+}

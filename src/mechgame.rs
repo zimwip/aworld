@@ -214,7 +214,6 @@ impl Game {
             Some(i) if self.mech.gears[i].motor.is_some() => {
                 self.selected_motor = Some(self.mech.gears[i].uid);
                 self.car_remote = false;
-                self.views_pin = true;
                 true
             }
             _ => false,
@@ -832,7 +831,6 @@ impl Game {
                     // A motor just placed is the one the remote shows.
                     if let Some(g) = self.mech.gears.last().filter(|g| g.motor.is_some()) {
                         self.selected_motor = Some(g.uid);
-                        self.views_pin = true;
                     }
                 }
             }

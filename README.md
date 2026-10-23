@@ -10,7 +10,8 @@ cargo run --release
 
 ## Jouer
 - **Panneau de gauche** (onglets) : Matières, Blocs, Voitures, Outils, Monde. Survole une case pour lire l'explication.
-- **Palette de droite** (Vues) : elle sort quand la souris va au bord droit. Normale, Température (°C de chaque cellule),
+- **Palette de droite** (Vues) : elle sort quand la souris va au bord droit et se range quand elle s'en va ; la punaise
+  (ou un clic sur l'onglet) la garde ouverte, comme la palette de gauche. Normale, Température (°C de chaque cellule),
   Efforts (charge des pièces, vert → rouge), Vent.
 - **Barre du haut** : Jouer/Pause, Retour, Annuler (plusieurs fois, même en simulation), Voiture, vitesse, Tourner,
   emplacements 1-2-3, Sauver, Charger, Monde, Vide, Science (toutes les transformations), Plein écran.
@@ -213,7 +214,10 @@ toujours à 100 %, la terre montre son humidité, les solides secs sont en gris.
   réglages sont dans le panneau sous les vues. L'onglet Voitures règle le modèle lui-même (puissance, vitesse, couleur...) :
   les prochaines voitures partent avec ces réglages. Entrée et Sortie y restent.
 - « Matériaux illimités » (Édition / Simulation) est dans les palettes Matières et Blocs, modifiable à tout moment.
-- La punaise à droite de Annuler épingle la palette (la poignée du bord gauche fait la même chose).
+- Les deux menus latéraux marchent pareil : ils sortent au survol, se rangent quand la souris s'en va, et une punaise
+  les garde ouverts. À gauche, la punaise est à droite de Annuler (la poignée du bord gauche fait la même chose) ; à
+  droite, elle est dans l'en-tête des Vues (un clic sur l'onglet fait la même chose). La télécommande d'un moteur et
+  les réglages d'une voiture restent affichés à droite tant qu'ils sont choisis, même vues rangées.
 - Le monde remplit toute la fenêtre : un peu de ciel est recadré en haut si la fenêtre n'est pas en 16:9.
 
 ## Air compressible (gaz parfait)

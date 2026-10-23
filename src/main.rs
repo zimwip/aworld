@@ -30,7 +30,7 @@ use science::{info, mat_color, MATTERS, RECIPES};
 use mech::{GearSize, Mechanism};
 use mechgame::MechDraft;
 use sound::{Ev, Mix, Sounds};
-use ui::{draw_icon, rrect, Icon, Ui, ACCENT, BG, BLUE, DIM, GREEN, PANEL, RED, TEXT, TILE, TILE_HOT};
+use ui::{draw_icon, rrect, Drawer, Icon, Ui, ACCENT, BG, BLUE, DIM, GREEN, PANEL, RED, TEXT, TILE, TILE_HOT};
 use world::{Biome, Cell, Mat, PaintRule, Season, World, H, W};
 
 /// Simulation steps per second at speed x1 (the rigid bodies use the same 1/60 s step).
@@ -171,10 +171,9 @@ struct Game {
     corner_hit: Rect,
     hud_hit: Rect,
     launch_hit: Rect,
-    /// The left palette hides like the views on the right: 1 = fully out. `panel_pin` keeps it out (and
-    /// the picture beside it); `panel_hit` is where it is, so that clicks on it do not paint the world.
-    panel_open: f32,
-    panel_pin: bool,
+    /// The left palette hides like the views on the right; pinned, it stays out (and the picture
+    /// beside it). `panel_hit` is where it is, so that clicks on it do not paint the world.
+    panel: Drawer,
     panel_hit: Rect,
     /// The car settings are shown under the views.
     car_remote: bool,
@@ -248,9 +247,8 @@ struct Game {
     /// whose states are shown under its button (the little arrow).
     matter_state: [usize; MATTERS.len()],
     matter_menu: Option<usize>,
-    /// 0 = palette tucked away, 1 = fully out.
-    views_open: f32,
-    views_pin: bool,
+    /// The views on the right edge, a side menu like the palette.
+    views: Drawer,
     views_hit: Rect,
     /// Ctrl + wheel / Ctrl + drag zoom and move the view; Escape brings back the whole world.
     camera: camera::Camera,
@@ -308,8 +306,7 @@ impl Game {
             corner_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             hud_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             launch_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
-            panel_open: 1.0,
-            panel_pin: false,
+            panel: Drawer { open: 1.0, pin: false },
             panel_hit: Rect::new(0.0, 0.0, PANEL_W, 10000.0),
             car_remote: false,
             selection: None,
@@ -362,8 +359,7 @@ impl Game {
             only_target: Mat::Empty,
             matter_state: MATTERS.map(|m| m.default),
             matter_menu: None,
-            views_open: 0.0,
-            views_pin: false,
+            views: Drawer::new(false),
             views_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             camera: camera::Camera::default(),
             shake: 0.0,
@@ -2090,12 +2086,12 @@ impl Game {
 
     /// Left edge of the picture: beside the palette when it is pinned, else the whole window.
     fn left(&self) -> f32 {
-        if self.panel_pin { PANEL_W } else { 0.0 }
+        if self.panel.pin { PANEL_W } else { 0.0 }
     }
 
     /// How far the palette is pushed off to the left (0 when fully out).
     fn panel_shift(&self) -> f32 {
-        -PANEL_W * (1.0 - self.panel_open)
+        -PANEL_W * (1.0 - self.panel.open)
     }
 
     /// The cars' launch bar, floating at the top of the picture: one button per model.
@@ -2139,14 +2135,10 @@ impl Game {
         let edge = PANEL_W + self.panel_shift();
         let handle = Rect::new(edge.max(0.0), TOP_H, handle_w, sh - TOP_H);
         let hovering = (ui.mouse.x < edge.max(handle_w) && ui.mouse.y > TOP_H) || handle.contains(ui.mouse);
-        let target = if hovering || self.panel_pin { 1.0 } else { 0.0 };
-        self.panel_open += (target - self.panel_open) * (get_frame_time() * 9.0).min(1.0);
-        if (self.panel_open - target).abs() < 0.01 {
-            self.panel_open = target;
-        }
+        self.panel.update(hovering, get_frame_time());
         let shift = self.panel_shift();
         let edge = PANEL_W + shift;
-        if self.panel_open > 0.02 {
+        if self.panel.visible() {
             let outer = (ui.mouse, ui.pressed);
             unsafe { get_internal_gl() }.quad_gl.push_model_matrix(Mat4::from_translation(vec3(shift, 0.0, 0.0)));
             ui.mouse.x -= shift;
@@ -2156,14 +2148,14 @@ impl Game {
             unsafe { get_internal_gl() }.quad_gl.pop_model_matrix();
             ui.mouse = outer.0;
         }
-        // The handle that stays in sight: click it to keep the palette out.
+        // The handle that stays in sight: click it to pin the palette out (or to unpin it).
         let handle = Rect::new(edge.max(0.0), TOP_H, handle_w, sh - TOP_H);
-        rrect(handle, 6.0, Color::new(0.1, 0.12, 0.2, if self.panel_open > 0.5 { 0.92 } else { 0.6 }));
-        ui.text_center(if self.panel_pin { "‹" } else { "›" }, handle.x + handle_w / 2.0, handle.y + handle.h / 2.0 + 7.0, 22, if self.panel_pin { ACCENT } else { TEXT });
+        rrect(handle, 6.0, Color::new(0.1, 0.12, 0.2, if self.panel.open > 0.5 { 0.92 } else { 0.6 }));
+        ui.text_center(if self.panel.pin { "‹" } else { "›" }, handle.x + handle_w / 2.0, handle.y + handle.h / 2.0 + 7.0, 22, if self.panel.pin { ACCENT } else { TEXT });
         if ui.pressed && handle.contains(ui.mouse) && !self.quit_modal {
-            self.panel_pin = !self.panel_pin;
+            self.panel.toggle_pin();
         }
-        self.panel_hit = if self.panel_open > 0.02 { Rect::new(0.0, TOP_H, edge.max(0.0) + handle_w, sh - TOP_H) } else { handle };
+        self.panel_hit = if self.panel.visible() { Rect::new(0.0, TOP_H, edge.max(0.0) + handle_w, sh - TOP_H) } else { handle };
         self.draw_tools_strip(ui, sh);
         self.draw_corner_buttons(ui, sw);
         self.draw_launch_bar(ui, sw);
@@ -2283,8 +2275,8 @@ impl Game {
         let pin_w = 34.0;
         let half = (PANEL_W - 24.0 - pin_w) / 2.0;
         let y = sh - 138.0;
-        if ui.button(Rect::new(18.0 + 2.0 * half, y, pin_w, 32.0), "", Icon::Pin, self.panel_pin, true, ACCENT) {
-            self.panel_pin = !self.panel_pin;
+        if ui.button(Rect::new(18.0 + 2.0 * half, y, pin_w, 32.0), "", Icon::Pin, self.panel.pin, true, ACCENT) {
+            self.panel.toggle_pin();
         }
         if ui.hover(Rect::new(18.0 + 2.0 * half, y, pin_w, 32.0)) {
             self.hover_info = Some(("Épingler la palette".to_string(), "Épinglée, la palette reste ouverte et l'image se place à côté. Sinon elle se cache et ressort quand la souris touche le bord gauche.".to_string()));
@@ -2875,46 +2867,59 @@ impl Game {
         }
     }
 
-    /// The palette of views on the right edge: it slides out when the mouse goes there.
+    /// The palette of views on the right edge: it slides out while the mouse is over it (or at the
+    /// edge), tucks away when the mouse leaves, and stays out when pinned, like the left palette.
     fn draw_views(&mut self, ui: &mut Ui, sw: f32, sh: f32) {
         let y = TOP_H + 60.0;
         let h = 376.0;
         let tab = Rect::new(sw - VIEWS_TAB, y, VIEWS_TAB, 96.0);
-        let px = sw - VIEWS_TAB - VIEWS_W * self.views_open;
+        let px = sw - VIEWS_TAB - VIEWS_W * self.views.open;
         let panel = Rect::new(px, y, VIEWS_W, h);
         let near_edge = ui.mouse.x > sw - 8.0 && ui.mouse.y > TOP_H;
-        let hovering = tab.contains(ui.mouse) || (self.views_open > 0.05 && panel.contains(ui.mouse)) || near_edge;
-        let target = if hovering || self.views_pin { 1.0 } else { 0.0 };
-        self.views_open += (target - self.views_open) * (get_frame_time() * 9.0).min(1.0);
-        if (self.views_open - target).abs() < 0.01 {
-            self.views_open = target;
-        }
-        let remote = self.remote_rect(panel);
-        // The car settings take the same place as the motor's remote control.
-        let car_panel = if remote.is_none() && self.car_remote { Some(Rect::new(panel.x, panel.y + panel.h + 8.0, panel.w, 286.0)) } else { None };
-        self.views_hit = if self.views_open > 0.02 {
-            match remote.or(car_panel) {
-                Some(r) => tab.combine_with(panel).combine_with(r),
-                None => tab.combine_with(panel),
-            }
-        } else {
-            tab
+        let hovering = tab.contains(ui.mouse) || (self.views.open > 0.05 && panel.contains(ui.mouse)) || near_edge;
+        self.views.update(hovering, get_frame_time());
+        let px = sw - VIEWS_TAB - VIEWS_W * self.views.open;
+        let panel = Rect::new(px, y, VIEWS_W, h);
+        // The motor's remote control and the car settings are not part of the menu: they stay in
+        // sight, where the menu's foot would be, as long as a motor or a car is chosen.
+        let rest = Rect::new(sw - VIEWS_TAB - VIEWS_W, y, VIEWS_W, h);
+        let remote = self.remote_rect(rest);
+        let car_panel = if remote.is_none() && self.car_remote { Some(Rect::new(rest.x, rest.y + rest.h + 8.0, rest.w, 286.0)) } else { None };
+        let menu = if self.views.visible() { tab.combine_with(panel) } else { tab };
+        self.views_hit = match remote.or(car_panel) {
+            Some(r) => menu.combine_with(r),
+            None => menu,
         };
+        if let Some(r) = remote {
+            self.draw_remote(ui, r);
+        } else if let Some(r) = car_panel {
+            self.draw_car_remote(ui, r);
+        }
 
-        // The tab that stays visible.
+        // The tab that stays visible: click it to pin the views out (or to unpin them).
         rrect(tab, 8.0, Color::new(0.1, 0.12, 0.2, 0.92));
         draw_icon(Icon::Eye, vec2(tab.x + tab.w / 2.0, tab.y + 22.0), 15.0, if self.mode == ViewMode::Normal { DIM } else { ACCENT });
-        let arrow = if self.views_open > 0.5 { "›" } else { "‹" };
-        ui.text_center(arrow, tab.x + tab.w / 2.0, tab.y + 56.0, 20, TEXT);
+        let arrow = if self.views.pin { "›" } else { "‹" };
+        ui.text_center(arrow, tab.x + tab.w / 2.0, tab.y + 56.0, 20, if self.views.pin { ACCENT } else { TEXT });
         if self.mode != ViewMode::Normal {
             draw_circle(tab.x + tab.w / 2.0, tab.y + 78.0, 4.0, ACCENT);
         }
-        if self.views_open <= 0.02 {
+        if ui.pressed && tab.contains(ui.mouse) && !self.quit_modal {
+            self.views.toggle_pin();
+        }
+        if !self.views.visible() {
             return;
         }
 
         rrect(panel, 12.0, Color::new(0.09, 0.1, 0.17, 0.95));
         ui.text("Vues", panel.x + 12.0, panel.y + 22.0, 16, ACCENT);
+        let pin = Rect::new(panel.x + panel.w - 34.0, panel.y + 5.0, 28.0, 24.0);
+        if ui.button(pin, "", Icon::Pin, self.views.pin, true, ACCENT) {
+            self.views.toggle_pin();
+        }
+        if ui.hover(pin) {
+            self.hover_info = Some(("Épingler les vues".to_string(), "Épinglées, les vues restent ouvertes. Sinon elles se cachent quand la souris s'en va et ressortent quand elle touche le bord droit.".to_string()));
+        }
         let modes: [(ViewMode, &str, Icon, Color); 6] = [
             (ViewMode::Normal, "Normale", Icon::Sun, ACCENT),
             (ViewMode::Thermal, "Température", Icon::Thermo, RED),
@@ -2990,11 +2995,6 @@ impl Game {
             ViewMode::Normal => {
                 ui.wrapped("Touches : H température, X efforts, V vent, P pression, Y hygrométrie.", bar.x, bar.y + 2.0, bar.w, 11, DIM);
             }
-        }
-        if let Some(r) = remote {
-            self.draw_remote(ui, r);
-        } else if let Some(r) = car_panel {
-            self.draw_car_remote(ui, r);
         }
         let _ = sh;
     }
@@ -3322,7 +3322,7 @@ async fn main() {
         game.sounds = Sounds::load().await;
     }
     if shot.is_some() {
-        game.panel_pin = !std::env::args().any(|a| a == "--hide-panel");
+        game.panel.pin = !std::env::args().any(|a| a == "--hide-panel");
         let biome = match arg("--biome").as_deref() {
             Some("mer") => Biome::Sea,
             Some("montagne") => Biome::Mountain,
@@ -3356,8 +3356,7 @@ async fn main() {
             _ => ViewMode::Normal,
         };
         if args.iter().any(|a| a == "--palette") {
-            game.views_open = 1.0;
-            game.views_pin = true;
+            game.views = Drawer::new(true);
         }
         if args.iter().any(|a| a == "--pipes") {
             demo_pipes(&mut game);
@@ -3387,8 +3386,7 @@ async fn main() {
             game.unlimited_sim = was;
             if args.iter().any(|a| a == "--remote") {
                 game.selected_motor = game.mech.gears.iter().find(|g| g.motor.is_some()).map(|g| g.uid);
-                game.views_open = 1.0;
-                game.views_pin = true;
+                game.views = Drawer::new(true);
             }
         }
         game.show_science = args.iter().any(|a| a == "--science");
