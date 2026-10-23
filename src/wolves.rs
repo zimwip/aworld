@@ -206,52 +206,48 @@ impl Wolves {
     }
 }
 
+/// A sitting wolf seen from the side, facing +x, in units (y up is negative, feet on 0).
+/// The body, from the tip of the tail lying on the ground round the back to the front paws.
+const BODY: [(f32, f32); 14] = [
+    (-8.6, 0.0), (-6.2, -1.0), (-4.6, -2.6), (-3.4, -5.0), (-1.2, -6.9), (0.4, -8.2), (2.4, -7.8),
+    (2.8, -5.0), (2.6, 0.0), (1.3, 0.0), (1.1, -2.6), (0.2, 0.0), (-4.0, 0.0), (-5.4, -0.4),
+];
+/// The head, around the top of the neck: ear, brow, muzzle, jaw, throat.
+const HEAD: [(f32, f32); 9] = [(-0.6, -1.6), (-0.2, -3.6), (0.8, -2.2), (1.6, -2.0), (4.0, -1.0), (4.0, -0.4), (2.0, 0.2), (1.0, 0.8), (-1.0, 0.4)];
+const NECK: (f32, f32) = (1.4, -8.0);
+
 /// A sitting wolf in silhouette, its outline lit by the moon. `howl` 0..1 raises its head.
 /// Returns where the tip of its muzzle is on the screen.
 fn draw_wolf(w: &Wolf, view: View, fade: f32, howl: f32) -> Vec2 {
     let u = w.size * SCALE;
-    let pt = |lx: f32, ly: f32| view.to_screen(vec2(w.x + w.dir * lx * u, w.y + ly * u));
-    // Head pose: muzzle forward and a bit down at rest, pointing up at the sky to howl.
-    let ang = 0.3 + (-1.15 - 0.3) * howl;
-    let head = (3.0 - 0.4 * howl, -8.8 - 0.8 * howl);
-    let rot = |dx: f32, dy: f32, a: f32| (head.0 + dx * a.cos() - dy * a.sin(), head.1 + dx * a.sin() + dy * a.cos());
-    let tip = rot(3.6, 0.0, ang);
-    let mut shapes: Vec<[(f32, f32); 3]> = vec![
-        // Bushy tail lying behind it.
-        [(-3.0, -1.6), (-3.6, -0.2), (-8.0, -0.3)],
-        // Back and chest.
-        [(-4.2, -0.2), (1.0, -0.2), (2.8, -7.8)],
-        [(-4.2, -0.2), (2.8, -7.8), (-0.8, -6.6)],
-        // Front legs.
-        [(1.0, 0.0), (2.6, 0.0), (2.6, -6.0)],
-        [(1.0, 0.0), (2.6, -6.0), (1.2, -6.0)],
-        // Neck.
-        [(0.6, -6.6), (3.2, -7.4), head],
-    ];
-    // Muzzle and ears turn with the head.
-    shapes.push([rot(0.0, -1.0, ang), rot(0.0, 1.0, ang), tip]);
-    let ear_a = ang * 0.5 + 0.15;
-    shapes.push([rot(-1.1, -0.9, ear_a), rot(0.2, -1.3, ear_a), rot(-0.9, -3.2, ear_a)]);
-    let to = |p: (f32, f32), off: (f32, f32)| {
-        let s = pt(p.0, p.1);
-        s + vec2(off.0, off.1)
-    };
-    // The moonlit rim first, a little towards the moon, then the dark body over it.
-    let rim = Color::new(0.55, 0.62, 0.85, 0.8 * fade);
-    let body = Color::new(0.07, 0.08, 0.14, fade);
-    let o = (w.dir * 0.3 * u * view.s.max(0.8), -0.3 * u * view.s.max(0.8));
-    for (col, off) in [(rim, o), (body, (0.0, 0.0))] {
-        for s in &shapes {
-            draw_triangle(to(s[0], off), to(s[1], off), to(s[2], off), col);
+    let pt = |p: (f32, f32)| view.to_screen(vec2(w.x + w.dir * p.0 * u, w.y + p.1 * u));
+    // To howl it lifts its muzzle to the sky.
+    let (sin, cos) = (-1.0 * howl).sin_cos();
+    let head: Vec<(f32, f32)> = HEAD.iter().map(|&(x, y)| (NECK.0 + x * cos - y * sin, NECK.1 + x * sin + y * cos)).collect();
+    let body = Color::new(0.06, 0.07, 0.12, fade);
+    let rim = Color::new(0.62, 0.68, 0.9, 0.85 * fade);
+    // The light comes from above, a little in front (the wolves face the moon).
+    let light = vec2(0.45, -0.9).normalize();
+    let width = (0.18 * u * view.s).max(1.0);
+    for (shape, center) in [(&BODY[..], (-1.0, -3.5)), (&head[..], (NECK.0 + 0.8, NECK.1 - 0.6))] {
+        let c = pt(center);
+        for i in 0..shape.len() {
+            let (a, b) = (shape[i], shape[(i + 1) % shape.len()]);
+            draw_triangle(c, pt(a), pt(b), body);
         }
-        let hp = to(head, off);
-        draw_circle(hp.x, hp.y, 1.8 * u * view.s, col);
-        let hip = to((-2.0, -2.6), off);
-        draw_circle(hip.x, hip.y, 2.6 * u * view.s, col);
+        // The edges facing the light (outward normal of a clockwise outline in y-down units).
+        for i in 0..shape.len() {
+            let (a, b) = (shape[i], shape[(i + 1) % shape.len()]);
+            let n = vec2(b.1 - a.1, -(b.0 - a.0)).normalize_or_zero();
+            if n.dot(light) > 0.25 {
+                let (pa, pb) = (pt(a), pt(b));
+                draw_line(pa.x, pa.y, pb.x, pb.y, width, rim);
+            }
+        }
     }
-    let eye = pt(rot(0.6, -0.5, ang).0, rot(0.6, -0.5, ang).1);
-    draw_circle(eye.x, eye.y, (0.35 * u * view.s).max(0.8), Color::new(0.95, 0.9, 0.5, fade * (1.0 - howl)));
-    pt(tip.0, tip.1)
+    let eye = pt((head[3].0 * 0.55 + head[0].0 * 0.45, head[3].1 * 0.55 + head[0].1 * 0.45 + 0.5));
+    draw_circle(eye.x, eye.y, (0.3 * u * view.s).max(0.8), Color::new(0.95, 0.85, 0.4, fade * (1.0 - howl)));
+    pt(head[4])
 }
 
 #[cfg(test)]

@@ -3705,12 +3705,12 @@ async fn main() {
                 game.fireworks.update(0.4);
             }
             // `--wolves t`: the pack is t seconds into its visit at the shot.
-            if frame == 300 {
-                if let Some(t) = arg("--wolves").and_then(|v| v.parse::<f32>().ok()) {
+            if let Some(t) = arg("--wolves").and_then(|v| v.parse::<f32>().ok()) {
+                if frame == 300 {
                     game.wolves.summon(&game.world);
-                    if let Some(p) = &mut game.wolves.pack {
-                        p.age = t - 1.0;
-                    }
+                }
+                if let Some(p) = game.wolves.pack.as_mut().filter(|_| frame >= 355) {
+                    p.age = t;
                 }
             }
             if frame == 240 && args.iter().any(|a| a == "--whale") {
