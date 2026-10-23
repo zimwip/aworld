@@ -45,8 +45,8 @@ cargo run --release
 - **Tiges** (bois, fer, acier) : un clic fixe un bout (sol, bloc ou nœud), tire, un second clic fixe l'autre. Longueur max 110.
   Elles pivotent aux nœuds : on dessine des fermes de pont. Le bois est léger et fragile, le fer lourd, l'acier lourd et solide.
   **Le poids des voitures pèse vraiment sur les tiges** : une longue tige chargée en son milieu plie (comme une planche
-  au-dessus d'un ruisseau) et casse sous un camion, même en acier ; il faut une ferme (des triangles) dessous pour raccourcir
-  les portées. Une tige chargée rougit au-delà de la moitié de sa résistance, le tablier s'affaisse (exagéré pour qu'on le
+  au-dessus d'un ruisseau). Une citadine passe sur une seule tige, même en bois ; un camion demande une tige en acier ou une
+  ferme (des triangles) en fer dessous pour raccourcir les portées. Une tige chargée rougit au-delà de la moitié de sa résistance, le tablier s'affaisse (exagéré pour qu'on le
   voie), et près de casser elle tremble et clignote en rouge. La vue Efforts écrit en plus le % de résistance utilisé
   (`--demo out.png --bridge` : un camion sur un pont en acier).
 - **Câble** (acier, fer, corde) : deux points — bloc, tige (bout ou milieu), sol ou n'importe quel bord du monde, ciel compris (les tiges, ressorts, élastiques et câbles s'y accrochent). Élastique : il prend la forme
