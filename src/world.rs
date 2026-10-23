@@ -217,6 +217,19 @@ pub struct Cell {
 
 const EMPTY: Cell = Cell { m: Mat::Empty, life: 0, stamp: 0 };
 
+/// Steps for a cell of water at 40 °C under perfectly dry, still air to evaporate, on average.
+const EVAPORATE_40C: f32 = 9_000.0;
+/// A trunk cell standing on soil tries to transpire once in this many steps.
+const TRANSPIRE_EVERY: u32 = 200;
+/// How much the water around an evaporating cell cools in all (the vapour takes its latent heat away).
+const EVAPORATIVE_COOLING_C: f32 = 10.0;
+
+/// Saturation vapour pressure of water at `t` °C, in kPa (Magnus formula): how much vapour the air
+/// can hold at that temperature. It roughly doubles every 11 °C.
+pub fn vapour_pressure(t: f32) -> f32 {
+    0.6108 * (17.27 * t / (t + 237.3)).exp()
+}
+
 /// An ember whose life is at least this is burning charcoal: hotter and slower than wood.
 pub(crate) const COAL_LIFE: u8 = 200;
 
@@ -471,6 +484,11 @@ impl World {
 
     fn chance(&mut self, n: u32) -> bool {
         self.rand() % n == 0
+    }
+
+    /// True with probability `p` (0..1).
+    fn chance_f(&mut self, p: f32) -> bool {
+        p > 0.0 && ((self.rand() % 1_000_000) as f32) < p * 1_000_000.0
     }
 
     fn dir(&mut self) -> i32 {
@@ -1246,9 +1264,21 @@ impl World {
 
     fn step_dirt(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
-        // Moisture slowly dries, faster in hot sun.
-        if self.cells[i].life > 0 && self.chance(if self.sun() > 0.5 { 600 } else { 2500 }) {
-            self.cells[i].life -= 1;
+        // Moisture slowly dries: faster in hot sun and in dry, windy air at the surface; buried
+        // soil keeps its water much longer.
+        if self.cells[i].life > 0 {
+            let base = if self.sun() > 0.5 { 600.0 } else { 2500.0 };
+            let open = self.at(x, y - 1) == Mat::Empty;
+            let speed = if open {
+                let dry = 1.0 - self.flow.moisture_at(x, y - 1);
+                let (wx, wy) = self.flow.sample(x, y - 1);
+                (0.5 + 1.5 * dry) * (1.0 + ((wx * wx + wy * wy).sqrt() / flow::GAIN).min(1.0))
+            } else {
+                0.5
+            };
+            if self.chance((base / speed) as u32) {
+                self.cells[i].life -= 1;
+            }
         }
         if self.chance(30) && self.flowing_water_near(x, y) && self.chance(8) {
             self.set(x, y, Mat::Mud);
@@ -1492,7 +1522,38 @@ impl World {
     }
 
     /// Wet wood slowly rots into soil.
+    /// A tree drinks through its roots and breathes the water out through its leaves, by day,
+    /// while it is in leaf: the soil around it dries and the air over a forest gets damp.
+    fn transpire(&mut self, x: i32, y: i32) {
+        if self.sun() < 0.2 || matches!(self.season(), Season::Winter) || !matches!(self.at(x, y + 1), Mat::Dirt | Mat::Grass) {
+            return;
+        }
+        // Up the trunk to the crown, then through the foliage to a leaf in the open air.
+        let mut top = y;
+        while top > 0 && self.raw(x, top - 1) == Mat::Trunk {
+            top -= 1;
+        }
+        let (mut cx, mut cy) = (x, top - 1);
+        if !matches!(self.raw(cx, cy), Mat::Leaf | Mat::Branch) {
+            return;
+        }
+        // Straight out of the crown in a random direction (up, up-left, up-right, left, right).
+        let (dx, dy) = [(0, -1), (-1, -1), (1, -1), (-1, 0), (1, 0)][(self.rand() % 5) as usize];
+        let mut steps = 0;
+        while steps < 20 * K && matches!(self.raw(cx + dx, cy + dy), Mat::Leaf | Mat::Branch) {
+            (cx, cy) = (cx + dx, cy + dy);
+            steps += 1;
+        }
+        let (vx, vy) = (cx + dx, cy + dy);
+        if self.raw(cx, cy) == Mat::Leaf && self.raw(vx, vy) == Mat::Empty && self.drink(x, y + 1, 4 * K, 6 * K) {
+            self.set(vx, vy, Mat::Steam);
+        }
+    }
+
     fn step_wood(&mut self, x: i32, y: i32) {
+        if self.chance(TRANSPIRE_EVERY) && self.raw(x, y) == Mat::Trunk {
+            self.transpire(x, y);
+        }
         // Wood buried for a long time, sealed in earth or rock, slowly becomes oil.
         if self.chance(30_000) {
             let mut cover = 0;
@@ -1663,12 +1724,26 @@ impl World {
             self.set(x, y, Mat::Empty);
             return;
         }
-        // The sun slowly evaporates a warm surface: the hotter, the faster.
+        // A free surface evaporates at any temperature above freezing: faster when the water is
+        // warm (warm water has a higher vapour pressure), when the air over it is dry, and when
+        // the wind carries the damp air away. The vapour leaves with heat: the water under it
+        // cools (that is why sweat cools you down).
         if self.at(x, y - 1) == Mat::Empty {
             let t = self.temp[i];
-            if t > 27.0 && self.chance((150_000.0 / (t - 26.0)) as u32) {
-                self.set(x, y, Mat::Steam);
-                return;
+            if t > 0.0 {
+                let dry = 1.0 - self.flow.moisture_at(x, y - 1);
+                let (wx, wy) = self.flow.sample(x, y - 1);
+                let breeze = 1.0 + 2.0 * ((wx * wx + wy * wy).sqrt() / flow::GAIN).min(1.0);
+                let rate = dry * breeze * vapour_pressure(t) / vapour_pressure(40.0) / EVAPORATE_40C;
+                if self.chance_f(rate) {
+                    self.set(x, y, Mat::Steam);
+                    let wet: Vec<(i32, i32)> = [(x, y + 1), (x - 1, y), (x + 1, y)].into_iter().filter(|&(nx, ny)| self.at(nx, ny) == Mat::Water).collect();
+                    for &(nx, ny) in &wet {
+                        let j = Self::idx(nx, ny);
+                        self.temp[j] -= EVAPORATIVE_COOLING_C / wet.len() as f32;
+                    }
+                    return;
+                }
             }
         }
         // Foliage lets water through: a drop that lands on leaves or branches trickles down to the
@@ -1727,7 +1802,16 @@ impl World {
             }
         }
         let d = self.dir();
-        let order: [(i32, i32); 3] = if hot && self.rand() % 10 < 7 { [(0, -1), (d, -1), (d, 0)] } else { [(d, 0), (-d, 0), (0, -1)] };
+        // Even cooled, vapour keeps drifting up a little: damp air is lighter than dry air (a water
+        // molecule weighs 18, air 29), which is how the vapour of a lake reaches the clouds.
+        let r = self.rand() % 10;
+        let order: [(i32, i32); 3] = if hot && r < 7 {
+            [(0, -1), (d, -1), (d, 0)]
+        } else if r < 3 {
+            [(0, -1), (d, 0), (-d, 0)]
+        } else {
+            [(d, 0), (-d, 0), (0, -1)]
+        };
         for (dx, dy) in order {
             let t = (Self::wrap_x(x + dx), y + dy);
             if self.at(t.0, t.1) == Mat::Empty {
@@ -3573,8 +3657,9 @@ mod tests {
         w.wind = 0.9;
         let mut sx = 0.0;
         let mut n = 0;
+        // A curtain of drops (three drops in one column were too few for a steady average).
         for k in 0..200 {
-            w.set(400, 100 + (k % 3), Mat::Water);
+            w.set(300 + k, 100 + (k % 3), Mat::Water);
         }
         let mut positions: Vec<i32> = vec![];
         for _ in 0..40 {
@@ -3587,10 +3672,11 @@ mod tests {
             }
         }
         for p in positions {
-            sx += (p - 400) as f32;
+            sx += (p - 400) as f32 + 0.5;
             n += 1;
         }
-        assert!(n > 0 && sx / n as f32 > 1.0, "drops should drift right, mean offset {}", sx / n.max(1) as f32);
+        // Without wind the mean offset is 0 (drops pick left and right at random).
+        assert!(n > 0 && sx / n as f32 > 0.6, "drops should drift right, mean offset {}", sx / n.max(1) as f32);
     }
 
     #[test]
@@ -4024,6 +4110,89 @@ mod science {
         }
         let wood = count(&w, Mat::Wood) + count(&w, Mat::Trunk) + count(&w, Mat::Sapling);
         assert!(wood >= 6, "tree only {wood} cells tall");
+    }
+
+    /// Cells of water a wide pan held at `t` °C loses in 3000 steps, under air of humidity
+    /// `rh` moving at `wind` cells per step.
+    fn evaporated(t: f32, rh: f32, wind: f32) -> usize {
+        let mut w = World::new_static();
+        w.flow.pin_uniform(wind, 0.0);
+        w.flow.pin_moisture(rh);
+        for x in 99..=300 {
+            w.set(x, 300, Mat::Terracotta);
+        }
+        for y in 295..300 {
+            w.set(99, y, Mat::Terracotta);
+            w.set(300, y, Mat::Terracotta);
+        }
+        for x in 100..300 {
+            for y in 297..300 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        let before = count(&w, Mat::Water);
+        for _ in 0..3000 {
+            for x in 100..300 {
+                for y in 290..300 {
+                    if w.raw(x, y) == Mat::Water {
+                        w.temp[World::idx(x, y)] = t;
+                    }
+                }
+            }
+            w.step();
+        }
+        before - count(&w, Mat::Water)
+    }
+
+    #[test]
+    fn water_evaporates_faster_when_warm_dry_and_windy() {
+        let base = evaporated(30.0, 0.2, 0.0);
+        let cold = evaporated(5.0, 0.2, 0.0);
+        let humid = evaporated(30.0, 0.9, 0.0);
+        let windy = evaporated(30.0, 0.2, 1.2);
+        eprintln!("EVAP base {base} cold {cold} humid {humid} windy {windy}");
+        assert!(cold > 0, "even cold water evaporates a little");
+        assert!(base > 2 * cold, "warm water evaporates faster: {base} / {cold}");
+        assert!(base > 3 * humid, "damp air takes less: {base} / {humid}");
+        assert!(windy > base * 3 / 2, "the wind carries the damp air away: {windy} / {base}");
+    }
+
+    #[test]
+    fn a_tree_drinks_from_the_soil_and_breathes_vapour_out_of_its_leaves() {
+        let mut w = World::new_static();
+        w.flow.pin_uniform(0.0, 0.0);
+        // Noon, early summer.
+        w.clock = thermal::DAY_STEPS * thermal::SEASON_DAYS + thermal::DAY_STEPS / 4;
+        assert_eq!(w.season(), Season::Summer);
+        floor(&mut w, 330, 80, 240);
+        for x in 80..240 {
+            for y in 310..330 {
+                w.set(x, y, Mat::Dirt);
+                let i = World::idx(x, y);
+                w.cells[i].life = 200;
+            }
+        }
+        // A trunk and a crown of leaves.
+        for y in 280..310 {
+            w.set(160, y, Mat::Trunk);
+            w.set(161, y, Mat::Trunk);
+        }
+        for x in 145..177 {
+            for y in 262..280 {
+                if (x - 160) * (x - 160) / 2 + (y - 271) * (y - 271) < 80 {
+                    w.set(x, y, Mat::Leaf);
+                }
+            }
+        }
+        let soil = |w: &World| (130..190).flat_map(|x| (310..320).map(move |y| (x, y))).map(|(x, y)| w.cells[World::idx(x, y)].life as u32).sum::<u32>();
+        let wet = soil(&w);
+        let mut vapour = 0;
+        for _ in 0..3000 {
+            w.step();
+            vapour = vapour.max((130..190).flat_map(|x| (200..285).map(move |y| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Steam).count());
+        }
+        assert!(vapour > 0, "vapour comes out of the crown");
+        assert!(soil(&w) + 200 < wet, "the roots dried the soil: {} -> {}", wet, soil(&w));
     }
 
     #[test]

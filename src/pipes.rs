@@ -630,7 +630,9 @@ mod tests {
         p.add_pipe((200.0, 200.0), (260.0, 300.0), 1, &mut uids());
         let before = water_in(&w, 0, W as i32);
         run(&mut p, &mut w, 300);
-        assert_eq!(water_in(&w, 0, W as i32), before);
+        // Only a few cells evaporate from the open vessels.
+        let after = water_in(&w, 0, W as i32);
+        assert!(after <= before && after + 5 >= before, "{before} -> {after}");
     }
 
     #[test]

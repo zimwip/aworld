@@ -13,9 +13,9 @@ pub fn info(m: Mat) -> Info {
     let (name, state, fact) = match m {
         Mat::Empty => ("Air", "gaz", "L'air est plus froid en altitude et la nuit."),
         Mat::Sand => ("Sable", "poudre", "Chauffé à 600 °C, il fond et devient du verre."),
-        Mat::Water => ("Eau", "liquide", "Bout à 100 °C à l'air libre, plus chaud sous pression (120 °C à 2 atm : la cocotte-minute). Gèle à 0 °C. Tant qu'elle bout ou gèle, sa température ne bouge plus : c'est le palier."),
+        Mat::Water => ("Eau", "liquide", "Bout à 100 °C à l'air libre, plus chaud sous pression (120 °C à 2 atm : la cocotte-minute). Gèle à 0 °C. Tant qu'elle bout ou gèle, sa température ne bouge plus : c'est le palier. Elle s'évapore aussi sans bouillir, plus vite au chaud, à l'air sec et au vent."),
         Mat::Fire => ("Feu", "flamme", "Environ 650 °C. Il brûle le bois et chauffe tout autour. Il lui faut de l'air : enfermé, il remplit l'air de fumée et s'étouffe."),
-        Mat::Steam => ("Vapeur", "gaz", "Eau chauffée à plus de 100 °C : elle prend bien plus de place que l'eau. Enfermée, elle pousse (chaudière, moteur à vapeur)."),
+        Mat::Steam => ("Vapeur", "gaz", "Eau chauffée à plus de 100 °C : elle prend bien plus de place que l'eau. Enfermée, elle pousse (chaudière, moteur à vapeur). Refroidie, c'est de la vapeur d'eau : plus légère que l'air sec, elle monte former les nuages."),
         Mat::Iron => ("Fer", "solide", "Rouille dans l'eau. Avec du carbone et de la chaleur, il devient de l'acier."),
         Mat::Wood => ("Bois", "solide", "Brûle vers 300 °C s'il a de l'air, et laisse de la cendre. Chauffé sans air (couvert de terre), il devient du charbon de bois."),
         Mat::Stone => ("Pierre", "solide", "Fond vers 540 °C. Le gel et le dégel l'effritent en sable."),
@@ -30,7 +30,7 @@ pub fn info(m: Mat) -> Info {
         Mat::Gunpowder => ("Poudre", "poudre", "Explose dès 210 °C. Attention au feu !"),
         Mat::Dirt => ("Terre", "solide", "Boit la pluie. Avec une graine, de l'eau et de la lumière : un arbre."),
         Mat::Grass => ("Herbe", "solide", "Ses racines retiennent la terre contre l'érosion."),
-        Mat::Leaf => ("Feuille", "solide", "Verte au printemps, rousse en automne, puis elle tombe."),
+        Mat::Leaf => ("Feuille", "solide", "Verte au printemps, rousse en automne, puis elle tombe. Le jour, elle rejette de la vapeur d'eau : l'eau que les racines ont bue (la transpiration)."),
         Mat::Steel => ("Acier", "solide", "Fer + carbone : bien plus solide, et il rouille moins vite."),
         Mat::Cloud => ("Nuage", "gaz", "Vapeur refroidie. Quand il est épais, il pleut (ou il neige s'il gèle)."),
         Mat::Seed => ("Graine", "poudre", "Elle pousse sur de la terre humide, en pleine lumière, si elle a de la place."),
@@ -46,7 +46,7 @@ pub fn info(m: Mat) -> Info {
         Mat::DeadLeaf => ("Feuille morte", "poudre", "Elle pourrit doucement et devient de la terre."),
         Mat::Branch => ("Branche", "solide", "Le squelette de la couronne : au printemps, les feuilles repoussent."),
         Mat::Charcoal => ("Charbon de bois", "poudre", "Du bois chauffé sans air : presque du carbone pur. Il brûle lentement et très chaud, et donne son carbone au fer (acier) et à la rouille (fer)."),
-        Mat::Trunk => ("Tronc", "solide", "Les voitures passent à travers les arbres. Il brûle comme du bois."),
+        Mat::Trunk => ("Tronc", "solide", "Les voitures passent à travers les arbres. Il brûle comme du bois. Il monte l'eau du sol jusqu'aux feuilles."),
     };
     Info { name, state, fact }
 }
@@ -68,6 +68,8 @@ pub const RECIPES: &[Recipe] = &[
     Recipe { from: &[Mat::Rust, Mat::Fire], to: &[Mat::Iron], text: "La rouille chauffée avec du carbone (charbon de bois, ou les flammes d'un feu de bois) redonne du fer : le carbone lui prend son oxygène." },
     Recipe { from: &[Mat::Water, Mat::Fire], to: &[Mat::Steam], text: "L'eau bout à 100 °C et devient vapeur." },
     Recipe { from: &[Mat::Steam], to: &[Mat::Cloud, Mat::Water], text: "La vapeur refroidit : nuage, puis pluie. C'est le cycle de l'eau." },
+    Recipe { from: &[Mat::Water], to: &[Mat::Steam], text: "L'eau s'évapore même froide, plus vite au chaud, à l'air sec et au vent. La vapeur, plus légère que l'air, monte faire des nuages." },
+    Recipe { from: &[Mat::Dirt, Mat::Trunk, Mat::Leaf], to: &[Mat::Steam], text: "Les arbres boivent l'eau du sol par leurs racines et la rejettent en vapeur par leurs feuilles : une forêt rend l'air humide." },
     Recipe { from: &[Mat::Water], to: &[Mat::Ice], text: "La nuit, quand il gèle, l'eau devient de la glace." },
     Recipe { from: &[Mat::Cloud], to: &[Mat::Water, Mat::Snow, Mat::Hail], text: "Nuage tiède : pluie. Gel : neige. Grand froid : grêle. Un nuage réchauffé par le soleil ne pleut pas." },
     Recipe { from: &[Mat::Sand, Mat::Fire], to: &[Mat::Glass], text: "Du sable très chaud fond : c'est du verre." },

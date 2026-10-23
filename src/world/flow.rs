@@ -579,6 +579,12 @@ impl Flow {
         self.frozen = true;
     }
 
+    /// Sets the humidity of all the air (for tests; pin the field too, or the wind moves it).
+    #[cfg(test)]
+    pub fn pin_moisture(&mut self, v: f32) {
+        self.moist.fill(v);
+    }
+
     #[cfg(test)]
     pub fn inject_vortex_for_test(&mut self, x: f32, y: f32, r: f32, gamma: f32) {
         self.swirl(Vortex { x, y, r, gamma, life: 1 }, 1.0);

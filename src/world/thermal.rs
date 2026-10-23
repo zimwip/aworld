@@ -909,12 +909,13 @@ mod latent_tests {
         let mut c = World::new_static();
         c.climate_fixed = Some(-3.0);
         c.reset_temps();
+        // A terracotta pot: stone would crumble in the frost and let the water out.
         for y in 294..301 {
-            c.set(199, y, Mat::Stone);
-            c.set(220, y, Mat::Stone);
+            c.set(199, y, Mat::Terracotta);
+            c.set(220, y, Mat::Terracotta);
         }
         for x in 200..220 {
-            c.set(x, 300, Mat::Stone);
+            c.set(x, 300, Mat::Terracotta);
             for y in 296..300 {
                 c.set(x, y, Mat::Water);
                 c.temp[y as usize * W + x as usize] = 2.0;
