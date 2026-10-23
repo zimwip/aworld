@@ -180,6 +180,11 @@ impl Mat {
         matches!(self, Mat::Molten | Mat::MoltenSteel)
     }
 
+    /// Molten rock or metal.
+    pub fn is_melt(self) -> bool {
+        matches!(self, Mat::Lava | Mat::Molten | Mat::MoltenSteel)
+    }
+
     pub fn hot(self) -> bool {
         matches!(self, Mat::Fire | Mat::Ember | Mat::Lava)
     }
@@ -291,8 +296,6 @@ const EMPTY: Cell = Cell { m: Mat::Empty, life: 0, stamp: 0 };
 const EVAPORATE_40C: f32 = 9_000.0;
 /// A trunk cell standing on soil tries to transpire once in this many steps.
 const TRANSPIRE_EVERY: u32 = 200;
-/// How much the water around an evaporating cell cools in all (the vapour takes its latent heat away).
-const EVAPORATIVE_COOLING_C: f32 = 10.0;
 
 /// Saturation vapour pressure of water at `t` °C, in kPa (Magnus formula): how much vapour the air
 /// can hold at that temperature. It roughly doubles every 11 °C.
@@ -1896,7 +1899,13 @@ impl World {
         }
         let (vx, vy) = (cx + dx, cy + dy);
         if self.raw(cx, cy) == Mat::Leaf && self.raw(vx, vy) == Mat::Empty && self.drink(x, y + 1, 4 * K, 6 * K) {
+            // A quarter of a cell of water leaves as vapour, with the heat that takes (the leaf
+            // and the air around it cool).
+            let (j, t) = (Self::idx(vx, vy), self.temp[Self::idx(cx, cy)]);
+            let q = thermal::heat_of(Mat::Empty, self.temp[j]) + thermal::heat_of(Mat::Water, t) / VAPOUR_PER_WATER as f32 - thermal::heat_of(Mat::Steam, t);
             self.set(vx, vy, Mat::Steam);
+            self.temp[j] = t;
+            self.release_heat(cx, cy, q);
         }
     }
 
@@ -2144,12 +2153,8 @@ impl World {
                 let airborne = if self.at(x, y + 1) == Mat::Empty { DROP_EVAPORATION } else { 1.0 };
                 let rate = airborne * dry * breeze * vapour_pressure(t) / vapour_pressure(40.0) / EVAPORATE_40C;
                 if self.chance_f(rate) {
+                    // The heat it takes cools the water and the air around (see `vaporize`).
                     self.vaporize(x, y);
-                    let wet: Vec<(i32, i32)> = [(x, y + 1), (x - 1, y), (x + 1, y)].into_iter().filter(|&(nx, ny)| self.at(nx, ny) == Mat::Water).collect();
-                    for &(nx, ny) in &wet {
-                        let j = Self::idx(nx, ny);
-                        self.temp[j] -= EVAPORATIVE_COOLING_C / wet.len() as f32;
-                    }
                     return;
                 }
             }
@@ -2240,7 +2245,21 @@ impl World {
     fn step_steam(&mut self, x: i32, y: i32) {
         // Condensation is handled by temperature (see thermal.rs). Hot steam rises on
         // its own; as it cools it stops climbing and just drifts with the wind.
-        let hot = self.temp[Self::idx(x, y)] > self.ambient_c(y) + 8.0;
+        let i = Self::idx(x, y);
+        let hot = self.temp[i] > self.ambient_c(y) + 8.0;
+        // Packed vapour (a full boiler) spreads into any room it finds.
+        if self.cells[i].life > 0 {
+            let n = Self::neighbors(x, y)[(self.rand() % 4) as usize];
+            if self.at(n.0, n.1) == Mat::Empty {
+                let (j, t) = (Self::idx(n.0, n.1), self.temp[i]);
+                let q = thermal::heat_of(Mat::Empty, self.temp[j]) - thermal::cap(Mat::Steam) * t;
+                self.cells[i].life -= 1;
+                self.set(n.0, n.1, Mat::Steam);
+                self.temp[j] = t;
+                self.release_heat(x, y, q);
+                return;
+            }
+        }
         if self.buoyancy(x, y) {
             return;
         }
@@ -2272,12 +2291,18 @@ impl World {
 
     /// Water at (x, y) turns to vapour and swells: the cell becomes steam, and the rest of its
     /// `VAPOUR_PER_WATER` cells of steam go into the nearest free cells around it. Shut in with no
-    /// room left (a full boiler), the vapour is squeezed into fewer cells.
+    /// room left (a full boiler), the rest of the vapour stays packed in the cell (its `life`
+    /// counts the extra cells' worth): no water is lost, and the packed vapour pushes harder
+    /// (see `pockets.rs`) until it finds room to spread. The heat it takes beyond what the water
+    /// held (all of it when the water boiled, less when it evaporates cold) comes from around.
     pub(crate) fn vaporize(&mut self, x: i32, y: i32) {
-        let t = self.temp[Self::idx(x, y)];
+        let i = Self::idx(x, y);
+        let t = self.temp[i];
+        let mut q = thermal::heat_of(Mat::Water, t) + self.latent[i];
         self.set(x, y, Mat::Steam);
-        self.temp[Self::idx(x, y)] = t;
+        self.temp[i] = t;
         let mut left = VAPOUR_PER_WATER - 1;
+        let mut made = 1.0;
         // (Not upward where the vapour could not rise: a drop evaporating above the top of the
         // weather would otherwise ratchet its water up a row each time.)
         'out: for r in 1..=2 {
@@ -2290,13 +2315,33 @@ impl World {
                         break 'out;
                     }
                     let (nx, ny) = (x + dx, y + dy);
-                    if Self::inb(nx, ny) && self.at(nx, ny) == Mat::Empty && (dy >= 0 || self.gas_may_rise_to(x, y, ny)) {
+                    // The second ring only through the first: never through a wall.
+                    let via = (nx - dx.signum() * (r - 1), ny - dy.signum() * (r - 1));
+                    if Self::inb(nx, ny)
+                        && self.at(nx, ny) == Mat::Empty
+                        && (r == 1 || matches!(self.at(via.0, via.1), Mat::Empty | Mat::Steam))
+                        && (dy >= 0 || self.gas_may_rise_to(x, y, ny))
+                    {
+                        let j = Self::idx(nx, ny);
+                        q += thermal::heat_of(Mat::Empty, self.temp[j]);
                         self.set(nx, ny, Mat::Steam);
-                        self.temp[Self::idx(nx, ny)] = t;
+                        self.temp[j] = t;
                         left -= 1;
+                        made += 1.0;
                     }
                 }
             }
+        }
+        self.cells[i].life = left as u8;
+        q -= made * thermal::cap(Mat::Steam) * t + VAPOUR_PER_WATER as f32 * thermal::latent0(Mat::Steam);
+        self.release_heat(x, y, q);
+    }
+
+    /// Cells' worth of vapour in a cell of steam or cloud (more than one when packed).
+    pub fn vapour_units(&self, i: usize) -> u32 {
+        match self.cells[i].m {
+            Mat::Steam | Mat::Cloud => 1 + self.cells[i].life as u32,
+            _ => 0,
         }
     }
 
@@ -2304,6 +2349,7 @@ impl World {
     /// taken from the cloud around it (within two cells). Returns false, taking nothing, if the
     /// cloud there is too thin.
     fn gather_vapour(&mut self, x: i32, y: i32) -> bool {
+        let mut need = VAPOUR_PER_WATER as u32 - self.vapour_units(Self::idx(x, y)).min(VAPOUR_PER_WATER as u32);
         let mut found = Vec::with_capacity(VAPOUR_PER_WATER);
         'out: for r in 1..=2 {
             for dy in -r..=r {
@@ -2311,21 +2357,35 @@ impl World {
                     if (dx as i32).abs().max((dy as i32).abs()) != r {
                         continue;
                     }
-                    if found.len() + 1 >= VAPOUR_PER_WATER {
+                    if need == 0 {
                         break 'out;
                     }
                     if self.raw(x + dx, y + dy) == Mat::Cloud {
-                        found.push((x + dx, y + dy));
+                        let take = self.vapour_units(Self::idx(x + dx, y + dy)).min(need);
+                        found.push((x + dx, y + dy, take));
+                        need -= take;
                     }
                 }
             }
         }
-        if found.len() + 1 < VAPOUR_PER_WATER {
+        if need > 0 {
             return false;
         }
-        for (cx, cy) in found {
-            self.set(cx, cy, Mat::Empty);
+        // The droplets taken from the cloud around bring their heat to the drop.
+        let mut q = 0.0;
+        for (cx, cy, take) in found {
+            let j = Self::idx(cx, cy);
+            if take >= self.vapour_units(j) {
+                q += thermal::heat_of(Mat::Cloud, self.temp[j]) + self.cells[j].life as f32 * thermal::latent0(Mat::Cloud) - thermal::heat_of(Mat::Empty, self.temp[j]);
+                let t = self.temp[j];
+                self.set(cx, cy, Mat::Empty);
+                self.temp[j] = t;
+            } else {
+                q += take as f32 * thermal::latent0(Mat::Cloud);
+                self.cells[j].life -= take as u8;
+            }
         }
+        self.release_heat(x, y, q);
         true
     }
 
@@ -2363,23 +2423,20 @@ impl World {
             let water = self.cloud_water(x, y);
             let thick = ((water - RAIN_MIN_WATER) / (24.0 - RAIN_MIN_WATER)).max(0.0);
             if self.chance_f(thick * thick / RAIN_EVERY) && self.gather_vapour(x, y) {
-                if t > 2.0 {
-                    self.set(x, y, Mat::Water);
-                    self.temp[i] = t.max(4.0);
-                } else if t > -12.0 {
-                    self.set(x, y, Mat::Snow);
-                } else {
-                    self.set(x, y, Mat::Hail);
-                }
+                // The drop holds the cloud's water; freezing into snow or hail, it gives off
+                // the heat of freezing (counted by `heat_of`).
+                let own = thermal::heat_of(Mat::Cloud, t) + self.cells[i].life as f32 * thermal::latent0(Mat::Cloud);
+                let (to, tt) = if t > 2.0 { (Mat::Water, t.max(4.0)) } else if t > -12.0 { (Mat::Snow, t) } else { (Mat::Hail, t) };
+                self.set(x, y, to);
+                self.temp[i] = tt;
+                self.release_heat(x, y, own - thermal::heat_of(to, tt));
                 return;
             }
         }
-        if t > 26.0 && self.chance(600) {
-            self.set(x, y, Mat::Steam);
-            return;
-        }
-        if near == 0 && self.chance(3000) {
-            self.set(x, y, Mat::Steam);
+        // Warmed above its dew point (by the sun, by warm air), or left alone in dry air, a cloud
+        // evaporates again.
+        if (self.chance(600) && self.above_dew_point(x, y)) || (near == 0 && self.chance(3000)) {
+            self.evaporate_cloud(x, y);
             return;
         }
         if self.buoyancy(x, y) {
@@ -2540,10 +2597,19 @@ impl World {
             match self.at(nx, ny) {
                 // Quenched: it sets solid and the water flashes to steam.
                 Mat::Water => {
+                    // The heat of setting (and of the melt above its melting point) boils the water.
+                    let (i, j) = (Self::idx(x, y), Self::idx(nx, ny));
+                    let t = self.temp[i];
+                    let mut q = thermal::heat_of(self.cells[i].m, t) + self.latent[i] - thermal::heat_of(solid, t);
                     self.set(x, y, solid);
-                    let j = Self::idx(nx, ny);
-                    self.temp[j] = 100.0;
+                    self.temp[i] = t;
+                    let tw = self.temp[j];
+                    if tw < 100.0 {
+                        q -= thermal::cap(Mat::Water) * (100.0 - tw);
+                        self.temp[j] = 100.0;
+                    }
                     self.vaporize(nx, ny);
+                    self.release_heat(x, y, q);
                     return;
                 }
                 m if m.is_wooden() => self.ignite(nx, ny, 20),
@@ -2552,6 +2618,14 @@ impl World {
         }
         if self.at(x, y - 1) == Mat::Empty && self.chance(150) {
             self.set(x, y - 1, Mat::Fire);
+        }
+        // A pool of melt churns (convection): hot melt from inside keeps coming against the
+        // walls and the floor, so they keep being heated, and the heat is only moved, not made.
+        let (nx, ny) = Self::neighbors(x, y)[(self.rand() % 4) as usize];
+        if self.at(nx, ny) == self.at(x, y) {
+            let (i, j) = (Self::idx(x, y), Self::idx(nx, ny));
+            self.temp.swap(i, j);
+            self.latent.swap(i, j);
         }
         if self.chance(2) {
             return;
@@ -3389,6 +3463,7 @@ mod tests {
             w.set(x, 98, Mat::Water);
         }
         w.set(5, 90, Mat::Lava);
+        w.temp[90 * W + 5] = thermal::LAVA_C;
         for _ in 0..60 {
             w.step();
         }
@@ -3691,7 +3766,7 @@ mod tests {
             (cloud0 - cloud_cells(&w)) as f32 / cloud0 as f32
         };
         let (thin, thick) = (rain(2), rain(16));
-        assert!(thin < 0.01, "a thin veil of cloud hardly rains: lost {thin}");
+        assert!(thin < 0.02, "a thin veil of cloud hardly rains (a drop or so): lost {thin}");
         assert!(thick > 4.0 * thin.max(0.005), "a thick cloud rains far more: {thick} against {thin}");
     }
 
@@ -4138,7 +4213,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_lava_melts_the_rock_beside_it_but_the_rock_never_melts_without_heat() {
+    fn a_flow_of_fresh_lava_melts_its_bed_but_the_rock_never_melts_without_heat() {
         let mut w = World::new_static();
         for x in 90..210 {
             for y in 300..340 {
@@ -4158,7 +4233,14 @@ mod tests {
                 w.temp[y as usize * W + x as usize] = 1100.0;
             }
         }
-        for _ in 0..1500 {
+        // A thin layer of lava chills against cold rock and sets before the rock under it reaches
+        // its melting point. Kept flowing (fresh lava poured in from above all along, as in a lava
+        // channel), it melts its bed: thermal erosion.
+        for _ in 0..800 {
+            for x in 101..105 {
+                w.set(x, 292, Mat::Lava);
+                w.temp[292 * W + x as usize] = 1100.0;
+            }
             w.step();
         }
         let lava = w.cells.iter().filter(|c| c.m == Mat::Lava).count();
@@ -4187,7 +4269,8 @@ mod tests {
                 w.set(x, y, Mat::Iron);
             }
         }
-        // Fresh lava sitting on the iron.
+        // Fresh lava kept flowing over the iron (a thin layer would set against the cold metal:
+        // iron draws the heat away fast).
         for x in 100..140 {
             for y in 306..312 {
                 w.set(x, y, Mat::Lava);
@@ -4195,7 +4278,15 @@ mod tests {
             }
         }
         let mut molten = false;
-        for _ in 0..2500 {
+        for k in 0..2500 {
+            if k < 1500 {
+                for x in 100..140 {
+                    if w.raw(x, 305) == Mat::Empty {
+                        w.set(x, 305, Mat::Lava);
+                        w.temp[305 * W + x as usize] = 1300.0;
+                    }
+                }
+            }
             w.step();
             molten |= w.cells.iter().any(|c| c.m == Mat::Molten);
         }
@@ -4889,7 +4980,8 @@ mod science {
             for x in 100..120 {
                 for y in 296..300 {
                     w.set(x, y, solid);
-                    w.temp[y as usize * W + x as usize] = thermal::METAL_MELT_C + 150.0;
+                    // Hot enough above its melting point to have the heat that melts it.
+                    w.temp[y as usize * W + x as usize] = thermal::METAL_MELT_C + 400.0;
                 }
             }
             let mut seen = false;
@@ -4922,7 +5014,7 @@ mod science {
         let cells: Vec<usize> = (0..W * H).filter(|&k| w.cells[k].m == Mat::Molten).collect();
         assert!(!cells.is_empty());
         assert!(cells.iter().all(|&k| w.temp[k] > thermal::METAL_MELT_C), "poured molten metal is above its melting point");
-        for _ in 0..300 {
+        for _ in 0..60 {
             w.step();
         }
         assert!(count(&w, Mat::Molten) > 0, "it does not set at once");

@@ -2468,7 +2468,7 @@ mod tests {
         let (calm, _) = run(false);
         let (blasted, lift) = run(true);
         eprintln!("calm drift {calm:?}, blasted displacement {blasted:?}, highest lift {lift}");
-        assert!(blasted.length() > calm.length() + 4.0 || lift > 4.0, "the blast moves the plank: {blasted:?} vs {calm:?}, lift {lift}");
+        assert!((blasted - calm).length() > 4.0 || lift > 4.0, "the blast moves the plank: {blasted:?} vs {calm:?}, lift {lift}");
     }
 
     #[test]
