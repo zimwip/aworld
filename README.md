@@ -32,7 +32,19 @@ cargo run --release
   à l'abri de la pluie, l'eau le dissout). Salpêtre + charbon de bois, à froid et au sec : de la poudre noire.
 - **Clins d'œil** : le Béluga (B) ; une **baleine** souffle dans les grandes étendues d'eau profonde (W pour l'appeler) ;
   un grand feu fait venir le **camion de pompiers** (pin-pon !) qui l'arrose avec de la vraie eau ; la nuit, la poudre
-  qui explose lance un **feu d'artifice** (couleurs des métaux : cuivre bleu, strontium rouge, sodium jaune, baryum vert).
+  qui explose lance un **feu d'artifice** (couleurs des métaux : cuivre bleu, strontium rouge, sodium jaune, baryum vert) ;
+  de temps en temps, un **petit garçon** (sweat jaune au dinosaure, jogging bleu) vient se promener (K pour l'appeler) :
+  il saute les murets, fait la roue et des saltos, et commente ce qu'il voit dans une bulle. Rien ne le brûle ni ne le
+  fait exploser, mais un coup, une explosion, du sable sur la tête ou un clic sur lui : « Aïe ! », « Hé ho, ça va pas
+  non ?! » (`--demo out.png --kid x[,walk|wave|jump|flip|wheel|ouch]`) ;
+  les nuits de **pleine lune**, une meute de **loups** monte sur la plus haute colline et hurle (L pour savoir dans combien
+  de nuits) ; le louveteau chante faux et la lune leur fait un clin d'œil.
+- **Phases de la lune** : un cycle de 8 jours (une année de jeu) : nouvelle lune, premier croissant, premier quartier,
+  lune gibbeuse, pleine lune, puis dernier quartier et dernier croissant. Éclairée à droite quand elle grandit, à gauche
+  quand elle décroît. Comme en vrai, elle se lève un peu plus tard chaque jour : la pleine lune se lève au coucher du
+  soleil, le premier quartier se voit dès l'après-midi, le dernier quartier ne se lève qu'à minuit et la nouvelle lune
+  traverse le ciel avec le soleil (invisible). Le reflet sur la mer et la lumière qu'elle donne suivent sa phase.
+  Le nom de la lune s'affiche la nuit dans la barre du monde (`--demo out.png --day 3 --hour 0 --wolves 4`).
 - **Plantes** : terre humide + graine + eau + lumière (jamais la nuit) = arbre ; les arbres font des graines : une forêt pousse.
   La terre nue s'érode sous l'eau qui coule (l'herbe la protège). Une graine sans eau pourrit en terre.
 - **Pas de vrai sol** : seule la roche posée sur le bas du monde retient le reste ; tout ce qui n'y est pas relié tombe et
@@ -66,7 +78,7 @@ vide ou en sortant du monde. Leur poids pèse sur les ponts. **Réglages** (ongl
 amortisseurs, adhérence, taille des roues, solidité, poids, couleur — sur la voiture choisie ou pour les suivantes.
 
 ## Raccourcis
-Espace jouer/pause · B Béluga · W baleine · R retour · Z annuler · C voiture · G monde suivant · N vide · H température · X efforts · V vent ·
+Espace jouer/pause · B Béluga · W baleine · L loups · K petit garçon · R retour · Z annuler · C voiture · G monde suivant · N vide · H température · X efforts · V vent ·
 Q/E/T tourner · Tab onglet · [ ] pinceau · ↑/↓ vitesse · 1-0 matières · F5/F9 sauver/charger · F11 plein écran.
 
 ## Développement
@@ -114,7 +126,7 @@ le jeu tourne simplement en silence. `--no-default-features` compile une version
 
 ## Raccourcis
 
-Espace jouer/pause · B Béluga · W baleine · R retour · C voiture · Z annuler · H/X/V vues · M son · F ou F11 plein écran · Tab onglet. Poteau (brique haute) dans les blocs : plus besoin de tourner les blocs.
+Espace jouer/pause · B Béluga · W baleine · L loups · K petit garçon · R retour · C voiture · Z annuler · H/X/V vues · M son · F ou F11 plein écran · Tab onglet. Poteau (brique haute) dans les blocs : plus besoin de tourner les blocs.
 **Ctrl + molette** zoome sur le pointeur (jusqu'à ×8), **Ctrl + glisser** déplace la vue.
 **Échap** recule d'un cran : page Science, tracé en cours, vue zoomée (retour à la vue standard), plein écran, puis une fenêtre « Quitter AWorld ? » qui met
 la simulation en pause ; Échap y reprend le jeu, **Entrée** quitte.
@@ -255,6 +267,19 @@ Le vent (`src/world/flow.rs`) est un air faiblement compressible : chaque case g
 
 Une explosion sous l'eau lève maintenant un panache : plus elle est peu profonde, plus l'eau de la surface au-dessus est projetée haut (rien si elle est très profonde, la surface se soulève seulement). `--demo out.png --biome mer --boom [x]` déclenche une explosion sous la surface juste avant la capture.
 
+## Liquides sous pression : vases communicants, siphons
+
+Case par case, un liquide ne fait que tomber et s'étaler, comme des grains qui ne s'entassent pas : il ne peut pas remonter. Ce qui en fait un liquide, c'est qu'il transmet sa pression. `src/world/hydro.rs` applique une seule règle à tous les liquides (eau, huile, lave, métal fondu), paramétrée par leur densité et leur fluidité :
+
+- Tous les 2 pas, les masses connectées de chaque liquide sont retrouvées. Dans une masse, le liquide passe des endroits où sa charge (hauteur + pression du gaz qui appuie dessus) est la plus haute vers ceux où elle est la plus basse, quelques cases à la fois, d'autant plus vite que l'écart est grand (Torricelli : en racine carrée). Une surface ne donne que si elle est calme (fermée d'une rive à l'autre). L'eau remonte dans un tube en U, deux vases reliés par le fond s'égalisent, une chaudière sous pression pousse son eau dans un tuyau.
+- **Embouchures** : le liquide au bas d'un tuyau plein (ou d'un trou étroit, 8 cases au plus) est tenu par la pression derrière lui, comme une paille bouchée du doigt : la colonne ne se casse pas. Si l'embouchure est sous la surface, le liquide s'y écoule (en jet, plusieurs cases d'un coup quand la charge est grande). Un tuyau qui passe par-dessus un rebord fait donc un **siphon** : amorcé (plein), il vide le réservoir jusqu'à son embouchure, puis l'air entre et il s'arrête. Vide, il ne fait rien.
+- **Limite de l'air** : l'air ne peut pousser l'eau qu'à environ 10 m (60 cases, `ATM_PER_CELL`) au-dessus de la surface : un siphon dont le sommet est plus haut se désamorce. Plus le liquide est dense, plus cette hauteur est faible (environ 20 cases pour la lave).
+- Un filet qui tombe dans l'air (de l'air à côté) ne transmet pas la pression : une cascade ne pompe pas le lac dans le bassin sous elle.
+- **Fluidité** : eau 1, huile 0,6, métal fondu 0,3, lave 0,12. La lave s’égalise environ huit fois plus lentement que l’eau, et fige si le tuyau est froid.
+- Coût : seules les masses qui touchent une zone éveillée sont parcourues (environ 0,05 ms par pas en campagne, 0,35 ms sur la mer).
+
+`--demo out.png --siphon --advance 900` montre deux vases d'eau, un siphon et un tube en U d'huile après 900 pas.
+
 ## Garder le jeu fluide : niveaux de simplification
 
 `cargo test --release cost_of_a_tick -- --ignored --nocapture` mesure le coût d'un pas de simulation (campagne : environ 3,4 ms, mer : environ 4,5 ms). La chaleur est le poste le plus lourd : la passe thermique coûte environ 6 ms tous les 3 pas (réactions et relaxation de l'air 2,7 ms, conduction 1,8 ms, transport de la chaleur par le vent jusqu'à 4 ms une passe sur deux), le vent 0,35 ms, la pression moins de 0,1 ms, le reste est l'automate de matière.
@@ -341,4 +366,17 @@ Le nouvel outil **Capteur** (barre d'outils à gauche, icône thermomètre) pose
 - **Reflets** : la surface de l'eau scintille au soleil (paillettes plus nombreuses sous le soleil), et à la lune la nuit.
 - **Lumière du feu** : la nuit, le feu, les braises et la lave éclairent tout autour d'eux d'une lumière chaude qui vacille.
 - **Air chaud** : au-dessus d'un feu ou de la lave, l'air chaud fait onduler ce qu'on voit à travers (comme au-dessus d'une route en été).
+- **Aube et crépuscule** : quand le soleil est bas, le ciel passe à l'orange près de l'horizon, au rose au-dessus et au violet en haut, avec un halo doré du côté où il se lève ou se couche. Le ciel ne s'éteint pas d'un coup : la lueur reste un moment après le coucher. Les nuages sont éclairés par en dessous et sur la face tournée vers le soleil, en or près de lui et en rose plus loin, leur sommet dans une ombre lavande.
 - Une petite carte de lumière (une case pour 6×6 cellules) suffit : tout reste fluide.
+
+## Explosions et cratères
+
+`src/world/blast.rs` fait le bilan d'énergie d'une explosion, avec la même règle pour tous les matériaux.
+
+- **Toute la charge part ensemble** : les grains de poudre qui se touchent brûlent dans le même instant, l'explosion a l'énergie de toute la charge (3 MJ/kg de poudre noire, dont 1 % travaille sur le sol ; le reste chauffe le gaz, fait de la lumière et du bruit). Une longue traînée fine part par morceaux, comme une mèche.
+- **Arracher une case coûte** `V · (σ + ½ ρ (v² + 2 g h))` : `σ` la résistance du matériau (MPa, la cohésion pour un sol), `ρ` sa densité, `v` la vitesse à laquelle il faut le lancer pour sortir du trou et `h` la hauteur dont il faut le lever. Le sable ne coûte que son poids et son lancer, la terre un peu plus, la roche bien plus, l'acier tient presque. Un nouveau matériau n'a besoin que de sa densité et de sa résistance.
+- **La ligne de moindre résistance** : l'énergie part en rayons depuis le centre, et un rayon qui atteint l'air libre à travers peu de sol en reçoit davantage. Ceux qui percent projettent ce qu'ils ont arraché avec l'énergie qui leur reste ; ceux qui s'épuisent sous terre écrasent seulement le sol (une cavité cachée, le « camouflet »).
+- **Les éjecta volent** (balistique, gravité), retombent et roulent comme du sable : ils font le bourrelet autour du cratère. La terre qui tombe dans l'eau devient de la boue.
+- Le gaz de la charge (environ 280 L par kg) monte la densité de l'air autour : l'onde de pression du vent compressible pousse ensuite les blocs, le sable et l'eau. Le rayon du feu, du souffle et de la secousse grandit avec la racine de la quantité de poudre.
+
+`--demo out.png --crater n` enterre une grosse charge de poudre sous une prairie et l'allume `n` images avant la capture.
