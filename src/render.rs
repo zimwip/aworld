@@ -817,8 +817,11 @@ impl Renderer {
             let s = v.s.max(0.6);
             let mut line = |pts: &[(f32, f32)], w: f32, a: f32, halo: bool| {
                 for seg in pts.windows(2) {
-                    if verts.len() > 60_000 {
-                        return;
+                    // A draw call holds at most `BOLT_MESH_INDICES` indices (macroquad cuts the
+                    // rest off, and the triangles left pointing past the cut come out as shards):
+                    // a long bolt zigzagging through rock goes out in several meshes.
+                    if idx.len() + 6 > BOLT_MESH_INDICES {
+                        draw_mesh(&Mesh { vertices: std::mem::take(&mut verts), indices: std::mem::take(&mut idx), texture: None });
                     }
                     let (p, q) = (px(seg[0]), px(seg[1]));
                     let d = q - p;
@@ -902,6 +905,10 @@ impl Renderer {
         gl_use_default_material();
     }
 }
+
+/// The most indices one mesh of a bolt holds: under macroquad's capacity for a draw call (5000
+/// indices, 10 000 vertices by default), and a whole number of quads.
+const BOLT_MESH_INDICES: usize = 4998;
 
 fn quad(a: Vec2, b: Vec2, c: Vec2, d: Vec2, col: Color) {
     draw_triangle(a, b, c, col);
@@ -1391,5 +1398,49 @@ mod tests {
         let lava = px[(300 / LS) * LW + 300 / LS];
         assert_eq!(lava[0], 0, "no flames on lava: {lava:?}");
         assert!(lava[3] > 0, "but it lights the night: {lava:?}");
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    /// What the picture costs the processor on the opening world: the light map (15 times a
+    /// second), a full recolouring (a new world, a view change), the tree cells (12 times a second).
+    /// `cargo test --release --bin aworld bench_render -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_render() {
+        let mut w = World::new();
+        w.generate_biome(3, crate::world::Biome::Countryside);
+        for _ in 0..60 {
+            w.step();
+        }
+        let time = |name: &str, f: &mut dyn FnMut()| {
+            let t = Instant::now();
+            for _ in 0..20 {
+                f();
+            }
+            eprintln!("RENDER {name}: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 20.0);
+        };
+        let mut light = vec![[0u8; 4]; LW * LH];
+        time("carte de lumière", &mut || light_map(&w, &mut light));
+        let mut px = vec![[0u8; 4]; W * H];
+        time("recoloriage complet (normal)", &mut || {
+            for (i, p) in px.iter_mut().enumerate() {
+                *p = w.color_without_trees(i % W, i / W);
+            }
+        });
+        time("recoloriage complet (thermique)", &mut || {
+            for (i, p) in px.iter_mut().enumerate() {
+                *p = w.thermal_color(i % W, i / W);
+            }
+        });
+        time("cellules des arbres (toutes les zones)", &mut || {
+            for k in 0..CW * CH {
+                let _ = Renderer::veg_of_zone(&w, k);
+            }
+        });
     }
 }

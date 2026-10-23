@@ -1617,6 +1617,14 @@ impl Game {
         for _ in 0..steps {
             self.sim_step();
         }
+        // `AWORLD_PROFILE=1`: every 600 steps, where the time of a step went (see `world/prof.rs`).
+        if self.world.prof.on || std::env::var_os("AWORLD_PROFILE").is_some_and(|v| v != "0") {
+            self.world.prof.on = true;
+            if self.world.prof.steps >= 600 {
+                eprint!("--- profil sur {} pas (vitesse x{}, simplification {})\n{}", self.world.prof.steps, self.speed, self.world.lod, self.world.prof.report());
+                self.world.prof.reset();
+            }
+        }
         if (self.time * 2.0) as u32 != ((self.time - dt) * 2.0) as u32 {
             let n = self.world.census();
             self.heat_cells = n[Mat::Fire as usize] + n[Mat::Lava as usize] / 3 + n[Mat::Ember as usize] / 2;
