@@ -552,8 +552,57 @@ impl MemberMat {
         }
     }
 
-    pub fn cost(self, len: f32) -> u32 {
-        (len * self.thickness() * 0.25).ceil() as u32
+    /// Matter used up by a rod `len` long: a deck, thicker, takes more.
+    pub fn cost(self, len: f32, role: MemberRole) -> u32 {
+        (len * role.thickness(self) * 0.25).ceil() as u32
+    }
+}
+
+/// What a rod is for in a bridge: the deck (tablier) is the floor the cars drive on; a girder
+/// (poutre) is structure, a truss diagonal or a post, that carries the loads but that the cars
+/// pass through, like trees.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemberRole {
+    Deck,
+    Girder,
+}
+
+impl MemberRole {
+    pub const ALL: [MemberRole; 2] = [MemberRole::Deck, MemberRole::Girder];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            MemberRole::Deck => "Tablier",
+            MemberRole::Girder => "Poutre",
+        }
+    }
+
+    pub fn id(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_id(id: u8) -> MemberRole {
+        Self::ALL.iter().copied().find(|r| r.id() == id).unwrap_or(MemberRole::Girder)
+    }
+
+    /// The role a rod drawn without one gets (old saves, built-in scenes): one lying roughly flat
+    /// (within about 20 degrees) is deck, a steeper one is structure.
+    pub fn guess(p0: Vec2, p1: Vec2) -> MemberRole {
+        let d = p1 - p0;
+        if d.y.abs() < 0.36 * d.x.abs().max(1e-3) {
+            MemberRole::Deck
+        } else {
+            MemberRole::Girder
+        }
+    }
+
+    /// How thick the rod is drawn and stamped in the world: a deck is a thick slab with cross
+    /// bracing, a girder a plain bar.
+    pub fn thickness(self, mat: MemberMat) -> f32 {
+        match self {
+            MemberRole::Deck => mat.thickness() * 1.75,
+            MemberRole::Girder => mat.thickness(),
+        }
     }
 }
 
@@ -562,6 +611,7 @@ impl MemberMat {
 pub struct Member {
     pub uid: u32,
     pub mat: MemberMat,
+    pub role: MemberRole,
     pub a: Anchor,
     pub b: Anchor,
     /// Current end positions (follow the physics once it runs).
@@ -581,6 +631,7 @@ impl Member {
         Member {
             uid: NEXT_MEMBER_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             mat,
+            role: MemberRole::guess(p0, p1),
             a,
             b,
             p0,
@@ -596,13 +647,32 @@ impl Member {
         (self.p1 - self.p0).length()
     }
 
-    /// Floor or structure? A rod lying roughly flat (within about 20 degrees) is
-    /// deck: a car drives on it and its weight rests on it. A steeper rod is
-    /// load-bearing structure (a truss diagonal, a post): it carries the loads but
-    /// does not block the car.
+    /// The same rod with the role picked in the palette.
+    pub fn with_role(mut self, role: MemberRole) -> Self {
+        self.role = role;
+        self
+    }
+
+    /// Floor or structure? The deck (tablier) is what a car drives on and rests its weight on.
+    /// A girder (poutre) is load-bearing structure (a truss diagonal, a post): it carries the
+    /// loads but does not block the car.
     pub fn is_deck(&self) -> bool {
-        let d = self.p1 - self.p0;
-        d.y.abs() < 0.36 * d.x.abs().max(1e-3)
+        self.role == MemberRole::Deck
+    }
+
+    /// Thickness in the world (cells): a deck is thicker than a girder.
+    pub fn thickness(&self) -> f32 {
+        self.role.thickness(self.mat)
+    }
+
+    /// How far the middle of the slab sits below the line between the pins. A deck's running
+    /// surface is where a girder's top would be, and its extra thickness hangs underneath, so a
+    /// deck laid at ground level is flush with the road.
+    pub fn slab_offset(&self) -> Vec2 {
+        let d = (self.p1 - self.p0).normalize_or_zero();
+        let n = vec2(-d.y, d.x);
+        let down = if n.y >= 0.0 { n } else { -n };
+        down * (self.thickness() - self.mat.thickness()) * 0.5
     }
 
     pub fn center(&self) -> Vec2 {
@@ -620,7 +690,7 @@ impl Member {
     }
 
     pub fn covers(&self, p: Vec2) -> bool {
-        self.distance_to(p) <= self.mat.thickness() / 2.0
+        self.distance_to(p - self.slab_offset()) <= self.thickness() / 2.0
     }
 
     pub fn distance_to(&self, p: Vec2) -> f32 {
@@ -630,7 +700,7 @@ impl Member {
     }
 
     pub fn bounds(&self) -> (i32, i32, i32, i32) {
-        let r = self.mat.thickness() + 1.0;
+        let r = self.thickness() + 1.0;
         (
             ((self.p0.x.min(self.p1.x) - r).floor() as i32).max(0),
             ((self.p0.y.min(self.p1.y) - r).floor() as i32).max(0),
@@ -663,7 +733,7 @@ pub fn node_at(world: &World, blocks: &[Block], members: &[Member], p: Vec2) -> 
         return Some(Anchor::Block { uid: b.uid, local: rot(-b.angle, p - b.pos) });
     }
     for m in members {
-        if m.distance_to(p) <= m.mat.thickness() / 2.0 + 3.0 {
+        if m.distance_to(p) <= m.thickness() / 2.0 + 3.0 {
             let ab = m.p1 - m.p0;
             let t = ((p - m.p0).dot(ab) / ab.length_squared().max(1.0)).clamp(0.0, 1.0);
             return Some(Anchor::Along { uid: m.uid, t });
@@ -2741,7 +2811,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_rods_are_deck_and_steep_ones_are_structure() {
+    fn a_rod_with_no_role_given_guesses_it_from_its_slope() {
         let rod = |a: Vec2, b: Vec2| Member::new(MemberMat::Steel, Anchor::Free(a), Anchor::Free(b), a, b);
         assert!(rod(vec2(0.0, 100.0), vec2(80.0, 100.0)).is_deck(), "level rod is floor");
         assert!(rod(vec2(0.0, 100.0), vec2(80.0, 112.0)).is_deck(), "a gentle ramp is still floor");
@@ -2788,6 +2858,23 @@ mod tests {
             }
         }
         assert!(crossed, "the car should pass the post and cross on the deck; ended at x = {} ({:?})", car.p.x, car.fate);
+    }
+
+    #[test]
+    fn the_role_picked_decides_what_the_car_rides_on_whatever_the_slope() {
+        let mut world = ground();
+        // A flat girder (a bottom chord) and a steep deck (a ramp): the role wins over the slope.
+        let (a, b) = (vec2(320.0, 250.0), vec2(400.0, 250.0));
+        let chord = Member::new(MemberMat::Steel, Anchor::Free(a), Anchor::Free(b), a, b).with_role(MemberRole::Girder);
+        let (c, d) = (vec2(500.0, 290.0), vec2(540.0, 250.0));
+        let ramp = Member::new(MemberMat::Wood, Anchor::Free(c), Anchor::Free(d), c, d).with_role(MemberRole::Deck);
+        assert!(!chord.is_deck() && ramp.is_deck());
+        assert!(ramp.thickness() > MemberMat::Wood.thickness(), "a deck is thicker than a girder");
+        assert!(MemberMat::Iron.cost(60.0, MemberRole::Deck) > MemberMat::Iron.cost(60.0, MemberRole::Girder), "and takes more matter");
+        stamp_all(&mut world, &[], &[chord, ramp]);
+        assert!(world.at(360, 250).is_hard(), "the girder is there for sand and water");
+        assert!(!world.hard_for_car(360, 250), "but a car goes through it");
+        assert!(world.hard_for_car(520, 270), "a car drives up the steep deck");
     }
 
     #[test]
