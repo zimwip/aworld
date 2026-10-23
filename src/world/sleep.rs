@@ -106,8 +106,9 @@ impl World {
         let sinks_into = |m: Mat| matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Liquid);
         match c.m {
             Mat::Empty | Mat::Stone | Mat::Brick | Mat::Glass | Mat::Ice | Mat::Clay | Mat::Terracotta => false,
-            Mat::Dirt => c.life > 0,
-            Mat::Grass => c.life > 0 || !self.at(x, y + 1).is_hard(),
+            Mat::Dirt => self.soil_restless(x, y, c.life),
+            // Grass can always change: it grows, dries, wilts or is smothered.
+            Mat::Grass => true,
             Mat::Sand | Mat::Rust | Mat::Hail | Mat::Snow | Mat::Gunpowder | Mat::Ash | Mat::Charcoal | Mat::Saltpeter => {
                 let can_fall = sinks_into(self.at(x, y + 1)) || sinks_into(self.at(x - 1, y + 1)) || sinks_into(self.at(x + 1, y + 1));
                 // Free-running grains roll two cells sideways (see `step_powder`), and a grain
@@ -142,7 +143,9 @@ impl World {
             Mat::Water => {
                 c.life >= 2
                     || free(self.at(x, y - 1))
-                    || matches!(self.at(x, y + 1), Mat::Dirt | Mat::Grass)
+                    || self.soil_drinks((x, y + 1))
+                    || self.soil_drinks((x - 1, y))
+                    || self.soil_drinks((x + 1, y))
                     || self.at(x, y + 1).is_vegetation()
                     || free(self.at(x, y + 1))
                     || free(self.at(x - 1, y + 1))

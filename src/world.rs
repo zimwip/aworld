@@ -302,6 +302,34 @@ const EVAPORATE_40C: f32 = 9_000.0;
 /// A trunk cell standing on soil tries to transpire once in this many steps.
 const TRANSPIRE_EVERY: u32 = 200;
 
+/// Moisture (a soil cell's `life`) that one cell of water brings when the soil drinks it.
+pub const SOIL_WATER: u8 = 64;
+/// Moisture of saturated soil: three cells of water. Wetter than this it drinks no more, the rest
+/// stays on top as a puddle, and where there is air under it, it drips.
+pub const SOIL_FULL: u8 = 192;
+/// Field capacity: above this the water is free and gravity drains it down into drier soil;
+/// below it the soil holds it, and it only creeps (capillarity) towards drier soil around.
+const SOIL_FIELD: u8 = 96;
+/// Moisture that leaves in one cell of vapour.
+const SOIL_VAPOUR: u8 = SOIL_WATER / VAPOUR_PER_WATER as u8;
+/// Soil moisture moves to a neighbour once in this many steps.
+const SOIL_SEEP: u32 = 8;
+/// Saturated soil over a hole lets a drop fall once in this many steps.
+const SOIL_DRIP: u32 = 300;
+/// Grass sprouts on soil at least this moist, and stays fully green down to `GRASS_GREEN`.
+const GRASS_GROW: u8 = 40;
+const GRASS_GREEN: u8 = 48;
+/// Below this the soil is dry for grass: it is straw yellow, and it wilts.
+const GRASS_DRY: u8 = SOIL_VAPOUR;
+/// Grass creeps onto a bare neighbour once in this many steps; with no grass near, a seed blown
+/// in by the wind sprouts once in `GRASS_SPROUT` steps.
+const GRASS_SPREAD: u32 = 250;
+const GRASS_SPROUT: u32 = 40_000;
+/// Dry grass dies back to bare earth once in this many steps; buried or drowned grass (no air
+/// or light) once in `GRASS_SMOTHER`.
+const GRASS_WILT: u32 = 2_500;
+const GRASS_SMOTHER: u32 = 1_500;
+
 /// Saturation vapour pressure of water at `t` °C, in kPa (Magnus formula): how much vapour the air
 /// can hold at that temperature. It roughly doubles every 11 °C.
 pub fn vapour_pressure(t: f32) -> f32 {
@@ -1059,14 +1087,17 @@ impl World {
                     // Snow caps (ice) on the peaks, bare rock below them, grass in the valleys.
                     Biome::Mountain if top < 250 && depth < 3 * K => Mat::Ice,
                     Biome::Mountain if top < 320 && depth < 5 * K => Mat::Stone,
-                    _ if depth < 2 * K => {
-                        if beach { Mat::Sand } else { Mat::Grass }
-                    }
+                    _ if depth < 2 * K && beach => Mat::Sand,
+                    _ if depth < K => Mat::Grass,
                     _ if depth < 6 * K && !beach => Mat::Dirt,
                     _ if depth < 3 * K => Mat::Sand,
                     _ => Mat::Stone,
                 };
                 self.set(x as i32, y, m);
+                if matches!(m, Mat::Dirt | Mat::Grass) {
+                    // Moist soil, below field capacity: it holds its water until the sun dries it.
+                    self.cells[Self::idx(x as i32, y)].life = 72;
+                }
             }
             for y in sea..top {
                 self.set(x as i32, y, Mat::Water);
@@ -1362,9 +1393,12 @@ impl World {
     }
 
     /// Loose sand and mud: flowing water drags them along (gullies, deltas);
-    /// mud that dries out consolidates back into soil.
+    /// mud that dries out consolidates back into soil. Mud holds water like soil.
     fn step_sediment(&mut self, x: i32, y: i32) {
         let mud = self.at(x, y) == Mat::Mud;
+        if mud {
+            self.step_soil(x, y);
+        }
         if self.flowing_water_near(x, y) && self.chance(if mud { 3 } else { 6 }) {
             let d = self.dir();
             for (dx, dy) in [(d, 0), (d, 1), (-d, 0), (-d, 1)] {
@@ -1375,48 +1409,160 @@ impl World {
             }
         }
         if mud && self.chance(4000) && Self::neighbors(x, y).iter().all(|&(nx, ny)| self.at(nx, ny) != Mat::Water) {
-            self.set(x, y, Mat::Dirt);
+            // It settles as soil, with the water it held, and goes on drying.
+            self.retype(x, y, Mat::Dirt);
             return;
         }
         self.step_powder(x, y);
     }
 
-    /// Bare soil washes away under flowing water (grass roots protect it).
-    /// Grass is a thin carpet: with nothing solid under it, it falls until it lands on
-    /// soil, sand or rock, or else drops out of the world. It dries out like soil,
-    /// but its roots hold the earth against erosion.
+    /// Grass is the living top of the soil. With nothing solid under it, it falls until it lands
+    /// on soil, sand or rock, or else drops out of the world. It holds water like soil (and its
+    /// leaves breathe it out faster); when the soil under it dries it turns straw yellow and dies
+    /// back to bare earth, and buried or drowned it dies too. Its roots hold the earth against
+    /// erosion, and it burns back to earth (see `thermal`).
     fn step_grass(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
         if matches!(self.at(x, y + 1).kind(), Kind::Empty | Kind::Gas | Kind::Liquid) && self.mask_free(x, y + 1) {
             self.swap((x, y), (x, y + 1));
             return;
         }
-        if self.cells[i].life > 0 && self.chance(if self.sun() > 0.5 { 600 } else { 2500 }) {
-            self.cells[i].life -= 1;
+        self.step_soil(x, y);
+        if (!self.turf_open(x, y) && self.chance(GRASS_SMOTHER)) || (self.cells[i].life < GRASS_DRY && self.chance(GRASS_WILT)) {
+            self.retype(x, y, Mat::Dirt);
         }
     }
 
+    /// Is the soil at (x, y) close enough to the open air for grass: open air right above it, or
+    /// above a turf at most `K` cells thick (one cell of the design grid).
+    fn turf_open(&self, x: i32, y: i32) -> bool {
+        let mut k = 1;
+        while k <= K && self.raw(x, y - k) == Mat::Grass {
+            k += 1;
+        }
+        k <= K && matches!(self.at(x, y - k).kind(), Kind::Empty | Kind::Gas)
+    }
+
+    /// Changes what a cell is made of, keeping its moisture and its heat.
+    fn retype(&mut self, x: i32, y: i32, m: Mat) {
+        let i = Self::idx(x, y);
+        let (life, t) = (self.cells[i].life, self.temp[i]);
+        self.set(x, y, m);
+        self.cells[i].life = life;
+        self.temp[i] = t;
+    }
+
+    /// Bare soil washes away under flowing water (grass roots protect it), and grass grows on it
+    /// where it is moist, in the open and in the light: it creeps in from grass nearby, and now
+    /// and then a seed blown in by the wind starts a new patch.
     fn step_dirt(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
-        // Moisture slowly dries: faster in hot sun and in dry, windy air at the surface; buried
-        // soil keeps its water much longer.
-        if self.cells[i].life > 0 {
-            let base = if self.sun() > 0.5 { 600.0 } else { 2500.0 };
-            let open = self.at(x, y - 1) == Mat::Empty;
-            let speed = if open {
-                let dry = 1.0 - self.flow.moisture_at(x, y - 1);
-                let (wx, wy) = self.flow.sample(x, y - 1);
-                (0.5 + 1.5 * dry) * (1.0 + ((wx * wx + wy * wy).sqrt() / flow::GAIN).min(1.0))
-            } else {
-                0.5
-            };
-            if self.chance((base / speed) as u32) {
-                self.cells[i].life -= 1;
+        self.step_soil(x, y);
+        if self.cells[i].life >= GRASS_GROW && self.temp[i] > 5.0 && matches!(self.at(x, y - 1), Mat::Empty | Mat::Grass) && self.turf_open(x, y) {
+            // Grass creeps sideways along the ground, and its roots thicken the turf downwards.
+            let near = self.raw(x, y - 1) == Mat::Grass || (-1..=1).any(|dy| self.raw(x - 1, y + dy) == Mat::Grass || self.raw(x + 1, y + dy) == Mat::Grass);
+            if self.chance(if near { GRASS_SPREAD } else { GRASS_SPROUT }) && self.lit(x, y) {
+                self.retype(x, y, Mat::Grass);
+                return;
             }
         }
         if self.chance(30) && self.flowing_water_near(x, y) && self.chance(8) {
-            self.set(x, y, Mat::Mud);
+            // Mud keeps the soil's water (in its `life`) and gives it back when it settles.
+            self.retype(x, y, Mat::Mud);
         }
+    }
+
+    /// How much moisture soil at (x, y) passes to the soil at `n` now: free water above field
+    /// capacity drains down into drier soil below, and moisture creeps from wetter to drier soil
+    /// in every direction (capillarity), a quarter of the difference at a time.
+    fn soil_seep(&self, x: i32, y: i32, n: (i32, i32)) -> u8 {
+        if !matches!(self.at(n.0, n.1), Mat::Dirt | Mat::Grass | Mat::Mud) {
+            return 0;
+        }
+        let (a, b) = (self.cells[Self::idx(x, y)].life as i32, self.cells[Self::idx(n.0, n.1)].life as i32);
+        let room = (SOIL_FULL as i32 - b).max(0);
+        let creep = (a - b) / 4;
+        let drain = if n.1 > y { a - SOIL_FIELD as i32 } else { 0 };
+        creep.max(drain).clamp(0, room) as u8
+    }
+
+    /// Water in the soil: it seeps through the ground, drips out of saturated soil into a hole
+    /// below, and evaporates where the soil meets the air, like a puddle does but slower as the
+    /// soil dries. A little moisture (less than one cell of vapour's worth) always stays.
+    fn step_soil(&mut self, x: i32, y: i32) {
+        let i = Self::idx(x, y);
+        if self.cells[i].life == 0 {
+            return;
+        }
+        if self.chance(SOIL_SEEP) {
+            let n = Self::neighbors(x, y)[(self.rand() % 4) as usize];
+            let k = self.soil_seep(x, y, n);
+            if k > 0 {
+                let j = Self::idx(n.0, n.1);
+                self.cells[i].life -= k;
+                self.cells[j].life += k;
+                self.zones.wake(j);
+            }
+        }
+        if self.cells[i].life >= SOIL_FULL && self.at(x, y + 1) == Mat::Empty && self.mask_free(x, y + 1) && self.chance(SOIL_DRIP) {
+            let (j, t) = (Self::idx(x, y + 1), self.temp[i]);
+            self.set(x, y + 1, Mat::Water);
+            self.temp[j] = t;
+            self.cells[i].life -= SOIL_WATER;
+            return;
+        }
+        // Evaporation, as for open water (see `step_water`): warmer, drier and windier is faster.
+        // Wet soil dries about as fast as a puddle, drier soil slower; grass breathes out the
+        // water its roots draw up, so a lawn dries faster than bare earth.
+        let t = self.temp[i];
+        if self.cells[i].life >= SOIL_VAPOUR && t > 0.0 && self.at(x, y - 1) == Mat::Empty && self.mask_free(x, y - 1) {
+            let dry = 1.0 - self.flow.moisture_at(x, y - 1);
+            let (wx, wy) = self.flow.sample(x, y - 1);
+            let breeze = 1.0 + 2.0 * ((wx * wx + wy * wy).sqrt() / flow::GAIN).min(1.0);
+            let wet = (self.cells[i].life as f32 / SOIL_WATER as f32).min(1.0);
+            let leaves = if self.cells[i].m == Mat::Grass { 1.5 } else { 1.0 };
+            let rate = VAPOUR_PER_WATER as f32 * wet * leaves * dry * breeze * vapour_pressure(t) / vapour_pressure(40.0) / EVAPORATE_40C;
+            if self.chance_f(rate) {
+                // A quarter of a cell of water leaves as vapour, with the heat that takes: the
+                // soil and the air over it cool.
+                let j = Self::idx(x, y - 1);
+                let q = thermal::heat_of(Mat::Empty, self.temp[j]) + thermal::heat_of(Mat::Water, t) / VAPOUR_PER_WATER as f32 - thermal::heat_of(Mat::Steam, t);
+                self.cells[i].life -= SOIL_VAPOUR;
+                self.set(x, y - 1, Mat::Steam);
+                self.temp[j] = t;
+                self.release_heat(x, y, q);
+            }
+        }
+    }
+
+    /// For the screenshots: soil soaked on the left of the world, drying across the middle and
+    /// dry on the right, then `steps` steps so the grass answers to it.
+    pub fn demo_lawn(&mut self, steps: u32) {
+        for y in 0..H as i32 {
+            for x in 0..W as i32 {
+                let i = Self::idx(x, y);
+                if matches!(self.cells[i].m, Mat::Dirt | Mat::Grass) {
+                    let f = (1.0 - (x as f32 - W as f32 * 0.3) / (W as f32 * 0.4)).clamp(0.0, 1.0);
+                    self.cells[i].life = (f * 170.0) as u8;
+                }
+            }
+        }
+        for _ in 0..steps {
+            self.step();
+        }
+    }
+
+    /// Can the soil at (x, y) still change by itself (seep, drip, dry out)?
+    pub(super) fn soil_restless(&self, x: i32, y: i32, life: u8) -> bool {
+        life > 0
+            && (Self::neighbors(x, y).iter().any(|&n| self.soil_seep(x, y, n) > 0)
+                || (life >= SOIL_FULL && self.at(x, y + 1) == Mat::Empty)
+                || (life >= SOIL_VAPOUR && self.at(x, y - 1) == Mat::Empty))
+    }
+
+    /// Can the water at (x, y) soak into the soil at `n`?
+    fn soil_drinks(&self, n: (i32, i32)) -> bool {
+        matches!(self.at(n.0, n.1), Mat::Dirt | Mat::Grass | Mat::Mud) && self.cells[Self::idx(n.0, n.1)].life <= SOIL_FULL - SOIL_WATER
     }
 
     /// Snowflakes drift on the wind while they fall, slowly (they are light and catch the air).
@@ -1925,12 +2071,18 @@ impl World {
 
     fn step_water(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
-        // Soil drinks the rain: the water is consumed and the soil gets moist.
-        if matches!(self.at(x, y + 1), Mat::Dirt | Mat::Grass) && self.chance(25) {
-            let j = Self::idx(x, y + 1);
-            self.cells[j].life = self.cells[j].life.saturating_add(60);
-            self.set(x, y, Mat::Empty);
-            return;
+        // Soil drinks the water on it and beside it, until it is saturated: the water goes into the
+        // ground (the soil gets moist) and the rest stays on top as a puddle.
+        let soils = [(x, y + 1), (x - 1, y), (x + 1, y)];
+        if soils.iter().any(|&n| self.soil_drinks(n)) && self.chance(25) {
+            let n = soils[(self.rand() % 3) as usize];
+            if self.soil_drinks(n) {
+                let j = Self::idx(n.0, n.1);
+                self.cells[j].life += SOIL_WATER;
+                self.zones.wake(j);
+                self.set(x, y, Mat::Empty);
+                return;
+            }
         }
         // A free surface evaporates at any temperature above freezing: faster when the water is
         // warm (warm water has a higher vapour pressure), when the air over it is dry, and when
@@ -2904,7 +3056,7 @@ impl World {
             _ => match m {
                 // Soil holds moisture of its own.
                 Mat::Mud => Some(1.0),
-                Mat::Dirt | Mat::Grass => Some((self.cells[y * W + x].life as f32 / 200.0).clamp(0.0, 1.0) * 0.8 + 0.1),
+                Mat::Dirt | Mat::Grass => Some((self.cells[y * W + x].life as f32 / SOIL_FULL as f32).clamp(0.0, 1.0) * 0.8 + 0.1),
                 _ => None,
             },
         };
@@ -2989,8 +3141,18 @@ impl World {
             Mat::Diamond => if flick > 28 { (255, 255, 255, 255) } else { (196 + v, 236 + v / 2, 246, 235) },
             // Red sticks with a pale band of paper.
             Mat::Dynamite => if y % 6 == 0 { (226 + v / 2, 214 + v / 2, 190, 255) } else { (196 + v, 46 + v / 2, 38, 255) },
-            Mat::Dirt => (112 + v, 78 + v / 2, 52 + v / 2, 255),
-            Mat::Grass => (self.grass_rgb.0 + v / 2, self.grass_rgb.1 + v, self.grass_rgb.2 + v / 2, 255),
+            Mat::Dirt => {
+                // Wet earth is darker.
+                let k = 256 - 96 * (c.life.min(SOIL_FULL) as i32) / SOIL_FULL as i32;
+                ((112 + v) * k / 256, (78 + v / 2) * k / 256, (52 + v / 2) * k / 256, 255)
+            }
+            Mat::Grass => {
+                // Green on moist soil, turning straw yellow as the soil dries.
+                let d = ((GRASS_GREEN as i32 - c.life as i32) * 256 / (GRASS_GREEN - GRASS_DRY) as i32).clamp(0, 256);
+                let (r, g, b) = self.grass_rgb;
+                let mix = |a: i32, s: i32| a + (s - a) * d / 256;
+                (mix(r, 200) + v / 2, mix(g, 178) + v, mix(b, 84) + v / 2, 255)
+            }
             Mat::Leaf => {
                 // In autumn each leaf takes its own colour: red, orange or yellow.
                 let (r, g, b) = self.leaf_rgb;
@@ -5477,9 +5639,7 @@ fn flowing_water_erodes_bare_soil() {
                     w.set(x, y, Mat::Dirt);
                 }
                 if grass {
-                    for y in 318..320 {
-                        w.set(x, y, Mat::Grass);
-                    }
+                    w.set(x, 319, Mat::Grass);
                 }
             }
             for t in 0..1500 {
@@ -5496,6 +5656,191 @@ fn flowing_water_erodes_bare_soil() {
         let covered = run(true);
         assert!(bare > 0, "bare soil should erode");
         assert!(covered * 3 <= bare, "grass should shield the soil below: {covered} vs {bare}");
+    }
+
+    /// A tray of earth `depth` cells deep between x 100 and 200, on a stone floor at y 320, with
+    /// stone walls 40 cells high.
+    fn soil_tray(w: &mut World, depth: i32, life: u8) {
+        floor(w, 320, 99, 201);
+        for y in 280..320 {
+            w.set(99, y, Mat::Stone);
+            w.set(200, y, Mat::Stone);
+        }
+        for x in 100..200 {
+            for y in 320 - depth..320 {
+                w.set(x, y, Mat::Dirt);
+                w.cells[World::idx(x, y)].life = life;
+            }
+        }
+    }
+
+    /// All the water in the world, in sixteenths of a cell: in the soil, in liquid water, and in
+    /// vapour (a cell of water is `SOIL_WATER`, a cell of vapour a quarter of that).
+    fn all_water(w: &World) -> u32 {
+        (0..W * H)
+            .map(|i| match w.cells[i].m {
+                Mat::Dirt | Mat::Grass | Mat::Mud => w.cells[i].life as u32,
+                Mat::Water => SOIL_WATER as u32,
+                _ => w.vapour_units(i) * SOIL_VAPOUR as u32,
+            })
+            .sum()
+    }
+
+    /// Mean moisture of the soil on row `y` of the tray.
+    fn soil_row(w: &World, y: i32) -> u32 {
+        (100..200).map(|x| w.cells[World::idx(x, y)].life as u32).sum::<u32>() / 100
+    }
+
+    #[test]
+    fn soil_drinks_water_until_it_is_saturated_and_the_rest_stays_as_a_puddle() {
+        let mut w = World::new_static();
+        w.flow.pin_moisture(1.0);
+        soil_tray(&mut w, 4, 0);
+        // More water than four rows of earth can hold (three cells of water per cell of earth).
+        for x in 100..200 {
+            for y in 290..306 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        let before = all_water(&w);
+        for t in 0..8000 {
+            w.step();
+            // Exactly, while the soil drinks (later, clouds drifting off the world take some away).
+            if t == 1500 {
+                assert_eq!(all_water(&w), before, "the water is kept, in the ground, in the puddle or in the air");
+            }
+        }
+        assert!(w.cells.iter().all(|c| !matches!(c.m, Mat::Dirt | Mat::Grass) || c.life <= SOIL_FULL), "no soil holds more than saturated");
+        for y in 316..320 {
+            assert!(soil_row(&w, y) > SOIL_FULL as u32 - SOIL_WATER as u32, "row {y} soaked through: {}", soil_row(&w, y));
+        }
+        let puddle = count(&w, Mat::Water);
+        assert!(puddle > 300, "what the earth cannot drink stays on top: {puddle}");
+    }
+
+    #[test]
+    fn water_drains_down_through_the_soil_and_creeps_back_up_to_dry_earth() {
+        let mut w = World::new_static();
+        w.flow.pin_moisture(1.0);
+        soil_tray(&mut w, 12, 0);
+        // A soaking at the top.
+        for x in 100..200 {
+            w.cells[World::idx(x, 308)].life = 180;
+        }
+        let before = all_water(&w);
+        for _ in 0..3000 {
+            w.step();
+        }
+        assert!(soil_row(&w, 308) < SOIL_FIELD as u32, "the free water left the top: {}", soil_row(&w, 308));
+        assert!(soil_row(&w, 312) > 0, "it went down: {}", soil_row(&w, 312));
+        assert!(all_water(&w) + 100 * SOIL_VAPOUR as u32 >= before, "the soil does not lose water as it seeps");
+
+        // Wet earth deep down, dry on top: the moisture creeps up (capillarity).
+        let mut w = World::new_static();
+        w.flow.pin_moisture(1.0);
+        soil_tray(&mut w, 12, 0);
+        for x in 100..200 {
+            for y in 316..320 {
+                w.cells[World::idx(x, y)].life = SOIL_FIELD;
+            }
+        }
+        for _ in 0..6000 {
+            w.step();
+        }
+        assert!(soil_row(&w, 312) > 0, "water crept up: {}", soil_row(&w, 312));
+        assert!(soil_row(&w, 319) < SOIL_FIELD as u32, "from the bottom: {}", soil_row(&w, 319));
+    }
+
+    #[test]
+    fn saturated_soil_over_a_hole_drips() {
+        let mut w = World::new_static();
+        w.flow.pin_moisture(1.0);
+        floor(&mut w, 330, 100, 200);
+        for x in 100..200 {
+            for y in 296..300 {
+                w.set(x, y, Mat::Dirt);
+                w.cells[World::idx(x, y)].life = SOIL_FULL;
+            }
+        }
+        let mut drops = 0;
+        for _ in 0..2000 {
+            w.step();
+            drops = drops.max(count(&w, Mat::Water));
+        }
+        assert!(drops > 10, "drops fall from the roof: {drops}");
+        assert!(soil_row(&w, 299) < SOIL_FULL as u32, "the roof gave up some of its water");
+    }
+
+    #[test]
+    fn moist_soil_dries_out_into_the_air_as_vapour() {
+        let mut w = World::new_static();
+        w.flow.pin_moisture(0.0);
+        soil_tray(&mut w, 3, 120);
+        let soil = soil_row(&w, 317);
+        let mut vapour = 0;
+        for _ in 0..3000 {
+            w.step();
+            vapour = vapour.max(count(&w, Mat::Steam) + count(&w, Mat::Cloud));
+        }
+        assert!(soil_row(&w, 317) < soil, "the surface dried: {} -> {}", soil, soil_row(&w, 317));
+        assert!(vapour > 5, "the water went into the air: {vapour}");
+        // The vapour took its heat from the ground: wet earth is cooler than the same earth dry.
+        let mut dry = World::new_static();
+        dry.flow.pin_moisture(0.0);
+        soil_tray(&mut dry, 3, 0);
+        for _ in 0..3000 {
+            dry.step();
+        }
+        let warmth = |w: &World| (100..200).map(|x| w.temp[World::idx(x, 317)]).sum::<f32>() / 100.0;
+        assert!(warmth(&w) < warmth(&dry), "evaporation cools the soil: {} vs {}", warmth(&w), warmth(&dry));
+    }
+
+    #[test]
+    fn grass_grows_by_itself_on_moist_soil_and_dies_on_dry_soil() {
+        let tray = |life: u8| {
+            let mut w = World::new_static();
+            w.clock = thermal::DAY_STEPS * thermal::SEASON_DAYS + thermal::DAY_STEPS / 8;
+            w.flow.pin_moisture(1.0);
+            soil_tray(&mut w, 6, life);
+            w.set(150, 314, Mat::Grass);
+            w.cells[World::idx(150, 314)].life = life;
+            for _ in 0..8000 {
+                w.step();
+            }
+            count(&w, Mat::Grass)
+        };
+        let moist = tray(80);
+        assert!(moist > 10, "grass spreads over moist earth: {moist}");
+        assert_eq!(tray(0), 0, "on dry earth the grass dies and none grows");
+    }
+
+    #[test]
+    fn grass_turns_yellow_as_its_soil_dries() {
+        let mut w = World::new_static();
+        w.set(100, 300, Mat::Grass);
+        w.set(102, 300, Mat::Grass);
+        w.cells[World::idx(100, 300)].life = 80;
+        w.cells[World::idx(102, 300)].life = 0;
+        let (green, straw) = (w.color(100, 300), w.color(102, 300));
+        assert!(green[1] > green[0] + 40, "moist: green {green:?}");
+        assert!(straw[0] > green[0] + 60 && straw[0] + 40 > straw[1], "dry: straw yellow {straw:?}");
+    }
+
+    #[test]
+    fn burning_grass_leaves_its_earth() {
+        let mut w = World::new_static();
+        floor(&mut w, 301, 100, 200);
+        for x in 100..200 {
+            w.set(x, 300, Mat::Grass);
+        }
+        for _ in 0..200 {
+            for x in 100..200 {
+                w.temp[World::idx(x, 300)] = 400.0;
+            }
+            w.step();
+        }
+        assert_eq!(count(&w, Mat::Grass), 0, "the grass burnt");
+        assert!(count(&w, Mat::Dirt) > 90, "the earth stays: {}", count(&w, Mat::Dirt));
     }
 
     #[test]

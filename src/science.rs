@@ -31,8 +31,8 @@ pub fn info(m: Mat) -> Info {
         Mat::Gunpowder => ("Poudre", "poudre", "Explose dès 210 °C. Attention au feu ! Elle déflagre : sa pression plafonne vers 3 000 atm."),
         Mat::Dynamite => ("Dynamite", "solide", "Un explosif brisant (nitroglycérine dans de la sciure, Nobel, 1867) : il détone, son onde de choc dépasse 100 000 atm. Assez pour changer le charbon de bois voisin en diamant."),
         Mat::Diamond => ("Diamant", "solide", "Du carbone serré au-delà de 50 000 atm et à plus de 1 500 °C : ses atomes se rangent en cristal. C'est ce qui se passe à 150 km sous terre, ou dans l'onde de choc d'une détonation (les nanodiamants). Le plus dur des matériaux, et le meilleur conducteur de chaleur."),
-        Mat::Dirt => ("Terre", "solide", "Boit la pluie. Avec une graine, de l'eau et de la lumière : un arbre."),
-        Mat::Grass => ("Herbe", "solide", "Ses racines retiennent la terre contre l'érosion."),
+        Mat::Dirt => ("Terre", "solide", "Elle boit l'eau jusqu'à saturation (trois cellules d'eau), puis l'eau reste en flaque. Mouillée, elle fonce. Son eau descend, remonte doucement vers la surface sèche (capillarité) et repart dans l'air en vapeur. Humide, au soleil, l'herbe y pousse ; avec une graine, un arbre."),
+        Mat::Grass => ("Herbe", "solide", "Elle pousse toute seule sur la terre humide, au soleil, et gagne de proche en proche. Quand la terre sèche, elle jaunit puis meurt ; enterrée ou noyée aussi. Ses racines retiennent la terre contre l'érosion."),
         Mat::Leaf => ("Feuille", "solide", "Verte au printemps, rousse en automne, puis elle tombe. Le jour, elle rejette de la vapeur d'eau : l'eau que les racines ont bue (la transpiration)."),
         Mat::Steel => ("Acier", "solide", "Fer + carbone : bien plus solide, et il rouille moins vite."),
         Mat::Cloud => ("Nuage", "gaz", "Vapeur refroidie jusqu'à son point de rosée : de minuscules gouttes. En se formant, il réchauffe l'air (la chaleur de la condensation, le moteur des orages). Quand il est épais, il pleut (ou il neige s'il gèle)."),
@@ -68,11 +68,10 @@ const fn one(m: &'static [Mat]) -> Matter {
     Matter { states: m, default: 0 }
 }
 
-pub const MATTERS: [Matter; 20] = [
+pub const MATTERS: [Matter; 19] = [
     one(&[Mat::Sand]),
     Matter { states: &[Mat::Ice, Mat::Snow, Mat::Water, Mat::Steam], default: 2 },
     one(&[Mat::Dirt]),
-    one(&[Mat::Grass]),
     one(&[Mat::Seed]),
     one(&[Mat::Wood]),
     one(&[Mat::Stone, Mat::Lava]),
@@ -128,6 +127,8 @@ pub const RECIPES: &[Recipe] = &[
     Recipe { from: &[Mat::Lava, Mat::Water], to: &[Mat::Stone], text: "La lave arrosée se fige en pierre." },
     Recipe { from: &[Mat::Stone, Mat::Ice], to: &[Mat::Sand], text: "Le gel et le dégel effritent la roche en sable." },
     Recipe { from: &[Mat::Dirt, Mat::Seed, Mat::Water], to: &[Mat::Trunk, Mat::Leaf], text: "Terre + graine + eau + lumière : un arbre pousse." },
+    Recipe { from: &[Mat::Dirt, Mat::Water], to: &[Mat::Grass], text: "La terre boit l'eau. Humide et au soleil, l'herbe y pousse toute seule et s'étend ; quand la terre sèche, elle jaunit puis disparaît." },
+    Recipe { from: &[Mat::Dirt, Mat::Water], to: &[Mat::Steam], text: "La terre mouillée sèche : son eau repart en vapeur, plus vite au chaud, à l'air sec et au vent, et plus vite encore sous l'herbe, qui transpire." },
     Recipe { from: &[Mat::Wood, Mat::Dirt], to: &[Mat::Oil], text: "Du bois enterré très longtemps devient du pétrole. Il flotte sur l'eau et brûle très fort." },
     Recipe { from: &[Mat::DeadLeaf, Mat::Ash], to: &[Mat::Saltpeter, Mat::Dirt], text: "La nitrière : des feuilles mortes qui pourrissent contre de la cendre de bois laissent du salpêtre, des cristaux blancs. À garder à l'abri de la pluie : l'eau le dissout." },
     Recipe { from: &[Mat::Saltpeter, Mat::Charcoal], to: &[Mat::Gunpowder], text: "Salpêtre + charbon de bois, mélangés à froid et au sec (à la pelle) : de la poudre noire. La vraie contient aussi un peu de soufre, qui la rend plus vive." },
@@ -208,6 +209,8 @@ mod tests {
         let water = MATTERS.iter().find(|m| m.states.contains(&Mat::Water)).unwrap();
         assert_eq!(water.states, &[Mat::Ice, Mat::Snow, Mat::Water, Mat::Steam]);
         assert_eq!(water.name(), "Eau");
+        // Grass grows by itself on moist earth: it is not painted.
+        assert!(!seen.contains(&Mat::Grass));
         // A metal and its melt are one matter.
         assert!(MATTERS.iter().any(|m| m.states == [Mat::Iron, Mat::Molten]));
     }
