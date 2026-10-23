@@ -56,14 +56,29 @@ pub fn draw_sky(v: View, biome: Biome, phase: f32, wind: f32, time: f32, season:
         draw_rectangle(r.x, r.y + r.h * t, r.w, r.h / bands as f32 + 1.0, c);
     }
 
-    // Stars fade in with the night.
+    // Stars fade in with the night. They twinkle because the air between them and us is turbulent:
+    // the lower the star (the more air its light crosses) and the stronger the wind, the more it
+    // flickers, flashing colours near the horizon. The planets (the first few) shine steadily:
+    // they are discs, not points, so the turbulence averages out.
     let night = 1.0 - day;
     if night > 0.05 {
         for k in 0..110 {
             let h = (k as f32 * 12.9898).sin() * 43758.547;
             let (fx, fy) = (h.fract().abs(), ((h * 1.7).fract()).abs());
-            let tw = 0.6 + 0.4 * (time * 2.0 + k as f32).sin();
-            draw_circle(r.x + fx * r.w, r.y + fy * r.h * 0.6, 0.8 + (k % 3) as f32 * 0.5, Color::new(1.0, 1.0, 0.95, night * 0.8 * tw));
+            let (x, y) = (r.x + fx * r.w, r.y + fy * r.h * 0.6);
+            if k < 3 {
+                let planet = [(1.0, 0.95, 0.8), (1.0, 0.75, 0.6), (0.95, 0.97, 1.0)][k];
+                draw_circle(x, y, 2.0, Color::new(planet.0, planet.1, planet.2, night * 0.95));
+                continue;
+            }
+            let k = k as f32;
+            let turb = (0.25 + 0.75 * fy) * (0.6 + 0.8 * wind.abs());
+            let flick = (time * (9.0 + k % 7.0) + k).sin() * (time * (5.3 + k % 5.0) + 2.0 * k).sin();
+            let tw = (1.0 - turb * (0.5 + 0.5 * flick)).max(0.05);
+            // Each colour bends a little differently in the moving air.
+            let hue = (time * 7.0 + k * 1.3).sin() * turb * 0.5;
+            let col = Color::new(1.0 - hue.max(0.0) * 0.6, 1.0 - hue.abs() * 0.3, 0.95 + hue.min(0.0) * 0.6, night * 0.85 * tw);
+            draw_circle(x, y, 0.8 + (k as i32 % 3) as f32 * 0.5 + 0.4 * (1.0 - tw), col);
         }
     }
 
@@ -216,14 +231,5 @@ fn draw_sea(v: View, day: f32, phase: f32, time: f32) {
         let spread = 6.0 + k as f32 * 2.2;
         let off = ((time * 3.0 + k as f32 * 1.3).sin()) * spread * 0.6;
         draw_line(gx + off - spread * 0.5, y, gx + off + spread * 0.5, y, 1.5, Color::new(1.0, 1.0, 0.9, 0.35 * (day.max(0.25))));
-    }
-}
-
-/// A bluish veil over the whole picture at night.
-pub fn draw_night(v: View, day: f32) {
-    let night = 1.0 - day;
-    if night > 0.02 {
-        let r = v.rect();
-        draw_rectangle(r.x, r.y, r.w, r.h, Color::new(0.02, 0.05, 0.2, 0.46 * night));
     }
 }

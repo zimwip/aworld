@@ -1771,7 +1771,7 @@ impl Game {
             draw_circle_lines(s.x, s.y, 6.0 + 26.0 * t, 2.0, Color::new(1.0, 1.0, 1.0, 1.0 - t));
         }
         if !flat {
-            backdrop::draw_night(view, day);
+            renderer.draw_night(view, day, self.time);
         } else if thermal {
             self.draw_sun_on_thermal(view, ui);
         }

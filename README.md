@@ -18,7 +18,8 @@ cargo run --release
 
 ## Le monde
 - **Décors** (Monde → Décor) : campagne, montagne (cimes enneigées), mer. Chacun a son arrière-plan.
-- **Jour et nuit**, soleil (la chaleur forme un gradient autour de lui), lune, étoiles ; **saisons** : les feuilles
+- **Jour et nuit**, soleil (la chaleur forme un gradient autour de lui), lune, étoiles (elles scintillent à cause des
+  turbulences de l'air, surtout près de l'horizon et par grand vent ; les planètes, elles, brillent sans scintiller) ; **saisons** : les feuilles
   rougissent, tombent, pourrissent en terre ; les arbres repoussent au printemps.
 - **Température** : l'air refroidit avec l'altitude ; l'eau bout à 100 °C et gèle à 0 °C, avec un palier (chaleur latente) ; la roche fond vers 540 °C ;
   la lave refroidit très lentement ; le sable chauffé devient verre (et casse sous un choc thermique).
@@ -270,3 +271,10 @@ L'eau gèle et la glace fond à 0 °C. Pour changer d'état, une cellule doit d'
 ## Capteurs : thermomètre, baromètre, hygromètre
 
 Le nouvel outil **Capteur** (barre d'outils à gauche, icône thermomètre) pose une sonde dans le monde, jusqu'à 4 (A, B, C, D). Chaque sonde relève toutes les 30 étapes (une demi-seconde de jeu) la température, la pression absolue (celle de la poche de gaz, ou dans un liquide le poids de ce qui est au-dessus plus le gaz qui appuie) et l'humidité de l'air. Ses courbes des deux dernières minutes s'affichent dans une carte en bas de l'image, chaque courbe à sa propre échelle pour qu'un petit changement se voie. On y voit l'eau d'une casserole chauffer sans jamais dépasser 100 °C, une chaudière monter en pression, l'air sécher à midi. Cliquer sur une sonde l'enlève ; « Retour » efface les courbes mais garde les sondes. Les sondes ne sont pas enregistrées dans les sauvegardes.
+
+## Lumière et effets (shaders)
+
+- **Reflets** : la surface de l'eau scintille au soleil (paillettes plus nombreuses sous le soleil), et à la lune la nuit.
+- **Lumière du feu** : la nuit, le feu, les braises et la lave éclairent tout autour d'eux d'une lumière chaude qui vacille.
+- **Air chaud** : au-dessus d'un feu ou de la lave, l'air chaud fait onduler ce qu'on voit à travers (comme au-dessus d'une route en été).
+- Une petite carte de lumière (une case pour 6×6 cellules) suffit : tout reste fluide.
