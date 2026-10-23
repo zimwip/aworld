@@ -2,6 +2,8 @@
 //! Rigid blocks live outside the grid; they are stamped into a mask each step
 //! so particles and the car treat them as solid.
 
+mod blast;
+pub use blast::Ejecta;
 pub mod flow;
 mod pockets;
 mod pressure;
@@ -395,8 +397,11 @@ pub struct World {
     pub touched: Vec<u16>,
     /// Explosions this step: (x, y, radius).
     pub blasts: Vec<(i32, i32, i32)>,
-    /// Gunpowder that went off this step (at night it launches fireworks).
+    /// Charges of gunpowder that went off this step, one entry or a few for a big one (at night
+    /// they launch fireworks).
     pub powder_booms: Vec<(i32, i32)>,
+    /// Clods of matter thrown out of craters, in flight.
+    pub ejecta: Vec<Ejecta>,
     /// Heavy landings of falling pieces: (x, y, strength). For sound.
     pub thuds: Vec<(i32, i32, f32)>,
     /// How many water cells moved since it was last read. For sound.
@@ -470,6 +475,7 @@ impl World {
             touched: Vec::new(),
             blasts: Vec::new(),
             powder_booms: Vec::new(),
+            ejecta: Vec::new(),
             thuds: Vec::new(),
             water_flow: 0,
             flow: flow::Flow::new(),
@@ -503,6 +509,7 @@ impl World {
     pub fn clear(&mut self) {
         self.revision += 1;
         self.cells.fill(EMPTY);
+        self.ejecta.clear();
         self.latent.fill(0.0);
         self.vel.fill(0);
         self.zones.wake_all();
@@ -533,6 +540,7 @@ impl World {
         self.touched.clear();
         self.blasts.clear();
         self.powder_booms.clear();
+        self.ejecta.clear();
         self.update_season_cache();
     }
 
@@ -924,114 +932,11 @@ impl World {
         }
     }
 
-    /// How hard a solid material is to break (rock = 1).
-    fn hardness(m: Mat) -> f32 {
-        match m {
-            Mat::Stone => 1.0,
-            Mat::Brick | Mat::Terracotta | Mat::Vault => 0.7,
-            Mat::Clay => 0.3,
-            Mat::Iron | Mat::Steel => 2.4,
-            Mat::Glass => 0.2,
-            Mat::Ice => 0.35,
-            Mat::Dirt | Mat::Grass | Mat::Mud => 0.3,
-            Mat::Wood | Mat::Trunk | Mat::Branch => 0.4,
-            Mat::Leaf | Mat::Sapling => 0.15,
-            _ => 0.5,
-        }
-    }
-
-    /// An explosion: a ball of fire and smoke, rock and other solids shattered
-    /// into rubble (metal resists), and a pressure wave that shoves everything
-    /// loose outward.
+    /// An explosion that reaches about `r` cells: as strong as the charge of powder whose fire,
+    /// pressure wave and shove reach that far (see `blast.rs`).
     pub fn explode(&mut self, cx: i32, cy: i32, r: i32) {
-        self.revision += 1;
-        self.flow.blast(cx, cy, r * 2, 0.15 + r as f32 * 0.03);
-        let heavy = self.blasts.len() < 8;
-        if heavy {
-            self.blasts.push((cx, cy, r));
-        }
-        // A blast under water: how deep it is below the surface (None in the open air).
-        let depth = {
-            let mut d = 0;
-            while d < 3 * r && self.raw(cx, cy - d).kind() == Kind::Liquid {
-                d += 1;
-            }
-            (d > 0 && matches!(self.raw(cx, cy - d).kind(), Kind::Empty | Kind::Gas)).then_some(d)
-        };
-        let r2 = (r * r) as f32;
-        for dy in -r..=r {
-            for dx in -r..=r {
-                let d2 = (dx * dx + dy * dy) as f32;
-                if d2 > r2 {
-                    continue;
-                }
-                let (x, y) = (cx + dx, cy + dy);
-                let m = self.raw(x, y);
-                let f = d2 / r2;
-                match m.kind() {
-                    Kind::Powder | Kind::Liquid | Kind::Gas | Kind::Flame | Kind::Empty => match self.rand() % 6 {
-                        0 => self.set(x, y, Mat::Fire),
-                        1 | 2 => self.set(x, y, Mat::Smoke),
-                        _ => self.set(x, y, Mat::Empty),
-                    },
-                    Kind::Static => {
-                        let h = Self::hardness(m);
-                        if f * h < 0.35 {
-                            // Shattered: rubble where it was rock, dust or embers otherwise.
-                            let into = match m {
-                                Mat::Stone => if self.chance(2) { Mat::Sand } else { Mat::Empty },
-                                Mat::Brick | Mat::Dirt | Mat::Grass | Mat::Mud | Mat::Clay | Mat::Terracotta => if self.chance(2) { Mat::Mud } else { Mat::Empty },
-                                Mat::Wood | Mat::Trunk | Mat::Branch => if self.chance(3) { Mat::Ember } else { Mat::Empty },
-                                Mat::Glass => if self.chance(2) { Mat::Shard } else { Mat::Empty },
-                                Mat::Ice => if self.chance(2) { Mat::Snow } else { Mat::Water },
-                                _ => Mat::Empty,
-                            };
-                            self.set(x, y, into);
-                        } else if m == Mat::Stone && f * h < 0.6 && self.chance(3) {
-                            // Fractured rock crumbles to sand.
-                            self.set(x, y, Mat::Sand);
-                        } else if m.is_wooden() && self.chance(3) {
-                            self.set(x, y, Mat::Ember);
-                        }
-                    }
-                }
-            }
-        }
-        if !heavy {
-            return;
-        }
-        self.shove_out(cx, cy, r);
-        // Under water the gas bubble lifts the surface above it into a dome and a plume of spray:
-        // the shallower the blast, the higher the water is thrown.
-        if let Some(d) = depth {
-            let strength = (1.0 - d as f32 / (3.0 * r as f32)).clamp(0.0, 1.0);
-            let half = r * 6 / 5;
-            for dx in -half..=half {
-                let x = cx + dx;
-                let Some(top) = (cy - d - 2..=cy).find(|&y| self.raw(x, y).kind() == Kind::Liquid) else { continue };
-                let shape = 1.0 - dx.abs() as f32 / half as f32;
-                let rise = (strength * r as f32 * 1.6 * shape * (0.5 + (self.rand() % 100) as f32 / 100.0)) as i32;
-                // The top few cells of the column go up, the highest first.
-                for k in 0..3 {
-                    let y = top + k;
-                    if self.raw(x, y).kind() != Kind::Liquid {
-                        break;
-                    }
-                    if let Some(up) = (1..=rise).rev().find(|&u| self.at(x, y - u) == Mat::Empty) {
-                        self.swap((x, y), (x, y - up));
-                    }
-                }
-            }
-        }
-        // A billow of smoke around the fireball.
-        for dy in -(r * 3 / 2)..=(r * 3 / 2) {
-            for dx in -(r * 3 / 2)..=(r * 3 / 2) {
-                let d2 = dx * dx + dy * dy;
-                if d2 > r * r && d2 <= (r * 3 / 2) * (r * 3 / 2) && self.chance(9) && self.at(cx + dx, cy + dy) == Mat::Empty {
-                    self.set(cx + dx, cy + dy, Mat::Smoke);
-                }
-            }
-        }
+        let grains = ((r as f32 - 6.0).max(0.5) / 2.2).powi(2);
+        self.detonate(cx, cy, grains);
     }
 
     /// Pressure wave: loose matter near (cx, cy) is thrown outward, the closer the harder.
@@ -1289,6 +1194,7 @@ impl World {
         if self.ticks % pockets::POCKETS_EVERY == pockets::POCKETS_EVERY / 2 {
             self.update_pockets();
         }
+        self.step_ejecta();
         self.update_wind();
         self.update_flow();
         if self.ticks % 4 == 0 {
@@ -1553,11 +1459,7 @@ impl World {
     fn step_gunpowder(&mut self, x: i32, y: i32) {
         for (nx, ny) in Self::neighbors(x, y) {
             if self.at(nx, ny).hot() {
-                self.set(x, y, Mat::Fire);
-                if self.powder_booms.len() < 16 {
-                    self.powder_booms.push((x, y));
-                }
-                self.explode(x, y, 4 * K + 4);
+                self.set_off_powder(x, y);
                 return;
             }
         }
