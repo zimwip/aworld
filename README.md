@@ -48,7 +48,8 @@ cargo run --release
 
 ## Voitures
 Citadine, Course, 4x4, Camion : suspensions, couple moteur, adhérence. Elles sautent, font demi-tour devant un obstacle, passent
-à travers les arbres, brisent le verre, explosent au choc trop fort (contre un mur ou une autre voiture), sont perdues dans le
+à travers les arbres, brisent le verre, explosent au choc trop fort (contre un mur ou une autre voiture) en projetant leurs morceaux (roues, carrosserie, vitres)
+qui retombent, rebondissent, roulent et fument tant qu'ils sont chauds, sont perdues dans le
 vide ou en sortant du monde. Leur poids pèse sur les ponts. **Réglages** (onglet Voitures) : puissance, vitesse, suspension,
 amortisseurs, adhérence, taille des roues, solidité, poids, couleur — sur la voiture choisie ou pour les suivantes.
 
@@ -58,7 +59,8 @@ Q/E/T tourner · Tab onglet · [ ] pinceau · ↑/↓ vitesse · 1-0 matières �
 
 ## Développement
 `cargo test` (≈70 tests : simulation, voitures, blocs, sauvegarde). `cargo run --release -- --demo out.png [--tab cars]
-[--biome mer|montagne] [--hour 18.5] [--season hiver] [--view thermique|efforts|vent] [--palette]` enregistre une capture.
+[--biome mer|montagne] [--hour 18.5] [--season hiver] [--view thermique|efforts|vent] [--palette] [--wreck]` enregistre une capture
+(`--wreck` fait exploser une voiture juste avant).
 
 
 ## Son

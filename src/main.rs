@@ -1,6 +1,7 @@
 mod backdrop;
 mod blocks;
 mod car;
+mod debris;
 mod mech;
 mod fluidgame;
 mod lens;
@@ -226,6 +227,8 @@ struct Game {
     last: Option<Vec2>,
     toast: Option<(String, f32)>,
     booms: Vec<Boom>,
+    /// Pieces of exploded cars, flying and bouncing.
+    debris: debris::Debris,
     hammer_fx: Vec<(Vec2, f32)>,
     time: f32,
     fullscreen: bool,
@@ -332,6 +335,7 @@ impl Game {
             last: None,
             toast: None,
             booms: vec![],
+            debris: debris::Debris::default(),
             hammer_fx: vec![],
             time: 0.0,
             fullscreen: false,
@@ -392,6 +396,7 @@ impl Game {
         self.cable_from = None;
         self.cable_via.clear();
         self.booms.clear();
+        self.debris.clear();
         self.phys = None;
         if self.running {
             self.build_physics();
@@ -490,6 +495,7 @@ impl Game {
         self.member_from = None;
         self.phys = None;
         self.cars.clear();
+        self.debris.clear();
         self.running = false;
         self.refresh_mask();
     }
@@ -509,6 +515,7 @@ impl Game {
         self.member_from = None;
         self.phys = None;
         self.cars.clear();
+        self.debris.clear();
         self.selected_car = None;
         self.running = false;
         self.arrived = 0;
@@ -1497,6 +1504,15 @@ impl Game {
         for c in &mut self.cars {
             c.step(&self.world, exit);
         }
+        let (clang, smoke) = self.debris.step(&self.world);
+        if clang > 0.5 {
+            self.sounds.emit(Ev::Thud(clang * 0.5));
+        }
+        for (x, y) in smoke {
+            if self.world.raw(x, y) == Mat::Empty {
+                self.world.set(x, y, Mat::Smoke);
+            }
+        }
         // Cars that meet either bump gently or wreck each other on the spot.
         for i in 0..self.cars.len() {
             for j in i + 1..self.cars.len() {
@@ -1694,6 +1710,7 @@ impl Game {
                 Fate::Exploded => {
                     self.lost += 1;
                     self.world.explode(c.p.x as i32, c.p.y as i32, 12);
+                    self.debris.burst(&c);
                 }
             }
         }
@@ -1761,6 +1778,7 @@ impl Game {
                 select::outline_car(c, view, ACCENT);
             }
         }
+        self.debris.draw(view);
         draw_booms(&self.booms, view);
         for (at, t) in &self.hammer_fx {
             let s = view.to_screen(*at);
@@ -3206,6 +3224,16 @@ async fn main() {
             let x = arg("--boom").and_then(|v| v.parse().ok()).unwrap_or(360);
             if let Some(top) = (0..H as i32).find(|&y| game.world.at(x, y) == Mat::Water) {
                 game.world.explode(x, top + 25, 18);
+            }
+        }
+
+        // `--wreck`: the first car blows up shortly before the shot, so its pieces are in the air.
+        if shot.is_some() && frame == 300 && args.iter().any(|a| a == "--wreck") {
+            game.launch_car();
+        }
+        if shot.is_some() && frame == 345 && args.iter().any(|a| a == "--wreck") {
+            if let Some(c) = game.cars.last_mut() {
+                c.fate = Fate::Exploded;
             }
         }
 
