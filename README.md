@@ -236,7 +236,7 @@ et faire des loopings et des culbutes. S'il touche quoi que ce soit (sol, eau, b
   donne le point de départ, la bulle permet de jouer avec en pleine simulation.
 - **Lance-flammes** (barre d'outils, icône flamme) : garder le clic enfoncé envoie un jet à 1500 °C de la taille du
   pinceau. Le bois s'embrase, la roche rougit puis fond en lave, le fer fond, l'eau bout ; ce qui est lourd chauffe plus
-  lentement. Sa chaleur compte dans le bilan d'énergie avec celle des feux.
+  lentement. Sa chaleur compte dans le bilan d'énergie avec celle des feux. C'est lui qui allume : le feu n'est plus dans la palette des matières.
 - La palette de gauche se cache comme celle de droite : elle sort quand la souris va au bord gauche. La petite poignée en
   haut la garde dehors (et l'image se place à côté).
 - Les feuillages laissent passer l'eau : elle goutte à travers les arbres.
