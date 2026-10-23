@@ -20,7 +20,7 @@ const WINK: (f32, f32) = (13.5, 17.5);
 const FACT: f32 = 18.0;
 const GONE: f32 = 23.0;
 /// Cells per unit of the wolf drawing (a sitting wolf is 10 units tall).
-const SCALE: f32 = 2.6;
+const SCALE: f32 = 3.0;
 
 #[derive(Clone, Debug)]
 pub struct Wolf {
@@ -83,7 +83,7 @@ fn ground_at(world: &World, x: i32) -> Option<i32> {
 fn find_spot(world: &World, dir: f32) -> Option<Vec<(f32, f32)>> {
     let mut tops: Vec<(i32, i32)> = (40..W as i32 - 40).step_by(2).filter_map(|x| ground_at(world, x).map(|y| (x, y))).collect();
     tops.sort_by_key(|&(x, y)| (y, x));
-    tops.into_iter().take(120).filter(|&(x, y)| !near_fire(world, x, y)).find_map(|(px, py)| {
+    tops.into_iter().filter(|&(x, y)| !near_fire(world, x, y)).find_map(|(px, py)| {
         OFFSETS
             .iter()
             .map(|&(dx, _, _)| {
@@ -104,7 +104,7 @@ const OFFSETS: [(f32, f32, f32); 3] = [(0.0, 1.0, 0.0), (-34.0, 0.92, 0.35), (28
 
 /// Wolves keep away from fire.
 fn near_fire(world: &World, x: i32, y: i32) -> bool {
-    (x - 50..=x + 50).step_by(2).any(|fx| (y - 40..=y + 4).step_by(2).any(|fy| matches!(world.at(fx, fy), Mat::Fire | Mat::Ember | Mat::Lava)))
+    (x - 36..=x + 36).step_by(2).any(|fx| (y - 40..=y + 4).step_by(2).any(|fy| matches!(world.at(fx, fy), Mat::Fire | Mat::Ember | Mat::Lava)))
 }
 
 /// 0..1 rise, hold, fall over a window.
@@ -200,40 +200,72 @@ impl Wolves {
                 let a = fade * (1.0 - k).min(k * 6.0).min(1.0);
                 let size = (size * view.s.max(0.7)).round() as u16;
                 let tw = ui.text_w(text, size);
-                ui.text(text, at.x - tw * 0.5, at.y, size, Color::new(0.88, 0.92, 1.0, a));
+                ui.text(text, at.x - tw * 0.5, at.y, size, Color::new(1.0, 1.0, 1.0, a));
             }
         }
     }
 }
 
 /// A sitting wolf seen from the side, facing +x, in units (y up is negative, feet on 0).
-/// The body, from the tip of the tail lying on the ground round the back to the front paws.
-const BODY: [(f32, f32); 14] = [
-    (-8.6, 0.0), (-6.2, -1.0), (-4.6, -2.6), (-3.4, -5.0), (-1.2, -6.9), (0.4, -8.2), (2.4, -7.8),
-    (2.8, -5.0), (2.6, 0.0), (1.3, 0.0), (1.1, -2.6), (0.2, 0.0), (-4.0, 0.0), (-5.4, -0.4),
+/// The body, clockwise from the tip of the tail lying on the ground, over the back, down the chest
+/// and the front leg, then back along the ground.
+const BODY: [(f32, f32); 23] = [
+    (-9.0, -0.2), (-7.5, -1.3), (-5.6, -1.7), (-4.8, -2.8), (-4.2, -4.6), (-3.0, -6.2), (-1.4, -7.6), (-0.2, -8.8),
+    (0.8, -9.2), (2.4, -8.4), (2.6, -7.2), (3.0, -5.6), (2.8, -3.2), (2.7, -0.6), (3.4, 0.0), (1.9, 0.0),
+    (1.8, -2.8), (1.0, -1.0), (0.9, 0.0), (-3.2, 0.0), (-4.4, -0.4), (-5.6, -0.7), (-7.6, -0.3),
 ];
-/// The head, around the top of the neck: ear, brow, muzzle, jaw, throat.
-const HEAD: [(f32, f32); 9] = [(-0.6, -1.6), (-0.2, -3.6), (0.8, -2.2), (1.6, -2.0), (4.0, -1.0), (4.0, -0.4), (2.0, 0.2), (1.0, 0.8), (-1.0, 0.4)];
-const NECK: (f32, f32) = (1.4, -8.0);
+/// The head around the base of the skull: ear, brow, muzzle, jaw, throat.
+const HEAD: [(f32, f32); 12] = [
+    (-0.6, -0.8), (-0.5, -2.0), (0.1, -3.9), (1.0, -2.5), (1.8, -2.3), (2.6, -1.7), (4.6, -1.2), (4.9, -0.7), (4.5, -0.3),
+    (2.6, 0.1), (1.6, 0.7), (0.0, 0.8),
+];
+/// Where the head sits on the neck, and how far it tips back to howl (radians).
+const NECK: (f32, f32) = (0.4, -8.4);
+const HOWL_TILT: f32 = 0.85;
 
-/// A sitting wolf in silhouette, its outline lit by the moon. `howl` 0..1 raises its head.
+/// Cuts a simple polygon (no crossing edges, any winding) into triangles: ear clipping.
+pub fn triangulate(poly: &[(f32, f32)]) -> Vec<[usize; 3]> {
+    let cross = |o: (f32, f32), a: (f32, f32), b: (f32, f32)| (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0);
+    let area: f32 = (0..poly.len()).map(|i| cross((0.0, 0.0), poly[i], poly[(i + 1) % poly.len()])).sum();
+    let turn = area.signum();
+    let mut left: Vec<usize> = (0..poly.len()).collect();
+    let mut out = vec![];
+    while left.len() > 3 {
+        let n = left.len();
+        let ear = (0..n).find(|&i| {
+            let (a, b, c) = (left[(i + n - 1) % n], left[i], left[(i + 1) % n]);
+            let (pa, pb, pc) = (poly[a], poly[b], poly[c]);
+            cross(pa, pb, pc) * turn > 0.0
+                && left.iter().filter(|&&j| j != a && j != b && j != c).all(|&j| {
+                    let p = poly[j];
+                    let (d0, d1, d2) = (cross(pa, pb, p) * turn, cross(pb, pc, p) * turn, cross(pc, pa, p) * turn);
+                    d0 < 0.0 || d1 < 0.0 || d2 < 0.0
+                })
+        });
+        // A degenerate outline: fall back on a fan rather than loop for ever.
+        let i = ear.unwrap_or(1);
+        out.push([left[(i + n - 1) % n], left[i], left[(i + 1) % n]]);
+        left.remove(i);
+    }
+    out.push([left[0], left[1], left[2]]);
+    out
+}
+
+/// A sitting wolf in silhouette, its outline lit by the moon. `howl` 0..1 tips its head back.
 /// Returns where the tip of its muzzle is on the screen.
 fn draw_wolf(w: &Wolf, view: View, fade: f32, howl: f32) -> Vec2 {
     let u = w.size * SCALE;
     let pt = |p: (f32, f32)| view.to_screen(vec2(w.x + w.dir * p.0 * u, w.y + p.1 * u));
-    // To howl it lifts its muzzle to the sky.
-    let (sin, cos) = (-1.0 * howl).sin_cos();
+    let (sin, cos) = (-HOWL_TILT * howl).sin_cos();
     let head: Vec<(f32, f32)> = HEAD.iter().map(|&(x, y)| (NECK.0 + x * cos - y * sin, NECK.1 + x * sin + y * cos)).collect();
     let body = Color::new(0.06, 0.07, 0.12, fade);
     let rim = Color::new(0.62, 0.68, 0.9, 0.85 * fade);
     // The light comes from above, a little in front (the wolves face the moon).
     let light = vec2(0.45, -0.9).normalize();
-    let width = (0.18 * u * view.s).max(1.0);
-    for (shape, center) in [(&BODY[..], (-1.0, -3.5)), (&head[..], (NECK.0 + 0.8, NECK.1 - 0.6))] {
-        let c = pt(center);
-        for i in 0..shape.len() {
-            let (a, b) = (shape[i], shape[(i + 1) % shape.len()]);
-            draw_triangle(c, pt(a), pt(b), body);
+    let width = (0.15 * u * view.s).max(1.0);
+    for shape in [&BODY[..], &head[..]] {
+        for [a, b, c] in triangulate(shape) {
+            draw_triangle(pt(shape[a]), pt(shape[b]), pt(shape[c]), body);
         }
         // The edges facing the light (outward normal of a clockwise outline in y-down units).
         for i in 0..shape.len() {
@@ -245,9 +277,12 @@ fn draw_wolf(w: &Wolf, view: View, fade: f32, howl: f32) -> Vec2 {
             }
         }
     }
-    let eye = pt((head[3].0 * 0.55 + head[0].0 * 0.45, head[3].1 * 0.55 + head[0].1 * 0.45 + 0.5));
+    // The neck, filling the joint as the head tips back.
+    let n = pt((NECK.0 + 0.6, NECK.1 + 0.2));
+    draw_circle(n.x, n.y, 1.3 * u * view.s, body);
+    let eye = pt((head[4].0 * 0.6 + head[0].0 * 0.4, head[4].1 * 0.6 + head[0].1 * 0.4 - 0.2));
     draw_circle(eye.x, eye.y, (0.3 * u * view.s).max(0.8), Color::new(0.95, 0.85, 0.4, fade * (1.0 - howl)));
-    pt(head[4])
+    pt(head[7])
 }
 
 #[cfg(test)]
@@ -312,5 +347,21 @@ mod tests {
         // Not twice the same night.
         wolves.update(0.1, &w);
         assert!(wolves.pack.is_none());
+    }
+
+    #[test]
+    fn the_silhouettes_are_cut_into_triangles_that_cover_them_exactly() {
+        let area = |p: &[(f32, f32)], t: &[usize]| {
+            let (a, b, c) = (p[t[0]], p[t[1]], p[t[2]]);
+            ((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)).abs() * 0.5
+        };
+        for shape in [&BODY[..], &HEAD[..]] {
+            let n = shape.len();
+            let outline = (0..n).map(|i| shape[i].0 * shape[(i + 1) % n].1 - shape[(i + 1) % n].0 * shape[i].1).sum::<f32>().abs() * 0.5;
+            let tris = triangulate(shape);
+            assert_eq!(tris.len(), n - 2);
+            let sum: f32 = tris.iter().map(|t| area(shape, t)).sum();
+            assert!((sum - outline).abs() < 1e-3, "{sum} vs {outline}");
+        }
     }
 }
