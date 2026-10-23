@@ -32,6 +32,10 @@ const CHANNEL_C: f32 = 2500.0;
 pub const GROUND_BREAKDOWN: f32 = 1.0;
 /// How strongly a charged cloud draws the opposite charge up into what lies under it.
 const INDUCE: f32 = 0.6;
+/// A charged square of ground draws at most this share of its charge, the other way, into the
+/// matter within `INFLUENCE_R` squares round it.
+const INFLUENCE: f32 = 1.0;
+const INFLUENCE_R: i32 = 3;
 
 /// A bolt of lightning, in cell coordinates: the main channel from top to bottom, and its branches.
 #[derive(Clone, Debug)]
@@ -115,6 +119,9 @@ impl World {
         let mut cold = vec![0.0f32; QW * QH];
         let mut cond = vec![-1.0f32; QW * QH];
         let mut open = vec![false; QW * QH];
+        // And whether it holds loose grains (which a field can pull), and iron filings (rust).
+        let mut grains = vec![false; QW * QH];
+        let mut rusty = vec![false; QW * QH];
         for qy in 0..QH {
             for qx in 0..QW {
                 let (mut n, mut t) = (0u32, 0.0f32);
@@ -127,10 +134,13 @@ impl World {
                             n += 1;
                             t += self.temp[i];
                         }
-                        if matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) {
-                            open[k] = true;
-                        } else {
-                            cond[k] = cond[k].max(conductivity(m));
+                        match m.kind() {
+                            Kind::Empty | Kind::Gas | Kind::Flame => open[k] = true,
+                            kind => {
+                                cond[k] = cond[k].max(conductivity(m));
+                                grains[k] |= kind == Kind::Powder;
+                                rusty[k] |= m == Mat::Rust;
+                            }
                         }
                     }
                 }
@@ -138,6 +148,7 @@ impl World {
                 cold[k] = if n > 0 && t / (n as f32) < ICE_C { 1.0 } else { 0.0 };
             }
         }
+        self.magnet_step(&rusty);
         let any_charge = self.charge.iter().chain(&self.mcharge).any(|q| q.abs() > 1e-4);
         if !any_charge && !cloud.iter().zip(&cold).any(|(c, k)| *c > 0.5 && *k > 0.0) {
             return;
@@ -195,6 +206,8 @@ impl World {
         // 2b. The ground under a charged cloud takes the opposite charge, most where it stands
         //     close to the cloud and conducts; the charge spreads along conductors and drains away.
         let exposed = self.ground_charge_step(&cond, &open);
+        // Charged grains are pulled toward the opposite charge and pushed from the same.
+        self.pull_charged_grains(&grains);
         // The air between the ground and the cloud breaks down where the ground is most charged.
         if self.ground_breakdown(&exposed) {
             return;
@@ -555,6 +568,9 @@ impl World {
         while let Some((mx, my)) = stack.pop() {
             let i = Self::idx(mx, my);
             self.temp[i] += 250.0 * power.max(0.5);
+            // The current through iron magnetises it (lightning makes magnets).
+            let q = (my as usize / QS) * QW + mx as usize / QS;
+            self.magnet[q] = self.magnet[q].max(power.max(0.5));
             self.zones.wake(i);
             if done.len() > 1500 {
                 continue;
@@ -595,6 +611,7 @@ impl World {
             .map(|(k, q)| ((k % QW) as i32, (k / QW) as i32, *q))
             .collect();
         if clouds.is_empty() && self.mcharge.iter().all(|q| q.abs() < 1e-4) {
+            self.polar.fill(0.0);
             return exposed;
         }
         // Conductors share their charge with their neighbours, quickly (several passes).
@@ -620,6 +637,46 @@ impl World {
                 }
             }
         }
+        // Influence: charge in the ground draws the opposite charge into the matter round it. Each
+        // charged square spreads the pull of its charge over its neighbourhood (normalised, so it
+        // gathers at most a share `INFLUENCE` of its own charge, the most close by). It shows in
+        // what conducts poorly (along a conductor the charge simply spreads out), at once, and is
+        // gone as soon as the charge that draws it is.
+        let mut influence = vec![0.0f32; QW * QH];
+        let sources: Vec<(i32, i32, f32)> = self
+            .mcharge
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| q.abs() > 0.03)
+            .map(|(k, q)| ((k % QW) as i32, (k / QW) as i32, *q))
+            .collect();
+        for &(sx, sy, q) in &sources {
+            let mut total = 0.0;
+            for dy in -INFLUENCE_R..=INFLUENCE_R {
+                for dx in -INFLUENCE_R..=INFLUENCE_R {
+                    let (x, y) = (sx + dx, sy + dy);
+                    if (dx, dy) != (0, 0) && x >= 0 && y >= 0 && x < QW as i32 && y < QH as i32 && cond[y as usize * QW + x as usize] >= 0.0 {
+                        total += 1.0 / (1.0 + (dx * dx + dy * dy) as f32);
+                    }
+                }
+            }
+            if total == 0.0 {
+                continue;
+            }
+            for dy in -INFLUENCE_R..=INFLUENCE_R {
+                for dx in -INFLUENCE_R..=INFLUENCE_R {
+                    let (x, y) = (sx + dx, sy + dy);
+                    if (dx, dy) != (0, 0) && x >= 0 && y >= 0 && x < QW as i32 && y < QH as i32 {
+                        let k = y as usize * QW + x as usize;
+                        // Only matter that holds no charge of its own takes it.
+                        if cond[k] >= 0.0 && self.mcharge[k].abs() < 0.1 {
+                            influence[k] -= INFLUENCE * q / (1.0 + (dx * dx + dy * dy) as f32) / total * (1.0 - cond[k]);
+                        }
+                    }
+                }
+            }
+        }
+        self.polar = influence;
         let m = &self.mcharge;
         let mut next = m.clone();
         for qy in 0..QH {
@@ -724,13 +781,157 @@ impl World {
     }
 }
 
+impl World {
+    /// The electric field at the centre of square (qx, qy), from the charge of the clouds and of
+    /// the ground (each charge pushes away from itself, as 1/d²), in charge per square. With a
+    /// `skip_d2` (squared squares), the sources that near, and those just under it, are left out.
+    fn field_at(&self, qx: usize, qy: usize, sources: &[(i32, i32, f32)], skip_d2: i32) -> (f32, f32) {
+        let (mut ex, mut ey) = (0.0, 0.0);
+        for &(sx, sy, q) in sources {
+            let (ix, iy) = (qx as i32 - sx, qy as i32 - sy);
+            // Close by, and the ground right under it, are what the grain lies on: left out.
+            if skip_d2 > 0 && (ix * ix + iy * iy <= skip_d2 || (iy < 0 && ix.abs() <= 4)) {
+                continue;
+            }
+            let (dx, dy) = (ix as f32, iy as f32);
+            let d2 = dx * dx + dy * dy + 1.0;
+            let f = q / (d2 * d2.sqrt());
+            ex += f * dx;
+            ey += f * dy;
+        }
+        (ex, ey)
+    }
+
+    /// Opposite charges attract, like charges repel: loose grains in a charged square are pulled
+    /// along the field (up toward a cloud of the other sign, away from a spot of the same).
+    fn pull_charged_grains(&mut self, grains: &[bool]) {
+        // The clouds, and the ground's own charge; a grain feels the ground's charge from a little
+        // way off, not the layer it lies in. A grain's charge is its square's, or the charge a
+        // charged spot nearby draws into it.
+        let clouds: Vec<(i32, i32, f32)> = self
+            .charge
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| q.abs() > 0.05)
+            .map(|(k, q)| ((k % QW) as i32, (k / QW) as i32, *q))
+            .collect();
+        let ground: Vec<(i32, i32, f32)> = (0..QW * QH)
+            .map(|k| (k, self.mcharge[k]))
+            .filter(|(_, q)| q.abs() > 0.05)
+            .map(|(k, q)| ((k % QW) as i32, (k / QW) as i32, q))
+            .collect();
+        if clouds.is_empty() && ground.is_empty() {
+            return;
+        }
+        for k in 0..QW * QH {
+            let q = self.mcharge[k] + self.polar[k];
+            if !grains[k] || q.abs() < 0.05 {
+                continue;
+            }
+            let (qx, qy) = (k % QW, k / QW);
+            let (cx, cy) = self.field_at(qx, qy, &clouds, 0);
+            let (gx, gy) = self.field_at(qx, qy, &ground, 8);
+            let (fx, fy) = (q * (cx + gx), q * (cy + gy));
+            let f = (fx * fx + fy * fy).sqrt();
+            let p = (f * 40.0).min(0.6);
+            if p > 0.02 {
+                self.nudge_grains(qx, qy, (fx / f, fy / f), p, 1, |m| m.kind() == Kind::Powder);
+            }
+        }
+    }
+
+    /// Moves the grains of square (qx, qy) that `which` accepts, each with probability `p`, up to
+    /// `reach` cells along `dir`, into empty air.
+    fn nudge_grains(&mut self, qx: usize, qy: usize, dir: (f32, f32), p: f32, reach: i32, which: impl Fn(Mat) -> bool) {
+        let step = |v: f32, r: f32| if v.abs() > r { v.signum() as i32 } else { 0 };
+        for y in qy * QS..(qy + 1) * QS {
+            for x in qx * QS..(qx + 1) * QS {
+                let (mut cx, mut cy) = (x as i32, y as i32);
+                if !which(self.raw(cx, cy)) || (self.storm_rng.next() % 1000) as f32 >= p * 1000.0 {
+                    continue;
+                }
+                for _ in 0..reach {
+                    // Mostly along the larger component, now and then the smaller.
+                    let r = (self.storm_rng.next() % 1000) as f32 / 1000.0;
+                    let (dx, dy) = (step(dir.0, r), step(dir.1, r));
+                    let (nx, ny) = (cx + dx, cy + dy);
+                    if (dx, dy) == (0, 0) || !Self::inb(nx, ny) || self.raw(nx, ny) != Mat::Empty {
+                        break;
+                    }
+                    self.swap((cx, cy), (nx, ny));
+                    (cx, cy) = (nx, ny);
+                }
+            }
+        }
+    }
+
+    /// Magnetised iron pulls iron filings (rust) toward it; its magnetism fades very slowly.
+    fn magnet_step(&mut self, rusty: &[bool]) {
+        let magnets: Vec<(i32, i32, f32)> = self
+            .magnet
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| **m > 0.05)
+            .map(|(k, m)| ((k % QW) as i32, (k / QW) as i32, *m))
+            .collect();
+        if magnets.is_empty() {
+            return;
+        }
+        for v in &mut self.magnet {
+            *v *= 0.9998;
+        }
+        for k in 0..QW * QH {
+            if !rusty[k] {
+                continue;
+            }
+            let (qx, qy) = (k % QW, k / QW);
+            let (mut fx, mut fy) = (0.0f32, 0.0f32);
+            for &(mx, my, s) in &magnets {
+                let (dx, dy) = ((mx - qx as i32) as f32, (my - qy as i32) as f32);
+                let d2 = dx * dx + dy * dy;
+                if d2 > MAGNET_R * MAGNET_R {
+                    continue;
+                }
+                let f = s / ((d2 + 1.0) * (d2 + 1.0).sqrt());
+                fx += f * dx;
+                fy += f * dy;
+            }
+            let f = (fx * fx + fy * fy).sqrt();
+            if f > 0.002 {
+                let p = (f * 6.0).min(0.9);
+                self.nudge_grains(qx, qy, (fx / f, fy / f), p, 1 + (f * 8.0).min(3.0) as i32, |m| m == Mat::Rust);
+            }
+        }
+    }
+
+    /// Filings touching magnetised iron (or a filing stuck to it) cling there.
+    pub(super) fn magnet_holds(&self, x: i32, y: i32) -> bool {
+        let (qx, qy) = (x as usize / QS, y as usize / QS);
+        let mut strong = 0.0f32;
+        for j in qy.saturating_sub(1)..(qy + 2).min(QH) {
+            for i in qx.saturating_sub(1)..(qx + 2).min(QW) {
+                strong = strong.max(self.magnet[j * QW + i]);
+            }
+        }
+        if strong <= 0.1 {
+            return false;
+        }
+        let iron = |w: &World, (nx, ny): (i32, i32)| matches!(w.at(nx, ny), Mat::Iron | Mat::Steel);
+        // On the iron itself, or on a filing that is (a short beard of filings).
+        Self::neighbors(x, y).iter().any(|&n| iron(self, n) || (self.at(n.0, n.1) == Mat::Rust && Self::neighbors(n.0, n.1).iter().any(|&nn| iron(self, nn))))
+    }
+}
+
+/// How far (in squares) a magnet reaches.
+const MAGNET_R: f32 = 8.0;
+
 /// Lightning goes into snow lying on the ground (low down), not into falling flakes.
 const GROUND_ROW: i32 = (H as i32) / 2;
 
 impl World {
     /// Charge in the ground at a cell, smoothly interpolated between the squares of the grid.
     pub fn mcharge_smooth(&self, x: usize, y: usize) -> f32 {
-        smooth(&self.mcharge, x, y)
+        smooth(&self.mcharge, x, y) + smooth(&self.polar, x, y)
     }
 
     /// Charge at a cell, smoothly interpolated between the squares of the grid.
@@ -768,6 +969,15 @@ impl World {
         }
         if m == Mat::Cloud {
             c = [62.0, 66.0, 82.0];
+        }
+        // Magnetised iron (and the filings it holds) shows violet.
+        if matches!(m, Mat::Iron | Mat::Steel | Mat::Rust) {
+            let g = self.magnet[(y / QS) * QW + x / QS].min(1.0);
+            if g > 0.05 {
+                for (v, t) in c.iter_mut().zip([190.0, 90.0, 255.0]) {
+                    *v += (t - *v) * g * 0.8;
+                }
+            }
         }
         let matter = !matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame);
         let q = if matter { self.mcharge_smooth(x, y) / GROUND_BREAKDOWN } else { self.charge_smooth(x, y) / BREAKDOWN };
@@ -1028,6 +1238,101 @@ mod tests {
             w.storm_step();
         }
         assert!(w.mcharge_at(310, 419).abs() < 0.05, "and it drains away into the ground: {}", w.mcharge_at(310, 419));
+    }
+
+    #[test]
+    fn a_charged_spot_draws_the_opposite_charge_round_it() {
+        let mut w = World::new_static();
+        for x in 0..W as i32 {
+            for y in 400..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        let k = (420 / QS) * QW + 480 / QS;
+        for _ in 0..200 {
+            w.mcharge[k] = -1.2;
+            w.ticks = 0;
+            w.storm_step();
+        }
+        let at = |x: usize, y: usize| w.polar[(y / QS) * QW + x / QS] + w.mcharge[(y / QS) * QW + x / QS];
+        let near = at(480 + QS * 2, 420);
+        let far = at(100, 420);
+        assert!(near > 0.02, "round a negative spot the rock turns positive: {near}");
+        assert!(far.abs() < near * 0.1, "but not far away: {far}");
+    }
+
+    #[test]
+    fn opposite_charges_attract_charged_sand_jumps_up_toward_the_cloud() {
+        let mut w = World::new_static();
+        ground(&mut w, 420);
+        for x in 450..510 {
+            for y in 410..420 {
+                w.set(x, y, Mat::Sand);
+            }
+        }
+        let before: Vec<Cell> = w.cells.clone();
+        for _ in 0..40 {
+            for qx in 450 / QS..510 / QS {
+                w.charge[(300 / QS) * QW + qx] = -1.0;
+                w.mcharge[(408 / QS) * QW + qx] = 0.8;
+                w.mcharge[(414 / QS) * QW + qx] = 0.8;
+            }
+            w.ticks = 0;
+            w.storm_step();
+        }
+        let lifted = (380..410).flat_map(|y| (440..520).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Sand).count();
+        assert!(lifted > 0, "grains leap up toward the cloud of the other sign");
+        // Like charges repel: the same sand under a positive cloud stays down.
+        let mut v = World::new_static();
+        v.cells.copy_from_slice(&before);
+        for _ in 0..40 {
+            for qx in 450 / QS..510 / QS {
+                v.charge[(300 / QS) * QW + qx] = 1.0;
+                v.mcharge[(408 / QS) * QW + qx] = 0.8;
+                v.mcharge[(414 / QS) * QW + qx] = 0.8;
+            }
+            v.ticks = 0;
+            v.storm_step();
+        }
+        let up = (380..410).flat_map(|y| (440..520).map(move |x| (x, y))).filter(|&(x, y)| v.raw(x, y) == Mat::Sand).count();
+        assert!(up * 5 < lifted, "a cloud of the same sign hardly lifts it: {up} against {lifted}");
+    }
+
+    #[test]
+    fn lightning_magnetises_iron_which_pulls_in_iron_filings() {
+        let mut w = World::new_static();
+        ground(&mut w, 420);
+        for y in 360..420 {
+            w.set(480, y, Mat::Iron);
+        }
+        // A heap of filings on the ground a little way off.
+        for x in 492..500 {
+            for y in 414..420 {
+                w.set(x, y, Mat::Rust);
+            }
+        }
+        w.strike(480, 340);
+        assert!(w.magnet[(400 / QS) * QW + 480 / QS] > 0.4, "the current magnetised the post");
+        let dist = |w: &World| {
+            let (mut n, mut d) = (0, 0i32);
+            for y in 300..420 {
+                for x in 470..520 {
+                    if w.raw(x, y) == Mat::Rust {
+                        n += 1;
+                        d += (x - 480).abs();
+                    }
+                }
+            }
+            d as f32 / n.max(1) as f32
+        };
+        let start = dist(&w);
+        for _ in 0..600 {
+            w.step();
+        }
+        let end = dist(&w);
+        assert!(end < start - 3.0, "the filings crept toward the magnet: {start} -> {end}");
+        let clinging = (360..420).filter(|&y| w.raw(481, y) == Mat::Rust).count();
+        assert!(clinging > 0, "and some reach the post and cling to it");
     }
 
     #[test]
