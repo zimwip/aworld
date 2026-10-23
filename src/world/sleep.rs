@@ -109,7 +109,7 @@ impl World {
             Mat::Dirt => {
                 // A clod with nothing under it, or at the edge of a bank steeper than it holds.
                 let drop = |dx: i32| sinks_into(self.at(x + dx, y + 1)) && (dx == 0 || sinks_into(self.at(x + dx, y + 2)));
-                (self.structures_fall && (drop(0) || drop(-1) || drop(1))) || self.soil_restless(x, y)
+                (self.structures_fall && (drop(0) || drop(-1) || drop(1))) || self.soil_restless(x, y) || self.seed_waits(x, y)
             }
             // Grass can always change: it grows, dries, wilts or is smothered.
             Mat::Grass => true,

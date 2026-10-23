@@ -3953,6 +3953,13 @@ async fn main() {
             Some("planet") => Tab::Planet,
             _ => Tab::Blocks,
         };
+        // `--sow`: seeds sown along the ground, all across the world (before `--lawn`'s steps).
+        if args.iter().any(|a| a == "--sow") {
+            for x in (0..W as i32).step_by(7) {
+                let y = (0..H as i32).find(|&y| matches!(game.world.raw(x, y), Mat::Dirt | Mat::Grass)).unwrap_or(0);
+                game.world.paint(x, y + 2, 2, Mat::Seed);
+            }
+        }
         // `--lawn n`: wet earth on the left, dry on the right, and n steps for the grass to answer.
         if let Some(n) = arg("--lawn").and_then(|v| v.parse::<u32>().ok()) {
             game.world.demo_lawn(n);
