@@ -178,11 +178,15 @@ void main() {
 
 // Clouds and steam are drawn from a density layer: blurred, then thresholded so
 // the cells merge into soft, billowy blobs, lit from above.
+// `dusk` is (twilight strength, x of the low sun from 0 to 1): at sunrise and sunset the sun shines
+// from below the clouds, so their undersides and the edges facing it glow gold and rose while
+// their tops fall into a lavender shade.
 const GAS_FRAG: &str = "#version 100
 precision highp float;
 varying vec2 uv;
 uniform sampler2D Texture;
 uniform vec2 texel;
+uniform vec2 dusk;
 float dens(vec2 p) {
     float d = 0.0;
     float ws = 0.0;
@@ -207,6 +211,16 @@ void main() {
     float dn = dens(uv + vec2(0.0, texel.y * 6.0));
     float lightness = clamp(0.88 + (up - dn) * 0.9, 0.7, 1.08);
     vec3 col = vec3(0.97, 0.98, 1.0) * lightness;
+    if (dusk.x > 0.01) {
+        float under = clamp((d - dn) * 4.0, 0.0, 1.0);
+        float toward = uv.x < dusk.y ? 1.0 : -1.0;
+        float side = dens(uv + vec2(toward * texel.x * 8.0, 0.0));
+        float facing = clamp((d - side) * 2.5, 0.0, 1.0);
+        float near = exp(-abs(uv.x - dusk.y) * 2.5);
+        vec3 warm = mix(vec3(0.98, 0.46, 0.5), vec3(1.0, 0.72, 0.36), near);
+        col = mix(col, vec3(0.56, 0.5, 0.7) * lightness, dusk.x * 0.75);
+        col = mix(col, warm * 1.05, clamp(0.35 * near + 1.1 * under + 0.7 * facing, 0.0, 0.9) * dusk.x);
+    }
     float alpha = a * 0.86;
     gl_FragColor = vec4(col * alpha, alpha);
 }";
@@ -312,7 +326,7 @@ impl Renderer {
             ShaderSource::Glsl { vertex: VERT, fragment: GAS_FRAG },
             MaterialParams {
                 pipeline_params: PipelineParams { color_blend: Some(blend), alpha_blend: Some(blend), ..Default::default() },
-                uniforms: vec![UniformDesc::new("texel", UniformType::Float2)],
+                uniforms: vec![UniformDesc::new("texel", UniformType::Float2), UniformDesc::new("dusk", UniformType::Float2)],
                 ..Default::default()
             },
         )
@@ -496,12 +510,21 @@ impl Renderer {
         }
         self.update_trees(world, time);
         self.update_light(world, time);
-        // The sun and the moon follow the same arcs as in the backdrop.
+        // The sun and the moon follow the same arcs as in the backdrop. The moon lights the
+        // world at night only, and only as much as its face is lit (nothing at new moon).
         let phase = world.phase();
-        let (u, sun) = if phase < 0.5 { (phase / 0.5, true) } else { ((phase - 0.5) / 0.5, false) };
-        let x = 0.08 + 0.84 * u;
-        let height = (std::f32::consts::PI * u).sin();
-        let sky = if sun { vec4(x, height.sqrt(), 0.0, 0.0) } else { vec4(0.0, 0.0, x, height.sqrt()) };
+        let at = |u: f32| (0.08 + 0.84 * u, (std::f32::consts::PI * u).sin().sqrt());
+        let sky = match (phase < 0.5, world.moon_arc()) {
+            (true, _) => {
+                let (x, h) = at(phase / 0.5);
+                vec4(x, h, 0.0, 0.0)
+            }
+            (false, Some(u)) => {
+                let (x, h) = at(u);
+                vec4(0.0, 0.0, x, h * world.moon_light())
+            }
+            (false, None) => vec4(0.0, 0.0, 0.0, 0.0),
+        };
         self.material.set_uniform("texel", vec2(1.0 / W as f32, 1.0 / H as f32));
         self.material.set_uniform("time", time);
         self.material.set_uniform("sky", sky);
@@ -580,7 +603,9 @@ impl Renderer {
         if !self.has_gas {
             return;
         }
+        let (dusk, sun_x) = crate::backdrop::twilight(world.phase());
         self.gas_material.set_uniform("texel", vec2(1.0 / W as f32, 1.0 / H as f32));
+        self.gas_material.set_uniform("dusk", vec2(dusk, sun_x));
         gl_use_material(&self.gas_material);
         draw_texture_ex(
             &self.gas_texture,

@@ -2619,7 +2619,7 @@ impl World {
             2 => 2,
             _ => 1,
         };
-        let slow = if coal { slow * 8 } else { slow };
+        let slow = if coal { slow * 12 } else { slow };
         if slow == 1 || self.chance(slow) {
             self.cells[i].life -= 1;
         }
@@ -4608,6 +4608,43 @@ mod tests {
         assert!((-12.0..=-3.0).contains(&night_summer) && (-12.0..=-3.0).contains(&night_winter), "nights are -10 to -5: {night_summer} {night_winter}");
         assert!(night_winter < night_summer, "winter nights are colder");
         assert!(w.ambient_c(0).abs() < 4.0);
+    }
+
+    #[test]
+    fn the_moon_goes_through_its_phases_and_rises_later_every_night() {
+        let mut w = World::new_static();
+        w.set_phase(0.75);
+        // Eight nights, eight different moons, then the cycle starts again.
+        let mut names = vec![];
+        for day in 1..=9 {
+            w.set_day(day);
+            names.push(w.moon_name());
+        }
+        assert_eq!(&names[..8], ["premier quartier", "lune gibbeuse croissante", "pleine lune", "lune gibbeuse décroissante", "dernier quartier", "dernier croissant", "nouvelle lune", "premier croissant"]);
+        assert_eq!(names[8], names[0]);
+        // Full moon: all lit, opposite the sun, high in the sky at midnight, gone by day.
+        w.set_day(3);
+        assert!(w.full_moon() && w.moon_light() > 0.99 && w.nights_to_full_moon() == 0);
+        let u = w.moon_arc().expect("the full moon is up at midnight");
+        assert!((u - 0.5).abs() < 0.1, "highest at midnight: {u}");
+        w.set_phase(0.25);
+        assert!(w.moon_arc().is_none(), "the full moon is set at noon");
+        // New moon: dark, and it crosses the sky with the sun.
+        w.set_day(7);
+        w.set_phase(0.25);
+        assert!(w.moon_light() < 0.05 && w.moon_arc().is_some());
+        w.set_phase(0.75);
+        assert!(w.moon_arc().is_none());
+        // First quarter: half lit, up in the evening, set before the morning.
+        w.set_day(1);
+        w.set_phase(0.55);
+        assert!((w.moon_light() - 0.5).abs() < 0.1 && w.moon_arc().is_some());
+        w.set_phase(0.95);
+        assert!(w.moon_arc().is_none());
+        assert_eq!(w.nights_to_full_moon(), 2);
+        w.set_day(4);
+        assert_eq!(w.nights_to_full_moon(), 7);
+        assert!(!w.full_moon());
     }
 
     #[test]
