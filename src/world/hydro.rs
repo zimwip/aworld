@@ -54,7 +54,8 @@ impl World {
     /// up: it is the mouth of a narrow pipe (or hole) full of liquid, where no air can get in to
     /// take its place (a drinking straw with a finger on top), and the levelling has not let it go.
     pub(super) fn held(&self, x: i32, y: i32) -> bool {
-        if !Self::inb(x, y) || self.released[Self::idx(x, y)] {
+        // Over the bottom edge of the world there is nothing to hold it against: it falls out.
+        if !Self::inb(x, y) || y + 1 >= H as i32 || self.released[Self::idx(x, y)] {
             return false;
         }
         let m = self.raw(x, y);
@@ -232,7 +233,7 @@ impl World {
             for &(x, y, head) in &open {
                 let n = ((high.head - head).max(0.0).sqrt() / 3.0).clamp(1.0, 4.0) as i32;
                 for k in 1..=n {
-                    if self.at(x, y + k) != Mat::Empty {
+                    if !Self::inb(x, y + k) || self.at(x, y + k) != Mat::Empty {
                         break;
                     }
                     to.push(Spot { head, x, y: y + k });
@@ -251,7 +252,7 @@ impl World {
             if flow < 1.0 && (self.rand() % 1000) as f32 >= flow * 1000.0 {
                 continue;
             }
-            if self.raw(d.x, d.y) != m || self.at(r.x, r.y) != Mat::Empty {
+            if !Self::inb(r.x, r.y) || self.raw(d.x, d.y) != m || self.at(r.x, r.y) != Mat::Empty {
                 continue;
             }
             let t = self.temp[Self::idx(d.x, d.y)];
@@ -409,6 +410,26 @@ mod tests {
         }
         let left = count(&w, 110, 240, 140, 300, Mat::Water);
         assert!(left > 300, "the tank went on draining below the mouth: {left} cells left");
+    }
+
+    #[test]
+    fn a_full_pipe_ending_on_the_bottom_of_the_world_drains_out_of_it() {
+        // A tank whose pipe goes down to the last row: the liquid leaves the world there.
+        let mut w = World::new_static();
+        let b = H as i32 - 1;
+        rect(&mut w, 300, b - 80, 340, b, Mat::Stone);
+        rect(&mut w, 305, b - 80, 335, b - 20, Mat::Empty);
+        rect(&mut w, 319, b - 19, 320, b, Mat::Empty);
+        for m in [Mat::Water, Mat::Oil] {
+            rect(&mut w, 305, b - 60, 335, b - 20, m);
+            rect(&mut w, 319, b - 19, 320, b, m);
+            let before = count(&w, 305, b - 80, 335, b - 20, m);
+            for _ in 0..1500 {
+                w.step();
+            }
+            let after = count(&w, 305, b - 80, 335, b - 20, m);
+            assert!(after * 4 < before * 3, "{m:?}: {before} -> {after}");
+        }
     }
 
     #[test]

@@ -105,7 +105,7 @@ struct Part {
     y: i32,
     cell: Cell,
     temp: f32,
-    states: States,
+    states: (States, u16),
 }
 
 /// A solid body tipping over or tumbling through the air.
@@ -169,7 +169,13 @@ struct Crack {
 }
 
 impl World {
-    fn put_states(&mut self, i: usize, st: States) {
+    /// The states of cell `i` and the log it belongs to.
+    fn take_states(&self, i: usize) -> (States, u16) {
+        (self.states(i), self.log[i])
+    }
+
+    fn put_states(&mut self, i: usize, (st, log): (States, u16)) {
+        self.log[i] = log;
         self.moisture[i] = st.moisture;
         self.fuel[i] = st.fuel;
         self.growth[i] = st.growth;
@@ -232,7 +238,7 @@ impl World {
                         continue;
                     }
                     let j = Self::idx(nx, ny);
-                    if pos[j] == u32::MAX || level[j] < d || !same_body(self.cells[i].m, self.cells[j].m) {
+                    if pos[j] == u32::MAX || level[j] < d || !self.same_body(i, j) {
                         continue;
                     }
                     let (a, b) = (find(&mut up, k as u32), find(&mut up, pos[j]));
@@ -303,7 +309,7 @@ impl World {
                         continue;
                     }
                     let j = Self::idx(nx, ny);
-                    if level[j] == u32::MAX || level[j] < crack.level || !same_body(self.cells[i].m, self.cells[j].m) {
+                    if level[j] == u32::MAX || level[j] < crack.level || !self.same_body(i, j) {
                         continue;
                     }
                     if taken[j] != 0 {
@@ -457,7 +463,7 @@ impl World {
             mass += rho;
             mx += rho * (x as f32 + 0.5);
             my += rho * (y as f32 + 0.5);
-            parts.push(Part { x, y, cell: self.cells[i], temp: self.temp[i], states: self.states(i) });
+            parts.push(Part { x, y, cell: self.cells[i], temp: self.temp[i], states: self.take_states(i) });
             home.insert((x, y), k as u32);
             drawn.push((i, k as u32));
         }
@@ -579,7 +585,7 @@ impl World {
         }
         // What the body leaves is filled with the air (or smoke, or flames) it pushes aside.
         let now: HashSet<usize> = drawn.iter().map(|d| d.0).collect();
-        let mut pushed: Vec<(Cell, f32, States)> = drawn.iter().filter(|d| !own.contains(&d.0) && self.cells[d.0].m != Mat::Empty).map(|d| (self.cells[d.0], self.temp[d.0], self.states(d.0))).collect();
+        let mut pushed: Vec<(Cell, f32, (States, u16))> = drawn.iter().filter(|d| !own.contains(&d.0) && self.cells[d.0].m != Mat::Empty).map(|d| (self.cells[d.0], self.temp[d.0], self.take_states(d.0))).collect();
         pushed.sort_by_key(|p| matches!(p.0.m.kind(), Kind::Liquid | Kind::Powder | Kind::Static));
         let frame = self.frame;
         for &(i, _) in &s.drawn {

@@ -401,3 +401,11 @@ Le nouvel outil **Capteur** (barre d'outils à gauche, icône thermomètre) pose
 
 - **Pression lithostatique** : une atmosphère d'air plus le poids de la colonne de matière au-dessus de la cellule (`World::load`).
 - **Tassement** : la terre sous l'eau calme devient de la vase ; la vase enfouie sous assez de poids devient de l'argile ; l'argile et le sable sous un grand poids deviennent de la roche (schiste, grès) ; la neige profonde devient de la glace. Dans la réalité, cela demande des kilomètres de terrain et des millions d'années. Le monde n'a que 27 m de profondeur : les seuils sont abaissés et les changements arrivent en quelques heures de jeu.
+
+## Bûches et arbres (palette Bois)
+
+- **Une bûche par coup de pinceau** : le bois peint d'un trait est un corps rigide à lui seul (`World::log`, un numéro de bûche par cellule). Il ne se colle ni au sol, ni à une falaise, ni à une autre bûche : il repose sur ce qui est dessous et porte ce qui est posé dessus. Une bûche peinte en l'air ou contre une paroi tombe donc d'un bloc, garde sa forme et s'empile sur les autres au lieu de se fondre dans le terrain.
+- Une pièce qui tombe sur du sable ou de la terre tassés y reste posée si elle est plus légère (Archimède, comme sur l'eau) : une bûche ne s'enfonce plus dans une dune, la roche si.
+- **Arbre** : la petite flèche du bouton Bois propose « Arbre ». Un clic plante un arbre adulte (tronc, branches, feuillage, comme ceux du paysage) sur le sol sous la souris ; un pinceau plus gros le fait plus grand. Pas d'arbre dans l'eau ni sous un surplomb.
+
+`--demo out.png --logs --tab matter --states 4` montre des arbres plantés et des bûches tombées en pile.
