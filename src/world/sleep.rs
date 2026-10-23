@@ -108,7 +108,7 @@ impl World {
             Mat::Empty | Mat::Stone | Mat::Brick | Mat::Glass | Mat::Ice | Mat::Clay | Mat::Terracotta => false,
             Mat::Dirt => c.life > 0,
             Mat::Grass => c.life > 0 || !self.at(x, y + 1).is_hard(),
-            Mat::Sand | Mat::Rust | Mat::Hail | Mat::Snow | Mat::Gunpowder | Mat::Ash | Mat::Charcoal => {
+            Mat::Sand | Mat::Rust | Mat::Hail | Mat::Snow | Mat::Gunpowder | Mat::Ash | Mat::Charcoal | Mat::Saltpeter => {
                 let can_fall = sinks_into(self.at(x, y + 1)) || sinks_into(self.at(x - 1, y + 1)) || sinks_into(self.at(x + 1, y + 1));
                 // Free-running grains roll two cells sideways (see `step_powder`), and a grain
                 // lighter than the liquid above it rises.
@@ -117,6 +117,8 @@ impl World {
                 let floats = self.at(x, y - 1).kind() == Kind::Liquid && density(self.at(x, y - 1)) > density(c.m);
                 let can_fall = can_fall || rolls || floats;
                 let wet = c.m == Mat::Ash && Self::neighbors(x, y).iter().any(|&(nx, ny)| self.at(nx, ny) == Mat::Water);
+                // Saltpetre dissolves in water and turns to powder against charcoal.
+                let wet = wet || c.m == Mat::Saltpeter && Self::neighbors(x, y).iter().any(|&(nx, ny)| matches!(self.at(nx, ny), Mat::Water | Mat::Charcoal));
                 can_fall || wet
             }
             Mat::Iron | Mat::Steel => Self::neighbors(x, y).iter().any(|&(nx, ny)| self.at(nx, ny) == Mat::Water),

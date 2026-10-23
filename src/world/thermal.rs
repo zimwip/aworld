@@ -74,7 +74,7 @@ fn props(m: Mat) -> (f32, f32) {
         Mat::Molten => (0.5, 300.0),
         Mat::Fire => (0.4, 1.0),
         Mat::Ember => (0.25, 1.0),
-        Mat::Gunpowder | Mat::Ash | Mat::Rust => (0.04, 1.2),
+        Mat::Gunpowder | Mat::Saltpeter | Mat::Ash | Mat::Rust => (0.04, 1.2),
         Mat::Charcoal => (0.04, 1.0),
     }
 }

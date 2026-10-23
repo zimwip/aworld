@@ -33,6 +33,12 @@ pub enum Ev {
     Crack,
     Spray,
     Snap,
+    /// The fire engine's two-tone siren (pin-pon).
+    Siren,
+    /// A firework bursting in the sky.
+    Pop,
+    /// A whale breathing out at the surface.
+    Blow,
 }
 
 impl Ev {
@@ -44,6 +50,9 @@ impl Ev {
             Ev::Crack => 3,
             Ev::Spray => 4,
             Ev::Snap => 5,
+            Ev::Siren => 6,
+            Ev::Pop => 7,
+            Ev::Blow => 8,
         }
     }
 }
@@ -262,6 +271,59 @@ pub fn snap() -> Vec<f32> {
     v
 }
 
+/// The French fire engine's two-tone siren: 435 Hz and 488 Hz, half a second each, twice.
+pub fn siren() -> Vec<f32> {
+    let n = secs(2.0);
+    let mut ph = 0.0f32;
+    let mut v: Vec<f32> = (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE as f32;
+            let hz = if (t * 2.0) as u32 % 2 == 0 { 435.0 } else { 488.0 };
+            ph += hz / RATE as f32;
+            // A bit of a horn: a few odd harmonics, soft edges at the start and the end.
+            let s = (TAU * ph).sin() + (TAU * ph * 3.0).sin() * 0.3 + (TAU * ph * 5.0).sin() * 0.12;
+            s * (t * 20.0).min(1.0) * ((2.0 - t) * 20.0).min(1.0)
+        })
+        .collect();
+    normalize(&mut v, 0.5);
+    v
+}
+
+/// A firework burst: a dull thump followed by a shower of crackles.
+pub fn pop() -> Vec<f32> {
+    let mut rng = Rng(777);
+    let n = secs(1.2);
+    let mut v = vec![0.0f32; n];
+    for (i, s) in v.iter_mut().enumerate() {
+        let t = i as f32 / RATE as f32;
+        *s = rng.next() * (-t * 30.0).exp() * 0.8 + (TAU * 70.0 * t).sin() * (-t * 12.0).exp();
+    }
+    // Crackles: tiny clicks scattered over the second after the bang.
+    for k in 0..60 {
+        let at = secs(0.15 + (k as f32 * 0.618).fract() * 0.95);
+        let amp = 0.5 * (1.0 - k as f32 / 60.0) + 0.1;
+        for j in 0..secs(0.006).min(n - at) {
+            v[at + j] += rng.next() * amp * (1.0 - j as f32 / secs(0.006) as f32);
+        }
+    }
+    normalize(&mut v, 0.8);
+    v
+}
+
+/// A whale's breath: a deep, airy whoosh.
+pub fn blow() -> Vec<f32> {
+    let mut rng = Rng(4242);
+    let n = secs(1.4);
+    let mut v = noise(&mut rng, n);
+    lowpass(&mut v, 0.12);
+    for (i, s) in v.iter_mut().enumerate() {
+        let t = i as f32 / n as f32;
+        *s *= (t * 8.0).min(1.0) * (1.0 - t).powf(1.5);
+    }
+    normalize(&mut v, 0.7);
+    v
+}
+
 /// 16-bit mono PCM WAV.
 pub fn wav(samples: &[f32]) -> Vec<u8> {
     let data = samples.len() as u32 * 2;
@@ -299,6 +361,9 @@ struct Bank {
     crack: Sound,
     spray: Sound,
     snap: Sound,
+    siren: Sound,
+    pop: Sound,
+    blow: Sound,
 }
 
 pub struct Sounds {
@@ -306,7 +371,7 @@ pub struct Sounds {
     bank: Option<Bank>,
     pub muted: bool,
     queue: Vec<Ev>,
-    cooldown: [f32; 6],
+    cooldown: [f32; 9],
     /// Smoothed loop volumes: engine x4, wind, water, fire.
     level: [f32; 7],
 }
@@ -319,7 +384,7 @@ impl Sounds {
             bank: None,
             muted: true,
             queue: vec![],
-            cooldown: [0.0; 6],
+            cooldown: [0.0; 9],
             level: [0.0; 7],
         }
     }
@@ -354,6 +419,9 @@ impl Sounds {
                 crack: one(&crack()).await?,
                 spray: one(&spray()).await?,
                 snap: one(&snap()).await?,
+                siren: one(&siren()).await?,
+                pop: one(&pop()).await?,
+                blow: one(&blow()).await?,
             })
         }
         .await;
@@ -412,7 +480,13 @@ impl Sounds {
                 if self.cooldown[slot] > 0.0 {
                     continue;
                 }
-                self.cooldown[slot] = if slot == 0 { 0.12 } else { 0.07 };
+                self.cooldown[slot] = match e {
+                    Ev::Boom(_) => 0.12,
+                    // The siren is two seconds long: never two at once.
+                    Ev::Siren => 2.0,
+                    Ev::Pop => 0.2,
+                    _ => 0.07,
+                };
                 let (s, v) = match e {
                     Ev::Boom(r) => (if r >= 7.0 { &b.boom_big } else { &b.boom_small }, (0.45 + r * 0.06).min(1.0)),
                     Ev::Thud(p) => (&b.thud, (0.2 + p * 0.12).min(0.9)),
@@ -420,6 +494,9 @@ impl Sounds {
                     Ev::Crack => (&b.crack, 0.7),
                     Ev::Spray => (&b.spray, 0.45),
                     Ev::Snap => (&b.snap, 0.7),
+                    Ev::Siren => (&b.siren, 0.35),
+                    Ev::Pop => (&b.pop, 0.55),
+                    Ev::Blow => (&b.blow, 0.5),
                 };
                 play_sound_once_at(s, v);
             }
@@ -450,7 +527,7 @@ mod tests {
         for hz in ENGINE_HZ {
             sane(&engine(hz));
         }
-        for v in [wind(), water(), fire(), boom(2.0, 1.0), boom(0.8, 0.4), thud(), clink(), crack(), spray(), snap()] {
+        for v in [wind(), water(), fire(), boom(2.0, 1.0), boom(0.8, 0.4), thud(), clink(), crack(), spray(), snap(), siren(), pop(), blow()] {
             sane(&v);
         }
     }

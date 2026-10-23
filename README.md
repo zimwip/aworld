@@ -26,6 +26,11 @@ cargo run --release
   Un nuage réchauffé par le soleil garde son eau. Les gaz qui sortent d'un côté reviennent de l'autre.
 - **Chimie** : bois + feu = cendre (carbone) ; fer + cendre + chaleur = acier ; l'eau rouille le fer ; rouille + feu = fer ;
   eau + lave = pierre ; roche + gel = sable ; verre brisé = éclats puis sable.
+- **Poudre** : des feuilles mortes qui pourrissent contre de la cendre de bois donnent du **salpêtre** (la nitrière ;
+  à l'abri de la pluie, l'eau le dissout). Salpêtre + charbon de bois, à froid et au sec : de la poudre noire.
+- **Clins d'œil** : le Béluga (B) ; une **baleine** souffle dans les grandes étendues d'eau profonde (W pour l'appeler) ;
+  un grand feu fait venir le **camion de pompiers** (pin-pon !) qui l'arrose avec de la vraie eau ; la nuit, la poudre
+  qui explose lance un **feu d'artifice** (couleurs des métaux : cuivre bleu, strontium rouge, sodium jaune, baryum vert).
 - **Plantes** : terre humide + graine + eau + lumière (jamais la nuit) = arbre ; les arbres font des graines : une forêt pousse.
   La terre nue s'érode sous l'eau qui coule (l'herbe la protège). Une graine sans eau pourrit en terre.
 - **Pas de vrai sol** : seule la roche posée sur le bas du monde retient le reste ; tout ce qui n'y est pas relié tombe et
@@ -53,7 +58,7 @@ vide ou en sortant du monde. Leur poids pèse sur les ponts. **Réglages** (ongl
 amortisseurs, adhérence, taille des roues, solidité, poids, couleur — sur la voiture choisie ou pour les suivantes.
 
 ## Raccourcis
-Espace jouer/pause · R retour · Z annuler · C voiture · G monde suivant · N vide · H température · X efforts · V vent ·
+Espace jouer/pause · B Béluga · W baleine · R retour · Z annuler · C voiture · G monde suivant · N vide · H température · X efforts · V vent ·
 Q/E/T tourner · Tab onglet · [ ] pinceau · ↑/↓ vitesse · 1-0 matières · F5/F9 sauver/charger · F11 plein écran.
 
 ## Développement
@@ -98,7 +103,7 @@ Sans carte son (ALSA/PipeWire), compiler avec `cargo build --release --no-defaul
 
 ## Raccourcis
 
-Espace jouer/pause · R retour · C voiture · Z annuler · H/X/V vues · M son · F ou F11 plein écran · Tab onglet. Poteau (brique haute) dans les blocs : plus besoin de tourner les blocs.
+Espace jouer/pause · B Béluga · W baleine · R retour · C voiture · Z annuler · H/X/V vues · M son · F ou F11 plein écran · Tab onglet. Poteau (brique haute) dans les blocs : plus besoin de tourner les blocs.
 **Échap** recule d'un cran : page Science, tracé en cours, plein écran, puis une fenêtre « Quitter AWorld ? » qui met
 la simulation en pause ; Échap y reprend le jeu, **Entrée** quitte.
 
