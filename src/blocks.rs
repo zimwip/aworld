@@ -403,9 +403,9 @@ pub fn block_at(blocks: &[Block], p: Vec2) -> Option<usize> {
 
 /// Longest beam that can be drawn in one go, in cells.
 pub const MEMBER_MAX_LEN: f32 = 110.0;
-/// How much a weight bends a rod: a truck (3.5) in the middle of the longest steel rod breaks it,
-/// a small car (1.5) does not.
-const BEND: f32 = 1.75;
+/// How much a weight bends a rod loaded in its middle: it adds to the strain of a long span,
+/// so a truck on one long rod is close to the limit even in steel.
+const BEND: f32 = 1.5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MemberMat {
@@ -453,9 +453,9 @@ impl MemberMat {
     /// Force (impulse per step) the beam can carry before it breaks.
     pub fn limit(self) -> f32 {
         match self {
-            MemberMat::Wood => 1.2,
-            MemberMat::Iron => 2.4,
-            MemberMat::Steel => 5.5,
+            MemberMat::Wood => 3.8,
+            MemberMat::Iron => 6.5,
+            MemberMat::Steel => 11.0,
         }
     }
 
@@ -2381,8 +2381,8 @@ mod tests {
         let iron_heavy = hang_from_beam(MemberMat::Iron, 4);
         let steel_heavy = hang_from_beam(MemberMat::Steel, 4);
         eprintln!("BEAM wood1 {wood_light:?} wood4 {wood_heavy:?} iron4 {iron_heavy:?} steel4 {steel_heavy:?}");
-        assert!(wood_light.0 && wood_light.1 < 0.4, "a wooden beam holds one cube easily");
-        assert!(wood_heavy.1 > 0.6, "four cubes load a wooden beam close to breaking (shown red)");
+        assert!(wood_light.0 && wood_light.1 < 0.2, "a wooden beam holds one cube easily");
+        assert!(wood_heavy.0 && wood_heavy.1 > 2.0 * wood_light.1, "four cubes load it much more");
         assert!(iron_heavy.0 && steel_heavy.0, "iron and steel hold four cubes");
         assert!(steel_heavy.1 < iron_heavy.1 && iron_heavy.1 < wood_heavy.1, "steel is less stressed than iron, iron than wood");
     }
@@ -2827,23 +2827,26 @@ mod tests {
     }
 
     #[test]
-    fn a_long_span_needs_a_truss_and_the_right_metal() {
+    fn every_rod_carries_a_car_but_a_truck_needs_metal_or_a_truss() {
         use crate::car::ModelKind::{Buggy, Truck};
-        // One long rod across the gap bends under the weight in its middle.
-        let steel_buggy = cross_rods(Buggy, MemberMat::Steel, false);
+        // A small car crosses one long rod of any material, a wooden one included.
+        for mat in MemberMat::ALL {
+            let r = cross_rods(Buggy, mat, false);
+            assert!(r.0 && r.2 == 1, "a small car crosses a single {mat:?} rod: {r:?}");
+        }
+        let wood = cross_rods(Buggy, MemberMat::Wood, false);
+        assert!(wood.1 > 0.5, "the wooden rod shows the load: {wood:?}");
+        // A truck: a single steel rod holds (working hard), iron and wood need help.
         let steel_truck = cross_rods(Truck, MemberMat::Steel, false);
-        let iron_buggy = cross_rods(Buggy, MemberMat::Iron, false);
-        assert!(steel_buggy.0 && steel_buggy.2 == 1, "a steel rod holds a small car: {steel_buggy:?}");
-        assert!(steel_buggy.1 > 0.3, "and shows the load: {steel_buggy:?}");
-        assert!(!steel_truck.0 && steel_truck.2 == 0, "but a truck snaps it: {steel_truck:?}");
-        assert!(!iron_buggy.0, "an iron rod is too weak even for a small car: {iron_buggy:?}");
+        assert!(steel_truck.0 && steel_truck.2 == 1 && steel_truck.1 > 0.6, "a steel rod holds a truck, near its limit: {steel_truck:?}");
+        let iron_truck = cross_rods(Truck, MemberMat::Iron, false);
+        assert!(!iron_truck.0, "a single iron rod snaps under a truck: {iron_truck:?}");
         // A truss underneath halves the span and carries the weight down to the banks.
-        let iron_truss_buggy = cross_rods(Buggy, MemberMat::Iron, true);
         let iron_truss_truck = cross_rods(Truck, MemberMat::Iron, true);
-        let steel_truss_truck = cross_rods(Truck, MemberMat::Steel, true);
-        assert!(iron_truss_buggy.0 && iron_truss_buggy.2 == 5, "an iron truss holds a small car: {iron_truss_buggy:?}");
-        assert!(!iron_truss_truck.0, "but not a truck: {iron_truss_truck:?}");
-        assert!(steel_truss_truck.0 && steel_truss_truck.2 == 5, "a steel truss holds a truck: {steel_truss_truck:?}");
-        assert!(steel_truss_truck.1 > 0.5, "working hard: {steel_truss_truck:?}");
+        assert!(iron_truss_truck.0 && iron_truss_truck.2 == 5, "an iron truss holds a truck: {iron_truss_truck:?}");
+        let wood_truss_truck = cross_rods(Truck, MemberMat::Wood, true);
+        assert!(!wood_truss_truck.0, "a wooden truss is too weak for a truck: {wood_truss_truck:?}");
     }
+
+
 }

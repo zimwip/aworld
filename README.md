@@ -10,7 +10,8 @@ cargo run --release
 
 ## Jouer
 - **Panneau de gauche** (onglets) : Matières, Blocs, Voitures, Outils, Monde. Survole une case pour lire l'explication.
-- **Palette de droite** (Vues) : elle sort quand la souris va au bord droit. Normale, Température (°C de chaque cellule),
+- **Palette de droite** (Vues) : elle sort quand la souris va au bord droit et se range quand elle s'en va ; la punaise
+  (ou un clic sur l'onglet) la garde ouverte, comme la palette de gauche. Normale, Température (°C de chaque cellule),
   Efforts (charge des pièces, vert → rouge), Vent.
 - **Barre du haut** : Jouer/Pause, Retour, Annuler (plusieurs fois, même en simulation), Voiture, vitesse, Tourner,
   emplacements 1-2-3, Sauver, Charger, Monde, Vide, Science (toutes les transformations), Plein écran.
@@ -45,8 +46,8 @@ cargo run --release
 - **Tiges** (bois, fer, acier) : un clic fixe un bout (sol, bloc ou nœud), tire, un second clic fixe l'autre. Longueur max 110.
   Elles pivotent aux nœuds : on dessine des fermes de pont. Le bois est léger et fragile, le fer lourd, l'acier lourd et solide.
   **Le poids des voitures pèse vraiment sur les tiges** : une longue tige chargée en son milieu plie (comme une planche
-  au-dessus d'un ruisseau) et casse sous un camion, même en acier ; il faut une ferme (des triangles) dessous pour raccourcir
-  les portées. Une tige chargée rougit au-delà de la moitié de sa résistance, le tablier s'affaisse (exagéré pour qu'on le
+  au-dessus d'un ruisseau). Une citadine passe sur une seule tige, même en bois ; un camion demande une tige en acier ou une
+  ferme (des triangles) en fer dessous pour raccourcir les portées. Une tige chargée rougit au-delà de la moitié de sa résistance, le tablier s'affaisse (exagéré pour qu'on le
   voie), et près de casser elle tremble et clignote en rouge. La vue Efforts écrit en plus le % de résistance utilisé
   (`--demo out.png --bridge` : un camion sur un pont en acier).
 - **Câble** (acier, fer, corde) : deux points — bloc, tige (bout ou milieu), sol ou n'importe quel bord du monde, ciel compris (les tiges, ressorts, élastiques et câbles s'y accrochent). Élastique : il prend la forme
@@ -143,7 +144,7 @@ sur un axe : poulie, tambour de treuil, roue motrice ; ou le bout d'une tige).
 - Une bielle s'accroche à tout : engrenage, chariot, bloc, tige, sol. Sur un bloc, la bielle le tire ou le pousse
   vraiment (l'effort revient sur le moteur). Un coulisseau accepte plusieurs bielles, et une bielle peut relier
   deux engrenages.
-- Télécommande du moteur (sélectionne un moteur : sous les Vues) : en marche/arrêt, sens, vitesse à vide, couple,
+- Télécommande du moteur (sélectionne un moteur : menu à part sous les Vues) : en marche/arrêt, sens, vitesse à vide, couple,
   seuil de retournement, et les mesures en direct (tr/min, charge). Vue Efforts : couple, charge des dents, force
   des bielles, pression sur les chariots.
 - Câbles : un bout peut rester libre (le second clic dans le vide) ; l'acier est bien plus raide.
@@ -179,6 +180,10 @@ Touche **V** pour voir les flèches.
   plus chaudes et plus durables) chauffe le fer et la cendre jusqu'à 400 °C : acier.
 - **Pelle** : un clic remplit la bulle (si elle est vide), elle reste pleine en se déplaçant, chaque clic verse une part ;
   clic droit verse tout. Elle garde la chaleur de ce qu'elle porte.
+- **Tunnel** : creuse comme la gomme, mais pose une voûte maçonnée (briques et joints) au-dessus et sur les côtés du trou.
+  La voûte est ancrée dans le terrain : le sable, la terre ou l'eau du plafond ne s'effondrent plus, et un tunnel qui
+  traverse une colline de part en part ne fait plus tomber son sommet. La roche tient seule et reste nue ; le sol du tunnel
+  n'est pas touché (`--demo out.png --tunnel` : la même dune creusée à la gomme et au tunnel).
 - **Loupe** : le pointeur est une loupe, une vue ronde agrandie en bas à droite montre la matière sous la croix.
 - **Sélection** : entoure un élément ; glisser le déplace (les blocs se clipsent), les poignées d'une tige, d'un câble, d'un
   tuyau ou d'un rail les retaillent ; Suppr efface ; Échap désélectionne.
@@ -216,7 +221,12 @@ toujours à 100 %, la terre montre son humidité, les solides secs sont en gris.
   réglages sont dans le panneau sous les vues. L'onglet Voitures règle le modèle lui-même (puissance, vitesse, couleur...) :
   les prochaines voitures partent avec ces réglages. Entrée et Sortie y restent.
 - « Matériaux illimités » (Édition / Simulation) est dans les palettes Matières et Blocs, modifiable à tout moment.
-- La punaise à droite de Annuler épingle la palette (la poignée du bord gauche fait la même chose).
+- Les deux menus latéraux marchent pareil : ils sortent au survol, se rangent quand la souris s'en va, et une punaise
+  les garde ouverts. À gauche, la punaise est à droite de Annuler (la poignée du bord gauche fait la même chose) ; à
+  droite, elle est dans l'en-tête des Vues (un clic sur l'onglet fait la même chose).
+- La télécommande d'un moteur (ou les réglages d'une voiture) est un menu à part, sous les Vues : son onglet apparaît
+  quand un moteur ou une voiture est choisi, le menu sort un instant pour se montrer, puis marche comme les autres
+  (survol, rangement automatique, punaise dans son en-tête ou clic sur l'onglet).
 - Le monde remplit toute la fenêtre : un peu de ciel est recadré en haut si la fenêtre n'est pas en 16:9.
 
 ## Air compressible (gaz parfait)
