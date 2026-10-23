@@ -178,6 +178,39 @@ impl Mat {
     }
 }
 
+/// The three science views (temperature, pressure, humidity) are drawn the same way: the air is a
+/// smooth field, and every grain of gas (steam, cloud, smoke) is drawn over it as a lighter dot
+/// carrying its own value, so one can watch it drift and swirl through the field.
+pub fn gas_grain(m: Mat) -> bool {
+    matches!(m, Mat::Steam | Mat::Cloud | Mat::Smoke)
+}
+
+/// How a grain of gas shows in a science view: its own colour, lightened a little.
+pub fn grain_dot([r, g, b]: [u8; 3]) -> [u8; 4] {
+    let up = |c: u8| (c as f32 + (255.0 - c as f32) * 0.28) as u8;
+    [up(r), up(g), up(b), 255]
+}
+
+/// A coarse field of `b`×`b` squares spread back over every cell, bilinear between the centres of
+/// the squares, so the picture has no visible blocks.
+pub fn upsample(coarse: &[f32], bw: usize, bh: usize, b: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; W * H];
+    for y in 0..H {
+        let fy = ((y as f32 + 0.5) / b as f32 - 0.5).clamp(0.0, bh as f32 - 1.0);
+        let (j0, ty) = (fy as usize, fy.fract());
+        let j1 = (j0 + 1).min(bh - 1);
+        for x in 0..W {
+            let fx = ((x as f32 + 0.5) / b as f32 - 0.5).clamp(0.0, bw as f32 - 1.0);
+            let (i0, tx) = (fx as usize, fx.fract());
+            let i1 = (i0 + 1).min(bw - 1);
+            let top = coarse[j0 * bw + i0] * (1.0 - tx) + coarse[j0 * bw + i1] * tx;
+            let bot = coarse[j1 * bw + i0] * (1.0 - tx) + coarse[j1 * bw + i1] * tx;
+            out[y * W + x] = top * (1.0 - ty) + bot * ty;
+        }
+    }
+    out
+}
+
 /// A pressure (atmospheres, absolute) as a colour: violet for thin air and suction, blue and green
 /// around one atmosphere, yellow, orange and red under load, white under crushing weight.
 pub fn pressure_rgb(atm: f32) -> (u8, u8, u8) {
@@ -2854,7 +2887,13 @@ impl World {
     /// The pressure view's colour of a cell, with the borders between gas, liquid and solid marked.
     pub fn pressure_color(&self, field: &[f32], x: usize, y: usize) -> [u8; 4] {
         let (r, g, b) = pressure_rgb(field[y * W + x]);
-        let here = self.at(x as i32, y as i32).kind();
+        let m = self.at(x as i32, y as i32);
+        if gas_grain(m) {
+            // A grain of gas is at the pressure of the air around it (mechanical equilibrium): it
+            // shows where it is, without a pressure of its own.
+            return grain_dot([r, g, b]);
+        }
+        let here = m.kind();
         let edge = [(1i32, 0i32), (0, 1)].iter().any(|&(dx, dy)| {
             let (nx, ny) = (x as i32 + dx, y as i32 + dy);
             Self::inb(nx, ny) && self.at(nx, ny).kind() != here && !(matches!(here, Kind::Empty | Kind::Gas) && matches!(self.at(nx, ny).kind(), Kind::Empty | Kind::Gas))
@@ -2871,7 +2910,8 @@ impl World {
     /// over and around water is damper to begin with. Water itself is always 1; other liquids (lava,
     /// oil, molten metal) hold no water and show as dry.
     pub fn humidity_field(&self) -> Vec<f32> {
-        const B: usize = 8;
+        // The same squares as the wind, which carries the humidity.
+        const B: usize = flow::CELL;
         let (bw, bh) = (W / B, H.div_ceil(B));
         let (mut vapour, mut wet, mut temp) = (vec![0.0f32; bw * bh], vec![0.0f32; bw * bh], vec![0.0f32; bw * bh]);
         let mut air = vec![0.0f32; bw * bh];
@@ -2922,21 +2962,7 @@ impl World {
                 (base + vapour_b[k] / capacity).clamp(0.0, 1.0)
             })
             .collect();
-        let mut out = vec![0.0f32; W * H];
-        for y in 0..H {
-            let fy = ((y as f32 + 0.5) / B as f32 - 0.5).clamp(0.0, bh as f32 - 1.0);
-            let (j0, ty) = (fy as usize, fy.fract());
-            let j1 = (j0 + 1).min(bh - 1);
-            for x in 0..W {
-                let fx = ((x as f32 + 0.5) / B as f32 - 0.5).clamp(0.0, bw as f32 - 1.0);
-                let (i0, tx) = (fx as usize, fx.fract());
-                let i1 = (i0 + 1).min(bw - 1);
-                let top = rh[j0 * bw + i0] * (1.0 - tx) + rh[j0 * bw + i1] * tx;
-                let bot = rh[j1 * bw + i0] * (1.0 - tx) + rh[j1 * bw + i1] * tx;
-                out[y * W + x] = top * (1.0 - ty) + bot * ty;
-            }
-        }
-        out
+        upsample(&rh, bw, bh, B)
     }
 
     /// Colour of a cell in the humidity view: dry tan, through green, to wet blue.
@@ -2945,7 +2971,8 @@ impl World {
         let rh = match m.kind() {
             // Humidity is water: lava, oil and molten metal are liquids without any.
             Kind::Liquid => (m == Mat::Water).then_some(1.0),
-            Kind::Empty | Kind::Gas => Some(if matches!(m, Mat::Cloud | Mat::Steam) { 1.0f32.min(field[y * W + x] + 0.15) } else { field[y * W + x] }),
+            // Steam and cloud are air saturated with water: 100 % on the grain itself.
+            Kind::Empty | Kind::Gas => Some(if matches!(m, Mat::Cloud | Mat::Steam) { 1.0 } else { field[y * W + x] }),
             _ => match m {
                 // Soil holds moisture of its own.
                 Mat::Mud => Some(1.0),
@@ -2962,6 +2989,9 @@ impl World {
         let ((p0, c0), (p1, c1)) = (STOPS[k - 1], STOPS[k]);
         let f = ((rh - p0) / (p1 - p0)).clamp(0.0, 1.0);
         let c = |a: f32, b: f32| (a + (b - a) * f) as u8;
+        if gas_grain(m) {
+            return grain_dot([c(c0[0], c1[0]), c(c0[1], c1[1]), c(c0[2], c1[2])]);
+        }
         let tint = if matches!(m, Mat::Dirt | Mat::Grass) { 0.7 } else { 1.0 };
         [(c(c0[0], c1[0]) as f32 * tint) as u8, (c(c0[1], c1[1]) as f32 * tint) as u8, (c(c0[2], c1[2]) as f32 * tint) as u8, 255]
     }
@@ -3361,6 +3391,29 @@ mod tests {
         assert!(near > far + 0.15, "air over water is damper: {near} vs {far}");
         assert!(cloud > 0.95, "inside a cloud the air is saturated: {cloud}");
         assert!(far < 0.3, "dry air far from water: {far}");
+    }
+
+    #[test]
+    fn a_grain_of_steam_shows_as_a_dot_in_every_science_view() {
+        let mut w = World::new_static();
+        w.set(400, 200, Mat::Steam);
+        let i = 200 * W + 400;
+        w.temp[i] = 105.0;
+        let (pf, hf) = (w.pressure_field(), w.humidity_field());
+        let views: [(&str, [u8; 4], [u8; 4]); 3] = [
+            ("température", w.thermal_color(400, 200), w.thermal_color(404, 200)),
+            ("pression", w.pressure_color(&pf, 400, 200), w.pressure_color(&pf, 404, 200)),
+            ("hygrométrie", w.humidity_color(&hf, 400, 200), w.humidity_color(&hf, 404, 200)),
+        ];
+        for (name, grain, air) in views {
+            assert_ne!(grain, air, "{name}: the grain of steam should stand out from the air beside it");
+        }
+        // The grain is at the pressure of the air around it: only lighter, not another colour.
+        let (r, g, b) = pressure_rgb(pf[i]);
+        assert_eq!(w.pressure_color(&pf, 400, 200), grain_dot([r, g, b]));
+        // And it is saturated air.
+        let (r, g, b) = (40, 100, 235);
+        assert_eq!(w.humidity_color(&hf, 400, 200), grain_dot([r, g, b]));
     }
 
     #[test]
