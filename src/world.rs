@@ -245,6 +245,22 @@ const SNOW_TERMINAL: u8 = 6;
 const SNOW_RUN: i32 = 5;
 /// A cell of snow at rest oozes once in this many steps: a very viscous liquid.
 const SNOW_CREEP: u32 = 8;
+/// Cells of vapour (steam or cloud) that one cell of liquid water makes, and that it takes to make
+/// one drop again. Real water swells about 1700 times as it boils; the game keeps a small ratio so
+/// that a pot does not fill the sky, but a sky full of cloud only gives back a little water.
+pub const VAPOUR_PER_WATER: usize = 4;
+/// The fastest a raindrop falls (eighths of a cell per step): a little faster than a grain of dust.
+const DROP_TERMINAL: u8 = 40;
+/// How much of the wind's speed a falling drop takes on sideways.
+const DROP_DRIFT: f32 = 0.8;
+/// How many times faster a drop in mid-air evaporates than the same water lying in a puddle.
+const DROP_EVAPORATION: f32 = 30.0;
+/// A drop falling through a cloud sweeps up the cell under it once in this many steps.
+const DROP_SWEEP: u32 = 5;
+/// In a cloud, a cell turns into a raindrop once in this many steps where the cloud is thickest.
+const RAIN_EVERY: f32 = 8000.0;
+/// Below this many cloud cells in the 5 x 5 around it (out of 24), a cloud is too thin to rain.
+const RAIN_MIN_WATER: f32 = 8.0;
 
 /// An ember whose life is at least this is burning charcoal: hotter and slower than wood.
 pub(crate) const COAL_LIFE: u8 = 200;
@@ -1762,7 +1778,7 @@ impl World {
         let d = self.dir();
         if lift > 0.05 && roll < lift * 0.7 {
             for (dx, dy) in [(0, -1), (d, -1), (-d, -1)] {
-                let t = (Self::wrap_x(x + dx), y + dy);
+                let t = (self.edge_x(x, y, x + dx), y + dy);
                 if self.at(t.0, t.1) == Mat::Empty {
                     self.swap((x, y), t);
                     return true;
@@ -1770,7 +1786,7 @@ impl World {
             }
         } else if lift < -0.05 && roll < -lift * 0.8 {
             for (dx, dy) in [(0, 1), (d, 1), (-d, 1)] {
-                let t = (Self::wrap_x(x + dx), y + dy);
+                let t = (self.edge_x(x, y, x + dx), y + dy);
                 if self.at(t.0, t.1) == Mat::Empty {
                     self.swap((x, y), t);
                     return true;
@@ -1778,7 +1794,7 @@ impl World {
             }
         } else if lift.abs() > 0.2 && self.rand() % 100 < 25 {
             // Expansion (hot) spreads the gas out; contraction (cold) draws it together.
-            let count = |w: &World, side: i32| (1..=3).filter(|k| matches!(w.raw(Self::wrap_x(x + side * k), y), Mat::Cloud | Mat::Steam | Mat::Smoke)).count();
+            let count = |w: &World, side: i32| (1..=3).filter(|k| matches!(w.raw(w.edge_x(x, y, x + side * k), y), Mat::Cloud | Mat::Steam | Mat::Smoke)).count();
             let side = if lift > 0.0 {
                 d
             } else if count(self, 1) >= count(self, -1) {
@@ -1786,13 +1802,20 @@ impl World {
             } else {
                 -1
             };
-            let t = (Self::wrap_x(x + side), y);
+            let t = (self.edge_x(x, y, x + side), y);
             if self.at(t.0, t.1) == Mat::Empty {
                 self.swap((x, y), t);
                 return true;
             }
         }
         false
+    }
+
+    /// Where the gas at (x, y) moving to column `to` ends up. Vapour and clouds blown past the
+    /// left or right edge leave the world (an open sky: they do not pile up). Smoke, which thins
+    /// out in the open air on its own, comes back on the other side.
+    pub(super) fn edge_x(&self, x: i32, y: i32, to: i32) -> i32 {
+        if self.raw(x, y) == Mat::Smoke { to.rem_euclid(W as i32) } else { to }
     }
 
     /// Trees are porous: a liquid resting on foliage, branches or a trunk drips straight
@@ -1870,7 +1893,6 @@ impl World {
             return;
         }
         if let Some(t) = self.wind_target(x, y) {
-            let t = (Self::wrap_x(t.0), t.1);
             if self.at(t.0, t.1) == Mat::Empty {
                 self.swap((x, y), t);
                 return;
@@ -1881,7 +1903,7 @@ impl World {
         let hot = self.temp[Self::idx(x, y)] > self.ambient_c(y) + 8.0;
         let order: [(i32, i32); 3] = if hot && self.rand() % 10 < 6 { [(0, -1), (d, -1), (d, 0)] } else { [(d, 0), (-d, 0), (d, 0)] };
         for (dx, dy) in order {
-            let t = (Self::wrap_x(x + dx), y + dy);
+            let t = (self.edge_x(x, y, x + dx), y + dy);
             if self.at(t.0, t.1) == Mat::Empty {
                 self.swap((x, y), t);
                 return;
@@ -1902,15 +1924,19 @@ impl World {
         // warm (warm water has a higher vapour pressure), when the air over it is dry, and when
         // the wind carries the damp air away. The vapour leaves with heat: the water under it
         // cools (that is why sweat cools you down).
-        if self.at(x, y - 1) == Mat::Empty {
+        // Steam drifting over the surface does not seal it: how damp the air is counts through `dry`.
+        if matches!(self.at(x, y - 1), Mat::Empty | Mat::Steam) {
             let t = self.temp[i];
             if t > 0.0 {
                 let dry = 1.0 - self.flow.moisture_at(x, y - 1);
                 let (wx, wy) = self.flow.sample(x, y - 1);
                 let breeze = 1.0 + 2.0 * ((wx * wx + wy * wy).sqrt() / flow::GAIN).min(1.0);
-                let rate = dry * breeze * vapour_pressure(t) / vapour_pressure(40.0) / EVAPORATE_40C;
+                // A falling drop is tiny and bathed in air all round: it dries far faster than a
+                // puddle (in warm, dry air some rain never reaches the ground).
+                let airborne = if self.at(x, y + 1) == Mat::Empty { DROP_EVAPORATION } else { 1.0 };
+                let rate = airborne * dry * breeze * vapour_pressure(t) / vapour_pressure(40.0) / EVAPORATE_40C;
                 if self.chance_f(rate) {
-                    self.set(x, y, Mat::Steam);
+                    self.vaporize(x, y);
                     let wet: Vec<(i32, i32)> = [(x, y + 1), (x - 1, y), (x + 1, y)].into_iter().filter(|&(nx, ny)| self.at(nx, ny) == Mat::Water).collect();
                     for &(nx, ny) in &wet {
                         let j = Self::idx(nx, ny);
@@ -1932,16 +1958,25 @@ impl World {
                 return;
             }
         }
-        let d = self.dir();
-        // Falling drops are pushed along by the wind: the rain slants.
-        let local = self.flow.sample(x, y).0 / flow::GAIN;
-        if self.at(x, y + 1) == Mat::Empty && local.abs() > 0.15 && (self.rand() % 100) as f32 <= local.abs().min(1.0) * 35.0 {
-            let w = if local > 0.0 { 1 } else { -1 };
-            if self.at(x + w, y + 1) == Mat::Empty {
-                self.swap((x, y), (x + w, y + 1));
+        // A drop in the air falls like any heavy particle: gravity speeds it up to a terminal speed
+        // (air drag) and the wind carries it along on the way down, so the rain slants and gusts.
+        // Water with more water on top of it (the roof of a hole in a lake, a thick stream) just
+        // sinks a cell at a time: only a free drop races down.
+        let free_drop = self.at(x, y - 1).kind() != Kind::Liquid;
+        if free_drop && matches!(self.at(x, y + 1).kind(), Kind::Empty | Kind::Gas) && self.mask_free(x, y + 1) {
+            // Falling through a cloud, the drop sweeps up the droplets in its way and grows: the
+            // cloud's water becomes rain (`VAPOUR_PER_WATER` cells of cloud, one cell of rain).
+            if self.raw(x, y + 1) == Mat::Cloud && self.chance(DROP_SWEEP) && self.gather_vapour(x, y + 1) {
+                let j = Self::idx(x, y + 1);
+                let t = self.temp[j].max(self.temp[i]);
+                self.set(x, y + 1, Mat::Water);
+                self.temp[j] = t;
                 return;
             }
+            self.fall_drop(x, y);
+            return;
         }
+        let d = self.dir();
         for dx in [0, d, -d] {
             if matches!(self.at(x + dx, y + 1).kind(), Kind::Empty | Kind::Gas) {
                 self.swap((x, y), (x + dx, y + 1));
@@ -1961,6 +1996,39 @@ impl World {
     }
 
 
+    /// Moves a drop with free air under it: one to `DROP_TERMINAL / 8` cells down this step, and
+    /// sideways as far as the local wind carries it.
+    fn fall_drop(&mut self, x: i32, y: i32) {
+        let i = Self::idx(x, y);
+        let v = self.vel[i].saturating_add(GRAIN_ACCEL).min(DROP_TERMINAL);
+        let fall = 1 + v as i32 / 8;
+        let wind = (self.flow.sample(x, y).0 * DROP_DRIFT).clamp(-3.0, 3.0);
+        let mut side = wind.trunc() as i32 + if (self.rand() % 1000) as f32 / 1000.0 < wind.fract().abs() { wind.signum() as i32 } else { 0 };
+        let free = |w: &World, x: i32, y: i32| matches!(w.at(x, y).kind(), Kind::Empty | Kind::Gas) && w.mask_free(x, y);
+        let (mut cx, mut cy) = (x, y);
+        let mut k = 0;
+        while k < fall {
+            // The sideways part of the move is spread over the fall.
+            let sx = side.signum();
+            if sx != 0 && free(self, cx + sx, cy + 1) {
+                cx += sx;
+                side -= sx;
+            } else if free(self, cx, cy + 1) {
+                side = 0;
+            } else {
+                break;
+            }
+            cy += 1;
+            k += 1;
+            if !Self::inb(cx, cy) {
+                break;
+            }
+        }
+        // Stopped short by what is below: it lands.
+        self.vel[i] = if k < fall { 0 } else { v };
+        self.swap((x, y), (cx, cy));
+    }
+
     fn step_steam(&mut self, x: i32, y: i32) {
         // Condensation is handled by temperature (see thermal.rs). Hot steam rises on
         // its own; as it cools it stops climbing and just drifts with the wind.
@@ -1969,7 +2037,6 @@ impl World {
             return;
         }
         if let Some(t) = self.wind_target(x, y) {
-            let t = (Self::wrap_x(t.0), t.1);
             if self.at(t.0, t.1) == Mat::Empty {
                 self.swap((x, y), t);
                 return;
@@ -1987,7 +2054,7 @@ impl World {
             [(d, 0), (-d, 0), (0, -1)]
         };
         for (dx, dy) in order {
-            let t = (Self::wrap_x(x + dx), y + dy);
+            let t = (x + dx, y + dy);
             if self.at(t.0, t.1) == Mat::Empty {
                 self.swap((x, y), t);
                 return;
@@ -1995,8 +2062,74 @@ impl World {
         }
     }
 
-    fn wrap_x(x: i32) -> i32 {
-        x.rem_euclid(W as i32)
+    /// Water at (x, y) turns to vapour and swells: the cell becomes steam, and the rest of its
+    /// `VAPOUR_PER_WATER` cells of steam go into the nearest free cells around it. Shut in with no
+    /// room left (a full boiler), the vapour is squeezed into fewer cells.
+    pub(crate) fn vaporize(&mut self, x: i32, y: i32) {
+        let t = self.temp[Self::idx(x, y)];
+        self.set(x, y, Mat::Steam);
+        self.temp[Self::idx(x, y)] = t;
+        let mut left = VAPOUR_PER_WATER - 1;
+        'out: for r in 1..=2 {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if (dx as i32).abs().max((dy as i32).abs()) != r {
+                        continue;
+                    }
+                    if left == 0 {
+                        break 'out;
+                    }
+                    let (nx, ny) = (x + dx, y + dy);
+                    if Self::inb(nx, ny) && self.at(nx, ny) == Mat::Empty {
+                        self.set(nx, ny, Mat::Steam);
+                        self.temp[Self::idx(nx, ny)] = t;
+                        left -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// For a drop to form at (x, y), the `VAPOUR_PER_WATER - 1` other cells of cloud it needs are
+    /// taken from the cloud around it (within two cells). Returns false, taking nothing, if the
+    /// cloud there is too thin.
+    fn gather_vapour(&mut self, x: i32, y: i32) -> bool {
+        let mut found = Vec::with_capacity(VAPOUR_PER_WATER);
+        'out: for r in 1..=2 {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if (dx as i32).abs().max((dy as i32).abs()) != r {
+                        continue;
+                    }
+                    if found.len() + 1 >= VAPOUR_PER_WATER {
+                        break 'out;
+                    }
+                    if self.raw(x + dx, y + dy) == Mat::Cloud {
+                        found.push((x + dx, y + dy));
+                    }
+                }
+            }
+        }
+        if found.len() + 1 < VAPOUR_PER_WATER {
+            return false;
+        }
+        for (cx, cy) in found {
+            self.set(cx, cy, Mat::Empty);
+        }
+        true
+    }
+
+    /// Cloud cells in the 5 x 5 around (x, y), not counting it: how much water the cloud holds there.
+    fn cloud_water(&self, x: i32, y: i32) -> f32 {
+        let mut n = 0;
+        for dy in -2..=2 {
+            for dx in -2..=2 {
+                if (dx != 0 || dy != 0) && self.raw(x + dx, y + dy) == Mat::Cloud {
+                    n += 1;
+                }
+            }
+        }
+        n as f32
     }
 
     fn step_cloud(&mut self, x: i32, y: i32) {
@@ -2009,20 +2142,27 @@ impl World {
                 }
             }
         }
-        // Thick, cool clouds let go of their water: rain when it is mild, snow when
-        // it freezes, hail when it is very cold. A cloud warmed by the sun keeps
-        // its water as vapour and does not rain.
+        // A cloud is water: countless droplets too small to fall. Where the cloud is thick they
+        // bump into each other and merge until some are heavy enough to fall: rain when it is
+        // mild, snow when it freezes, hail when it is very cold. A drop can start anywhere in the
+        // cloud and grows as it falls through it (see `step_water`). Every drop takes
+        // `VAPOUR_PER_WATER` cells of the cloud's water, so a cloud that rains thins out and the rain eases off by itself until
+        // fresh vapour feeds it again. A cloud warmed by the sun keeps its water and does not rain.
         let t = self.temp[i];
-        if near >= 2 && t < 12.0 && self.at(x, y + 1) == Mat::Empty && self.chance(250) {
-            if t > 2.0 {
-                self.set(x, y, Mat::Water);
-                self.temp[i] = t.max(4.0);
-            } else if t > -12.0 {
-                self.set(x, y, Mat::Snow);
-            } else {
-                self.set(x, y, Mat::Hail);
+        if near >= 2 && t < 12.0 && matches!(self.at(x, y + 1), Mat::Empty | Mat::Cloud) {
+            let water = self.cloud_water(x, y);
+            let thick = ((water - RAIN_MIN_WATER) / (24.0 - RAIN_MIN_WATER)).max(0.0);
+            if self.chance_f(thick * thick / RAIN_EVERY) && self.gather_vapour(x, y) {
+                if t > 2.0 {
+                    self.set(x, y, Mat::Water);
+                    self.temp[i] = t.max(4.0);
+                } else if t > -12.0 {
+                    self.set(x, y, Mat::Snow);
+                } else {
+                    self.set(x, y, Mat::Hail);
+                }
+                return;
             }
-            return;
         }
         if t > 26.0 && self.chance(600) {
             self.set(x, y, Mat::Steam);
@@ -2049,8 +2189,7 @@ impl World {
                 return;
             }
         };
-        // Wraps around the edges like steam does.
-        let target = (Self::wrap_x(target.0), target.1);
+        // Blown past the left or right edge, it leaves the world like steam does.
         if self.at(target.0, target.1) == Mat::Empty {
             self.swap((x, y), target);
         }
@@ -2192,9 +2331,9 @@ impl World {
                 // Quenched: it sets solid and the water flashes to steam.
                 Mat::Water => {
                     self.set(x, y, solid);
-                    self.set(nx, ny, Mat::Steam);
                     let j = Self::idx(nx, ny);
                     self.temp[j] = 100.0;
+                    self.vaporize(nx, ny);
                     return;
                 }
                 m if m.is_wooden() => self.ignite(nx, ny, 20),
@@ -3176,21 +3315,112 @@ mod tests {
     }
 
     #[test]
-    fn clouds_blown_off_one_side_come_back_on_the_other() {
+    fn vapour_blown_off_one_side_leaves_the_world() {
         let mut w = World::new_static();
         for k in 0..6 {
             w.set(W as i32 - 3 + (k % 3), 60 + k / 3, Mat::Cloud);
+            w.set(W as i32 - 3 + (k % 3), 70 + k / 3, Mat::Steam);
         }
-        let total = w.cells.iter().filter(|c| c.m == Mat::Cloud).count();
-        let mut reappeared = false;
+        w.flow.pin_uniform(1.0, 0.0);
+        let mut came_back = false;
         for _ in 0..600 {
-            w.wind = 1.0;
             w.step();
-            reappeared |= (0..40).any(|x| (50..80).any(|y| w.raw(x, y) == Mat::Cloud));
+            came_back |= (0..40).any(|x| (50..80).any(|y| matches!(w.raw(x, y), Mat::Cloud | Mat::Steam)));
         }
-        let now = w.cells.iter().filter(|c| c.m == Mat::Cloud).count();
-        assert!(reappeared, "cloud never reached the other side");
-        assert!(now + 2 >= total, "clouds vanished at the edge: {now} of {total} left");
+        let left = w.cells.iter().filter(|c| matches!(c.m, Mat::Cloud | Mat::Steam)).count();
+        assert!(!came_back, "vapour wrapped round to the other side");
+        assert_eq!(left, 0, "vapour blown off the edge should be gone, {left} cells left");
+    }
+
+    #[cfg(test)]
+    /// A stone tray with walls under a slab of cloud `rows` thick, in still, cool air.
+    fn cloud_over_a_tray(rows: i32) -> World {
+        let mut w = World::new_static();
+        w.climate_fixed = Some(6.0);
+        w.reset_temps();
+        w.day_cycle = false;
+        w.flow.pin_uniform(0.0, 0.0);
+        for x in 300..520 {
+            w.set(x, 400, Mat::Stone);
+        }
+        for y in 40..400 {
+            w.set(300, y, Mat::Stone);
+            w.set(519, y, Mat::Stone);
+        }
+        for x in 340..480 {
+            for y in 60..60 + rows {
+                w.set(x, y, Mat::Cloud);
+            }
+        }
+        w
+    }
+
+    #[cfg(test)]
+    fn cloud_cells(w: &World) -> usize {
+        w.cells.iter().filter(|c| c.m == Mat::Cloud).count()
+    }
+
+    #[cfg(test)]
+    /// All the water in the world, in cells of vapour (a cell of liquid or ice is `VAPOUR_PER_WATER`).
+    fn water_units(w: &World) -> usize {
+        w.cells
+            .iter()
+            .map(|c| match c.m {
+                Mat::Cloud | Mat::Steam => 1,
+                Mat::Water | Mat::Snow | Mat::Hail | Mat::Ice => VAPOUR_PER_WATER,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn rain_is_the_clouds_own_water() {
+        let mut w = cloud_over_a_tray(16);
+        let total = water_units(&w);
+        let cloud0 = cloud_cells(&w);
+        for _ in 0..3000 {
+            w.step();
+        }
+        let (cloud, water) = (cloud_cells(&w), w.cells.iter().filter(|c| c.m == Mat::Water).count());
+        assert!(water > 60, "a thick cool cloud rains: {water} drops");
+        assert!(cloud + water * VAPOUR_PER_WATER <= cloud0, "each drop took {VAPOUR_PER_WATER} cells of cloud: {cloud} of {cloud0} left, {water} drops");
+        assert_eq!(water_units(&w), total, "every drop came out of the cloud: no water made or lost");
+    }
+
+    #[test]
+    fn a_thick_cloud_rains_hard_and_a_thin_one_barely() {
+        let rain = |rows: i32| {
+            let mut w = cloud_over_a_tray(rows);
+            let cloud0 = cloud_cells(&w);
+            for _ in 0..1500 {
+                w.step();
+            }
+            (cloud0 - cloud_cells(&w)) as f32 / cloud0 as f32
+        };
+        let (thin, thick) = (rain(2), rain(16));
+        assert!(thin < 0.01, "a thin veil of cloud hardly rains: lost {thin}");
+        assert!(thick > 4.0 * thin.max(0.005), "a thick cloud rains far more: {thick} against {thin}");
+    }
+
+    #[test]
+    fn a_cell_of_water_swells_into_several_cells_of_steam() {
+        let mut w = World::new_static();
+        w.set(400, 200, Mat::Water);
+        w.vaporize(400, 200);
+        assert_eq!(w.cells.iter().filter(|c| c.m == Mat::Steam).count(), VAPOUR_PER_WATER);
+        assert_eq!(w.cells.iter().filter(|c| c.m == Mat::Water).count(), 0);
+    }
+
+    #[test]
+    fn raindrops_speed_up_as_they_fall() {
+        let mut w = World::new_static();
+        w.flow.pin_uniform(0.0, 0.0);
+        w.set(400, 20, Mat::Water);
+        for _ in 0..40 {
+            w.step();
+        }
+        let y = (0..H as i32).find(|&y| (380..420).any(|x| w.raw(x, y) == Mat::Water)).unwrap_or(H as i32);
+        assert!(y > 20 + 100, "in 40 steps a drop falls well over 40 cells: it is at {y}");
     }
 
     #[test]

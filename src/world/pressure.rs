@@ -182,7 +182,7 @@ impl World {
                             if tx == 0 && ty == 0 {
                                 continue;
                             }
-                            let (nx, ny) = ((x + tx).rem_euclid(W as i32), y + ty);
+                            let (nx, ny) = (x + tx, y + ty);
                             if ny >= 0 && ny < H as i32 && matches!(self.at(nx, ny).kind(), Kind::Empty | Kind::Gas) {
                                 self.swap((x, y), (nx, ny));
                                 break;

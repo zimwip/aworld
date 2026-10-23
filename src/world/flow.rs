@@ -630,7 +630,7 @@ impl World {
             if tx == 0 && ty == 0 {
                 continue;
             }
-            let (nx, ny) = ((x + tx).rem_euclid(W as i32), y + ty);
+            let (nx, ny) = (self.edge_x(x, y, x + tx), y + ty);
             if ny >= 0 && ny < H as i32 && self.at(nx, ny) == super::Mat::Empty {
                 return Some((nx, ny));
             }
