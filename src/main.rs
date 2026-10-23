@@ -91,6 +91,7 @@ enum Tool {
     Shovel,
     Select,
     Eraser,
+    Tunnel,
     Hammer,
     Loupe,
     Sensor,
@@ -1442,6 +1443,7 @@ impl Game {
             Tool::Pipe | Tool::Valve | Tool::Pump if click => self.fluid_click(at),
             Tool::Shovel => self.shovel_mouse(at, click, left),
             Tool::Select => self.select_mouse(at, click, left, is_key_down(KeyCode::LeftShift)),
+            Tool::Tunnel => self.world.tunnel_line(from, g, self.brush.max(2)),
             Tool::Hammer if click => self.hammer(at),
             Tool::Sensor if click => self.sensor_click(at),
             Tool::Entry if click => self.entry = Some(g),
@@ -1978,6 +1980,18 @@ impl Game {
                     let r = (self.brush.max(if self.tool == Tool::Eraser { 2 } else { 0 }) as f32 + 0.5) * view.s;
                     draw_circle_lines(ui.mouse.x, ui.mouse.y, r, 1.5, Color::new(1.0, 1.0, 1.0, 0.9));
                 }
+                Tool::Tunnel => {
+                    // The hole, and the brick vault drawn over its top half.
+                    let r = (self.brush.max(2) as f32 + 0.5) * view.s;
+                    draw_circle_lines(ui.mouse.x, ui.mouse.y, r, 1.5, Color::new(1.0, 1.0, 1.0, 0.9));
+                    let vault = r + (world::TUNNEL_LINING as f32 + 0.5) * view.s;
+                    let brick = Color::new(0.85, 0.42, 0.3, 0.95);
+                    let n = 16;
+                    for k in 0..n {
+                        let (a0, a1) = (std::f32::consts::PI * (1.0 + k as f32 / n as f32), std::f32::consts::PI * (1.0 + (k + 1) as f32 / n as f32));
+                        draw_line(ui.mouse.x + vault * a0.cos(), ui.mouse.y + vault * a0.sin(), ui.mouse.x + vault * a1.cos(), ui.mouse.y + vault * a1.sin(), 2.5, brick);
+                    }
+                }
                 Tool::Beam(_) => {
                     // Green: it will be pinned there. Orange: no attachment, the rod will fall.
                     if self.snap_point(at).is_none() {
@@ -2370,9 +2384,10 @@ impl Game {
 
     /// The tools, always in reach on the left edge of the picture.
     fn draw_tools_strip(&mut self, ui: &mut Ui, sh: f32) {
-        let tools: [(Tool, &str, Icon, &str); 6] = [
+        let tools: [(Tool, &str, Icon, &str); 7] = [
             (Tool::Select, "Sélection", Icon::Select, "Clique un élément (bloc, tige, engrenage, câble, tuyau, rail, voiture...) : il est entouré. Glisse-le pour le déplacer ; pour une tige, un câble, un tuyau ou un rail, glisse une poignée au bout pour le retailler. Suppr l'efface. Échap désélectionne. Une voiture sélectionnée affiche ses réglages."),
             (Tool::Eraser, "Gomme", Icon::Eraser, "Efface la matière, les blocs et les câbles (clic droit aussi)."),
+            (Tool::Tunnel, "Tunnel", Icon::Tunnel, "Creuse comme la gomme, mais pose une voûte de briques au-dessus du trou : le sable, la terre ou l'eau du plafond ne s'effondrent plus dedans. La roche, elle, tient toute seule et reste telle quelle ; le sol du tunnel n'est pas touché. Le pinceau règle la largeur."),
             (Tool::Hammer, "Marteau", Icon::Hammer, "Tape sur le verre et la glace pour les casser, secoue les autres blocs."),
             (Tool::Loupe, "Loupe", Icon::Loupe, "Le pointeur est une loupe : une vue ronde en bas à droite montre la matière sous la croix."),
             (Tool::Sensor, "Capteur", Icon::Thermo, "Pose une sonde (jusqu'à 4) : thermomètre, baromètre et hygromètre. Ses courbes s'affichent en bas de l'image : l'eau qui chauffe puis reste à 100 °C, une chaudière qui monte en pression, l'air qui sèche à midi. Clique sur une sonde pour l'enlever."),
@@ -3336,6 +3351,32 @@ fn demo_scene(g: &mut Game, biome: Biome) {
 }
 
 /// `--demo --bridge`: a gap in a flat floor, crossed by a steel deck held up by a small truss.
+/// `--tunnel`: two sand dunes on bedrock, both dug through. The left one with the eraser (the sand
+/// pours back in), the right one with the tunnel tool (the vault holds), then the world runs.
+fn demo_tunnel(g: &mut Game) {
+    g.empty_world();
+    let floor = 420;
+    for x in 0..W as i32 {
+        for y in floor..H as i32 {
+            g.world.set(x, y, Mat::Stone);
+        }
+    }
+    for (x0, x1) in [(40i32, 440i32), (520, 920)] {
+        let (mid, half) = ((x0 + x1) / 2, (x1 - x0) / 2);
+        for x in x0..x1 {
+            let h = 30 + 80 * (half - (x - mid).abs()) / half;
+            for y in floor - h..floor {
+                g.world.set(x, y, Mat::Sand);
+            }
+        }
+    }
+    let y = floor - 16;
+    g.world.line((20, y), (460, y), 9, Mat::Empty);
+    g.world.tunnel_line((500, y), (940, y), 9);
+    g.tool = Tool::Tunnel;
+    g.set_running(true);
+}
+
 fn demo_bridge(g: &mut Game) {
     g.empty_world();
     for x in 0..W as i32 {
@@ -3522,6 +3563,9 @@ async fn main() {
             game.tab = Tab::Matter;
             game.matter_menu = Some(i);
             game.tool = Tool::Mat(MATTERS[i].states[MATTERS[i].default]);
+        }
+        if args.iter().any(|a| a == "--tunnel") {
+            demo_tunnel(&mut game);
         }
     }
     // `--mouse x,y` pins the pointer for screenshots.

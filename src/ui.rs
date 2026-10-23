@@ -28,6 +28,7 @@ pub enum Icon {
     Plus,
     Full,
     Eraser,
+    Tunnel,
     Flag,
     Hammer,
     Cable,
@@ -194,6 +195,13 @@ pub fn draw_icon(icon: Icon, c: Vec2, s: f32, col: Color) {
         Icon::Eraser => {
             draw_rectangle_ex(c.x - s * 0.1, c.y - s * 0.22, s * 0.6, s * 0.4, DrawRectangleParams { offset: vec2(0.5, 0.5), rotation: -0.6, color: col });
             draw_rectangle_ex(c.x - s * 0.1, c.y - s * 0.22, s * 0.28, s * 0.4, DrawRectangleParams { offset: vec2(-0.6, 0.5), rotation: -0.6, color: Color::new(1.0, 0.55, 0.6, 1.0) });
+        }
+        Icon::Tunnel => {
+            // A hill with a vaulted opening: brick arch over a dark hole.
+            draw_triangle(vec2(c.x - s * 0.5, c.y + s * 0.38), vec2(c.x + s * 0.5, c.y + s * 0.38), vec2(c.x, c.y - s * 0.45), col);
+            draw_rectangle(c.x - s * 0.2, c.y + s * 0.05, s * 0.4, s * 0.33, BG);
+            draw_circle(c.x, c.y + s * 0.05, s * 0.2, BG);
+            draw_arc(c.x, c.y + s * 0.05, 12, s * 0.24, 180.0, th * 1.2, 180.0, Color::new(0.85, 0.42, 0.3, 1.0));
         }
         Icon::Hammer => {
             draw_line(c.x - s * 0.35, c.y + s * 0.4, c.x + s * 0.2, c.y - s * 0.15, th * 1.3, col);
