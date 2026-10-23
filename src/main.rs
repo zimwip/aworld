@@ -2058,6 +2058,9 @@ impl Game {
         // Fireworks and lightning are light: drawn over the night, so they glow in the dark.
         self.fireworks.draw(view, self.time);
         self.wolves.draw_song(view, ui);
+        if !flat {
+            renderer.draw_corona(&self.world, view, self.time);
+        }
         renderer.draw_bolts(&self.bolts, view);
         if self.mode == ViewMode::Wind {
             self.draw_wind_field(view);
@@ -3338,9 +3341,10 @@ impl Game {
                 ui.text("−", bar.x, bar.y + 25.0, 11, DIM);
                 ui.text("0", bar.x + bar.w * 0.5 - 3.0, bar.y + 25.0, 11, DIM);
                 ui.text("+", bar.x + bar.w - 8.0, bar.y + 25.0, 11, DIM);
-                let peak = self.world.charge.iter().fold(0.0f32, |a, q| a.max(q.abs())) / world::BREAKDOWN;
+                let peak = (self.world.charge.iter().fold(0.0f32, |a, q| a.max(q.abs())) / world::BREAKDOWN)
+                    .max(self.world.mcharge.iter().fold(0.0f32, |a, q| a.max(q.abs())) / world::GROUND_BREAKDOWN);
                 ui.text(&format!("Claquage : {:.0} %", peak.min(1.0) * 100.0), bar.x, bar.y + 44.0, 13, TEXT);
-                ui.wrapped("Dans un gros nuage froid et ascendant, les cristaux de glace (+) montent en haut, le grésil (−) reste en bas. Quand la charge atteint le claquage, l'éclair part : dans le nuage, ou vers le sol, sur ce qui est haut et conduit. Or : métal, cyan : eau.", bar.x, bar.y + 60.0, bar.w, 11, DIM);
+                ui.wrapped("Dans un gros nuage froid et ascendant, les cristaux de glace (+) montent en haut, le grésil (−) reste en bas. Sous le nuage, le sol et ce qui s'y dresse prennent la charge opposée, surtout ce qui est haut et conduit. Quand la tension atteint le claquage, l'éclair part, et il laisse sa charge là où il frappe. Or : métal, cyan : eau.", bar.x, bar.y + 60.0, bar.w, 11, DIM);
             }
             ViewMode::Normal => {
                 ui.wrapped("Touches : H température, X efforts, V vent, P pression, Y hygrométrie, E électricité.", bar.x, bar.y + 2.0, bar.w, 11, DIM);
@@ -4185,6 +4189,8 @@ async fn main() {
                     }
                 }
             }
+            // The ground under it has had time to take the opposite charge.
+            game.world.settle_ground_charge(150);
         }
         if shot.is_some() && frame == 356 {
             // `--lightning x` or `--lightning x,y` (y: where the pointer is; the top of the sky by default).
