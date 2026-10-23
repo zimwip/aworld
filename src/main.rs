@@ -3664,6 +3664,27 @@ fn demo_crater(g: &mut Game, dynamite: bool) {
     g.set_running(true);
 }
 
+/// `--demo --lava`: underground pockets of lava, a big one and a small one, to see the light they
+/// cast at night.
+fn demo_lava(g: &mut Game) {
+    g.empty_world();
+    for x in 0..W as i32 {
+        g.world.set(x, 330, Mat::Grass);
+        for y in 331..H as i32 {
+            g.world.set(x, y, Mat::Stone);
+        }
+    }
+    for (cx, cy, r) in [(400i32, 380i32, 30i32), (620, 390, 3)] {
+        for x in cx - r..=cx + r {
+            for y in cy - r..=cy + r {
+                if (x - cx).pow(2) + (y - cy).pow(2) <= r * r {
+                    g.world.set(x, y, Mat::Lava);
+                }
+            }
+        }
+    }
+}
+
 fn demo_bridge(g: &mut Game) {
     g.empty_world();
     for x in 0..W as i32 {
@@ -3868,6 +3889,9 @@ async fn main() {
         }
         if args.iter().any(|a| a == "--siphon") {
             demo_siphon(&mut game);
+        }
+        if args.iter().any(|a| a == "--lava") {
+            demo_lava(&mut game);
         }
         // `--advance n`: the world runs n steps before the first frame.
         for _ in 0..arg("--advance").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) {
