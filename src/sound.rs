@@ -5,7 +5,9 @@
 //! The synthesis is plain Rust returning samples, so it is unit-tested without a sound card.
 
 #[cfg(feature = "sound")]
-use macroquad::audio::{load_sound_from_bytes, play_sound, set_sound_volume, PlaySoundParams, Sound};
+mod out;
+#[cfg(feature = "sound")]
+use out::{Clip, Out};
 
 pub const RATE: u32 = 22050;
 const TAU: f32 = std::f32::consts::TAU;
@@ -324,7 +326,8 @@ pub fn blow() -> Vec<f32> {
     v
 }
 
-/// 16-bit mono PCM WAV.
+/// 16-bit mono PCM WAV, for macroquad's audio (Linux plays the samples directly).
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn wav(samples: &[f32]) -> Vec<u8> {
     let data = samples.len() as u32 * 2;
     let mut out = Vec::with_capacity(44 + data as usize);
@@ -350,20 +353,21 @@ pub fn wav(samples: &[f32]) -> Vec<u8> {
 
 #[cfg(feature = "sound")]
 struct Bank {
-    engine: Vec<Sound>,
-    wind: Sound,
-    water: Sound,
-    fire: Sound,
-    boom_big: Sound,
-    boom_small: Sound,
-    thud: Sound,
-    clink: Sound,
-    crack: Sound,
-    spray: Sound,
-    snap: Sound,
-    siren: Sound,
-    pop: Sound,
-    blow: Sound,
+    out: Out,
+    engine: Vec<Clip>,
+    wind: Clip,
+    water: Clip,
+    fire: Clip,
+    boom_big: Clip,
+    boom_small: Clip,
+    thud: Clip,
+    clink: Clip,
+    crack: Clip,
+    spray: Clip,
+    snap: Clip,
+    siren: Clip,
+    pop: Clip,
+    blow: Clip,
 }
 
 pub struct Sounds {
@@ -391,37 +395,40 @@ impl Sounds {
 
     #[cfg(feature = "sound")]
     pub async fn load() -> Self {
-        async fn one(samples: &[f32]) -> Option<Sound> {
-            load_sound_from_bytes(&wav(samples)).await.ok()
-        }
-        async fn looped(samples: &[f32]) -> Option<Sound> {
-            let s = one(samples).await?;
-            play_sound(&s, PlaySoundParams { looped: true, volume: 0.0 });
-            Some(s)
-        }
-        let mut engines = vec![];
-        for hz in ENGINE_HZ {
-            match looped(&engine(hz)).await {
-                Some(s) => engines.push(s),
-                None => return Sounds { bank: None, muted: false, ..Sounds::silent() },
+        let Some(out) = Out::open() else { return Sounds::silent() };
+        let one = |samples: Vec<f32>| {
+            let out = &out;
+            async move { out.load(&samples).await }
+        };
+        let looped = |samples: Vec<f32>| {
+            let out = &out;
+            async move {
+                let c = out.load(&samples).await?;
+                out.play(&c, true, 0.0);
+                Some(c)
             }
-        }
+        };
         let all = async {
+            let mut engines = vec![];
+            for hz in ENGINE_HZ {
+                engines.push(looped(engine(hz)).await?);
+            }
             Some(Bank {
+                out: out.clone(),
                 engine: engines,
-                wind: looped(&wind()).await?,
-                water: looped(&water()).await?,
-                fire: looped(&fire()).await?,
-                boom_big: one(&boom(2.0, 1.0)).await?,
-                boom_small: one(&boom(0.8, 0.4)).await?,
-                thud: one(&thud()).await?,
-                clink: one(&clink()).await?,
-                crack: one(&crack()).await?,
-                spray: one(&spray()).await?,
-                snap: one(&snap()).await?,
-                siren: one(&siren()).await?,
-                pop: one(&pop()).await?,
-                blow: one(&blow()).await?,
+                wind: looped(wind()).await?,
+                water: looped(water()).await?,
+                fire: looped(fire()).await?,
+                boom_big: one(boom(2.0, 1.0)).await?,
+                boom_small: one(boom(0.8, 0.4)).await?,
+                thud: one(thud()).await?,
+                clink: one(clink()).await?,
+                crack: one(crack()).await?,
+                spray: one(spray()).await?,
+                snap: one(snap()).await?,
+                siren: one(siren()).await?,
+                pop: one(pop()).await?,
+                blow: one(blow()).await?,
             })
         }
         .await;
@@ -470,11 +477,11 @@ impl Sounds {
         #[cfg(feature = "sound")]
         if let Some(b) = &self.bank {
             for (s, l) in b.engine.iter().zip(self.level) {
-                set_sound_volume(s, l);
+                b.out.set_volume(s, l);
             }
-            set_sound_volume(&b.wind, self.level[4]);
-            set_sound_volume(&b.water, self.level[5]);
-            set_sound_volume(&b.fire, self.level[6]);
+            b.out.set_volume(&b.wind, self.level[4]);
+            b.out.set_volume(&b.water, self.level[5]);
+            b.out.set_volume(&b.fire, self.level[6]);
             for e in queue {
                 let slot = e.slot();
                 if self.cooldown[slot] > 0.0 {
@@ -498,17 +505,12 @@ impl Sounds {
                     Ev::Pop => (&b.pop, 0.55),
                     Ev::Blow => (&b.blow, 0.5),
                 };
-                play_sound_once_at(s, v);
+                b.out.play(s, false, v);
             }
         }
         #[cfg(not(feature = "sound"))]
         drop(queue);
     }
-}
-
-#[cfg(feature = "sound")]
-fn play_sound_once_at(s: &Sound, volume: f32) {
-    play_sound(s, PlaySoundParams { looped: false, volume });
 }
 
 #[cfg(test)]

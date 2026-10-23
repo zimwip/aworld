@@ -17,10 +17,15 @@ path = "src/bin/serve.rs"
 macroquad = { version = "0.4", default-features = false }
 rapier2d = "0.36"
 
+# Sound (src/sound/out.rs): macroquad's audio everywhere but Linux, where macroquad would link
+# ALSA at build time. Linux has its own mixer and loads ALSA when the game starts instead.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+macroquad = { version = "0.4", default-features = false, features = ["audio"] }
+
 [features]
 default = ["sound"]
-# Needs an ALSA/PipeWire sound device at start-up; build with --no-default-features without one.
-sound = ["macroquad/audio"]
+# Without it the game is always silent. Nothing to install either way, on any system.
+sound = []
 
 [profile.dev]
 opt-level = 2

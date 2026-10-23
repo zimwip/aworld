@@ -80,7 +80,9 @@ Q/E/T tourner · Tab onglet · [ ] pinceau · ↑/↓ vitesse · 1-0 matières �
 Tout le son est synthétisé au démarrage (aucun fichier audio) : moteur (4 régimes mélangés selon la vitesse),
 vent fort, eau qui coule, feu/lave qui crépitent, explosions, chocs et objets qui tombent, verre qui casse,
 tiges/câbles/ressorts qui cèdent, sable projeté. **M** coupe/remet le son ; `--mute` démarre sans son.
-Sans carte son (ALSA/PipeWire), compiler avec `cargo build --release --no-default-features`.
+Rien à installer pour le son, ni pour compiler ni pour jouer : Windows passe par WASAPI, macOS par CoreAudio, le web
+par WebAudio ; sous Linux le jeu charge ALSA (PipeWire/PulseAudio compris) au démarrage. Sans carte son ou sans ALSA,
+le jeu tourne simplement en silence. `--no-default-features` compile une version toujours muette.
 
 ## Sol meuble et vent
 
