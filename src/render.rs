@@ -148,6 +148,26 @@ void main() {
         rgb += vec3(1.0, 0.97, 0.86) * surf * lit * (flash * 2.4 + wave * 0.16);
     }
     float a = max(c.a, clamp(length(glow) * 2.0, 0.0, 1.0));
+    // Flames: tongues of fire dance above the burning cells. The light map's red is how much fire
+    // each square holds; read a little below this point, through a column that sways with slow
+    // noise, it fades smoothly upwards from the top of the fire. Turbulent noise rising through it
+    // tears it into licks that flare and die, taller in some places than others. Yellow-white at
+    // the foot, orange, then red at the tips.
+    if (c.a < 0.5) {
+        float sway = (fbm(vec2(cellf.y * 0.1 - time * 2.0, cellf.x * 0.05)) - 0.5) * 7.0 * texel.x;
+        vec2 b = uv + vec2(sway, lt.y * 1.1);
+        float fire = 0.5 * texture2D(Light, b).r + 0.25 * (texture2D(Light, b + vec2(lt.x * 0.5, 0.0)).r + texture2D(Light, b - vec2(lt.x * 0.5, 0.0)).r);
+        if (fire > 0.02) {
+            float n = fbm(vec2(cellf.x * 0.3 + sway / texel.x * 0.1, cellf.y * 0.2 + time * 4.5));
+            float tall = fbm(vec2(cellf.x * 0.12 - time * 0.4, time * 1.3));
+            float v = fire * (0.9 + 0.9 * tall) - 0.35 + (n - 0.5) * 1.0;
+            float fa = smoothstep(0.0, 0.2, v) * 0.9;
+            vec3 col = mix(vec3(0.9, 0.2, 0.04), vec3(1.0, 0.58, 0.1), smoothstep(0.05, 0.4, v));
+            col = mix(col, vec3(1.0, 0.92, 0.55), smoothstep(0.5, 0.9, v));
+            rgb = rgb * (1.0 - fa) + col * fa;
+            a = a + fa * (1.0 - a);
+        }
+    }
     // In clear air the haze shows itself as faint bright and dark swirls.
     float rip = shim * heat * 0.05 * (1.0 - a);
     gl_FragColor = vec4(rgb + vec3(max(rip, 0.0)), a + max(-rip, 0.0));
@@ -351,20 +371,26 @@ const LH: usize = H / LS;
 /// simulation does (it takes 20 % per cell of cloud).
 const CLOUD_PASS: f32 = 0.26;
 
-/// The light map: for each `LS`×`LS` square, how much it glows (fire, embers, lava) in red, how
-/// hot its air is (for the heat haze) in green, and how much of the sunlight the clouds, steam
-/// and smoke between it and the sun hold back (their shadow) in blue. Glow and heat saturate
-/// softly, so a big blaze is not blinding and a single ember still shows.
+/// The light map: for each `LS`×`LS` square, how many flames it holds (fire only, which the
+/// shader turns into dancing tongues) in red, how hot its air is (for the heat haze) in green,
+/// how much of the sunlight the clouds, steam and smoke between it and the sun hold back (their
+/// shadow) in blue, and in alpha the night's pool of light from everything that glows (fire,
+/// embers, lava). Flames, glow and heat saturate softly, so a big blaze is not blinding and a
+/// single ember still shows.
 pub fn light_map(world: &World, out: &mut [[u8; 4]]) {
     let shadow = cloud_shadow(world);
+    let mut glows = vec![0u8; LW * LH];
     for ty in 0..LH {
         for tx in 0..LW {
-            let (mut glow, mut heat) = (0.0f32, 0.0f32);
+            let (mut glow, mut heat, mut fire) = (0.0f32, 0.0f32, 0.0f32);
             for y in ty * LS..(ty + 1) * LS {
                 for x in tx * LS..(tx + 1) * LS {
                     let i = y * W + x;
                     match world.cells[i].m {
-                        Mat::Fire => glow += 1.0,
+                        Mat::Fire => {
+                            glow += 1.0;
+                            fire += 1.0;
+                        }
                         Mat::Lava => glow += 1.3,
                         Mat::Ember => glow += 0.5,
                         Mat::Empty | Mat::Steam | Mat::Smoke => heat += ((world.temp[i] - 60.0) / 160.0).clamp(0.0, 1.0),
@@ -374,16 +400,17 @@ pub fn light_map(world: &World, out: &mut [[u8; 4]]) {
             }
             let soft = |v: f32, k: f32| (255.0 * (1.0 - (-v / k).exp())) as u8;
             // Above a flame the air is hot too, even before the simulation has warmed it.
-            out[ty * LW + tx] = [soft(glow, 5.0), soft(heat + glow * 0.5, 10.0), (shadow[ty * LW + tx] * 255.0) as u8, 255];
+            out[ty * LW + tx] = [soft(fire, 4.0), soft(heat + glow * 0.5, 10.0), (shadow[ty * LW + tx] * 255.0) as u8, 255];
+            glows[ty * LW + tx] = soft(glow, 5.0);
         }
     }
-    night_pool(out);
+    night_pool(&glows, out);
 }
 
-/// Spreads the glow (red) into a wide, smooth pool of light in the alpha channel, for the night.
+/// Spreads the glow into a wide, smooth pool of light in the alpha channel, for the night.
 /// A gaussian blur done here, in two passes over the small light map: sampling a few far-apart
 /// texels in the shader instead drew the pool as a grid of squares, like a waffle.
-fn night_pool(out: &mut [[u8; 4]]) {
+fn night_pool(glows: &[u8], out: &mut [[u8; 4]]) {
     const R: i32 = 9;
     let weights: Vec<f32> = (-R..=R).map(|d| (-(d * d) as f32 / 29.0).exp()).collect();
     let total: f32 = weights.iter().sum::<f32>().powi(2);
@@ -393,7 +420,7 @@ fn night_pool(out: &mut [[u8; 4]]) {
             let mut v = 0.0;
             for (k, w) in weights.iter().enumerate() {
                 let sx = (x as i32 + k as i32 - R).clamp(0, LW as i32 - 1) as usize;
-                v += out[y * LW + sx][0] as f32 * w;
+                v += glows[y * LW + sx] as f32 * w;
             }
             rows[y * LW + x] = v;
         }
@@ -1285,5 +1312,22 @@ mod tests {
         assert!(pool[0] > 0, "the fire lights the night: {pool:?}");
         assert!(pool.windows(2).all(|p| p[1] <= p[0]), "the pool fades steadily: {pool:?}");
         assert!(pool[6] > 0, "and reaches a few metres away: {pool:?}");
+    }
+
+    #[test]
+    fn only_fire_throws_flames_but_lava_still_lights_the_night() {
+        let mut w = World::new_static();
+        w.climate_fixed = Some(15.0);
+        w.reset_temps();
+        for y in 300..306 {
+            for x in 300..306 {
+                w.set(x, y, Mat::Lava);
+            }
+        }
+        let mut px = vec![[0u8; 4]; LW * LH];
+        light_map(&w, &mut px);
+        let lava = px[(300 / LS) * LW + 300 / LS];
+        assert_eq!(lava[0], 0, "no flames on lava: {lava:?}");
+        assert!(lava[3] > 0, "but it lights the night: {lava:?}");
     }
 }
