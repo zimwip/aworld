@@ -141,14 +141,15 @@ fn weight(m: Mat) -> f32 {
 
 impl World {
     /// Turns cell `i` into `to`, keeping the heat it holds: the temperature moves so that the
-    /// new matter holds what the old one did, less the latent heat the change gives off.
+    /// new matter holds what the old one did, less the latent heat the change gives off. The
+    /// other states the cell carries stay when `to` carries them too (see `Aspect`).
     pub(super) fn change_state(&mut self, i: usize, to: Mat, latent: f32) {
-        let from = self.cells[i].m;
-        let t = self.temp[i];
+        let (from, t, kept) = (self.cells[i].m, self.temp[i], self.states(i));
         let heat = heat_of(from, t) - latent;
         let (x, y) = ((i % W) as i32, (i / W) as i32);
         self.set(x, y, to);
         self.temp[i] = (heat - latent0(to)) / cap(to);
+        self.keep_states(i, kept, from);
     }
 
     /// Lithostatic pressure (atm) at every cell: the air plus the weight of the column above it.
@@ -257,6 +258,32 @@ mod tests {
         assert!(!w.shock_cell(10 * W + 1, 100_000.0, 600.0), "squeezed but cold");
         assert!(w.shock_cell(10 * W + 2, 100_000.0, 3_000.0));
         assert_eq!(w.raw(2, 10), Mat::Diamond);
+    }
+
+    #[test]
+    fn soil_soaking_into_mud_keeps_its_water_and_rock_loses_it() {
+        let mut w = World::new_static();
+        w.set(5, 5, Mat::Dirt);
+        let i = 5 * W + 5;
+        w.moisture[i] = 150;
+        w.change_state(i, Mat::Mud, 0.0);
+        assert_eq!(w.moisture[i], 150, "mud carries water: the soil's stays in it");
+        w.change_state(i, Mat::Clay, 0.0);
+        assert_eq!(w.moisture[i], 0, "clay carries none");
+    }
+
+    #[test]
+    fn states_move_with_the_matter_and_painting_starts_afresh() {
+        let mut w = World::new_static();
+        w.set(5, 5, Mat::Mud);
+        let (i, j) = (5 * W + 5, 6 * W + 5);
+        w.moisture[i] = 99;
+        w.swap((5, 5), (5, 6));
+        assert_eq!((w.moisture[i], w.moisture[j]), (0, 99), "the water went down with the mud");
+        w.set(5, 6, Mat::Mud);
+        assert_eq!(w.moisture[j], 0);
+        w.set(5, 6, Mat::Ember);
+        assert!(w.fuel[j].left > 0 && !w.fuel[j].carbon, "a fresh ember of wood");
     }
 
     #[test]
