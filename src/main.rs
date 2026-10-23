@@ -3248,17 +3248,29 @@ impl Game {
                 ui.wrapped("Couches de vent opposées et tourbillons : ils portent nuages, vapeur, fumée et pluie, et contournent le relief.", bar.x, bar.y + 22.0, bar.w, 11, DIM);
             }
             ViewMode::Pressure => {
+                // Two scales, both logarithmic: the air (from the thin air at the top of the sky to a
+                // boiler) and the ground and liquids (up to tens of atmospheres).
+                let air_atm = |u: f32| world::AIR_LOW_ATM * (world::AIR_TOP_ATM / world::AIR_LOW_ATM).powf(u);
+                let ground = Rect::new(bar.x, bar.y + 44.0, bar.w, bar.h);
                 for i in 0..40 {
-                    let atm = 0.35 + 6.0 * (i as f32 / 39.0).powf(2.0);
-                    let (r2, g2, b2) = world::pressure_rgb(atm);
+                    let u = i as f32 / 39.0;
+                    let (r2, g2, b2) = world::air_pressure_rgb(air_atm(u));
                     draw_rectangle(bar.x + bar.w * i as f32 / 40.0, bar.y, bar.w / 40.0 + 1.0, bar.h, Color::from_rgba(r2, g2, b2, 255));
+                    let (r2, g2, b2) = world::ground_pressure_rgb(world::GROUND_TOP_ATM.powf(u));
+                    draw_rectangle(ground.x + ground.w * i as f32 / 40.0, ground.y, ground.w / 40.0 + 1.0, ground.h, Color::from_rgba(r2, g2, b2, 255));
                 }
-                for (atm, label) in [(0.5f32, "0,5"), (1.0, "1"), (2.0, "2"), (5.0, "5")] {
-                    let u = ((atm - 0.35) / 6.0).sqrt();
+                ui.text("Air", bar.x, ly + 10.0, 11, TEXT);
+                for (atm, label) in [(0.05f32, "0,05"), (0.2, "0,2"), (1.0, "1"), (5.0, "5")] {
+                    let u = world::air_scale(atm);
                     ui.text(label, bar.x + bar.w * u - 4.0, bar.y + 25.0, 11, DIM);
                 }
                 ui.text("atm", bar.x + bar.w - 20.0, ly + 10.0, 11, DIM);
-                ui.wrapped("Air : plus mince en altitude, plus dense dans les courants. Liquides : le poids de la colonne. Solides : le poids au-dessus. Traits sombres : frontières gaz / liquide / solide. Points clairs : grains de gaz, à la pression de l'air autour.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
+                ui.text("Sol et liquides", ground.x, ground.y - 4.0, 11, TEXT);
+                for (atm, label) in [(1.0f32, "1"), (3.0, "3"), (10.0, "10"), (30.0, "30")] {
+                    let u = world::ground_scale(atm);
+                    ui.text(label, ground.x + (ground.w * u - 4.0).min(ground.w - 12.0), ground.y + 25.0, 11, DIM);
+                }
+                ui.wrapped("Air : plus mince en altitude, plus fort dans une poche fermée. Sol et liquides : le poids de ce qui est au-dessus. Traits sombres : frontières gaz / liquide / solide.", bar.x, ground.y + 42.0, bar.w, 11, DIM);
             }
             ViewMode::Humidity => {
                 for i in 0..40 {

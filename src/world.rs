@@ -256,6 +256,65 @@ pub fn pressure_rgb(atm: f32) -> (u8, u8, u8) {
     (m(c0[0], c1[0]), m(c0[1], c1[1]), m(c0[2], c1[2]))
 }
 
+fn ramp(stops: &[(f32, [f32; 3])], v: f32) -> (u8, u8, u8) {
+    let v = v.clamp(stops[0].0, stops[stops.len() - 1].0);
+    let k = stops.iter().position(|s| s.0 >= v).unwrap_or(stops.len() - 1).max(1);
+    let ((p0, c0), (p1, c1)) = (stops[k - 1], stops[k]);
+    let f = ((v - p0) / (p1 - p0)).clamp(0.0, 1.0);
+    let m = |a: f32, b: f32| (a + (b - a) * f) as u8;
+    (m(c0[0], c1[0]), m(c0[1], c1[1]), m(c0[2], c1[2]))
+}
+
+/// The pressure view's scale for gas (atmospheres, logarithmic): the air thins tenfold and more
+/// from the valley to the top of the sky, and a boiler holds a few atmospheres. Violet and blue for
+/// thin air, green at 1 atm, yellow to red for a pocket under pressure, white about to burst.
+pub fn air_pressure_rgb(atm: f32) -> (u8, u8, u8) {
+    const STOPS: [(f32, [f32; 3]); 9] = [
+        (0.0, [40.0, 20.0, 90.0]),
+        (0.3, [80.0, 45.0, 170.0]),
+        (0.5, [60.0, 90.0, 230.0]),
+        (0.62, [40.0, 165.0, 215.0]),
+        (0.69, [60.0, 200.0, 120.0]),
+        (0.76, [230.0, 225.0, 70.0]),
+        (0.85, [245.0, 140.0, 40.0]),
+        (0.95, [225.0, 45.0, 40.0]),
+        (1.0, [255.0, 235.0, 235.0]),
+    ];
+    ramp(&STOPS, air_scale(atm))
+}
+
+/// Where a pressure sits on the air scale (0 at `AIR_LOW_ATM`, 1 at `AIR_TOP_ATM`).
+pub fn air_scale(atm: f32) -> f32 {
+    ((atm.max(AIR_LOW_ATM) / AIR_LOW_ATM).ln() / (AIR_TOP_ATM / AIR_LOW_ATM).ln()).clamp(0.0, 1.0)
+}
+
+/// The ends of the air pressure scale.
+pub const AIR_LOW_ATM: f32 = 0.02;
+pub const AIR_TOP_ATM: f32 = 6.0;
+
+/// The pressure view's scale for liquids and the ground (atmospheres, logarithmic): from about
+/// 1 atm at the surface to tens of atmospheres deep down, in colours of their own (dark plum,
+/// through crimson and orange, to pale yellow) so that they never read as air.
+pub fn ground_pressure_rgb(atm: f32) -> (u8, u8, u8) {
+    const STOPS: [(f32, [f32; 3]); 6] = [
+        (0.0, [45.0, 30.0, 70.0]),
+        (0.2, [95.0, 40.0, 115.0]),
+        (0.4, [165.0, 50.0, 110.0]),
+        (0.6, [225.0, 85.0, 60.0]),
+        (0.8, [250.0, 165.0, 50.0]),
+        (1.0, [255.0, 245.0, 190.0]),
+    ];
+    ramp(&STOPS, ground_scale(atm))
+}
+
+/// Where a pressure sits on the ground scale (0 at 1 atm, 1 at `GROUND_TOP_ATM`).
+pub fn ground_scale(atm: f32) -> f32 {
+    (atm.max(1.0).ln() / GROUND_TOP_ATM.ln()).clamp(0.0, 1.0)
+}
+
+/// The top of the ground pressure scale.
+pub const GROUND_TOP_ATM: f32 = 30.0;
+
 /// Hot metal glows: dull red from about 500 °C, then orange, then yellow-white as it nears its
 /// melting point (the colours a smith reads off the iron in the forge).
 fn glow((r, g, b): (i32, i32, i32), t: f32) -> (i32, i32, i32, i32) {
@@ -3183,7 +3242,14 @@ impl World {
         let mut prev_dense = vec![false; W];
         let mut dense = vec![false; W];
         for y in 0..=until {
-            let air = 1.05 * (-((H - y) as f32) / 700.0).exp();
+            // The still air at this height (the same atmosphere as the sensors read).
+            let air = air_pressure_atm(y as i32);
+            // The wind solver's pressure is only read for its changes along the row (a gust, the
+            // push in front of a blast): its level, row by row, is the solver's own and not the
+            // atmosphere's.
+            let row_flow: Vec<Option<f32>> = (0..W).map(|x| self.flow.air_pressure(x as i32, y as i32)).collect();
+            let (sum, n) = row_flow.iter().flatten().fold((0.0f32, 0usize), |(s, n), p| (s + p, n + 1));
+            let row_mean = if n > 0 { (sum / n as f32).max(1e-3) } else { 1.0 };
             for x in 0..W {
                 let m = self.at(x as i32, y as i32);
                 match m.kind() {
@@ -3198,8 +3264,11 @@ impl World {
                             // A closed pocket (a boiler, a sealed room) has its own pressure.
                             air * p.pressure
                         } else {
-                            match self.flow.air_pressure(x as i32, y as i32) {
-                                Some(p) => air * p.clamp(0.3, 4.0),
+                            match row_flow[x] {
+                                // Open air evens out its pressure almost at once: the solver's
+                                // swings (hot air over a fire reads three times its row) are shown a
+                                // quarter as strong, still enough to see a gust or a blast.
+                                Some(p) => air * (1.0 + (p / row_mean - 1.0) * 0.25).clamp(0.8, 1.6),
                                 None => {
                                     let kelvin = (self.temp[y * W + x] + 273.15).max(1.0) / (self.ambient_c(y as i32) + 273.15).max(1.0);
                                     air * dynamic * kelvin.clamp(0.5, 3.0)
@@ -3236,8 +3305,10 @@ impl World {
 
     /// The pressure view's colour of a cell, with the borders between gas, liquid and solid marked.
     pub fn pressure_color(&self, field: &[f32], x: usize, y: usize) -> [u8; 4] {
-        let (r, g, b) = pressure_rgb(field[y * W + x]);
         let m = self.at(x as i32, y as i32);
+        // Two scales: the air's changes are a few hundredths of an atmosphere, the ground's tens of
+        // atmospheres; on one scale either the sky or the ground would be a flat colour.
+        let (r, g, b) = if matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) { air_pressure_rgb(field[y * W + x]) } else { ground_pressure_rgb(field[y * W + x]) };
         if gas_grain(m) {
             // A grain of gas is at the pressure of the air around it (mechanical equilibrium): it
             // shows where it is, without a pressure of its own.
@@ -3779,6 +3850,24 @@ mod tests {
     }
 
     #[test]
+    fn the_pressure_view_reads_the_real_atmosphere_on_its_own_scale() {
+        let mut w = World::new_static();
+        for x in 0..W as i32 {
+            for y in 450..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        let f = w.pressure_field();
+        let (low, high) = (f[440 * W + 300], f[10 * W + 300]);
+        assert!((low - air_pressure_atm(440)).abs() < 0.05, "air by the ground: {low}");
+        assert!(high < 0.2 * low, "the air thins with height: {high} up high, {low} below");
+        // The sky's gradient spans the air scale, and the ground has a scale of its own.
+        assert!(air_scale(low) - air_scale(high) > 0.3);
+        assert_ne!(air_pressure_rgb(1.0), ground_pressure_rgb(1.0), "air and ground never share a colour at the surface");
+        assert!(ground_scale(f[530 * W + 300]) > ground_scale(f[460 * W + 300]));
+    }
+
+    #[test]
     fn the_weight_of_a_pillar_fans_out_in_the_ground_instead_of_running_down_as_a_stripe() {
         let mut w = World::new_static();
         for x in 0..W as i32 {
@@ -3817,7 +3906,7 @@ mod tests {
             assert_ne!(grain, air, "{name}: the grain of steam should stand out from the air beside it");
         }
         // The grain is at the pressure of the air around it: only lighter, not another colour.
-        let (r, g, b) = pressure_rgb(pf[i]);
+        let (r, g, b) = air_pressure_rgb(pf[i]);
         assert_eq!(w.pressure_color(&pf, 400, 200), grain_dot([r, g, b]));
         // And it is saturated air.
         let (r, g, b) = (40, 100, 235);
@@ -6403,6 +6492,7 @@ mod glass {
         assert!(booms > 0);
     }
 }
+
 
 
 
