@@ -255,3 +255,9 @@ L'eau gèle et la glace fond à 0 °C. Pour changer d'état, une cellule doit d'
 - **La vapeur monte** même refroidie : l'air humide est plus léger que l'air sec (18 contre 29 pour la masse d'une molécule). Elle rejoint l'air froid d'en haut et y devient nuage, puis pluie. Sur une journée de mer, une centaine de cellules d'eau partent en vapeur et une centaine de cellules de nuage se forment.
 - **Les arbres transpirent** : le jour, à la belle saison, le pied du tronc boit l'eau du sol (ou d'une flaque) par ses racines, et une feuille au bord de la couronne la rejette en vapeur. Le sol sèche autour des arbres et l'air au-dessus d'une forêt devient humide.
 - **Le sol sèche avec l'air** : la terre en surface sèche plus vite à l'air sec et au vent ; enterrée, elle garde son eau bien plus longtemps.
+
+## Grains qui tombent, talus et poussée d'Archimède
+
+- **Les grains accélèrent** en chute libre : chaque grain garde sa vitesse de chute (`World::vel`, en huitièmes de cellule par pas). Elle augmente à chaque pas (la gravité) jusqu'à une vitesse limite de 5 cellules par pas (le frottement de l'air), et retombe à zéro quand le grain se pose.
+- **Chaque matériau a son angle de talus** : le sable sec coule en tas plats (environ 33°, comme le vrai), le sable mouillé et la neige tiennent des pentes raides (environ 58° pour la neige), la grêle et la boue s'étalent. Certains grains d'un tas ne glissent que s'il y a deux cellules de chute, d'autres roulent de deux cellules : lesquels dépend de leur place (`World::grain_pick`), donc le tas se pose à un angle stable.
+- **Poussée d'Archimède** : un grain plus léger que le liquide qui l'entoure remonte (charbon de bois, cendre, feuilles mortes, grêle flottent sur l'eau), un plus lourd coule. Un bloc qui tombe fait pareil selon sa densité moyenne : une rondelle de bois flotte comme la glace, un rocher coule au fond du lac en poussant l'eau (avant, il restait posé sur l'eau).

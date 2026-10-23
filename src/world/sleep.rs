@@ -89,6 +89,12 @@ impl World {
             Mat::Grass => c.life > 0 || !self.at(x, y + 1).is_hard(),
             Mat::Sand | Mat::Rust | Mat::Hail | Mat::Snow | Mat::Gunpowder | Mat::Ash | Mat::Charcoal => {
                 let can_fall = sinks_into(self.at(x, y + 1)) || sinks_into(self.at(x - 1, y + 1)) || sinks_into(self.at(x + 1, y + 1));
+                // Free-running grains roll two cells sideways (see `step_powder`), and a grain
+                // lighter than the liquid above it rises.
+                let rolls = Self::grain_pick(x, y) < self.repose(x, y, c.m).1
+                    && ((sinks_into(self.at(x - 1, y)) && sinks_into(self.at(x - 2, y + 1))) || (sinks_into(self.at(x + 1, y)) && sinks_into(self.at(x + 2, y + 1))));
+                let floats = self.at(x, y - 1).kind() == Kind::Liquid && density(self.at(x, y - 1)) > density(c.m);
+                let can_fall = can_fall || rolls || floats;
                 let wet = c.m == Mat::Ash && Self::neighbors(x, y).iter().any(|&(nx, ny)| self.at(nx, ny) == Mat::Water);
                 can_fall || wet
             }
@@ -139,7 +145,8 @@ mod tests {
                 w.set(x, y, Mat::Sand);
             }
         }
-        for _ in 0..40 {
+        // Dry sand runs out at the sides of the world before it settles.
+        for _ in 0..150 {
             w.step();
         }
         w.zones.begin();

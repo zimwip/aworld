@@ -12,7 +12,7 @@ pub struct Info {
 pub fn info(m: Mat) -> Info {
     let (name, state, fact) = match m {
         Mat::Empty => ("Air", "gaz", "L'air est plus froid en altitude et la nuit."),
-        Mat::Sand => ("Sable", "poudre", "Chauffé à 600 °C, il fond et devient du verre."),
+        Mat::Sand => ("Sable", "poudre", "Chauffé à 600 °C, il fond et devient du verre. Sec, il coule en tas plats (environ 33°) ; mouillé, il tient (châteaux de sable)."),
         Mat::Water => ("Eau", "liquide", "Bout à 100 °C à l'air libre, plus chaud sous pression (120 °C à 2 atm : la cocotte-minute). Gèle à 0 °C. Tant qu'elle bout ou gèle, sa température ne bouge plus : c'est le palier. Elle s'évapore aussi sans bouillir, plus vite au chaud, à l'air sec et au vent."),
         Mat::Fire => ("Feu", "flamme", "Environ 650 °C. Il brûle le bois et chauffe tout autour. Il lui faut de l'air : enfermé, il remplit l'air de fumée et s'étouffe."),
         Mat::Steam => ("Vapeur", "gaz", "Eau chauffée à plus de 100 °C : elle prend bien plus de place que l'eau. Enfermée, elle pousse (chaudière, moteur à vapeur). Refroidie, c'est de la vapeur d'eau : plus légère que l'air sec, elle monte former les nuages."),
@@ -70,6 +70,7 @@ pub const RECIPES: &[Recipe] = &[
     Recipe { from: &[Mat::Steam], to: &[Mat::Cloud, Mat::Water], text: "La vapeur refroidit : nuage, puis pluie. C'est le cycle de l'eau." },
     Recipe { from: &[Mat::Water], to: &[Mat::Steam], text: "L'eau s'évapore même froide, plus vite au chaud, à l'air sec et au vent. La vapeur, plus légère que l'air, monte faire des nuages." },
     Recipe { from: &[Mat::Dirt, Mat::Trunk, Mat::Leaf], to: &[Mat::Steam], text: "Les arbres boivent l'eau du sol par leurs racines et la rejettent en vapeur par leurs feuilles : une forêt rend l'air humide." },
+    Recipe { from: &[Mat::Charcoal, Mat::Sand, Mat::Water], to: &[Mat::Charcoal, Mat::Water, Mat::Sand], text: "Archimède : ce qui est plus léger que l'eau flotte (charbon de bois, feuilles mortes, glace, bois), ce qui est plus lourd coule (sable, pierre, fer)." },
     Recipe { from: &[Mat::Water], to: &[Mat::Ice], text: "La nuit, quand il gèle, l'eau devient de la glace." },
     Recipe { from: &[Mat::Cloud], to: &[Mat::Water, Mat::Snow, Mat::Hail], text: "Nuage tiède : pluie. Gel : neige. Grand froid : grêle. Un nuage réchauffé par le soleil ne pleut pas." },
     Recipe { from: &[Mat::Sand, Mat::Fire], to: &[Mat::Glass], text: "Du sable très chaud fond : c'est du verre." },

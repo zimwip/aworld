@@ -230,6 +230,11 @@ pub fn vapour_pressure(t: f32) -> f32 {
     0.6108 * (17.27 * t / (t + 237.3)).exp()
 }
 
+/// A falling grain speeds up by this many eighths of a cell per step, every step.
+const GRAIN_ACCEL: u8 = 2;
+/// The fastest a grain falls through air (eighths of a cell per step).
+const GRAIN_TERMINAL: u8 = 32;
+
 /// An ember whose life is at least this is burning charcoal: hotter and slower than wood.
 pub(crate) const COAL_LIFE: u8 = 200;
 
@@ -238,8 +243,8 @@ struct Piece {
     cells: Vec<usize>,
     /// Downward speed in cells per drop (negative while bouncing up).
     vy: f32,
-    /// Made only of ice: it floats on liquids.
-    ice: bool,
+    /// Mean density relative to water: lighter than a liquid, it floats on it (ice, wood).
+    density: f32,
 }
 
 /// A copy of everything that changes while the world runs (for undo).
@@ -318,6 +323,9 @@ pub struct World {
     /// Latent heat taken in (positive) or given up (negative) by a cell of water or ice on its way
     /// to changing state (see `thermal::latent_heat`).
     pub latent: Vec<f32>,
+    /// Falling speed of each grain, in eighths of a cell per step (gravity speeds a free-falling
+    /// grain up; landing stops it).
+    vel: Vec<u8>,
     /// Absolute pressure (atm) inside each liquid cell; 1 elsewhere.
     liq_p: Vec<f32>,
     /// Scratch for the pockets: what each cell is to the gas, and the weight of each liquid cell.
@@ -373,6 +381,7 @@ impl World {
             pockets: Vec::new(),
             liq_p: vec![1.0; W * H],
             latent: vec![0.0; W * H],
+            vel: vec![0; W * H],
             cls: vec![0; W * H],
             liq_w: vec![0.0; W * H],
             bursts: Vec::new(),
@@ -394,6 +403,7 @@ impl World {
         self.revision += 1;
         self.cells.fill(EMPTY);
         self.latent.fill(0.0);
+        self.vel.fill(0);
         self.zones.wake_all();
         self.reset_temps();
         self.update_season_cache();
@@ -414,6 +424,7 @@ impl World {
         self.revision += 1;
         self.cells.copy_from_slice(&st.cells);
         self.latent.fill(0.0);
+        self.vel.fill(0);
         self.zones.wake_all();
         self.temp.copy_from_slice(&st.temp);
         self.clock = st.clock;
@@ -470,6 +481,7 @@ impl World {
         self.revision += 1;
         self.cells.copy_from_slice(snap);
         self.latent.fill(0.0);
+        self.vel.fill(0);
         self.zones.wake_all();
     }
 
@@ -584,6 +596,7 @@ impl World {
         let i = Self::idx(x, y);
         self.cells[i] = Cell { m, life, stamp: frame };
         self.latent[i] = 0.0;
+        self.vel[i] = 0;
         self.zones.wake(i);
         match m {
             Mat::Fire => self.temp[i] = thermal::FIRE_C,
@@ -609,6 +622,7 @@ impl World {
         self.cells.swap(ia, ib);
         self.temp.swap(ia, ib);
         self.latent.swap(ia, ib);
+        self.vel.swap(ia, ib);
         self.cells[ia].stamp = self.frame;
         self.cells[ib].stamp = self.frame;
     }
@@ -1206,14 +1220,93 @@ impl World {
 
     /// Returns true if the cell moved.
     fn step_powder(&mut self, x: i32, y: i32) -> bool {
+        let i = Self::idx(x, y);
+        let m = self.cells[i].m;
+        let light = density(m);
+        // Archimedes: a grain lighter than the liquid round it is pushed up through it (ash,
+        // charcoal, dead leaves and hail float on water); a heavier one sinks.
+        let sinks_in = |n: Mat| match n.kind() {
+            Kind::Empty | Kind::Gas => true,
+            Kind::Liquid => density(n) < light,
+            _ => false,
+        };
+        let above = self.at(x, y - 1);
+        if above.kind() == Kind::Liquid && density(above) > light && self.mask_free(x, y - 1) && self.chance(2) {
+            self.vel[i] = 0;
+            self.swap((x, y), (x, y - 1));
+            return true;
+        }
+        // Free fall: the grain gathers speed (gravity) up to a terminal speed (air drag), and
+        // covers several cells in a step once it is fast.
+        if matches!(self.at(x, y + 1).kind(), Kind::Empty | Kind::Gas) && self.mask_free(x, y + 1) {
+            let v = self.vel[i].saturating_add(GRAIN_ACCEL).min(GRAIN_TERMINAL);
+            let mut k = 1;
+            while k < 1 + v as i32 / 8 && matches!(self.at(x, y + k + 1).kind(), Kind::Empty | Kind::Gas) && self.mask_free(x, y + k + 1) {
+                k += 1;
+            }
+            // Stopped short by what is below: it lands.
+            self.vel[i] = if k < 1 + v as i32 / 8 { 0 } else { v };
+            self.swap((x, y), (x, y + k));
+            return true;
+        }
+        self.vel[i] = 0;
+        if sinks_in(self.at(x, y + 1)) {
+            self.swap((x, y), (x, y + 1));
+            return true;
+        }
+        // Sliding down the side of the heap. Each material has its own angle of repose: some
+        // grains of a cohesive heap (snow, wet sand) only slide where the drop is two cells, which
+        // makes it steeper; some grains of a free-running one (dry sand, hail, mud) roll two cells
+        // sideways, which makes it flatter. Which grains is fixed by their place in the heap, so
+        // the heap settles at a steady angle in between.
+        let (steep, flat) = self.repose(x, y, m);
+        let pick = Self::grain_pick(x, y);
         let d = self.dir();
-        for dx in [0, d, -d] {
-            if matches!(self.at(x + dx, y + 1).kind(), Kind::Empty | Kind::Liquid | Kind::Gas) {
-                self.swap((x, y), (x + dx, y + 1));
-                return true;
+        for dx in [d, -d] {
+            if !sinks_in(self.at(x + dx, y + 1)) {
+                continue;
+            }
+            if pick < steep && Self::inb(x + dx, y + 2) && !sinks_in(self.at(x + dx, y + 2)) {
+                continue;
+            }
+            self.swap((x, y), (x + dx, y + 1));
+            return true;
+        }
+        if pick < flat {
+            for dx in [d, -d] {
+                if sinks_in(self.at(x + dx, y)) && sinks_in(self.at(x + 2 * dx, y + 1)) {
+                    self.swap((x, y), (x + 2 * dx, y + 1));
+                    return true;
+                }
             }
         }
         false
+    }
+
+    /// A number from 0 to 99 fixed for each place in the world, to pick which grains of a heap
+    /// hold and which run.
+    pub(super) fn grain_pick(x: i32, y: i32) -> u32 {
+        ((((x as u32).wrapping_mul(73_856_093) ^ (y as u32).wrapping_mul(19_349_663)).wrapping_mul(2_654_435_761) >> 16) & 0xffff) % 100
+    }
+
+    /// How a heap of `m` holds: (percent of grains that need a two-cell drop to slide, percent
+    /// that roll two cells sideways). (0, 0) is the plain 45 degree heap.
+    fn repose(&self, x: i32, y: i32, m: Mat) -> (u32, u32) {
+        match m {
+            // Dry sand runs (about 34 degrees); wet sand holds (sandcastles).
+            Mat::Sand => {
+                if Self::neighbors(x, y).iter().any(|&(nx, ny)| self.at(nx, ny) == Mat::Water) {
+                    (70, 0)
+                } else {
+                    (0, 50)
+                }
+            }
+            Mat::Snow => (75, 0),
+            Mat::Hail => (0, 70),
+            Mat::Mud => (0, 90),
+            Mat::Ash => (30, 0),
+            _ => (0, 0),
+        }
     }
 
     /// Water that moved during the last two steps is flowing, not resting.
@@ -2126,8 +2219,8 @@ impl World {
             }
             budget = budget.saturating_sub(cells.len());
             let vy = cells.iter().step_by(5).filter_map(|c| speeds.get(c)).fold(0.0f32, |a, b| a.max(*b));
-            let ice = cells.iter().all(|&i| self.cells[i].m == Mat::Ice);
-            self.falling.push(Piece { cells, vy, ice });
+            let density = cells.iter().map(|&i| density(self.cells[i].m)).sum::<f32>() / cells.len().max(1) as f32;
+            self.falling.push(Piece { cells, vy, density });
             if budget == 0 {
                 break;
             }
@@ -2201,11 +2294,12 @@ impl World {
                 || (self.mask[target] == 0
                     && match self.cells[target].m.kind() {
                         Kind::Empty | Kind::Gas | Kind::Powder | Kind::Flame => true,
-                        // Ice floats on a body of water, but a stray drop or a puff of
-                        // liquid in mid-air does not hold it up: it just gets pushed aside.
+                        // Archimedes: a piece heavier than the liquid (rock, iron) sinks through
+                        // it, pushing it aside; a lighter one (ice, wood) floats on a body of it,
+                        // but a stray drop or a puff of liquid in mid-air does not hold it up.
                         Kind::Liquid => {
-                            if !piece.ice {
-                                false
+                            if piece.density >= density(self.cells[target].m) {
+                                true
                             } else {
                                 let under = target + W;
                                 let settled = under >= W * H || matches!(self.cells[under].m.kind(), Kind::Liquid | Kind::Static | Kind::Powder);
@@ -2235,6 +2329,7 @@ impl World {
             self.cells.swap(i, t);
             self.temp.swap(i, t);
             self.latent.swap(i, t);
+            self.vel.swap(i, t);
             self.cells[i].stamp = self.frame;
             self.cells[t].stamp = self.frame;
             piece.cells[k] = t;
@@ -2601,8 +2696,10 @@ impl World {
             // A fire on sand still makes glass.
             let mut w = World::new_static();
             w.lod = lod;
-            for x in 100..140 {
+            for x in 80..160 {
                 w.set(x, 300, Mat::Stone);
+            }
+            for x in 100..140 {
                 for y in 292..300 {
                     w.set(x, y, Mat::Sand);
                 }
@@ -2610,8 +2707,10 @@ impl World {
             let mut glass = false;
             for t in 0..3500 {
                 for x in 100..140 {
-                    if w.raw(x, 291) == Mat::Empty {
-                        w.set(x, 291, Mat::Fire);
+                    if let Some(top) = (250..300).find(|&y| w.raw(x, y) != Mat::Empty && w.raw(x, y) != Mat::Fire && w.raw(x, y) != Mat::Smoke) {
+                        if w.raw(x, top - 1) == Mat::Empty {
+                            w.set(x, top - 1, Mat::Fire);
+                        }
                     }
                 }
                 w.step();
@@ -3240,6 +3339,46 @@ mod tests {
             eprintln!("LAYER {layer:?}: {} ice cells left, highest row {top}", ice_rows.len());
             assert!(ice_rows.is_empty() || top > 190, "ice stayed up in a layer of {layer:?}: top row {top}");
         }
+    }
+
+    #[test]
+    fn a_falling_rock_sinks_in_a_lake_and_a_log_floats() {
+        let mut w = World::new();
+        w.day_cycle = false;
+        w.set_phase(0.75);
+        for x in 0..W as i32 {
+            for y in H as i32 - 10..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for y in 300..H as i32 - 10 {
+            w.set(99, y, Mat::Stone);
+            w.set(300, y, Mat::Stone);
+        }
+        for x in 100..300 {
+            for y in 340..H as i32 - 10 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        // Loose blocks in the air above the lake: one of rock, one of wood.
+        for x in 130..145 {
+            for y in 250..260 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for x in 230..250 {
+            for y in 250..256 {
+                w.set(x, y, Mat::Wood);
+            }
+        }
+        for _ in 0..600 {
+            w.step();
+        }
+        let rows = |m: Mat, x0: i32, x1: i32| (0..H as i32).filter(|&y| (x0..x1).any(|x| w.raw(x, y) == m)).collect::<Vec<_>>();
+        let rock = rows(Mat::Stone, 120, 160);
+        let wood = rows(Mat::Wood, 200, 290);
+        assert!(rock.iter().min().is_some_and(|&y| y > 400), "the rock sank: rows {:?}", rock.first());
+        assert!(wood.iter().max().is_some_and(|&y| y < 350), "the log floats: rows {:?}", wood.last());
     }
 
     #[test]
@@ -4196,6 +4335,89 @@ mod science {
     }
 
     #[test]
+    fn a_falling_grain_speeds_up() {
+        let mut w = World::new_static();
+        w.set(200, 20, Mat::Sand);
+        let at = |w: &World| (0..H as i32).find(|&y| w.raw(200, y) == Mat::Sand).unwrap();
+        let mut ys = vec![at(&w)];
+        for _ in 0..40 {
+            w.step();
+            ys.push(at(&w));
+        }
+        let first = ys[10] - ys[0];
+        let last = ys[40] - ys[30];
+        assert!(last > 2 * first, "it falls faster and faster: {first} cells in the first 10 steps, {last} in the last 10");
+        assert!(last <= 50, "but no faster than its terminal speed (5 cells a step): {last}");
+    }
+
+    /// Rise and run of the slope of a heap of `m` slumped from a tall block onto a wide floor.
+    fn heap(m: Mat) -> (i32, i32) {
+        let mut w = World::new_static();
+        // Just below freezing: snow neither melts nor gets pressed into ice.
+        w.climate_fixed = Some(-1.0);
+        w.reset_temps();
+        floor(&mut w, 300, 0, W as i32);
+        // A tall block of it, left to slump.
+        for x in 285..315 {
+            for y in 200..300 {
+                w.set(x, y, m);
+            }
+        }
+        for _ in 0..1500 {
+            w.step();
+        }
+        // The slope of the left flank, between a quarter and three quarters of the height (a
+        // flat top and stray grains do not count).
+        let top = (101..300).find(|&y| w.raw(300, y) == m).unwrap();
+        let (y1, y2) = (top + (300 - top) / 4, 300 - (300 - top) / 4);
+        let edge = |y: i32| (0..=300).rev().find(|&x| w.raw(x, y) != m).unwrap();
+        (y2 - y1, edge(y1) - edge(y2))
+    }
+
+    #[test]
+    fn each_material_piles_up_at_its_own_angle() {
+        let angle = |m: Mat| {
+            let (h, r) = heap(m);
+            (h as f32).atan2(r as f32).to_degrees()
+        };
+        let (sand, snow, rust) = (angle(Mat::Sand), angle(Mat::Snow), angle(Mat::Rust));
+        eprintln!("HEAP sand {sand:.0} snow {snow:.0} rust {rust:.0}");
+        assert!(sand < rust - 4.0, "dry sand runs flatter: {sand:.0} / {rust:.0}");
+        assert!(snow > rust + 4.0, "snow holds steeper: {snow:.0} / {rust:.0}");
+    }
+
+    #[test]
+    fn light_grains_float_and_heavy_ones_sink() {
+        let mut w = World::new_static();
+        floor(&mut w, 300, 99, 141);
+        for y in 260..300 {
+            w.set(99, y, Mat::Stone);
+            w.set(140, y, Mat::Stone);
+        }
+        for x in 100..140 {
+            for y in 270..300 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        // Dropped in at the bottom of the tank, and on its surface.
+        for x in 102..108 {
+            w.set(x, 299, Mat::Charcoal);
+            w.set(x + 10, 299, Mat::DeadLeaf);
+            w.set(x + 20, 270, Mat::Sand);
+        }
+        for _ in 0..400 {
+            w.step();
+        }
+        let depth = |m: Mat| {
+            let ys: Vec<i32> = (100..140).flat_map(|x| (250..300).map(move |y| (x, y))).filter(|&(x, y)| w.raw(x, y) == m).map(|(_, y)| y).collect();
+            ys.iter().sum::<i32>() as f32 / ys.len().max(1) as f32
+        };
+        assert!(depth(Mat::Charcoal) < 274.0, "charcoal rose to the surface: {}", depth(Mat::Charcoal));
+        assert!(depth(Mat::DeadLeaf) < 274.0, "dead leaves float: {}", depth(Mat::DeadLeaf));
+        assert!(depth(Mat::Sand) > 296.0, "sand sank to the bottom: {}", depth(Mat::Sand));
+    }
+
+    #[test]
     fn floating_stone_falls_but_attached_stone_stays() {
         let mut w = World::new();
         floor(&mut w, H as i32 - 1, 0, W as i32);
@@ -4453,16 +4675,22 @@ mod glass {
     #[test]
     fn sand_fuses_into_glass_in_the_heat() {
         let mut w = World::new_static();
-        for x in 100..140 {
+        // A floor wider than the heap: dry sand runs out to a flat slope.
+        for x in 80..160 {
             w.set(x, 300, Mat::Stone);
+        }
+        for x in 100..140 {
             for y in 292..300 {
                 w.set(x, y, Mat::Sand);
             }
         }
         for _ in 0..2500 {
+            // The fire is kept lit right on the sand, which slumps flatter as it runs.
             for x in 100..140 {
-                if w.raw(x, 291) == Mat::Empty {
-                    w.set(x, 291, Mat::Fire);
+                if let Some(top) = (250..300).find(|&y| w.raw(x, y) != Mat::Empty && w.raw(x, y) != Mat::Fire && w.raw(x, y) != Mat::Smoke) {
+                    if w.raw(x, top - 1) == Mat::Empty {
+                        w.set(x, top - 1, Mat::Fire);
+                    }
                 }
             }
             w.step();
