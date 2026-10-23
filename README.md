@@ -32,7 +32,11 @@ cargo run --release
   à l'abri de la pluie, l'eau le dissout). Salpêtre + charbon de bois, à froid et au sec : de la poudre noire.
 - **Clins d'œil** : le Béluga (B) ; une **baleine** souffle dans les grandes étendues d'eau profonde (W pour l'appeler) ;
   un grand feu fait venir le **camion de pompiers** (pin-pon !) qui l'arrose avec de la vraie eau ; la nuit, la poudre
-  qui explose lance un **feu d'artifice** (couleurs des métaux : cuivre bleu, strontium rouge, sodium jaune, baryum vert).
+  qui explose lance un **feu d'artifice** (couleurs des métaux : cuivre bleu, strontium rouge, sodium jaune, baryum vert) ;
+  de temps en temps, un **petit garçon** (sweat jaune au dinosaure, jogging bleu) vient se promener (K pour l'appeler) :
+  il saute les murets, fait la roue et des saltos, et commente ce qu'il voit dans une bulle. Rien ne le brûle ni ne le
+  fait exploser, mais un coup, une explosion, du sable sur la tête ou un clic sur lui : « Aïe ! », « Hé ho, ça va pas
+  non ?! » (`--demo out.png --kid x[,walk|wave|jump|flip|wheel|ouch]`).
 - **Plantes** : terre humide + graine + eau + lumière (jamais la nuit) = arbre ; les arbres font des graines : une forêt pousse.
   La terre nue s'érode sous l'eau qui coule (l'herbe la protège). Une graine sans eau pourrit en terre.
 - **Pas de vrai sol** : seule la roche posée sur le bas du monde retient le reste ; tout ce qui n'y est pas relié tombe et
@@ -66,7 +70,7 @@ vide ou en sortant du monde. Leur poids pèse sur les ponts. **Réglages** (ongl
 amortisseurs, adhérence, taille des roues, solidité, poids, couleur — sur la voiture choisie ou pour les suivantes.
 
 ## Raccourcis
-Espace jouer/pause · B Béluga · W baleine · R retour · Z annuler · C voiture · G monde suivant · N vide · H température · X efforts · V vent ·
+Espace jouer/pause · B Béluga · W baleine · K petit garçon · R retour · Z annuler · C voiture · G monde suivant · N vide · H température · X efforts · V vent ·
 Q/E/T tourner · Tab onglet · [ ] pinceau · ↑/↓ vitesse · 1-0 matières · F5/F9 sauver/charger · F11 plein écran.
 
 ## Développement
@@ -114,7 +118,7 @@ le jeu tourne simplement en silence. `--no-default-features` compile une version
 
 ## Raccourcis
 
-Espace jouer/pause · B Béluga · W baleine · R retour · C voiture · Z annuler · H/X/V vues · M son · F ou F11 plein écran · Tab onglet. Poteau (brique haute) dans les blocs : plus besoin de tourner les blocs.
+Espace jouer/pause · B Béluga · W baleine · K petit garçon · R retour · C voiture · Z annuler · H/X/V vues · M son · F ou F11 plein écran · Tab onglet. Poteau (brique haute) dans les blocs : plus besoin de tourner les blocs.
 **Ctrl + molette** zoome sur le pointeur (jusqu'à ×8), **Ctrl + glisser** déplace la vue.
 **Échap** recule d'un cran : page Science, tracé en cours, vue zoomée (retour à la vue standard), plein écran, puis une fenêtre « Quitter AWorld ? » qui met
 la simulation en pause ; Échap y reprend le jeu, **Entrée** quitte.

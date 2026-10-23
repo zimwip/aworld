@@ -4,6 +4,7 @@ mod camera;
 mod car;
 mod fireworks;
 mod firetruck;
+mod kid;
 mod debris;
 mod mech;
 mod fluidgame;
@@ -166,6 +167,8 @@ struct Game {
     whales: whale::Whales,
     trucks: firetruck::FireTrucks,
     fireworks: fireworks::Fireworks,
+    /// The little boy who comes for a walk now and then.
+    kids: kid::Kids,
     /// The night (day number) whose fireworks were explained already.
     fireworks_told: u32,
     /// The day pill (the world's menu opens under it).
@@ -303,6 +306,7 @@ impl Game {
             whales: whale::Whales::new(),
             trucks: firetruck::FireTrucks::new(),
             fireworks: fireworks::Fireworks::new(),
+            kids: kid::Kids::new(),
             fireworks_told: 0,
             hud_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             climate_menu: false,
@@ -1249,6 +1253,9 @@ impl Game {
                 self.say("Un Béluga passe dans le ciel !");
             }
         }
+        if is_key_pressed(KeyCode::K) && !self.kids.summon(&self.world) && self.kids.kid.is_none() {
+            self.say("Il faut un bout de terre ferme pour se promener");
+        }
         if is_key_pressed(KeyCode::W) {
             if self.whales.summon(&self.world) {
                 self.say("Une baleine remonte respirer !");
@@ -1362,6 +1369,12 @@ impl Game {
         self.last = Some(at);
         let click = is_mouse_button_pressed(MouseButton::Left);
         let rclick = is_mouse_button_pressed(MouseButton::Right);
+        // A click on the little boy is for him, not for the tool.
+        if click && self.kids.kid.as_ref().map_or(false, |k| k.contains(at)) {
+            self.kids.ouch(kid::Hit::Click);
+            self.last = None;
+            return;
+        }
 
         if rclick && (self.cable_from.is_some() || self.member_from.is_some() || self.spring_draft.is_some() || self.mech_draft.is_some() || self.pipe_from.is_some()) {
             self.mech_draft = None;
@@ -1507,6 +1520,7 @@ impl Game {
             self.sounds.emit(Ev::Blow);
         }
         self.fireworks.update(dt);
+        self.update_kid(dt);
         if self.fireworks.take_bursts() > 0 {
             self.sounds.emit(Ev::Pop);
         }
@@ -1640,8 +1654,11 @@ impl Game {
             }
             p.step(&self.world, &mut self.blocks);
             impacts = p.take_impacts();
-            for (_, hard) in p.take_bumps() {
+            for (at, hard) in p.take_bumps() {
                 self.sounds.emit(Ev::Thud(hard));
+                if self.kids.kid.as_ref().map_or(false, |k| (k.centre() - at).length() < 16.0) {
+                    self.kids.ouch(kid::Hit::Block);
+                }
             }
             let broken = p.update_members(&self.world, &mut self.members);
             p.sync_cables(&self.blocks, &self.members, &mut self.cables);
@@ -1721,6 +1738,9 @@ impl Game {
                         burn.push(i);
                     }
                 }
+            }
+            if self.kids.kid.as_ref().map_or(false, |k| (k.centre() - c).length() < r as f32 * 1.6 + 12.0) {
+                self.kids.ouch(kid::Hit::Blast);
             }
             for car in &mut self.cars {
                 if (car.p - c).length() < r as f32 * 1.4 && car.fate == Fate::Driving {
@@ -1809,6 +1829,29 @@ impl Game {
         }
     }
 
+    /// The little boy: what he can see for his remarks, and the cars that run into him.
+    fn update_kid(&mut self, dt: f32) {
+        let at = self.kids.kid.as_ref().map(|k| k.centre());
+        let sights = kid::Sights {
+            whale: self.whales.whale.as_ref().map_or(false, |w| w.sink() < 0.0),
+            plane: self.planes.plane.is_some(),
+            truck: self.trucks.truck.is_some(),
+            fireworks: self.fireworks.active(),
+            cars: self.cars.iter().filter(|c| c.fate == Fate::Driving).count(),
+            blocks: self.blocks.len(),
+            night: backdrop::daylight(self.world.phase()) < 0.3,
+            temp_c: at.map_or(15.0, |p| self.world.temp_c(p.x as i32, p.y as i32)),
+        };
+        self.kids.update(dt, &self.world, &sights);
+        if let Some(p) = at {
+            let car = self.cars.iter().any(|c| c.fate == Fate::Driving && (c.p - p).length() < 14.0 && c.v.length() > 0.3);
+            let truck = self.trucks.truck.as_ref().map_or(false, |t| (vec2(t.x, t.y - 8.0) - p).length() < 18.0);
+            if car || truck {
+                self.kids.ouch(kid::Hit::Car);
+            }
+        }
+    }
+
     // ----- drawing ----------------------------------------------------------
 
     /// The just-for-fun visitors (Beluga, whale, fire engine...), drawn over the world in every
@@ -1817,6 +1860,7 @@ impl Game {
         self.planes.draw(view, self.time);
         self.whales.draw(view);
         self.trucks.draw(view, self.time);
+        self.kids.draw(view, self.time);
     }
 
     fn draw_scene(&mut self, view: View, renderer: &mut Renderer, ui: &mut Ui) {
@@ -1894,6 +1938,8 @@ impl Game {
         if self.mode == ViewMode::Wind {
             self.draw_wind_field(view);
         }
+        // What the little boy says, over the night and the science views so it can be read.
+        self.kids.draw_bubble(view, ui);
 
         // Cursor preview.
         let over_ui = ui.over_ui();
@@ -3669,6 +3715,13 @@ async fn main() {
             if (320..=340).contains(&frame) && frame % 10 == 0 && args.iter().any(|a| a == "--fireworks") {
                 game.fireworks.launch(vec2(260.0 + (frame - 320) as f32 * 20.0, 430.0), 3);
                 game.fireworks.update(0.4);
+            }
+            // `--kid x[,act]`: the little boy at x, doing act (walk, wave, jump, flip, wheel, ouch).
+            if frame == 357 {
+                if let Some(v) = arg("--kid") {
+                    let (x, act) = v.split_once(',').unwrap_or((v.as_str(), "walk"));
+                    game.kids.demo(&game.world, x.parse().unwrap_or(400.0), act);
+                }
             }
             if frame == 240 && args.iter().any(|a| a == "--whale") {
                 game.whales.summon(&game.world);
