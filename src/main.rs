@@ -28,7 +28,7 @@ use blocks::{anchor_world, block_at, clip, node_at, placement_ok, snap, stamp_al
 use car::{collide_cars, Car, Fate, ModelKind, Tuning};
 use macroquad::prelude::*;
 use render::{RenderMode, cable_preview, draw_block, draw_block_shape, draw_booms, draw_cable, draw_car, draw_flag, draw_member, draw_spring, draw_spring_between, Boom, LiveBolt, Renderer, View, BOLT_LIFE};
-use science::{info, mat_color, MATTERS, RECIPES};
+use science::{info, mat_color, palette_info, MATTERS, RECIPES};
 use mech::{GearSize, Mechanism};
 use mechgame::MechDraft;
 use sound::{Ev, Mix, Sounds};
@@ -75,6 +75,8 @@ enum PaintMode {
 #[derive(Clone, Copy, PartialEq)]
 enum Tool {
     Mat(Mat),
+    /// Plants a whole tree (the wood matter's second state in the palette).
+    Tree,
     Block(BlockKind),
     Cable(CableMat),
     Spring(SpringKind),
@@ -1337,7 +1339,7 @@ impl Game {
         ];
         for (i, k) in digits.iter().enumerate() {
             if is_key_pressed(*k) {
-                self.tool = Tool::Mat(MATTERS[i].states[self.matter_state[i]]);
+                self.tool = matter_tool(MATTERS[i].states[self.matter_state[i]]);
                 self.tab = Tab::Matter;
             }
         }
@@ -1467,7 +1469,16 @@ impl Game {
                         PaintRule::Only(self.only_target)
                     }
                 };
+                if click && m == Mat::Wood {
+                    // Each stroke of wood is a log of its own.
+                    self.world.new_log();
+                }
                 self.world.line_rule(from, g, self.brush, m, rule);
+            }
+            Tool::Tree if click => {
+                if !self.world.plant_tree(g.0, g.1, self.brush as f32 / 20.0) {
+                    self.say("Pas de place pour un arbre ici : il lui faut un sol dégagé.".to_string());
+                }
             }
             Tool::Block(k) if click => self.place_block(k, at),
             Tool::Cable(m) if click => self.cable_click(m, at),
@@ -2702,20 +2713,26 @@ impl Game {
         for (i, matter) in MATTERS.iter().enumerate() {
             let r = Self::tile_rect(i, 3, grid_top, 48.0);
             let m = matter.states[self.matter_state[i]];
-            let inf = info(m);
+            let inf = palette_info(m);
             let col = mat_color(m);
             let many = matter.states.len() > 1;
             let arrow = Rect::new(r.x + r.w - 25.0, r.y + 4.0, 21.0, 18.0);
             let on_arrow = many && ui.hover(arrow);
             if ui.hover(r) && menu.is_none_or(|(_, mr)| !ui.hover(mr)) {
                 let mut fact = inf.fact.to_string();
-                if many {
+                if matter.states.contains(&Mat::Trunk) {
+                    fact = format!("{fact} Petite flèche du bouton : une bûche ou un arbre entier.");
+                } else if many {
                     let names: Vec<&str> = matter.states.iter().map(|s| info(*s).name).collect();
                     fact = format!("{fact} Ses états : {} (petite flèche du bouton). La chaleur et le froid la font passer de l'un à l'autre.", names.join(", "));
                 }
                 self.hover_info = Some((format!("{} · {}", inf.name, inf.state), fact));
             }
-            let clicked = ui.tile(r, inf.name, self.tool == Tool::Mat(m), |s| {
+            let clicked = ui.tile(r, inf.name, self.tool == matter_tool(m), |s| {
+                if m == Mat::Trunk {
+                    draw_tree_icon(s);
+                    return;
+                }
                 rrect(s, 7.0, col);
                 rrect(Rect::new(s.x, s.y, s.w, s.h * 0.4), 7.0, Color::new(1.0, 1.0, 1.0, 0.18));
                 if matches!(m, Mat::Fire | Mat::Lava | Mat::Molten | Mat::MoltenSteel) {
@@ -2738,7 +2755,7 @@ impl Game {
                     arrow_hit = true;
                     self.matter_menu = if self.matter_menu == Some(i) { None } else { Some(i) };
                 } else {
-                    self.tool = Tool::Mat(m);
+                    self.tool = matter_tool(m);
                 }
             }
         }
@@ -2752,21 +2769,26 @@ impl Game {
             let w = (mr.w - 6.0 * (n as f32 + 1.0)) / n as f32;
             for (k, st) in matter.states.iter().enumerate() {
                 let cr = Rect::new(mr.x + 6.0 + k as f32 * (w + 6.0), mr.y + 6.0, w, mr.h - 12.0);
-                let inf = info(*st);
+                let inf = palette_info(*st);
                 let hot = ui.hover(cr);
                 let chosen = self.matter_state[i] == k;
                 rrect(cr, 7.0, if hot { TILE_HOT } else { TILE });
                 if chosen {
                     ui::rrect_lines(cr, 7.0, 2.0, ACCENT);
                 }
-                rrect(Rect::new(cr.x + 5.0, cr.y + 5.0, cr.w - 10.0, 12.0), 4.0, mat_color(*st));
+                let swatch = Rect::new(cr.x + 5.0, cr.y + 5.0, cr.w - 10.0, 12.0);
+                if *st == Mat::Trunk {
+                    draw_tree_icon(Rect::new(swatch.x + swatch.w / 2.0 - 9.0, swatch.y - 2.0, 18.0, 16.0));
+                } else {
+                    rrect(swatch, 4.0, mat_color(*st));
+                }
                 let size = ui.fit_size(inf.name, cr.w - 4.0).min(14);
                 ui.text_center(inf.name, cr.x + cr.w / 2.0, cr.y + cr.h - 6.0, size, if chosen { ACCENT } else { TEXT });
                 if hot {
                     self.hover_info = Some((format!("{} · {}", inf.name, inf.state), inf.fact.to_string()));
                     if ui.pressed {
                         self.matter_state[i] = k;
-                        self.tool = Tool::Mat(*st);
+                        self.tool = matter_tool(*st);
                         self.matter_menu = None;
                     }
                 }
@@ -3598,6 +3620,40 @@ fn demo_scene(g: &mut Game, biome: Biome) {
 /// pours back in), the right one with the tunnel tool (the vault holds), then the world runs.
 /// Liquids under pressure: two vessels of water joined at the bottom, a siphon draining a tank
 /// over a crest into a basin, and a U-tube of oil.
+/// Trees planted from the palette, and logs painted in the air: each falls as one piece and they
+/// pile up instead of melting into one another or into the ground.
+fn demo_logs(g: &mut Game) {
+    g.empty_world();
+    g.blocks.clear();
+    g.cables.clear();
+    g.members.clear();
+    let ground = 430;
+    for x in 0..W as i32 {
+        for y in ground..H as i32 {
+            g.world.set(x, y, if y < ground + 3 { Mat::Grass } else if y < ground + 20 { Mat::Dirt } else { Mat::Stone });
+        }
+    }
+    // A rock wall: a log painted against its side does not stick to it.
+    for x in 640..700 {
+        for y in 330..ground {
+            g.world.set(x, y, Mat::Stone);
+        }
+    }
+    for x in [140, 330, 860] {
+        g.world.plant_tree(x, 0, 0.6);
+    }
+    for (k, (x, len)) in [(500, 80), (512, 56), (494, 64), (506, 40)].into_iter().enumerate() {
+        g.world.new_log();
+        let y = ground - 60 - k as i32 * 26;
+        g.world.line((x - len / 2, y), (x + len / 2, y), 3, Mat::Wood);
+    }
+    g.world.new_log();
+    g.world.line((703, 300), (740, 300), 3, Mat::Wood);
+    // A standing log, painted upright.
+    g.world.new_log();
+    g.world.line((580, ground - 120), (580, ground - 80), 3, Mat::Wood);
+}
+
 fn demo_siphon(g: &mut Game) {
     g.empty_world();
     let rect = |g: &mut Game, x0: i32, y0: i32, x1: i32, y1: i32, m: Mat| {
@@ -3796,6 +3852,26 @@ fn demo_pipes(g: &mut Game) {
 }
 
 /// A little car, `s` times its natural size, centred on `c`.
+/// The tool a state of the palette picks: the trunk stands for a whole tree.
+fn matter_tool(m: Mat) -> Tool {
+    if m == Mat::Trunk {
+        Tool::Tree
+    } else {
+        Tool::Mat(m)
+    }
+}
+
+/// A little tree on a strip of grass, for the palette.
+fn draw_tree_icon(s: Rect) {
+    rrect(s, 7.0, Color::from_rgba(120, 170, 220, 255));
+    rrect(Rect::new(s.x, s.y + s.h * 0.8, s.w, s.h * 0.2), 7.0, Color::from_rgba(88, 172, 64, 255));
+    let cx = s.x + s.w * 0.5;
+    let trunk = mat_color(Mat::Trunk);
+    draw_rectangle(cx - s.w * 0.05, s.y + s.h * 0.4, s.w * 0.1, s.h * 0.42, trunk);
+    draw_circle(cx, s.y + s.h * 0.36, s.h * 0.27, Color::from_rgba(52, 140, 60, 255));
+    draw_circle(cx, s.y + s.h * 0.38, s.h * 0.08, mat_color(Mat::Branch));
+}
+
 fn draw_car_icon(c: Vec2, col: Color, s: f32) {
     rrect(Rect::new(c.x - 17.0 * s, c.y - 2.0 * s, 34.0 * s, 10.0 * s), 3.0, col);
     rrect(Rect::new(c.x - 11.0 * s, c.y - 10.0 * s, 18.0 * s, 10.0 * s), 3.0, col);
@@ -3903,7 +3979,7 @@ async fn main() {
         if let Some(i) = arg("--states").and_then(|v| v.parse::<usize>().ok()).filter(|&i| i < MATTERS.len()) {
             game.tab = Tab::Matter;
             game.matter_menu = Some(i);
-            game.tool = Tool::Mat(MATTERS[i].states[MATTERS[i].default]);
+            game.tool = matter_tool(MATTERS[i].states[MATTERS[i].default]);
         }
         if args.iter().any(|a| a == "--tunnel") {
             demo_tunnel(&mut game);
@@ -3913,6 +3989,9 @@ async fn main() {
         }
         if args.iter().any(|a| a == "--siphon") {
             demo_siphon(&mut game);
+        }
+        if args.iter().any(|a| a == "--logs") {
+            demo_logs(&mut game);
         }
         if args.iter().any(|a| a == "--lava") {
             demo_lava(&mut game);

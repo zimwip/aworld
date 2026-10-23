@@ -17,7 +17,7 @@ pub fn info(m: Mat) -> Info {
         Mat::Fire => ("Feu", "flamme", "Environ 650 °C. Il brûle le bois et chauffe tout autour. Il lui faut de l'air : enfermé, il remplit l'air de fumée et s'étouffe."),
         Mat::Steam => ("Vapeur", "gaz", "Eau chauffée à plus de 100 °C : elle prend bien plus de place que l'eau. Enfermée, elle pousse (chaudière, moteur à vapeur). Refroidie, c'est de la vapeur d'eau : plus légère que l'air sec, elle monte. Arrivée à son point de rosée (plus haut quand elle est dense), elle se condense en nuage et rend la chaleur qui l'avait fait bouillir."),
         Mat::Iron => ("Fer", "solide", "Rouille dans l'eau. Avec du carbone et de la chaleur, il devient de l'acier. Chauffé, il rougit vers 500 °C, jaunit, puis fond vers 900 °C."),
-        Mat::Wood => ("Bois", "solide", "Brûle vers 300 °C s'il a de l'air, et laisse de la cendre. Chauffé sans air (couvert de terre), il devient du charbon de bois."),
+        Mat::Wood => ("Bois", "solide", "Chaque coup de pinceau fait une bûche : un bloc rigide qui tombe d'une pièce et repose sur ce qui est dessous, sans se coller au reste. Brûle vers 300 °C s'il a de l'air, et laisse de la cendre. Chauffé sans air (couvert de terre), il devient du charbon de bois."),
         Mat::Stone => ("Pierre", "solide", "Fond vers 540 °C. Le gel et le dégel l'effritent en sable."),
         Mat::Brick => ("Brique", "solide", "Brique de plastique emboîtable."),
         Mat::Clay => ("Argile", "solide", "Terre grasse. Cuite dans un feu vers 550 °C, elle devient de la terre cuite."),
@@ -56,6 +56,18 @@ pub fn info(m: Mat) -> Info {
     Info { name, state, fact }
 }
 
+/// How the palette names a state: as `info`, except the trunk, which plants a whole tree.
+pub fn palette_info(m: Mat) -> Info {
+    match m {
+        Mat::Trunk => Info {
+            name: "Arbre",
+            state: "plante",
+            fact: "Un clic plante un arbre adulte (tronc, branches et feuillage) sur le sol sous la souris. Le pinceau plus gros le fait plus grand. Il boit l'eau du sol, brûle comme du bois, et les voitures passent à travers.",
+        },
+        _ => info(m),
+    }
+}
+
 /// A matter as the palette shows it: one button, with its states (solid, powder, liquid, gas)
 /// behind a little arrow. The button paints `states[default]` until another state is picked.
 /// Heat and cold move a cell from one state to the next by themselves (see `thermal::phase`).
@@ -73,7 +85,8 @@ pub const MATTERS: [Matter; 19] = [
     Matter { states: &[Mat::Ice, Mat::Snow, Mat::Water, Mat::Steam], default: 2 },
     one(&[Mat::Dirt]),
     one(&[Mat::Seed]),
-    one(&[Mat::Wood]),
+    // Wood: a log, or behind the arrow a whole tree (its trunk stands for it in the palette).
+    Matter { states: &[Mat::Wood, Mat::Trunk], default: 0 },
     one(&[Mat::Stone, Mat::Lava]),
     one(&[Mat::Iron, Mat::Molten]),
     one(&[Mat::Steel, Mat::MoltenSteel]),
