@@ -6,6 +6,7 @@ use crate::world::sleep::{CH, CS, CW};
 use crate::world::{Kind, Mat, World, H, W};
 use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation, PipelineParams};
 use macroquad::prelude::*;
+use rayon::prelude::*;
 
 /// Where the world sits on screen.
 #[derive(Clone, Copy)]
@@ -387,7 +388,8 @@ const CLOUD_PASS: f32 = 0.26;
 pub fn light_map(world: &World, out: &mut [[u8; 4]]) {
     let shadow = cloud_shadow(world);
     let mut glows = vec![0u8; LW * LH];
-    for ty in 0..LH {
+    // (A row of squares per task, side by side.)
+    out[..LW * LH].par_chunks_mut(LW).zip(glows.par_chunks_mut(LW)).enumerate().for_each(|(ty, (out, glows))| {
         for tx in 0..LW {
             let (mut glow, mut heat, mut fire) = (0.0f32, 0.0f32, 0.0f32);
             for y in ty * LS..(ty + 1) * LS {
@@ -407,10 +409,10 @@ pub fn light_map(world: &World, out: &mut [[u8; 4]]) {
             }
             let soft = |v: f32, k: f32| (255.0 * (1.0 - (-v / k).exp())) as u8;
             // Above a flame the air is hot too, even before the simulation has warmed it.
-            out[ty * LW + tx] = [soft(fire, 4.0), soft(heat + glow * 0.5, 10.0), (shadow[ty * LW + tx] * 255.0) as u8, 255];
-            glows[ty * LW + tx] = soft(glow, 5.0);
+            out[tx] = [soft(fire, 4.0), soft(heat + glow * 0.5, 10.0), (shadow[ty * LW + tx] * 255.0) as u8, 255];
+            glows[tx] = soft(glow, 5.0);
         }
-    }
+    });
     night_pool(&glows, out);
 }
 
@@ -1463,6 +1465,11 @@ mod bench {
         };
         let mut light = vec![[0u8; 4]; LW * LH];
         time("carte de lumière", &mut || light_map(&w, &mut light));
+        time("  dont ombre des nuages", &mut || {
+            let _ = cloud_shadow(&w);
+        });
+        let glows = vec![9u8; LW * LH];
+        time("  dont halo de nuit", &mut || night_pool(&glows, &mut light));
         let mut px = vec![[0u8; 4]; W * H];
         time("recoloriage complet (normal)", &mut || {
             for (i, p) in px.iter_mut().enumerate() {

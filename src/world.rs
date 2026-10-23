@@ -15,6 +15,7 @@ mod thermal;
 mod storm;
 mod statics;
 pub mod prof;
+mod par;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]
@@ -575,6 +576,10 @@ pub struct World {
     /// A fingerprint of the anchored cells when their sections were last checked: they are only
     /// checked again once something changed.
     strain_key: u64,
+    /// The sections of each anchored body by a fingerprint of its cells, and a scratch map of
+    /// cells to their place in the order of the supports (see `statics::stress_pass`).
+    stress_cache: std::collections::HashMap<u64, std::sync::Arc<statics::BodyStress>>,
+    stress_pos: Vec<u32>,
     ticks: u32,
     /// Which log each cell of wood belongs to: every stroke of the wood brush is one log, a rigid
     /// body of its own that rests on what is under it but never sticks to anything else (see
@@ -671,6 +676,11 @@ pub struct World {
     /// Electric charge held in the ground and the things on it, one value per `QS`×`QS` square:
     /// what a charged cloud draws up under it, and what a bolt leaves behind (see `storm.rs`).
     pub mcharge: Vec<f32>,
+    /// How strongly the iron of each `QS`×`QS` square is magnetised (by the current of a bolt).
+    pub magnet: Vec<f32>,
+    /// The opposite charge a charged square draws into the matter round it (influence), worked
+    /// out afresh each storm step from `mcharge`.
+    pub polar: Vec<f32>,
     /// Bolts of lightning since they were last read. For the picture and the thunder.
     pub bolts: Vec<Bolt>,
     storm_rng: storm::StormRng,
@@ -710,6 +720,8 @@ impl World {
             level: vec![u32::MAX; W * H],
             strain: vec![0; W * H],
             strain_key: 0,
+            stress_cache: std::collections::HashMap::new(),
+            stress_pos: Vec::new(),
             ticks: 0,
             log: vec![0; W * H],
             paint_log: 0,
@@ -761,6 +773,8 @@ impl World {
             zones: sleep::Zones::new(),
             charge: vec![0.0; QW * QH],
             mcharge: vec![0.0; QW * QH],
+            magnet: vec![0.0; QW * QH],
+            polar: vec![0.0; QW * QH],
             bolts: Vec::new(),
             storm_rng: storm::StormRng(0x9e37_79b9),
             prof: prof::Profile::default(),
@@ -783,6 +797,8 @@ impl World {
         self.revision += 1;
         self.charge.fill(0.0);
         self.mcharge.fill(0.0);
+        self.magnet.fill(0.0);
+        self.polar.fill(0.0);
         self.cells.fill(EMPTY);
         self.log.fill(0);
         self.ejecta.clear();
@@ -1510,7 +1526,9 @@ impl World {
                     }
                     match c.m {
                         Mat::Rust => {
-                            self.step_powder(x, y);
+                            if !self.magnet_holds(x, y) {
+                                self.step_powder(x, y);
+                            }
                         }
                         Mat::Sand | Mat::Mud => self.step_sediment(x, y),
                         Mat::Dirt => self.step_dirt(x, y),
