@@ -26,11 +26,11 @@ use blocks::{anchor_world, block_at, clip, node_at, placement_ok, snap, stamp_al
 use car::{collide_cars, Car, Fate, ModelKind, Tuning};
 use macroquad::prelude::*;
 use render::{RenderMode, cable_preview, draw_block, draw_block_shape, draw_booms, draw_cable, draw_car, draw_flag, draw_member, draw_spring, draw_spring_between, Boom, Renderer, View};
-use science::{info, mat_color, RECIPES};
+use science::{info, mat_color, MATTERS, RECIPES};
 use mech::{GearSize, Mechanism};
 use mechgame::MechDraft;
 use sound::{Ev, Mix, Sounds};
-use ui::{draw_icon, rrect, Icon, Ui, ACCENT, BG, BLUE, DIM, GREEN, PANEL, RED, TEXT};
+use ui::{draw_icon, rrect, Icon, Ui, ACCENT, BG, BLUE, DIM, GREEN, PANEL, RED, TEXT, TILE, TILE_HOT};
 use world::{Biome, Cell, Mat, PaintRule, Season, World, H, W};
 
 /// Simulation steps per second at speed x1 (the rigid bodies use the same 1/60 s step).
@@ -98,10 +98,6 @@ enum Tool {
     Exit,
 }
 
-const MATTER: [Mat; 23] = [
-    Mat::Sand, Mat::Water, Mat::Dirt, Mat::Grass, Mat::Seed, Mat::Wood, Mat::Stone, Mat::Iron, Mat::Steel, Mat::Glass,
-    Mat::Ash, Mat::Charcoal, Mat::Rust, Mat::Ice, Mat::Snow, Mat::Fire, Mat::Lava, Mat::Steam, Mat::Cloud, Mat::Saltpeter, Mat::Gunpowder, Mat::Clay, Mat::Terracotta,
-];
 
 fn window_conf() -> Conf {
     Conf {
@@ -250,6 +246,10 @@ struct Game {
     /// How the brush treats existing material, and the material "only" mode targets.
     paint_mode: PaintMode,
     only_target: Mat,
+    /// The state each matter of the palette paints (an index into its states), and the matter
+    /// whose states are shown under its button (the little arrow).
+    matter_state: [usize; MATTERS.len()],
+    matter_menu: Option<usize>,
     /// 0 = palette tucked away, 1 = fully out.
     views_open: f32,
     views_pin: bool,
@@ -363,6 +363,8 @@ impl Game {
             mode: ViewMode::Normal,
             paint_mode: PaintMode::Add,
             only_target: Mat::Empty,
+            matter_state: MATTERS.map(|m| m.default),
+            matter_menu: None,
             views_open: 0.0,
             views_pin: false,
             views_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
@@ -1306,7 +1308,7 @@ impl Game {
         ];
         for (i, k) in digits.iter().enumerate() {
             if is_key_pressed(*k) {
-                self.tool = Tool::Mat(MATTER[i]);
+                self.tool = Tool::Mat(MATTERS[i].states[self.matter_state[i]]);
                 self.tab = Tab::Matter;
             }
         }
@@ -2449,25 +2451,95 @@ impl Game {
             }
         }
         let grid_top = top + 34.0 + 30.0;
-        for (i, m) in MATTER.iter().enumerate() {
+        // The states of the matter whose arrow was clicked, in a strip under its button. It is
+        // drawn over the buttons below, so they must not take its clicks.
+        let menu = self.matter_menu.map(|i| {
             let r = Self::tile_rect(i, 3, grid_top, 48.0);
-            let inf = info(*m);
-            let col = mat_color(*m);
-            let hot = ui.hover(r);
-            if hot {
-                self.hover_info = Some((format!("{} · {}", inf.name, inf.state), inf.fact.to_string()));
+            (i, Rect::new(6.0, r.y + r.h + 2.0, PANEL_W - 12.0, 50.0))
+        });
+        let pressed = ui.pressed;
+        if menu.is_some_and(|(_, mr)| ui.hover(mr)) {
+            ui.pressed = false;
+        }
+        let mut arrow_hit = false;
+        for (i, matter) in MATTERS.iter().enumerate() {
+            let r = Self::tile_rect(i, 3, grid_top, 48.0);
+            let m = matter.states[self.matter_state[i]];
+            let inf = info(m);
+            let col = mat_color(m);
+            let many = matter.states.len() > 1;
+            let arrow = Rect::new(r.x + r.w - 25.0, r.y + 4.0, 21.0, 18.0);
+            let on_arrow = many && ui.hover(arrow);
+            if ui.hover(r) && menu.is_none_or(|(_, mr)| !ui.hover(mr)) {
+                let mut fact = inf.fact.to_string();
+                if many {
+                    let names: Vec<&str> = matter.states.iter().map(|s| info(*s).name).collect();
+                    fact = format!("{fact} Ses états : {} (petite flèche du bouton). La chaleur et le froid la font passer de l'un à l'autre.", names.join(", "));
+                }
+                self.hover_info = Some((format!("{} · {}", inf.name, inf.state), fact));
             }
-            if ui.tile(r, inf.name, self.tool == Tool::Mat(*m), |s| {
+            let clicked = ui.tile(r, inf.name, self.tool == Tool::Mat(m), |s| {
                 rrect(s, 7.0, col);
                 rrect(Rect::new(s.x, s.y, s.w, s.h * 0.4), 7.0, Color::new(1.0, 1.0, 1.0, 0.18));
-                if matches!(m, Mat::Fire | Mat::Lava) {
+                if matches!(m, Mat::Fire | Mat::Lava | Mat::Molten | Mat::MoltenSteel) {
                     draw_circle(s.x + s.w * 0.5, s.y + s.h * 0.5, s.h * 0.32, Color::new(1.0, 0.9, 0.3, 0.55));
                 }
-            }) {
-                self.tool = Tool::Mat(*m);
+            });
+            if many {
+                let open = self.matter_menu == Some(i);
+                rrect(arrow, 5.0, if open { ACCENT } else if on_arrow { Color::new(0.0, 0.0, 0.0, 0.7) } else { Color::new(0.0, 0.0, 0.0, 0.45) });
+                let (c, h) = (vec2(arrow.x + arrow.w / 2.0, arrow.y + arrow.h / 2.0), 4.5);
+                let fg = if open { BG } else { TEXT };
+                if open {
+                    draw_triangle(vec2(c.x - h, c.y + h * 0.5), vec2(c.x + h, c.y + h * 0.5), vec2(c.x, c.y - h * 0.6), fg);
+                } else {
+                    draw_triangle(vec2(c.x - h, c.y - h * 0.5), vec2(c.x + h, c.y - h * 0.5), vec2(c.x, c.y + h * 0.6), fg);
+                }
+            }
+            if clicked {
+                if on_arrow {
+                    arrow_hit = true;
+                    self.matter_menu = if self.matter_menu == Some(i) { None } else { Some(i) };
+                } else {
+                    self.tool = Tool::Mat(m);
+                }
             }
         }
-        let rows = MATTER.len().div_ceil(3);
+        ui.pressed = pressed;
+        if let Some((i, mr)) = menu {
+            let matter = &MATTERS[i];
+            rrect(Rect::new(mr.x, mr.y + 2.0, mr.w, mr.h), 10.0, Color::new(0.0, 0.0, 0.0, 0.45));
+            rrect(mr, 10.0, PANEL);
+            ui::rrect_lines(mr, 10.0, 2.0, ACCENT);
+            let n = matter.states.len();
+            let w = (mr.w - 6.0 * (n as f32 + 1.0)) / n as f32;
+            for (k, st) in matter.states.iter().enumerate() {
+                let cr = Rect::new(mr.x + 6.0 + k as f32 * (w + 6.0), mr.y + 6.0, w, mr.h - 12.0);
+                let inf = info(*st);
+                let hot = ui.hover(cr);
+                let chosen = self.matter_state[i] == k;
+                rrect(cr, 7.0, if hot { TILE_HOT } else { TILE });
+                if chosen {
+                    ui::rrect_lines(cr, 7.0, 2.0, ACCENT);
+                }
+                rrect(Rect::new(cr.x + 5.0, cr.y + 5.0, cr.w - 10.0, 12.0), 4.0, mat_color(*st));
+                let size = ui.fit_size(inf.name, cr.w - 4.0).min(14);
+                ui.text_center(inf.name, cr.x + cr.w / 2.0, cr.y + cr.h - 6.0, size, if chosen { ACCENT } else { TEXT });
+                if hot {
+                    self.hover_info = Some((format!("{} · {}", inf.name, inf.state), inf.fact.to_string()));
+                    if ui.pressed {
+                        self.matter_state[i] = k;
+                        self.tool = Tool::Mat(*st);
+                        self.matter_menu = None;
+                    }
+                }
+            }
+            // A click anywhere else closes the strip.
+            if ui.pressed && !arrow_hit && !ui.hover(mr) {
+                self.matter_menu = None;
+            }
+        }
+        let rows = MATTERS.len().div_ceil(3);
         self.unlimited_toggles(ui, grid_top + rows as f32 * 54.0 + 2.0);
     }
 
@@ -3395,6 +3467,12 @@ async fn main() {
         game.climate_menu = args.iter().any(|a| a == "--climate");
         game.player_pin = args.iter().any(|a| a == "--player");
         game.tool = if args.iter().any(|a| a == "--loupe") { Tool::Loupe } else { Tool::Block(BlockKind::Brick) };
+        // `--states N` opens the states of the palette's matter N (1 is water).
+        if let Some(i) = arg("--states").and_then(|v| v.parse::<usize>().ok()).filter(|&i| i < MATTERS.len()) {
+            game.tab = Tab::Matter;
+            game.matter_menu = Some(i);
+            game.tool = Tool::Mat(MATTERS[i].states[MATTERS[i].default]);
+        }
     }
     // `--mouse x,y` pins the pointer for screenshots.
     let demo_mouse = arg("--mouse").and_then(|v| {

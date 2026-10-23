@@ -41,9 +41,11 @@ const C_ICE: f32 = 2.0;
 pub const LAVA_SOLID_C: f32 = 390.0;
 pub const ROCK_MELT_C: f32 = 540.0;
 pub const GLASS_C: f32 = 600.0;
-/// Metal melts only in fresh lava and sets again once it cools below this.
-pub const METAL_MELT_C: f32 = 1000.0;
-pub const METAL_SOLID_C: f32 = 850.0;
+/// Metal melts in fresh lava or at the heart of a closed charcoal forge, and sets again once it
+/// cools below `METAL_SOLID_C`. (Real iron melts at 1538 °C; the game squeezes the hot end of the
+/// scale the same way for rock and sand, so that a forge can get there.)
+pub const METAL_MELT_C: f32 = 900.0;
+pub const METAL_SOLID_C: f32 = 820.0;
 pub const STEEL_C: f32 = 400.0;
 /// Clay turns to terracotta once it has been this hot.
 pub const KILN_C: f32 = 550.0;
@@ -168,7 +170,7 @@ fn props(m: Mat) -> (f32, f32) {
         Mat::Iron | Mat::Steel => (0.5, 2.5),
         Mat::Glass | Mat::Shard => (0.08, 3.0),
         Mat::Lava => (0.2, 400.0),
-        Mat::Molten => (0.5, 300.0),
+        Mat::Molten | Mat::MoltenSteel => (0.5, 300.0),
         Mat::Fire => (0.4, 1.0),
         Mat::Ember => (0.25, 1.0),
         Mat::Gunpowder | Mat::Saltpeter | Mat::Ash | Mat::Rust => (0.04, 1.2),
@@ -192,7 +194,7 @@ fn tables() -> &'static Tables {
             t.inv_c[m as usize] = 1.0 / c;
             t.reactive[m as usize] = matches!(
                 m,
-                Mat::Water | Mat::Ice | Mat::Snow | Mat::Hail | Mat::Steam | Mat::Lava | Mat::Molten | Mat::Stone | Mat::Sand
+                Mat::Water | Mat::Ice | Mat::Snow | Mat::Hail | Mat::Steam | Mat::Lava | Mat::Molten | Mat::MoltenSteel | Mat::Stone | Mat::Sand
                     | Mat::Shard | Mat::Glass | Mat::Rust | Mat::Iron | Mat::Steel | Mat::Wood | Mat::Trunk | Mat::Leaf | Mat::Branch | Mat::DeadLeaf
                     | Mat::Grass | Mat::Seed | Mat::Sapling | Mat::Gunpowder | Mat::Oil | Mat::Clay | Mat::Charcoal
             );
@@ -217,12 +219,26 @@ fn phase(m: Mat) -> Phase {
         // rock <-> lava
         Mat::Stone => Phase { up: Some((ROCK_MELT_C, Mat::Lava, 30)), down: None },
         Mat::Lava => Phase { up: None, down: Some((LAVA_SOLID_C, Mat::Stone, 20)) },
-        // iron and steel <-> molten metal (only fresh lava is hot enough)
-        Mat::Iron | Mat::Steel => Phase { up: Some((METAL_MELT_C, Mat::Molten, 40)), down: None },
+        // iron <-> molten iron, steel <-> molten steel (fresh lava or a closed charcoal forge)
+        Mat::Iron => Phase { up: Some((METAL_MELT_C, Mat::Molten, 40)), down: None },
         Mat::Molten => Phase { up: None, down: Some((METAL_SOLID_C, Mat::Iron, 20)) },
+        Mat::Steel => Phase { up: Some((METAL_MELT_C, Mat::MoltenSteel, 40)), down: None },
+        Mat::MoltenSteel => Phase { up: None, down: Some((METAL_SOLID_C, Mat::Steel, 20)) },
         // sand fuses into glass
         Mat::Sand | Mat::Shard => Phase { up: Some((GLASS_C, Mat::Glass, 15)), down: None },
         _ => none,
+    }
+}
+
+/// The temperature a freshly painted state starts at, when it is not the air's: a state only
+/// lasts at a temperature where it belongs (molten metal poured cold would set at once).
+pub fn paint_temp(m: Mat) -> Option<f32> {
+    match m {
+        Mat::Lava => Some(LAVA_C),
+        Mat::Molten | Mat::MoltenSteel => Some(METAL_MELT_C + 200.0),
+        Mat::Ice | Mat::Snow => Some(-15.0),
+        Mat::Steam => Some(95.0),
+        _ => None,
     }
 }
 
@@ -490,7 +506,7 @@ impl World {
                 // Flames and embers pour heat into whatever touches them.
                 let k = if mi == Mat::Fire as usize || mi == Mat::Ember as usize || mj == Mat::Fire as usize || mj == Mat::Ember as usize {
                     0.25
-                } else if mi == Mat::Lava as usize || mj == Mat::Lava as usize || mi == Mat::Molten as usize || mj == Mat::Molten as usize {
+                } else if mi == Mat::Lava as usize || mj == Mat::Lava as usize || mi == Mat::Molten as usize || mj == Mat::Molten as usize || mi == Mat::MoltenSteel as usize || mj == Mat::MoltenSteel as usize {
                     // Lava and molten metal soak into whatever they touch.
                     0.2
                 } else {
@@ -901,7 +917,7 @@ impl World {
             }
         }
         match m {
-            Mat::Water | Mat::Molten => {}
+            Mat::Water | Mat::Molten | Mat::MoltenSteel => {}
             Mat::Ice | Mat::Snow | Mat::Hail => {
                 if m == Mat::Snow && t < -2.0 {
                     // Deep, cold snow is pressed into ice (the way a glacier forms).
