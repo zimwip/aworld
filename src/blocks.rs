@@ -1,5 +1,5 @@
 //! Lego-like rigid blocks. They live outside the sand grid: while building
-//! they are plain shapes snapped to a stud grid; when the simulation runs
+//! they are plain shapes, placed freely and pulled onto their neighbours; when the simulation runs
 //! they become rapier bodies, welded to the blocks they touch.
 
 use crate::world::{Mat, World, H, W};
@@ -7,7 +7,7 @@ use macroquad::prelude::{vec2, Vec2};
 use rapier2d::prelude::*;
 use std::collections::{HashMap, HashSet};
 
-/// Size of one stud in cells; blocks snap to this grid.
+/// Size of one stud in cells.
 pub const STUD: f32 = 10.0;
 /// Cells per physics meter.
 pub const PX_PER_M: f32 = 16.0;
@@ -281,16 +281,6 @@ pub fn placement_ok(world: &World, blocks: &[Block], cand: &Block, ignore: Optio
     blocks.iter().enumerate().all(|(i, b)| Some(i) == ignore || cand.gap(b) > -0.2)
 }
 
-/// Snap a block so its corner sits on the stud grid.
-pub fn snap(kind: BlockKind, rot90: u8, mouse: Vec2) -> Vec2 {
-    let s = kind.spec();
-    let (w, h) = if rot90 % 2 == 0 { (s.w, s.h) } else { (s.h, s.w) };
-    if s.round {
-        return vec2((mouse.x / STUD).round() * STUD, (mouse.y / STUD).round() * STUD);
-    }
-    vec2(((mouse.x - w / 2.0) / STUD).round() * STUD + w / 2.0, ((mouse.y - h / 2.0) / STUD).round() * STUD + h / 2.0)
-}
-
 /// Does this kind carry studs on top (and tubes underneath), like a Lego brick?
 pub fn has_studs(kind: BlockKind) -> bool {
     matches!(kind, BlockKind::Brick | BlockKind::Long | BlockKind::Post | BlockKind::Cube | BlockKind::Glass | BlockKind::GlassHalf)
@@ -330,9 +320,6 @@ pub fn block_studs(a: &Block, b: &Block) -> u32 {
     shared_stud_points(a.kind, a.pos, a.angle, b.kind, b.pos, b.angle).len() as u32
 }
 
-/// Distance (cells) within which a block is pulled onto its neighbours.
-pub const CLIP: f32 = 6.0;
-
 fn quarter_turns(angle: f32) -> Option<i32> {
     let q = angle / std::f32::consts::FRAC_PI_2;
     ((q - q.round()).abs() < 0.02).then(|| q.round() as i32)
@@ -348,50 +335,131 @@ fn flat_half(kind: BlockKind, angle: f32) -> Option<Vec2> {
     Some(if turns.rem_euclid(2) == 0 { vec2(s.w / 2.0, s.h / 2.0) } else { vec2(s.h / 2.0, s.w / 2.0) })
 }
 
-/// Magnetic clip: pull a block flush against nearby blocks (on top, below or
-/// beside) and onto their stud grid, like Lego bricks snapping together.
-pub fn clip(blocks: &[Block], kind: BlockKind, angle: f32, pos: Vec2) -> Vec2 {
-    let Some(h) = flat_half(kind, angle) else { return pos };
-    let mut best: Option<(f32, Vec2)> = None;
-    let mut consider = |cost: f32, p: Vec2, other: &Block| {
-        // The more studs a spot would engage, the better it is: a brick settles where it grips most.
-        let studs = shared_stud_points(kind, p, angle, other.kind, other.pos, other.angle).len() as f32;
-        let cost = cost - 1.5 * studs.min(6.0);
-        if best.map_or(true, |b| cost < b.0) {
-            best = Some((cost, p));
+/// Distance (cells) within which a block is pulled onto a neighbour's edge or line.
+pub const MAGNET: f32 = 5.0;
+/// Distance (cells) within which a stacked brick is pulled onto the studs below.
+const STUD_PULL: f32 = 3.0;
+/// How far apart (cells) two blocks can be and still line up with each other.
+const ALIGN_RANGE: f32 = 60.0;
+
+/// Half-size of the box a block fills: round blocks count as their square, tilted ones have none.
+fn box_half(kind: BlockKind, angle: f32) -> Option<Vec2> {
+    let s = kind.spec();
+    if s.round {
+        return Some(vec2(s.w / 2.0, s.w / 2.0));
+    }
+    flat_half(kind, angle)
+}
+
+/// The best pull along one axis: (move, how good, lower is better).
+fn pull(best: &mut Option<(f32, f32)>, from: f32, to: f32, reach: f32, bonus: f32) {
+    let d = to - from;
+    if d.abs() < reach {
+        let cost = d.abs() - bonus;
+        if best.map_or(true, |b| cost < b.1) {
+            *best = Some((d, cost));
         }
-    };
-    // Align an edge to the neighbour's stud grid when it is close enough.
-    let stud = |edge: f32, origin: f32| {
-        let snapped = origin + ((edge - origin) / STUD).round() * STUD;
-        if (snapped - edge).abs() < CLIP { snapped } else { edge }
-    };
-    for b in blocks {
-        let Some(bh) = flat_half(b.kind, b.angle) else { continue };
-        let (bl, br, bt, bb) = (b.pos.x - bh.x, b.pos.x + bh.x, b.pos.y - bh.y, b.pos.y + bh.y);
+    }
+}
+
+/// Free placement with a magnet: the block goes where the cursor is (on whole cells), and only when
+/// it comes near another block is it pulled flush against it, onto its edges, its middle or its studs.
+pub fn magnet(blocks: &[Block], kind: BlockKind, angle: f32, at: Vec2) -> Vec2 {
+    let Some(h) = box_half(kind, angle) else { return at.round() };
+    let free = (at - h).round() + h;
+    let studded = has_studs(kind) && quarter_turns(angle) == Some(0);
+    let mut pos = free;
+    // Up and down first (resting on a block decides which studs it sits on), then sideways.
+    for vertical in [true, false] {
+        let mut best = None;
         let (l, r, t, bot) = (pos.x - h.x, pos.x + h.x, pos.y - h.y, pos.y + h.y);
-        let x_overlap = r > bl + 1.0 && l < br - 1.0;
-        let y_overlap = bot > bt + 1.0 && t < bb - 1.0;
-        if x_overlap {
-            // On top of it.
-            if (bot - bt).abs() < CLIP {
-                consider((bot - bt).abs(), vec2(stud(l, bl) + h.x, bt - h.y), b);
+        for b in blocks {
+            let Some(bh) = box_half(b.kind, b.angle) else { continue };
+            let (bl, br, bt, bb) = (b.pos.x - bh.x, b.pos.x + bh.x, b.pos.y - bh.y, b.pos.y + bh.y);
+            let (gap_x, gap_y) = ((bl - r).max(l - br), (bt - bot).max(t - bb));
+            if gap_x.max(gap_y) > ALIGN_RANGE {
+                continue;
             }
-            // Hanging below it.
-            if (t - bb).abs() < CLIP {
-                consider((t - bb).abs(), vec2(stud(l, bl) + h.x, bb + h.y), b);
+            if vertical {
+                // Flush on top of it or under it, when they are one above the other.
+                if gap_x < -1.0 {
+                    pull(&mut best, bot, bt, MAGNET, 0.5);
+                    pull(&mut best, t, bb, MAGNET, 0.5);
+                }
+                for (a, c) in [(t, bt), (bot, bb), (pos.y, b.pos.y)] {
+                    pull(&mut best, a, c, MAGNET, 0.0);
+                }
+            } else {
+                // Flush beside it, when they are side by side.
+                if gap_y < -1.0 {
+                    pull(&mut best, r, bl, MAGNET, 0.5);
+                    pull(&mut best, l, br, MAGNET, 0.5);
+                }
+                for (a, c) in [(l, bl), (r, br), (pos.x, b.pos.x)] {
+                    pull(&mut best, a, c, MAGNET, 0.0);
+                }
+                // Sitting on a brick (or under it): onto its studs, like Lego.
+                let stacked = gap_x < -1.0 && ((bot - bt).abs() < 0.01 || (t - bb).abs() < 0.01);
+                if studded && stacked && has_studs(b.kind) && quarter_turns(b.angle) == Some(0) {
+                    pull(&mut best, l, bl + ((l - bl) / STUD).round() * STUD, STUD_PULL, 0.2);
+                }
             }
         }
-        if y_overlap {
-            if (r - bl).abs() < CLIP {
-                consider((r - bl).abs(), vec2(bl - h.x, stud(t, bt) + h.y), b);
-            }
-            if (l - br).abs() < CLIP {
-                consider((l - br).abs(), vec2(br + h.x, stud(t, bt) + h.y), b);
+        if let Some((d, _)) = best {
+            if vertical {
+                pos.y += d;
+            } else {
+                pos.x += d;
             }
         }
     }
-    best.map_or(pos, |b| b.1)
+    // A pull must not push it into another block: then keep only one of the two, or none.
+    let fits = |p: Vec2| {
+        let c = Block::new(kind, p, angle);
+        blocks.iter().all(|b| c.gap(b) > -0.2)
+    };
+    [pos, vec2(free.x, pos.y), vec2(pos.x, free.y), free].into_iter().find(|p| fits(*p)).unwrap_or(pos)
+}
+
+/// The lines a block shares with its neighbours (an edge or its middle lined up, or flush against
+/// one), as world segments: drawn as faint guides while it is being placed.
+pub fn guides(blocks: &[Block], cand: &Block) -> Vec<(Vec2, Vec2)> {
+    let Some(h) = box_half(cand.kind, cand.angle) else { return vec![] };
+    let p = cand.pos;
+    let mut out = vec![];
+    for b in blocks {
+        if b.uid == cand.uid {
+            continue;
+        }
+        let Some(bh) = box_half(b.kind, b.angle) else { continue };
+        let q = b.pos;
+        let (gap_x, gap_y) = ((q.x - bh.x - p.x - h.x).max(p.x - h.x - q.x - bh.x), (q.y - bh.y - p.y - h.y).max(p.y - h.y - q.y - bh.y));
+        if gap_x.max(gap_y) > ALIGN_RANGE {
+            continue;
+        }
+        let (y0, y1) = ((p.y - h.y).min(q.y - bh.y), (p.y + h.y).max(q.y + bh.y));
+        let (x0, x1) = ((p.x - h.x).min(q.x - bh.x), (p.x + h.x).max(q.x + bh.x));
+        // Edges against edges (lined up or flush), middles against middles.
+        let lined = |a: f32, ha: f32, b: f32, hb: f32| {
+            let mut v = vec![];
+            for e in [a - ha, a + ha] {
+                if [b - hb, b + hb].iter().any(|f| (f - e).abs() < 0.01) {
+                    v.push(e);
+                }
+            }
+            if (a - b).abs() < 0.01 {
+                v.push(a);
+            }
+            v
+        };
+        for x in lined(p.x, h.x, q.x, bh.x) {
+            out.push((vec2(x, y0), vec2(x, y1)));
+        }
+        for y in lined(p.y, h.y, q.y, bh.y) {
+            out.push((vec2(x0, y), vec2(x1, y)));
+        }
+    }
+    out
 }
 
 pub fn block_at(blocks: &[Block], p: Vec2) -> Option<usize> {
@@ -2743,23 +2811,46 @@ mod tests {
     #[test]
     fn bricks_clip_onto_each_other() {
         let base = Block::new(BlockKind::Brick, vec2(100.0, 295.0), 0.0);
-        // Hovering 3 cells too high and 4 cells off the stud grid.
-        let p = clip(&[base.clone()], BlockKind::Brick, 0.0, vec2(106.0, 282.0));
-        assert!((p.y - 285.0).abs() < 1e-3, "y = {}", p.y);
-        assert!(((p.x - 100.0) % STUD).abs() < 1e-3, "x = {}", p.x);
-        // Too far away: untouched.
-        let far = clip(&[base.clone()], BlockKind::Brick, 0.0, vec2(106.0, 250.0));
-        assert_eq!(far, vec2(106.0, 250.0));
+        // Hovering 3 cells too high and 2 cells off the stud grid: it sits on it, onto the studs.
+        let p = magnet(&[base.clone()], BlockKind::Brick, 0.0, vec2(108.0, 282.0));
+        assert_eq!(p, vec2(110.0, 285.0));
         // Beside it, flush.
-        let side = clip(&[base], BlockKind::Brick, 0.0, vec2(123.0, 297.0));
+        let side = magnet(&[base], BlockKind::Brick, 0.0, vec2(123.0, 297.0));
         assert!((side.x - 120.0).abs() < 1e-3 && (side.y - 295.0).abs() < 1e-3, "{side:?}");
     }
 
     #[test]
-    fn snap_aligns_to_studs() {
-        let p = snap(BlockKind::Brick, 0, vec2(103.0, 87.0));
-        assert_eq!((p.x - 10.0) % STUD, 0.0);
-        assert_eq!((p.y - 5.0) % STUD, 0.0);
+    fn blocks_are_free_away_from_others() {
+        let base = Block::new(BlockKind::Brick, vec2(100.0, 295.0), 0.0);
+        // Nothing near: it goes where the cursor is, on whole cells, off any grid.
+        assert_eq!(magnet(&[], BlockKind::Brick, 0.0, vec2(103.4, 87.2)), vec2(103.0, 87.0));
+        let far = magnet(&[base.clone()], BlockKind::Brick, 0.0, vec2(143.0, 250.0));
+        assert_eq!(far, vec2(143.0, 250.0));
+        // Stacked, half way between two studs: it stays where it is put.
+        let half = magnet(&[base], BlockKind::Brick, 0.0, vec2(105.0, 285.0));
+        assert_eq!(half, vec2(105.0, 285.0));
+    }
+
+    #[test]
+    fn magnet_lines_up_edges_and_shows_guides() {
+        let base = Block::new(BlockKind::Long, vec2(100.0, 295.0), 0.0);
+        // Above it with a gap, its left edge 3 cells off the base's: pulled into line, not down.
+        let p = magnet(&[base.clone()], BlockKind::Brick, 0.0, vec2(93.0, 260.0));
+        assert_eq!(p, vec2(90.0, 260.0));
+        let g = guides(&[base.clone()], &Block::new(BlockKind::Brick, p, 0.0));
+        assert!(g.iter().any(|(a, b)| a.x == 80.0 && b.x == 80.0), "a guide down the shared left edge: {g:?}");
+        // Wherever the cursor is around a few blocks, the pull never pushes a block that fits into another.
+        let others = [base, Block::new(BlockKind::Post, vec2(135.0, 270.0), 0.0), Block::new(BlockKind::Brick, vec2(70.0, 262.0), 0.0)];
+        let fits = |p: Vec2| others.iter().all(|o| Block::new(BlockKind::Cube, p, 0.0).gap(o) > -0.2);
+        for y in (230..300).step_by(3) {
+            for x in (50..160).step_by(3) {
+                let at = vec2(x as f32, y as f32);
+                if fits(at) {
+                    let q = magnet(&others, BlockKind::Cube, 0.0, at);
+                    assert!(fits(q), "{at:?} -> {q:?}");
+                }
+            }
+        }
     }
 
     #[test]
