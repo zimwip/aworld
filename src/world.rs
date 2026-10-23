@@ -829,6 +829,17 @@ impl World {
         self.temp.swap(ia, ib);
         self.latent.swap(ia, ib);
         self.vel.swap(ia, ib);
+        // Grains slipping past the air (or gas) between them share its warmth on the way: hot air
+        // cannot bubble up through a heap of sand and carry the heat out of the top; it gives it
+        // to the grains it touches, and the heap warms out from where it was heated.
+        let (ma, mb) = (self.cells[ia].m, self.cells[ib].m);
+        let airy = |m: Mat| matches!(m.kind(), Kind::Empty | Kind::Gas);
+        if (ma.kind() == Kind::Powder && airy(mb)) || (mb.kind() == Kind::Powder && airy(ma)) {
+            let (ca, cb) = (thermal::cap(ma), thermal::cap(mb));
+            let t = (ca * self.temp[ia] + cb * self.temp[ib]) / (ca + cb);
+            self.temp[ia] = t;
+            self.temp[ib] = t;
+        }
         if a.1 != b.1 {
             // Vapour and clouds cool as they rise into thinner air, and warm as they sink.
             self.temp[ib] -= adiabatic_cooling_c(self.cells[ib].m, a.1, b.1);
@@ -3618,6 +3629,26 @@ mod tests {
     }
 
     #[test]
+    fn hot_air_slipping_up_through_falling_sand_leaves_its_heat_in_the_grains() {
+        let mut w = World::new_static();
+        w.climate_fixed = Some(-5.0);
+        w.reset_temps();
+        // A grain of cold sand over a pocket of very hot air: the grain falls through it.
+        w.set(100, 100, Mat::Sand);
+        for y in 101..104 {
+            w.temp[World::idx(100, y)] = 600.0;
+        }
+        w.set(100, 104, Mat::Stone);
+        w.swap((100, 100), (100, 103));
+        let (sand, air) = (w.temp_c(100, 103), w.temp_c(100, 100));
+        assert_eq!(w.raw(100, 103), Mat::Sand);
+        assert!(sand > 50.0, "the grain took heat from the air it fell through: {sand}");
+        assert!((air - sand).abs() < 1e-3, "and the air that slipped up left at the same temperature: {air}");
+        let total = |t_sand: f32, t_air: f32| thermal::cap(Mat::Sand) * t_sand + thermal::cap(Mat::Empty) * t_air;
+        assert!((total(sand, air) - total(-5.0, 600.0)).abs() < 1e-2, "no heat made or lost");
+    }
+
+    #[test]
     fn the_weight_of_a_pillar_fans_out_in_the_ground_instead_of_running_down_as_a_stripe() {
         let mut w = World::new_static();
         for x in 0..W as i32 {
@@ -6242,5 +6273,6 @@ mod glass {
         assert!(booms > 0);
     }
 }
+
 
 

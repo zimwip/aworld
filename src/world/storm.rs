@@ -270,10 +270,12 @@ impl World {
     }
 
     /// Lightning from the sky where the player clicked: from the cloud above (or the top of the
-    /// sky) down to the first thing under the pointer.
+    /// sky) down to the first thing in the column under the pointer. A bolt comes from the sky,
+    /// so a click deep in the ground strikes the surface above it, not a point inside the rock.
     pub fn strike(&mut self, x: i32, y: i32) {
         let x = x.clamp(0, W as i32 - 1);
-        let hit = self.first_hit(x, y.max(0)).unwrap_or(H as i32 - 1);
+        let _ = y;
+        let hit = self.first_hit(x, 0).unwrap_or(H as i32 - 1);
         // From the base of the cloud above (the first cloud from the top, down through it), or
         // else from the top of the picture. A wisp of cloud just above the ground does not count.
         let mut top = (0..hit).find(|&yy| self.raw(x, yy) == Mat::Cloud).unwrap_or(0);
@@ -513,6 +515,16 @@ mod tests {
         assert!(w.temp_c(790, 419) > 100.0, "the current runs along the iron: {}", w.temp_c(790, 419));
         let heated = (0..60).filter(|y| w.temp_c(205, 300 + y) > 500.0 || w.temp_c(195, 300 + y) > 500.0 || w.temp_c(200, 300 + y) > 500.0).count();
         assert!(heated > 0 || w.bolts[0].path.iter().any(|p| w.temp_c(p.0 as i32, p.1 as i32) > 500.0), "the channel heats the air");
+    }
+
+    #[test]
+    fn a_click_deep_in_the_ground_strikes_the_surface_above_it() {
+        let mut w = World::new_static();
+        ground(&mut w, 420);
+        w.strike(300, 500);
+        let end = w.bolts[0].path.last().unwrap();
+        assert_eq!((end.0 as i32, end.1 as i32), (300, 420), "lightning comes from the sky: it stops at the ground");
+        assert!((440..H as i32).all(|y| w.raw(300, y) == Mat::Stone), "and leaves the rock below whole");
     }
 
     #[test]
