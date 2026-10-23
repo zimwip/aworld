@@ -15,6 +15,7 @@ mod thermal;
 mod storm;
 mod statics;
 pub mod prof;
+mod par;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]
@@ -575,6 +576,10 @@ pub struct World {
     /// A fingerprint of the anchored cells when their sections were last checked: they are only
     /// checked again once something changed.
     strain_key: u64,
+    /// The sections of each anchored body by a fingerprint of its cells, and a scratch map of
+    /// cells to their place in the order of the supports (see `statics::stress_pass`).
+    stress_cache: std::collections::HashMap<u64, std::sync::Arc<statics::BodyStress>>,
+    stress_pos: Vec<u32>,
     ticks: u32,
     /// Which log each cell of wood belongs to: every stroke of the wood brush is one log, a rigid
     /// body of its own that rests on what is under it but never sticks to anything else (see
@@ -710,6 +715,8 @@ impl World {
             level: vec![u32::MAX; W * H],
             strain: vec![0; W * H],
             strain_key: 0,
+            stress_cache: std::collections::HashMap::new(),
+            stress_pos: Vec::new(),
             ticks: 0,
             log: vec![0; W * H],
             paint_log: 0,

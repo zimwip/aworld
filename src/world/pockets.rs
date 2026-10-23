@@ -196,31 +196,65 @@ impl World {
         }
         self.stack = stack;
         // What each pocket is held in: how much wall and how much liquid round it, and its
-        // weakest wall.
-        for i in 0..W * H {
-            let c = self.cls[i];
-            if c != 0 && c != 3 {
-                continue;
-            }
-            let strength = if c == 0 && self.mask[i] == 0 { wall_strength(self.cells[i].m) } else { None };
-            let x = i % W;
-            for j in [i.wrapping_sub(W), if x + 1 < W { i + 1 } else { usize::MAX }, i + W, if x > 0 { i - 1 } else { usize::MAX }] {
-                if j >= W * H {
-                    continue;
+        // weakest wall. Bands of rows side by side, each with its own tally, added up in the
+        // order of the bands (the first of equally weak walls stays the weakest).
+        #[derive(Clone, Copy, Default)]
+        struct Held {
+            wall_edge: u32,
+            liquid_edge: u32,
+            porous_edge: u32,
+            leaky: bool,
+            weakest: Option<(usize, f32)>,
+        }
+        // (One band per thread: each tally holds every pocket; a world riddled with tiny pockets
+        // is tallied in one go.)
+        let npockets = self.pockets.len();
+        let bands = if npockets > 20_000 { 1 } else { rayon::current_num_threads().clamp(1, 16) };
+        let band_rows = H.div_ceil(bands);
+        let tallies: Vec<Vec<Held>> = (0..bands)
+            .into_par_iter()
+            .map(|band| {
+                let mut held = vec![Held::default(); npockets];
+                for i in band * band_rows * W..((band + 1) * band_rows).min(H) * W {
+                    let c = self.cls[i];
+                    if c != 0 && c != 3 {
+                        continue;
+                    }
+                    let strength = if c == 0 && self.mask[i] == 0 { wall_strength(self.cells[i].m) } else { None };
+                    let x = i % W;
+                    for j in [i.wrapping_sub(W), if x + 1 < W { i + 1 } else { usize::MAX }, i + W, if x > 0 { i - 1 } else { usize::MAX }] {
+                        if j >= W * H {
+                            continue;
+                        }
+                        let id = self.pocket_of[j];
+                        if id == 0 {
+                            continue;
+                        }
+                        let p = &mut held[id as usize - 1];
+                        if c == 3 {
+                            p.liquid_edge += 1;
+                        } else {
+                            p.wall_edge += 1;
+                            p.leaky |= matches!(self.cells[i].m, Mat::Ember | Mat::Charcoal | Mat::Ash);
+                            p.porous_edge += (self.mask[i] == 0 && porous(self.cells[i].m)) as u32;
+                        }
+                        if let Some(s) = strength {
+                            if p.weakest.map_or(true, |w| s < w.1) {
+                                p.weakest = Some((i, s));
+                            }
+                        }
+                    }
                 }
-                let id = self.pocket_of[j];
-                if id == 0 {
-                    continue;
-                }
-                let p = &mut self.pockets[id as usize - 1];
-                if c == 3 {
-                    p.liquid_edge += 1;
-                } else {
-                    p.wall_edge += 1;
-                    p.leaky |= matches!(self.cells[i].m, Mat::Ember | Mat::Charcoal | Mat::Ash);
-                    p.porous_edge += (self.mask[i] == 0 && porous(self.cells[i].m)) as u32;
-                }
-                if let Some(s) = strength {
+                held
+            })
+            .collect();
+        for held in tallies {
+            for (p, h) in self.pockets.iter_mut().zip(held) {
+                p.wall_edge += h.wall_edge;
+                p.liquid_edge += h.liquid_edge;
+                p.porous_edge += h.porous_edge;
+                p.leaky |= h.leaky;
+                if let Some((i, s)) = h.weakest {
                     if p.weakest.map_or(true, |w| s < w.1) {
                         p.weakest = Some((i, s));
                     }
@@ -290,63 +324,80 @@ impl World {
         let rows: Vec<bool> = (0..H).map(|y| self.cls[y * W..(y + 1) * W].contains(&3)).collect();
         // Down each column from the gas above (row by row, all columns at once). NaN: no gas
         // above, only walls.
-        let mut above = vec![f32::NAN; W];
-        for y in 0..H {
-            for x in 0..W {
-                let i = y * W + x;
-                let wt = self.liq_w[i];
-                if wt > 0.0 {
-                    let p = if above[x].is_nan() { 0.0 } else { above[x] + wt };
-                    self.liq_p[i] = p;
-                    if !above[x].is_nan() {
-                        above[x] = p;
+        // (Each column on its own, the columns side by side; then each row on its own.)
+        {
+            let p = super::par::Shared::new(&mut self.liq_p);
+            let (cls, pocket_of, pockets, wt) = (&self.cls, &self.pocket_of, &self.pockets, &self.liq_w);
+            super::par::column_bands(|xs| {
+                let mut above = vec![f32::NAN; xs.len()];
+                for y in 0..H {
+                    for (a, x) in above.iter_mut().zip(xs.clone()) {
+                        let i = y * W + x;
+                        // SAFETY: a band only reaches its own columns.
+                        let p = unsafe { p.at(i) };
+                        if wt[i] > 0.0 {
+                            *p = if a.is_nan() { 0.0 } else { *a + wt[i] };
+                            if !a.is_nan() {
+                                *a = *p;
+                            }
+                        } else {
+                            *p = 1.0;
+                            *a = match (cls[i], pocket_of[i]) {
+                                (1, id) if id != 0 => pockets[id as usize - 1].pressure,
+                                _ => f32::NAN,
+                            };
+                        }
                     }
-                } else {
-                    self.liq_p[i] = 1.0;
-                    above[x] = match (self.cls[i], self.pocket_of[i]) {
-                        (1, id) if id != 0 => self.pockets[id as usize - 1].pressure,
-                        _ => f32::NAN,
-                    };
                 }
-            }
+            });
         }
         // Then shared: sideways at the same depth, down and up with the weight of each cell.
-        let (p, wt) = (&mut self.liq_p, &self.liq_w);
+        let wt = &self.liq_w;
         for _ in 0..2 {
-            for y in (0..H).filter(|&y| rows[y]) {
-                let row = y * W;
-                for i in row + 1..row + W {
+            self.liq_p.par_chunks_mut(W).enumerate().filter(|(y, _)| rows[*y]).for_each(|(y, p)| {
+                let wt = &wt[y * W..(y + 1) * W];
+                for i in 1..W {
                     if wt[i] > 0.0 && wt[i - 1] > 0.0 && p[i - 1] > p[i] {
                         p[i] = p[i - 1];
                     }
                 }
-                for i in (row..row + W - 1).rev() {
+                for i in (0..W - 1).rev() {
                     if wt[i] > 0.0 && wt[i + 1] > 0.0 && p[i + 1] > p[i] {
                         p[i] = p[i + 1];
                     }
                 }
-            }
-            for y in (1..H).filter(|&y| rows[y] && rows[y - 1]) {
-                for i in y * W..(y + 1) * W {
-                    if wt[i] > 0.0 && wt[i - W] > 0.0 {
-                        p[i] = p[i].max(p[i - W] + wt[i]);
+            });
+            let p = super::par::Shared::new(&mut self.liq_p);
+            super::par::column_bands(|xs| {
+                // SAFETY (both sweeps): a band only reaches its own columns.
+                for y in (1..H).filter(|&y| rows[y] && rows[y - 1]) {
+                    for x in xs.clone() {
+                        let i = y * W + x;
+                        if wt[i] > 0.0 && wt[i - W] > 0.0 {
+                            let up = unsafe { *p.at(i - W) };
+                            let here = unsafe { p.at(i) };
+                            *here = here.max(up + wt[i]);
+                        }
                     }
                 }
-            }
-            for y in (0..H - 1).rev().filter(|&y| rows[y] && rows[y + 1]) {
-                for i in y * W..(y + 1) * W {
-                    if wt[i] > 0.0 && wt[i + W] > 0.0 {
-                        p[i] = p[i].max(p[i + W] - wt[i + W]);
+                for y in (0..H - 1).rev().filter(|&y| rows[y] && rows[y + 1]) {
+                    for x in xs.clone() {
+                        let i = y * W + x;
+                        if wt[i] > 0.0 && wt[i + W] > 0.0 {
+                            let down = unsafe { *p.at(i + W) };
+                            let here = unsafe { p.at(i) };
+                            *here = here.max(down - wt[i + W]);
+                        }
                     }
                 }
-            }
+            });
         }
         // A liquid sealed off from any gas: as if at 1 atm (it has nowhere to go anyway).
-        for i in 0..W * H {
-            if p[i] < 1.0 && wt[i] > 0.0 {
-                p[i] = 1.0;
+        self.liq_p.par_iter_mut().zip(wt.par_iter()).for_each(|(p, &w)| {
+            if *p < 1.0 && w > 0.0 {
+                *p = 1.0;
             }
-        }
+        });
     }
 
     /// The weakest wall of a pocket under more pressure than it can hold gives way: with a bang

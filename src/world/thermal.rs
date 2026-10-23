@@ -326,13 +326,6 @@ struct Tables {
     airy: [bool; NMAT],
 }
 
-/// Columns of the temperature grid, shared out to the threads of the vertical conduction sweep.
-struct Columns(*mut f32);
-// SAFETY: each thread only reaches the columns of its own band (see `thermal_pass`).
-unsafe impl Sync for Columns {}
-/// Columns per band of that sweep.
-const COLUMN_BAND: usize = 64;
-
 /// Heat flowing between cells `i` and `j` of `temp` (made of `mi` and `mj`) during one pass.
 #[inline]
 fn conduct(temp: &mut [f32], i: usize, j: usize, mi: Mat, mj: Mat, ts: f32, lod3: bool, tb: &Tables) {
@@ -713,15 +706,14 @@ impl World {
                 }
             });
         } else {
-            let temp = Columns(self.temp.as_mut_ptr());
+            let temp = super::par::Shared::new(&mut self.temp);
             let cells = &self.cells;
-            (0..W.div_ceil(COLUMN_BAND)).into_par_iter().for_each(|band| {
-                let temp = &temp;
+            super::par::column_bands(|xs| {
                 for y in 0..H - 1 {
-                    for x in band * COLUMN_BAND..((band + 1) * COLUMN_BAND).min(W) {
+                    for x in xs.clone() {
                         let (i, j) = (y * W + x, (y + 1) * W + x);
                         // SAFETY: the bands are apart, and a band only touches its own columns.
-                        let pair = unsafe { [&mut *temp.0.add(i), &mut *temp.0.add(j)] };
+                        let pair = unsafe { [temp.at(i), temp.at(j)] };
                         conduct_pair(pair, cells[i].m, cells[j].m, ts, lod3, tb);
                     }
                 }
@@ -806,29 +798,40 @@ impl World {
         let mut from_sun = 0.0f32;
         let mut to_space = 0.0f32;
         if !fixed {
-            for x in 0..W {
-                let mut cover = 0.0f32;
-                for y in 0..H {
-                    let i = y * W + x;
-                    let m = self.cells[i].m;
-                    match m {
-                        Mat::Empty | Mat::Fire => {}
-                        Mat::Smoke => cover += 0.05,
-                        Mat::Cloud | Mat::Steam => cover += 0.2,
-                        // Embers are held at their glow by the burning (see above).
-                        Mat::Ember => break,
-                        _ => {
-                            let t = self.temp[i];
-                            let amb = row_amb[y];
-                            if t > amb {
-                                let q = (t - amb) * RADIATE_K * ts * out_gain * (1.0 - blanket * cover.min(1.0));
-                                self.temp[i] = t - q * tb.inv_c[m as usize];
-                                to_space += q;
+            // (Each column on its own, side by side; what they give off is added up in order.)
+            let mut given = [0.0f32; W];
+            let temp = super::par::Shared::new(&mut self.temp);
+            let out = super::par::Shared::new(&mut given);
+            let cells = &self.cells;
+            super::par::column_bands(|xs| {
+                for x in xs {
+                    let mut cover = 0.0f32;
+                    for y in 0..H {
+                        let i = y * W + x;
+                        let m = cells[i].m;
+                        match m {
+                            Mat::Empty | Mat::Fire => {}
+                            Mat::Smoke => cover += 0.05,
+                            Mat::Cloud | Mat::Steam => cover += 0.2,
+                            // Embers are held at their glow by the burning (see above).
+                            Mat::Ember => break,
+                            _ => {
+                                // SAFETY: a band only reaches its own columns.
+                                let t = unsafe { temp.at(i) };
+                                let amb = row_amb[y];
+                                if *t > amb {
+                                    let q = (*t - amb) * RADIATE_K * ts * out_gain * (1.0 - blanket * cover.min(1.0));
+                                    *t -= q * tb.inv_c[m as usize];
+                                    unsafe { *out.at(x) = q };
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
                 }
+            });
+            for q in given {
+                to_space += q;
             }
         }
 
@@ -1046,7 +1049,11 @@ impl World {
         // First the air is carried: each cell only reads the grid as it was (`old`), so the rows
         // of flow blocks are carried side by side.
         let (flow, cells, old_t) = (&self.flow, &self.cells, &old);
-        self.temp.par_chunks_mut(cell * W).enumerate().for_each(|(bj, band)| {
+        // Each row of blocks also lists, in order, its air cells with something beside them for
+        // the convection below, and the gust there.
+        let convective = |m: Mat| !(m == Mat::Empty || matches!(m.kind(), super::Kind::Gas | super::Kind::Flame) || matches!(m, Mat::Fire | Mat::Ember | Mat::Lava));
+        let beside: Vec<Vec<(u32, f32)>> = self.temp.par_chunks_mut(cell * W).enumerate().map(|(bj, band)| {
+            let mut beside = vec![];
             for bi in 0..fw {
                 let (vx, vy) = flow.at_cell(bi, bj);
                 let speed = vx.abs() + vy.abs();
@@ -1062,6 +1069,7 @@ impl World {
                 let c = [corner(0, 0), corner(cell as i32, 0), corner(0, cell as i32), corner(cell as i32, cell as i32)];
                 let spread = c.iter().map(|w| (w.0 - c[0].0).abs() + (w.1 - c[0].1).abs()).fold(0.0f32, f32::max);
                 let fine = spread * reach > 2.0 || (vx.abs().max(vy.abs()) * reach) > 10.0;
+                let gust = speed.min(1.5) * 0.02;
                 let (ox, oy) = (-vx * reach, -vy * reach);
                 let (ix, iy) = (ox.floor(), oy.floor());
                 let (tx, ty) = (ox - ix, oy - iy);
@@ -1099,40 +1107,29 @@ impl World {
                                 }
                             }
                         }
+                        if [i + 1, i.wrapping_sub(1), i + W, i.wrapping_sub(W)].iter().any(|&j| j < W * H && convective(cells[j].m)) {
+                            beside.push((i as u32, gust));
+                        }
                     }
                 }
             }
-        });
+            beside
+        }).collect();
         // Then convection: the moving air also cools or warms the solid or liquid beside it.
         // A solid cell can lie between two rows of blocks, so this part goes in order.
-        for bj in 0..super::flow::FH {
-            for bi in 0..fw {
-                let (vx, vy) = self.flow.at_cell(bi, bj);
-                let speed = vx.abs() + vy.abs();
-                if speed < 0.05 {
+        for &(i, gust) in beside.iter().flatten() {
+            let i = i as usize;
+            for j in [i + 1, i.wrapping_sub(1), i + W, i.wrapping_sub(W)] {
+                if j >= W * H {
                     continue;
                 }
-                let gust = speed.min(1.5) * 0.02;
-                for y in (bj * cell..((bj + 1) * cell).min(H)).step_by(stride) {
-                    for x in (bi * cell..(bi + 1) * cell).step_by(stride) {
-                        let i = y * W + x;
-                        if self.cells[i].m != Mat::Empty {
-                            continue;
-                        }
-                        for j in [i + 1, i.wrapping_sub(1), i + W, i.wrapping_sub(W)] {
-                            if j >= W * H {
-                                continue;
-                            }
-                            let m = self.cells[j].m;
-                            if m == Mat::Empty || matches!(m.kind(), super::Kind::Gas | super::Kind::Flame) || matches!(m, Mat::Fire | Mat::Ember | Mat::Lava) {
-                                continue;
-                            }
-                            let flux = (self.temp[i] - self.temp[j]) * gust;
-                            self.temp[j] += flux * tb.inv_c[m as usize];
-                            self.temp[i] -= flux * tb.inv_c[Mat::Empty as usize];
-                        }
-                    }
+                let m = self.cells[j].m;
+                if !convective(m) {
+                    continue;
                 }
+                let flux = (self.temp[i] - self.temp[j]) * gust;
+                self.temp[j] += flux * tb.inv_c[m as usize];
+                self.temp[i] -= flux * tb.inv_c[Mat::Empty as usize];
             }
         }
     }
