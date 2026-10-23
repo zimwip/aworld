@@ -80,7 +80,7 @@ const fn one(m: &'static [Mat]) -> Matter {
     Matter { states: m, default: 0 }
 }
 
-pub const MATTERS: [Matter; 19] = [
+pub const MATTERS: [Matter; 18] = [
     one(&[Mat::Sand]),
     Matter { states: &[Mat::Ice, Mat::Snow, Mat::Water, Mat::Steam], default: 2 },
     one(&[Mat::Dirt]),
@@ -94,7 +94,6 @@ pub const MATTERS: [Matter; 19] = [
     one(&[Mat::Ash]),
     one(&[Mat::Charcoal]),
     one(&[Mat::Rust]),
-    one(&[Mat::Fire]),
     one(&[Mat::Saltpeter]),
     one(&[Mat::Gunpowder]),
     one(&[Mat::Dynamite]),
@@ -226,6 +225,8 @@ mod tests {
         assert!(!seen.contains(&Mat::Grass));
         // A metal and its melt are one matter.
         assert!(MATTERS.iter().any(|m| m.states == [Mat::Iron, Mat::Molten]));
+        // Fire is lit with the flamethrower: it is not painted.
+        assert!(!seen.contains(&Mat::Fire));
     }
 
     #[test]
