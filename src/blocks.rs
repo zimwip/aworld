@@ -15,6 +15,8 @@ const TILE: i32 = 16;
 /// Weld breaking limits (per step): force and torque impulses.
 const BREAK_FORCE: f32 = 1.3;
 const BREAK_TORQUE: f32 = 3.2;
+/// Torque a driven axle puts in per radian per second it is short of its speed.
+const ARM_DAMPING: f32 = 200.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockKind {
@@ -1641,6 +1643,24 @@ impl Physics {
             let dt = self.w.integration_parameters.dt;
             self.w.bodies[h].apply_torque_impulse(torque * dt, true);
         }
+    }
+
+    /// Drives the axle at one end of a tige (the joint that pins that end to its support): it turns
+    /// the tige against its support at `speed` (radians per second), with at most `max_torque`.
+    /// Returns the torque the drive gave over the last step (positive when it turned the tige the
+    /// positive way), or `None` if that end is not pinned.
+    pub fn drive_member_end(&mut self, m: &Member, end: u8, speed: f32, max_torque: f32) -> Option<f32> {
+        // The member is the second body of the joints that pin its ends: end 0 is on its negative side.
+        let h = m.joints.iter().copied().find(|h| self.w.impulse_joints.get(*h).map_or(false, |j| (j.data.local_anchor2().x < 0.0) == (end == 0)))?;
+        // The solver works in substeps; the impulse kept is the last substep's.
+        let substep = self.w.integration_parameters.dt / self.w.integration_parameters.num_solver_iterations.max(1) as f32;
+        let j = self.w.impulse_joints.get_mut(h, true)?;
+        let done = j.data.motors[JointAxis::AngX as usize].impulse / substep;
+        j.data
+            .set_motor_model(JointAxis::AngX, MotorModel::ForceBased)
+            .set_motor_velocity(JointAxis::AngX, speed, ARM_DAMPING)
+            .set_motor_max_force(JointAxis::AngX, max_torque);
+        Some(done)
     }
 
     /// A hammer blow: a small shove at `point`, away from it.

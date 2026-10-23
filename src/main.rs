@@ -77,6 +77,7 @@ enum Tool {
     Rail,
     Crank,
     Pivot,
+    Screw,
     Winch,
     Pulley,
     Pipe,
@@ -430,6 +431,9 @@ impl Game {
         }
         p.build_members(&self.blocks, &mut self.members);
         self.mech_prune_wheels();
+        for g in &mut self.mech.gears {
+            g.arm_base = None;
+        }
         for pv in &self.mech.pivots {
             p.add_pivot(&self.blocks, &self.members, pv.wheel, &pv.support);
         }
@@ -1368,7 +1372,7 @@ impl Game {
             Tool::Cable(m) if click => self.cable_click(m, at),
             Tool::Spring(k) if click => self.spring_click(k, at),
             Tool::Beam(m) if click => self.beam_click(m, at),
-            Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Winch | Tool::Pulley if click => self.mech_click(at),
+            Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Screw | Tool::Winch | Tool::Pulley if click => self.mech_click(at),
             Tool::Pipe | Tool::Valve | Tool::Pump if click => self.fluid_click(at),
             Tool::Shovel => self.shovel_mouse(at, click, left),
             Tool::Select => self.select_mouse(at, click, left, is_key_down(KeyCode::LeftShift)),
@@ -1429,7 +1433,7 @@ impl Game {
         } else {
             self.fast_frames = 0;
         }
-        let building = matches!(self.tool, Tool::Block(_) | Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(_) | Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Winch | Tool::Pulley | Tool::Pipe | Tool::Valve | Tool::Pump);
+        let building = matches!(self.tool, Tool::Block(_) | Tool::Cable(_) | Tool::Spring(_) | Tool::Beam(_) | Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Screw | Tool::Winch | Tool::Pulley | Tool::Pipe | Tool::Valve | Tool::Pump);
         if (self.tab == Tab::Blocks || building) && (self.time * 4.0) as u32 != ((self.time - dt) * 4.0) as u32 {
             self.census = self.world.census();
         }
@@ -2318,7 +2322,7 @@ impl Game {
                 let len = self.member_from.as_ref().map_or(60.0, |f| drafted(f.1).min(MEMBER_MAX_LEN));
                 (m.cost_from(), m.cost(len))
             }
-            Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Winch | Tool::Pulley => self.mech_cost(at)?,
+            Tool::Gear(_) | Tool::Motor | Tool::Axle | Tool::Rail | Tool::Crank | Tool::Pivot | Tool::Screw | Tool::Winch | Tool::Pulley => self.mech_cost(at)?,
             Tool::Pipe | Tool::Valve | Tool::Pump => self.fluid_cost(at)?,
             _ => return None,
         };
@@ -3462,6 +3466,129 @@ mod tests {
         let l = save::decode(&bytes).unwrap();
         assert_eq!(l.cables.len(), 1, "the half-loose cable comes back");
         assert!(matches!(l.cables[0].b, Anchor::Free(_)));
+    }
+
+    /// How far a tige driven by a gear lags behind it (radians), given what its pivot is fixed to.
+    fn arm_lag(g: &Game, gi: usize) -> f32 {
+        let gear = &g.mech.gears[gi];
+        let (uid, end) = gear.arm.unwrap();
+        let m = g.members.iter().find(|m| m.uid == uid).unwrap();
+        let support = match if end == 0 { m.a } else { m.b } {
+            Anchor::End { uid, .. } | Anchor::Along { uid, .. } => g.members.iter().find(|o| o.uid == uid).unwrap().angle(),
+            _ => 0.0,
+        };
+        let (g0, a0) = gear.arm_base.unwrap();
+        let d = m.angle() - support - (a0 + gear.angle - g0);
+        (d + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+    }
+
+    #[test]
+    fn a_pivot_on_the_end_of_a_tige_and_a_shaft_from_a_motor_make_a_swinging_arm() {
+        let mut g = mech_game();
+        let (p0, p1) = (vec2(300.0, 200.0), vec2(370.0, 200.0));
+        g.members.push(Member::new(MemberMat::Steel, Anchor::Free(p0), Anchor::Free(p1), p0, p1));
+        click_with(&mut g, Tool::Pivot, 301.0, 200.0);
+        assert!(matches!(g.members[0].a, Anchor::Ground(_)), "the loose end gets an axle in the air");
+        assert!(matches!(g.members[0].b, Anchor::Free(_)));
+        // A large gear on the pivot, geared down from a motor just above it.
+        click_with(&mut g, Tool::Gear(GearSize::Large), 300.0, 200.0);
+        click_with(&mut g, Tool::Motor, 300.0, 180.0);
+        // Axle tool: the gear, then the gear again (the tige end it sits on).
+        click_with(&mut g, Tool::Axle, 300.0, 200.0);
+        click_with(&mut g, Tool::Axle, 300.0, 200.0);
+        assert_eq!(g.mech.gears[0].arm, Some((g.members[0].uid, 0)), "the gear swings the tige about its fixed end");
+        // It comes back from a save.
+        let bytes = save::encode(&g.world, None, None, &g.blocks, &g.cables, &g.members, &g.springs, &g.mech);
+        let l = save::decode(&bytes).unwrap();
+        assert_eq!(l.mech.gears[0].arm, Some((l.members[0].uid, 0)));
+        assert!(matches!(l.members[0].a, Anchor::Ground(_)));
+        g.set_running(true);
+        let mut worst = 0.0f32;
+        for t in 0..1500 {
+            g.sim_step();
+            if t > 30 {
+                worst = worst.max(arm_lag(&g, 0).abs());
+            }
+        }
+        eprintln!("ARM gear {:.2} lag {worst:.3} pivot {:?} tip {:?}", g.mech.gears[0].angle, g.members[0].p0, g.members[0].p1);
+        assert!(g.mech.gears[0].angle.abs() > 4.0, "the gear (and the arm) went round: {}", g.mech.gears[0].angle);
+        assert!(worst < 0.15, "the arm follows its gear: lag {worst}");
+        assert!((g.members[0].p0 - p0).length() < 2.0, "the pivot stays put: {:?}", g.members[0].p0);
+        // Pivot tool again on the axle in the air: it comes off, and the shaft with it.
+        g.set_running(false);
+        let pivot = g.members[0].p0;
+        click_with(&mut g, Tool::Pivot, pivot.x, pivot.y);
+        assert!(matches!(g.members[0].a, Anchor::Free(_)));
+        assert_eq!(g.mech.gears[0].arm, None);
+    }
+
+    #[test]
+    fn a_tige_on_the_end_of_an_arm_makes_an_articulated_arm() {
+        let mut g = mech_game();
+        // Shoulder on the ground, elbow at the end of the first tige, forearm hanging from it.
+        let (s, e, h) = (vec2(300.0, 299.0), vec2(300.0, 230.0), vec2(360.0, 230.0));
+        g.members.push(Member::new(MemberMat::Steel, Anchor::Ground(s), Anchor::Free(e), s, e));
+        let upper = g.members[0].uid;
+        g.members.push(Member::new(MemberMat::Wood, Anchor::End { uid: upper, end: 1 }, Anchor::Free(h), e, h));
+        // Each joint has its own motor, through a large gear, somewhere off to the side.
+        for (y, along) in [(150.0, vec2(300.0, 260.0)), (100.0, vec2(330.0, 230.0))] {
+            click_with(&mut g, Tool::Gear(GearSize::Large), 200.0, y);
+            click_with(&mut g, Tool::Motor, 180.0, y);
+            click_with(&mut g, Tool::Axle, 200.0, y);
+            click_with(&mut g, Tool::Axle, along.x, along.y); // the middle of a tige: its fixed end is the joint
+        }
+        let large: Vec<usize> = (0..g.mech.gears.len()).filter(|&i| g.mech.gears[i].size == GearSize::Large).collect();
+        assert_eq!(g.mech.gears[large[0]].arm, Some((upper, 0)));
+        assert_eq!(g.mech.gears[large[1]].arm, Some((g.members[1].uid, 0)), "the forearm turns about the elbow");
+        g.mech.gears.iter_mut().filter(|x| x.motor.is_some()).for_each(|x| x.motor.as_mut().unwrap().free_speed = 0.05);
+        g.set_running(true);
+        let mut worst = [0.0f32; 2];
+        let start = g.members[1].p1;
+        let mut reach = 0.0f32;
+        for t in 0..1200 {
+            g.sim_step();
+            if t > 30 {
+                for k in 0..2 {
+                    worst[k] = worst[k].max(arm_lag(&g, large[k]).abs());
+                }
+            }
+            reach = reach.max((g.members[1].p1 - start).length());
+        }
+        eprintln!("ELBOW lags {worst:?} reach {reach:.1} elbow {:?}", g.members[0].p1);
+        assert!(worst[0] < 0.2 && worst[1] < 0.2, "both joints follow their gears: {worst:?}");
+        assert!(reach > 40.0, "the hand travels: {reach}");
+        assert!((g.members[0].p1 - g.members[1].p0).length() < 2.0, "the elbow holds together");
+    }
+
+    #[test]
+    fn the_screw_tool_turns_a_rail_into_a_lead_screw_that_survives_a_save() {
+        let mut g = mech_game();
+        click_with(&mut g, Tool::Gear(GearSize::Large), 300.0, 250.0);
+        click_with(&mut g, Tool::Motor, 300.0, 230.0);
+        click_with(&mut g, Tool::Rail, 330.0, 250.0);
+        click_with(&mut g, Tool::Rail, 430.0, 250.0);
+        // The rail first, then the gear.
+        click_with(&mut g, Tool::Screw, 380.0, 250.0);
+        click_with(&mut g, Tool::Screw, 300.0, 250.0);
+        let gear = g.mech.gears[0].uid;
+        assert_eq!(g.mech.sliders[0].screw, Some(gear));
+        let bytes = save::encode(&g.world, None, None, &g.blocks, &g.cables, &g.members, &g.springs, &g.mech);
+        assert_eq!(save::decode(&bytes).unwrap().mech.sliders[0].screw, Some(gear));
+        g.set_running(true);
+        let (s0, a0) = (g.mech.sliders[0].s, g.mech.gears[0].angle);
+        for _ in 0..600 {
+            g.sim_step();
+        }
+        let moved = g.mech.sliders[0].s - s0;
+        let want = Mechanism::screw_travel(g.mech.gears[0].angle - a0);
+        eprintln!("SCREW moved {moved:.2} want {want:.2}");
+        assert!(moved.abs() > 5.0, "the nut travels: {moved}");
+        assert!((moved - want).abs() < 0.05, "one lead per turn: {moved} vs {want}");
+        // The eraser on the shaft between gear and screw makes it a plain rail again.
+        g.set_running(false);
+        assert!(g.mech_erase(vec2(318.0, 250.0)));
+        assert_eq!(g.mech.sliders[0].screw, None);
+        assert_eq!(g.mech.gears.len(), 2, "the gears are still there");
     }
 
     #[test]
