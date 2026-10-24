@@ -16,6 +16,7 @@ mod storm;
 mod statics;
 pub mod prof;
 mod par;
+mod turn;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]
@@ -654,6 +655,9 @@ pub struct World {
     /// 1 = the wind carries air heat in 2 x 2 blocks, 2 = the heat pass runs half as often (with
     /// doubled rates), 3 = same, and calm air next to air no longer conducts heat (it only relaxes).
     pub lod: u8,
+    /// Whether the cells take their turn on every core: faster, but not the same turn (see
+    /// `turn.rs`). Off unless `AWORLD_CELLS_PAR=1`.
+    pub parallel_cells: bool,
     /// Closed pockets of gas (see `pockets.rs`): for each cell its pocket id + 1 (0: not gas).
     pocket_of: Vec<u32>,
     pockets: Vec<pockets::Pocket>,
@@ -699,6 +703,9 @@ pub struct World {
     /// (heat given off as vapour condenses): the table holds while it is still `air_sky`.
     air_rows: Vec<f32>,
     air_sky: f32,
+    /// In the view of a strip of the cells' turn, the rules it puts off to the end of the turn
+    /// (see `turn.rs`); None in the world itself.
+    later: Option<Vec<turn::Later>>,
 }
 
 /// Runs `$e`, adding its time to phase `$p` of the profile when it is on.
@@ -764,6 +771,7 @@ impl World {
             dpd: vec![0.0; flow::FW * flow::FH],
             pressure_forces: true,
             lod: 0,
+            parallel_cells: turn::parallel_by_default(),
             pocket_of: vec![0; W * H],
             pockets: Vec::new(),
             liq_p: vec![1.0; W * H],
@@ -786,6 +794,7 @@ impl World {
             prof: prof::Profile::default(),
             air_rows: Vec::new(),
             air_sky: 0.0,
+            later: None,
         }
     }
 
@@ -973,12 +982,19 @@ impl World {
     #[cfg_attr(debug_assertions, track_caller)]
     fn idx(x: i32, y: i32) -> usize {
         debug_assert!(Self::inb(x, y), "cell ({x}, {y}) is outside the world");
+        #[cfg(debug_assertions)]
+        turn::guard(x);
         y as usize * W + x as usize
     }
 
     /// Index of a cell, or None outside the world. Mind that `at` reads Empty past the sides
     /// and the bottom: a free cell by `at` may still be outside the grid.
+    #[cfg_attr(debug_assertions, track_caller)]
     fn ix(x: i32, y: i32) -> Option<usize> {
+        #[cfg(debug_assertions)]
+        if Self::inb(x, y) {
+            turn::guard(x);
+        }
         if Self::inb(x, y) { Some(y as usize * W + x as usize) } else { None }
     }
 
@@ -1504,99 +1520,79 @@ impl World {
         }
     }
 
-    /// Every cell of matter takes its turn, bottom row first.
-    fn step_cells(&mut self) {
-        let f = self.frame;
-        let ltr = f & 1 == 0;
-        self.air_rows = (0..H as i32).map(|y| self.ambient_c(y)).collect();
-        self.air_sky = self.climate.sky_dev;
-        self.zones.begin();
-        for y in (0..H as i32).rev() {
-            let zrow = y as usize / sleep::CS * sleep::CW;
-            for zi in 0..sleep::CW {
-                let zx = if ltr { zi } else { sleep::CW - 1 - zi };
-                let zone = zrow + zx;
-                if !self.zones.awake[zone] {
-                    continue;
-                }
-                let (x0, x1) = ((zx * sleep::CS) as i32, ((zx + 1) * sleep::CS).min(W) as i32);
-                for i in 0..x1 - x0 {
-                    let x = if ltr { x0 + i } else { x1 - 1 - i };
-                    let c = self.cells[Self::idx(x, y)];
-                    if c.m == Mat::Empty {
-                        continue;
-                    }
-                    if c.stamp == f {
-                        // Moved here this step, or a stamp left from 256 steps ago: either way
-                        // look again next step.
-                        self.zones.mark_restless(zone);
-                        continue;
-                    }
-                    if self.restless(x, y, c) {
-                        self.zones.mark_restless(zone);
-                    }
-                    match c.m {
-                        Mat::Rust => {
-                            if !self.magnet_holds(x, y) {
-                                self.step_powder(x, y);
-                            }
-                        }
-                        Mat::Sand | Mat::Mud => self.step_sediment(x, y),
-                        Mat::Dirt => self.step_dirt(x, y),
-                        Mat::Grass => self.step_grass(x, y),
-                        Mat::Snow => self.step_snow(x, y),
-                        Mat::Hail => {
-                            self.step_powder(x, y);
-                        }
-                        Mat::Shard => self.step_shard(x, y),
-                        Mat::Ash => self.step_ash(x, y),
-                        Mat::Charcoal => self.step_charcoal(x, y),
-                        Mat::Seed => self.step_seed(x, y),
-                        Mat::Sapling => self.step_sapling(x, y),
-                        Mat::Leaf => self.step_leaf(x, y),
-                        Mat::Wood | Mat::Trunk => self.step_wood(x, y),
-                        Mat::Branch => self.step_branch(x, y),
-                        Mat::DeadLeaf => self.step_dead_leaf(x, y),
-                        Mat::Cloud => self.step_cloud(x, y),
-                        Mat::Oil => {
-                            if !self.fly(x, y) && !self.jet(x, y) && !self.seep(x, y) {
-                                self.step_oil(x, y);
-                            }
-                        }
-                        Mat::Smoke => self.step_smoke(x, y),
-                        Mat::Steel => self.step_iron(x, y, 1500),
-                        Mat::Gunpowder | Mat::Dynamite => self.step_gunpowder(x, y),
-                        Mat::Saltpeter => self.step_saltpeter(x, y),
-                        Mat::Water => {
-                            if !self.fly(x, y) && !self.jet(x, y) && !self.seep(x, y) {
-                                self.step_water(x, y);
-                            }
-                        }
-                        Mat::Steam => self.step_steam(x, y),
-                        Mat::Fire => self.step_fire(x, y),
-                        Mat::Ember => self.step_ember(x, y),
-                        Mat::Lava => {
-                            if !self.seep(x, y) {
-                                self.step_hot_liquid(x, y, Mat::Stone);
-                            }
-                        }
-                        Mat::Molten => {
-                            if !self.seep(x, y) {
-                                self.step_hot_liquid(x, y, Mat::Iron);
-                            }
-                        }
-                        Mat::MoltenSteel => {
-                            if !self.seep(x, y) {
-                                self.step_hot_liquid(x, y, Mat::Steel);
-                            }
-                        }
-                        Mat::Iron => self.step_iron(x, y, 300),
-                        _ => {}
-                    }
+    /// The turn of the cell at (x, y), in zone `zone` (see `turn.rs` for the order).
+    fn cell_turn(&mut self, x: i32, y: i32, zone: usize) {
+        let c = self.cells[Self::idx(x, y)];
+        if c.m == Mat::Empty {
+            return;
+        }
+        if c.stamp == self.frame {
+            // Moved here this step, or a stamp left from 256 steps ago: either way look again
+            // next step.
+            self.zones.mark_restless(zone);
+            return;
+        }
+        if self.restless(x, y, c) {
+            self.zones.mark_restless(zone);
+        }
+        match c.m {
+            Mat::Rust => {
+                if !self.magnet_holds(x, y) {
+                    self.step_powder(x, y);
                 }
             }
+            Mat::Sand | Mat::Mud => self.step_sediment(x, y),
+            Mat::Dirt => self.step_dirt(x, y),
+            Mat::Grass => self.step_grass(x, y),
+            Mat::Snow => self.step_snow(x, y),
+            Mat::Hail => {
+                self.step_powder(x, y);
+            }
+            Mat::Shard => self.step_shard(x, y),
+            Mat::Ash => self.step_ash(x, y),
+            Mat::Charcoal => self.step_charcoal(x, y),
+            Mat::Seed => self.step_seed(x, y),
+            Mat::Sapling => self.step_sapling(x, y),
+            Mat::Leaf => self.step_leaf(x, y),
+            Mat::Wood | Mat::Trunk => self.step_wood(x, y),
+            Mat::Branch => self.step_branch(x, y),
+            Mat::DeadLeaf => self.step_dead_leaf(x, y),
+            Mat::Cloud => self.step_cloud(x, y),
+            Mat::Oil => {
+                if !self.fly(x, y) && !self.jet(x, y) && !self.seep(x, y) {
+                    self.step_oil(x, y);
+                }
+            }
+            Mat::Smoke => self.step_smoke(x, y),
+            Mat::Steel => self.step_iron(x, y, 1500),
+            Mat::Gunpowder | Mat::Dynamite => self.step_gunpowder(x, y),
+            Mat::Saltpeter => self.step_saltpeter(x, y),
+            Mat::Water => {
+                if !self.fly(x, y) && !self.jet(x, y) && !self.seep(x, y) {
+                    self.step_water(x, y);
+                }
+            }
+            Mat::Steam => self.step_steam(x, y),
+            Mat::Fire => self.step_fire(x, y),
+            Mat::Ember => self.step_ember(x, y),
+            Mat::Lava => {
+                if !self.seep(x, y) {
+                    self.step_hot_liquid(x, y, Mat::Stone);
+                }
+            }
+            Mat::Molten => {
+                if !self.seep(x, y) {
+                    self.step_hot_liquid(x, y, Mat::Iron);
+                }
+            }
+            Mat::MoltenSteel => {
+                if !self.seep(x, y) {
+                    self.step_hot_liquid(x, y, Mat::Steel);
+                }
+            }
+            Mat::Iron => self.step_iron(x, y, 300),
+            _ => {}
         }
-        self.air_rows.clear();
     }
 
     /// `ambient_c(y)`, from the table of the cells' turn when it is on.
@@ -2339,6 +2335,10 @@ impl World {
     /// A tree drinks through its roots and breathes the water out through its leaves, by day,
     /// while it is in leaf: the soil around it dries and the air over a forest gets damp.
     fn transpire(&mut self, x: i32, y: i32) {
+        // Through the crown it can reach far to the side: after the other cells.
+        if self.put_off(turn::Later::Transpire(x, y)) {
+            return;
+        }
         if self.sun() < 0.2 || matches!(self.season(), Season::Winter) || !matches!(self.at(x, y + 1), Mat::Dirt | Mat::Grass) {
             return;
         }

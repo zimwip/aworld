@@ -215,6 +215,10 @@ impl World {
     /// Explosive at (x, y) caught fire: the whole charge it belongs to goes off together, at its
     /// centre. A long thin trail of powder goes off in pieces, like a fuse.
     pub(super) fn set_off_powder(&mut self, x: i32, y: i32) {
+        // The charge and its blast reach far: they go off after the other cells.
+        if self.put_off(super::turn::Later::Powder(x, y)) {
+            return;
+        }
         let mut charge = vec![(x, y)];
         let mut front = vec![(x, y)];
         let mut taken = std::collections::HashSet::from([(x, y)]);

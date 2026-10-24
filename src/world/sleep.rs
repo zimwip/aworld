@@ -32,6 +32,28 @@ impl Zones {
         Zones { awake: vec![true; CW * CH], woke: vec![true; CW * CH], restless: vec![true; CW * CH], enabled: true, stamp: 1, changed: vec![1; CW * CH] }
     }
 
+    /// Zones with no storage (to put in place of a view's zones once it is done with).
+    pub(super) fn none() -> Self {
+        Zones { awake: Vec::new(), woke: Vec::new(), restless: Vec::new(), enabled: true, stamp: 0, changed: Vec::new() }
+    }
+
+    /// The zones for a strip of the cells' turn (see `turn.rs`): which run this step, and marks of
+    /// its own for what it wakes, finds restless or changes.
+    pub(super) fn view(&self) -> Self {
+        Zones { awake: self.awake.clone(), woke: vec![false; CW * CH], restless: vec![false; CW * CH], enabled: self.enabled, stamp: self.stamp, changed: vec![0; CW * CH] }
+    }
+
+    /// Takes in the marks of a strip's zones.
+    pub(super) fn absorb(&mut self, v: &Zones) {
+        for k in 0..CW * CH {
+            self.woke[k] |= v.woke[k];
+            self.restless[k] |= v.restless[k];
+            if v.changed[k] == self.stamp {
+                self.changed[k] = self.stamp;
+            }
+        }
+    }
+
     /// Wakes every zone (after the whole grid was replaced).
     pub fn wake_all(&mut self) {
         self.woke.fill(true);
