@@ -3323,7 +3323,7 @@ impl Game {
         if ui.button(Rect::new(12.0 + half, sy0 + 40.0, half, 28.0), "Charger", Icon::Load, false, save::slot_used(self.slot), ACCENT) {
             self.load();
         }
-        let ty = sy0 + 82.0;
+        let ty = sy0 + 78.0;
         ui.text("Temps", 10.0, ty, 16, ACCENT);
         let half = (PANEL_W - 18.0) / 2.0;
         if ui.button(Rect::new(6.0, ty + 6.0, half, 28.0), "Midi", Icon::Sun, false, true, ACCENT) {
@@ -3336,7 +3336,7 @@ impl Game {
         if ui.button(Rect::new(6.0, ty + 40.0, PANEL_W - 12.0, 26.0), if cycle { "Jour et nuit : en marche" } else { "Jour et nuit : figé" }, Icon::None, cycle, true, GREEN) {
             self.world.day_cycle = !cycle;
         }
-        let sy = ty + 80.0;
+        let sy = ty + 76.0;
         ui.text("Saison", 10.0, sy, 16, ACCENT);
         for (i, s) in Season::ALL.iter().enumerate() {
             let r = Rect::new(6.0 + (i % 2) as f32 * (half + 6.0), sy + 6.0 + (i / 2) as f32 * 32.0, half, 27.0);
@@ -3344,7 +3344,7 @@ impl Game {
                 self.world.set_season(*s);
             }
         }
-        let iy = sy + 6.0 + 2.0 * 32.0 + 14.0;
+        let iy = sy + 6.0 + 2.0 * 32.0 + 10.0;
         let w = &self.world;
         ui.text(&format!("Air {:.0} °C · vent {:.0} km/h {}", w.surface_temp_c(), w.wind.abs() * 40.0, if w.wind > 0.0 { "→" } else { "←" }), 10.0, iy, 14, TEXT);
         ui.text("Vent", 10.0, iy + 22.0, 16, ACCENT);
@@ -3356,7 +3356,7 @@ impl Game {
         ];
         let mut vals = [maxv, ch, windy];
         for (k, (label, _, lo, hi, shown)) in rows.iter().enumerate() {
-            let y = iy + 30.0 + k as f32 * 22.0;
+            let y = iy + 30.0 + k as f32 * 20.0;
             ui.text(label, 10.0, y + 12.0, 12, TEXT);
             ui.slider(Rect::new(96.0, y, PANEL_W - 96.0 - 74.0, 18.0), &mut vals[k], *lo, *hi, BLUE);
             ui.text(shown, PANEL_W - 64.0, y + 13.0, 12, DIM);
@@ -3364,9 +3364,21 @@ impl Game {
         self.world.wind_max = vals[0];
         self.world.wind_changes = vals[1];
         self.world.windiness = vals[2];
-        let cr = Rect::new(10.0, iy + 30.0 + 3.0 * 22.0 + 2.0, PANEL_W - 20.0, 24.0);
+        let cr = Rect::new(10.0, iy + 30.0 + 3.0 * 20.0 + 2.0, PANEL_W - 20.0, 24.0);
         if ui.checkbox(cr, "Air compressible (P V = n R T)", self.world.flow.compress, true) {
             self.world.flow.compress = !self.world.flow.compress;
+        }
+        // The cells' turn on every core: about twice as fast when much is moving, but water spreads
+        // and drains a little differently (see `world/turn.rs`).
+        let pr = Rect::new(10.0, cr.y + 27.0, PANEL_W - 20.0, 24.0);
+        if ui.checkbox(pr, "Calcul sur tous les cœurs", self.world.parallel_cells, true) {
+            self.world.parallel_cells = !self.world.parallel_cells;
+        }
+        if ui.hover(pr) {
+            self.hover_info = Some((
+                "Calcul sur tous les cœurs".to_string(),
+                "Jusqu'à deux fois plus vite quand beaucoup bouge, mais l'eau s'écoule un peu autrement.".to_string(),
+            ));
         }
     }
 
