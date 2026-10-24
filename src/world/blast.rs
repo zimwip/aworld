@@ -23,7 +23,9 @@
 //! The cells can be anything with a density and a strength, so the same rule shapes a crater in a
 //! meadow, a hole in a brick wall or a dent in an iron plate.
 
+use super::num::round_i;
 use super::{density, Kind, Mat, World, H, W};
+use rayon::prelude::*;
 
 /// Side of a cell, in metres.
 const CELL_M: f32 = 0.05;
@@ -381,7 +383,7 @@ impl World {
         let mut out: Vec<(i32, i32, f32)> = vec![];
         let mut t = 0.0;
         while t <= len {
-            let (x, y) = (cx + (ux * t).round() as i32, cy + (uy * t).round() as i32);
+            let (x, y) = (cx + round_i(ux * t), cy + round_i(uy * t));
             if out.last().map_or(true, |&(px, py, _)| (px, py) != (x, y)) {
                 out.push((x, y, t));
             }
@@ -397,13 +399,14 @@ impl World {
         let len = ((energy / cell_cost(Mat::Sand, 0.0)).sqrt() * 1.2 + r as f32).min(MAX_REACH);
         let n = ((std::f32::consts::TAU * len) as usize).clamp(256, 1440);
         let wedge = std::f32::consts::TAU / n as f32;
-        let rays: Vec<Vec<(i32, i32, f32)>> = (0..n).map(|k| Self::ray(cx, cy, k as f32 * wedge, len)).collect();
+        // (The rays, and what it costs to break out along each, are worked out side by side.)
+        let rays: Vec<Vec<(i32, i32, f32)>> = (0..n).into_par_iter().map(|k| Self::ray(cx, cy, k as f32 * wedge, len)).collect();
         // A ray owns `d · wedge` of each cell it crosses at distance d.
         let share = |d: f32| (d * wedge).clamp(0.08, 1.0);
 
         // First the cost of breaking out along each ray: what lies between the charge and the air.
         let escape: Vec<f32> = rays
-            .iter()
+            .par_iter()
             .map(|ray| {
                 let (mut cost, mut ground, mut air) = (0.0, false, 0);
                 for &(x, y, d) in ray {
@@ -524,13 +527,15 @@ impl World {
             // side that are still digging.
             let mut spill = vec![0.0f32; n];
             let mut any = false;
+            // The nearest rays still digging, less than a quarter turn away on each side.
+            let digs: Vec<bool> = st.iter().map(|s| !s.out && !s.stuck && s.ground).collect();
+            let (left_of, right_of) = nearest_on_each_side(&digs, n / 4);
             for k in 0..n {
                 if !st[k].out || st[k].e <= 0.0 {
                     continue;
                 }
                 let give = st[k].e * 0.7;
-                let left = (1..n / 4).map(|j| (k + n - j) % n).find(|&j| !st[j].out && !st[j].stuck && st[j].ground);
-                let right = (1..n / 4).map(|j| (k + j) % n).find(|&j| !st[j].out && !st[j].stuck && st[j].ground);
+                let (left, right) = (left_of[k], right_of[k]);
                 let to: Vec<usize> = [left, right].into_iter().flatten().collect();
                 if to.is_empty() {
                     continue;
@@ -709,9 +714,61 @@ impl World {
     }
 }
 
+/// For each place `k` of a ring of `ok.len()` places, the nearest place on the left and the
+/// nearest on the right, closer than `reach`, where `ok` holds: what scanning out from `k` one
+/// place at a time would find, in two sweeps instead.
+fn nearest_on_each_side(ok: &[bool], reach: usize) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+    let n = ok.len();
+    let (mut left, mut right) = (vec![None; n], vec![None; n]);
+    // Round the ring twice, so that the places near the start see those near the end.
+    let mut last: Option<usize> = None;
+    for u in 0..2 * n {
+        let k = u % n;
+        if u >= n {
+            left[k] = last.filter(|&p| u - p < reach).map(|p| p % n);
+        }
+        if ok[k] {
+            last = Some(u);
+        }
+    }
+    let mut next: Option<usize> = None;
+    for u in (0..2 * n).rev() {
+        let k = u % n;
+        if u < n {
+            right[k] = next.filter(|&p| p - u < reach).map(|p| p % n);
+        }
+        if ok[k] {
+            next = Some(u);
+        }
+    }
+    (left, right)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_nearest_rays_on_each_side_are_those_a_scan_finds() {
+        let mut r = 0x9e37_79b9u32;
+        for n in [256usize, 257, 300, 1440] {
+            for density in [2u32, 10, 60, 400] {
+                let ok: Vec<bool> = (0..n)
+                    .map(|_| {
+                        r ^= r << 13;
+                        r ^= r >> 17;
+                        r ^= r << 5;
+                        r % density == 0
+                    })
+                    .collect();
+                let (left, right) = nearest_on_each_side(&ok, n / 4);
+                for k in 0..n {
+                    assert_eq!(left[k], (1..n / 4).map(|j| (k + n - j) % n).find(|&j| ok[j]), "left of {k} in {n}");
+                    assert_eq!(right[k], (1..n / 4).map(|j| (k + j) % n).find(|&j| ok[j]), "right of {k} in {n}");
+                }
+            }
+        }
+    }
 
     /// A meadow over rock: grass on top at y = 300, dirt down to 420, stone below.
     fn ground() -> World {

@@ -4,6 +4,7 @@
 //!
 //! Velocities are kept in coarse cells per step (a coarse cell is `CELL` world cells wide).
 
+use super::num::floor_f;
 use super::{Cell, World, H, W};
 
 /// Width of a flow cell, in world cells.
@@ -185,7 +186,7 @@ impl Flow {
         // Bilinear between the centres of the flow cells, so the picture has no visible blocks.
         let fx = (x as f32 + 0.5) / CELL as f32 - 0.5;
         let fy = ((y as f32 + 0.5) / CELL as f32 - 0.5).clamp(0.0, FH as f32 - 1.001);
-        let (i0, j0) = (fx.floor(), fy.floor());
+        let (i0, j0) = (floor_f(fx), floor_f(fy));
         let (tx, ty) = (fx - i0, fy - j0);
         let (i0, j0) = (i0 as i32, j0 as i32);
         let a = self.pr[at(i0, j0)] * (1.0 - tx) + self.pr[at(i0 + 1, j0)] * tx;
@@ -399,7 +400,7 @@ impl Flow {
                 }
                 let x = i as f32 - self.vx[k] * 2.0;
                 let y = (j as f32 - self.vy[k] * 2.0).clamp(0.0, FH as f32 - 1.001);
-                let (i0, j0) = (x.floor(), y.floor());
+                let (i0, j0) = (floor_f(x), floor_f(y));
                 let (fx, fy) = (x - i0, y - j0);
                 let (i0, j0) = (i0 as i32, j0 as i32);
                 let m = |ii: i32, jj: i32| {
@@ -428,7 +429,7 @@ impl Flow {
                 }
                 let x = i as f32 - self.ux[k];
                 let y = (j as f32 - self.uy[k]).clamp(0.0, FH as f32 - 1.001);
-                let (i0, j0) = (x.floor(), y.floor());
+                let (i0, j0) = (floor_f(x), floor_f(y));
                 let (fx, fy) = (x - i0, y - j0);
                 let (i0, j0) = (i0 as i32, j0 as i32);
                 let s = |a: &[f32]| {
@@ -499,7 +500,7 @@ impl Flow {
     pub fn sample(&self, x: i32, y: i32) -> (f32, f32) {
         let fx = (x as f32 + 0.5) / CELL as f32 - 0.5;
         let fy = ((y as f32 + 0.5) / CELL as f32 - 0.5).clamp(0.0, FH as f32 - 1.001);
-        let (i0, j0) = (fx.floor(), fy.floor());
+        let (i0, j0) = (floor_f(fx), floor_f(fy));
         let (tx, ty) = (fx - i0, fy - j0);
         let (i0, j0) = (i0 as i32, j0 as i32);
         let s = |a: &[f32]| {

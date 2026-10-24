@@ -233,6 +233,7 @@ impl World {
                 strain_key: self.strain_key,
                 stress_cache: Default::default(),
                 stress_pos: Vec::new(),
+                stress_local: Vec::new(),
                 ticks: self.ticks,
                 log: share(&self.log),
                 paint_log: self.paint_log,
