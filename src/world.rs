@@ -19,6 +19,7 @@ mod num;
 mod par;
 mod turn;
 mod field;
+mod liquid;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]
@@ -665,6 +666,11 @@ pub struct World {
     /// Whether water at rest is a field that moves by its weight, drops staying particles (see
     /// `field.rs`; a prototype). Off unless `AWORLD_WATER_FIELD=1`.
     pub water_field: bool,
+    /// Whether every liquid moves by real forces (velocities, pressure, viscosity, see
+    /// `liquid.rs`). Off unless `AWORLD_LIQUIDS=1`; never with `water_field`.
+    pub liquid_physics: bool,
+    /// The velocities and pressure of the liquids (see `liquid.rs`).
+    liq: liquid::Liquids,
     /// Units of water in each cell of water, `field::FULL` for a full one (stored as 0, so that a
     /// cell painted water is full).
     fill: Vec<u32>,
@@ -787,7 +793,9 @@ impl World {
             pressure_forces: true,
             lod: 0,
             parallel_cells: turn::parallel_by_default(),
-            water_field: field::field_by_default(),
+            water_field: field::field_by_default() && !liquid::physics_by_default(),
+            liquid_physics: liquid::physics_by_default(),
+            liq: liquid::Liquids::default(),
             fill: vec![0; W * H],
             gifts: Vec::new(),
             flux: Vec::new(),
@@ -836,6 +844,7 @@ impl World {
         self.cells.fill(EMPTY);
         self.fill.fill(0);
         self.flux.fill(0.0);
+        self.liq.clear();
         self.log.fill(0);
         self.ejecta.clear();
         self.slabs.clear();
@@ -962,6 +971,7 @@ impl World {
         self.revision += 1;
         self.cells.copy_from_slice(&snap.cells);
         self.fill.fill(0);
+        self.liq.clear();
         self.moisture.copy_from_slice(&snap.moisture);
         self.fuel.copy_from_slice(&snap.fuel);
         self.growth.copy_from_slice(&snap.growth);
@@ -1540,6 +1550,9 @@ impl World {
         if self.water_field {
             timed!(self, prof::FIELD, self.step_water_field());
         }
+        if self.liquid_physics {
+            timed!(self, prof::LIQUIDS, self.step_liquids());
+        }
         self.after_cells();
         self.prof.stop(prof::TOTAL, clock);
         if self.prof.on {
@@ -1666,7 +1679,8 @@ impl World {
         if self.day_cycle {
             self.clock = self.clock.wrapping_add(1);
         }
-        if self.ticks % hydro::LEVEL_EVERY == 0 {
+        // (The physics of the liquids levels them itself, by their pressure.)
+        if self.ticks % hydro::LEVEL_EVERY == 0 && !self.liquid_physics {
             timed!(self, 14, self.level_liquids());
         }
     }
@@ -2625,7 +2639,7 @@ impl World {
             let n = soils[(self.rand() % 3) as usize];
             if self.soil_drinks(n) {
                 let j = Self::idx(n.0, n.1);
-                self.moisture[j] += if self.water_field { self.water_units_in(i).min(SOIL_WATER) } else { SOIL_WATER };
+                self.moisture[j] += if self.partial_liquids() { self.water_units_in(i).min(SOIL_WATER) } else { SOIL_WATER };
                 self.zones.wake(j);
                 self.set(x, y, Mat::Empty);
                 return;
@@ -2670,7 +2684,11 @@ impl World {
         // Water with more water on top of it (the roof of a hole in a lake, a thick stream) just
         // sinks a cell at a time: only a free drop races down.
         // (In the field, all water with air under it is a drop: water at rest is the field's.)
-        let free_drop = self.water_field || self.at(x, y - 1).kind() != Kind::Liquid;
+        let free_drop = if self.liquid_physics {
+            self.lone_liquid(x, y)
+        } else {
+            self.water_field || self.at(x, y - 1).kind() != Kind::Liquid
+        };
         if free_drop && matches!(self.at(x, y + 1).kind(), Kind::Empty | Kind::Gas) && self.mask_free(x, y + 1) {
             // Falling through a cloud, the drop sweeps up the droplets in its way and grows: the
             // cloud's water becomes rain (`VAPOUR_PER_WATER` cells of cloud, one cell of rain).
@@ -2689,6 +2707,12 @@ impl World {
         }
     }
 
+    /// Whether a cell of liquid may hold less than a full cell (the field, the physics).
+    #[inline]
+    fn partial_liquids(&self) -> bool {
+        self.water_field || self.liquid_physics
+    }
+
     /// The one way every liquid moves (`Kind::Liquid`), the matter only setting how thick it is
     /// (`viscosity`): a liquid lighter than the one on top of it rises through it (oil on water),
     /// a thick one stays still now and then, then it runs down if it can (unless it is the mouth
@@ -2701,6 +2725,10 @@ impl World {
         if above.kind() == Kind::Liquid && density(above) > density(m) && self.chance(2) {
             self.swap((x, y), (x, y - 1));
             return true;
+        }
+        // Moved by their physics, the liquids only sort by weight here.
+        if self.liquid_physics {
+            return false;
         }
         if rest > 0 && self.chance(rest) {
             return false;
@@ -2794,7 +2822,7 @@ impl World {
         let t = self.temp[i];
         // A cell of the field that is not full makes less vapour (none at all from a thin film:
         // it just dries).
-        let share = if self.water_field { self.water_fill(i) as f32 / field::FULL as f32 } else { 1.0 };
+        let share = if self.partial_liquids() { self.water_fill(i) as f32 / field::FULL as f32 } else { 1.0 };
         // (A part of a cell of steam is a whole one or none, by chance: on average the water is
         // all there.)
         let v = share * VAPOUR_PER_WATER as f32;
@@ -3772,7 +3800,7 @@ impl World {
                 // Warm water shifts toward a pale, reddish tone just before it boils.
                 let warm = ((t - 30.0).max(0.0) * 1.3) as i32;
                 // A cell of the field that is not full shows paler.
-                let a = if self.water_field { 60 + (145 * self.water_fill(y * W + x).min(field::FULL) as u64 / field::FULL as u64) as i32 } else { 205 };
+                let a = if self.partial_liquids() { 60 + (145 * self.water_fill(y * W + x).min(field::FULL) as u64 / field::FULL as u64) as i32 } else { 205 };
                 (44 + v / 2 + warm, 124 + v + flick / 4 + warm / 3, (224 + v - warm).max(0), a)
             }
             Mat::Fire => (255, (80 + self.fuel[y * W + x].left as i32 * 3).min(235), 30, 235),

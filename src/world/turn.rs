@@ -272,6 +272,8 @@ impl World {
                 lod: self.lod,
                 parallel_cells: true,
                 water_field: self.water_field,
+                liquid_physics: self.liquid_physics,
+                liq: Default::default(),
                 fill: share(&self.fill),
                 gifts: Vec::new(),
                 flux: Vec::new(),
