@@ -337,8 +337,6 @@ fn flat_half(kind: BlockKind, angle: f32) -> Option<Vec2> {
 
 /// Distance (cells) within which a block is pulled onto a neighbour's edge or line.
 pub const MAGNET: f32 = 5.0;
-/// Distance (cells) within which a stacked brick is pulled onto the studs below.
-const STUD_PULL: f32 = 3.0;
 /// How far apart (cells) two blocks can be and still line up with each other.
 const ALIGN_RANGE: f32 = 60.0;
 
@@ -363,12 +361,15 @@ fn pull(best: &mut Option<(f32, f32)>, from: f32, to: f32, reach: f32, bonus: f3
 }
 
 /// Free placement with a magnet: the block goes where the cursor is (on whole cells), and only when
-/// it comes near another block is it pulled flush against it, onto its edges, its middle or its studs.
+/// it comes near another block is it pulled flush against it, onto its edges or its middle. A brick
+/// that fits onto another one (on top or under it) always sits exactly on its studs, like Lego.
 pub fn magnet(blocks: &[Block], kind: BlockKind, angle: f32, at: Vec2) -> Vec2 {
     let Some(h) = box_half(kind, angle) else { return at.round() };
     let free = (at - h).round() + h;
     let studded = has_studs(kind) && quarter_turns(angle) == Some(0);
     let mut pos = free;
+    // The x of the stud grid it is fitted onto, if it is.
+    let mut seated: Option<f32> = None;
     // Up and down first (resting on a block decides which studs it sits on), then sideways.
     for vertical in [true, false] {
         let mut best = None;
@@ -398,14 +399,19 @@ pub fn magnet(blocks: &[Block], kind: BlockKind, angle: f32, at: Vec2) -> Vec2 {
                 for (a, c) in [(l, bl), (r, br), (pos.x, b.pos.x)] {
                     pull(&mut best, a, c, MAGNET, 0.0);
                 }
-                // Sitting on a brick (or under it): onto its studs, like Lego.
+                // Fitted onto a brick (or under it): on its studs, whatever else lines up.
                 let stacked = gap_x < -1.0 && ((bot - bt).abs() < 0.01 || (t - bb).abs() < 0.01);
                 if studded && stacked && has_studs(b.kind) && quarter_turns(b.angle) == Some(0) {
-                    pull(&mut best, l, bl + ((l - bl) / STUD).round() * STUD, STUD_PULL, 0.2);
+                    let x = bl + ((l - bl) / STUD).round() * STUD + h.x;
+                    if seated.map_or(true, |s| (x - pos.x).abs() < (s - pos.x).abs()) {
+                        seated = Some(x);
+                    }
                 }
             }
         }
-        if let Some((d, _)) = best {
+        if let (false, Some(x)) = (vertical, seated) {
+            pos.x = x;
+        } else if let Some((d, _)) = best {
             if vertical {
                 pos.y += d;
             } else {
@@ -418,6 +424,10 @@ pub fn magnet(blocks: &[Block], kind: BlockKind, angle: f32, at: Vec2) -> Vec2 {
         let c = Block::new(kind, p, angle);
         blocks.iter().all(|b| c.gap(b) > -0.2)
     };
+    if seated.is_some() {
+        // Fitted on studs it stays on them: the next stud along if this one is taken, else refused.
+        return [0.0, -1.0, 1.0, -2.0, 2.0].into_iter().map(|k| vec2(pos.x + k * STUD, pos.y)).find(|p| fits(*p)).unwrap_or(pos);
+    }
     [pos, vec2(free.x, pos.y), vec2(pos.x, free.y), free].into_iter().find(|p| fits(*p)).unwrap_or(pos)
 }
 
@@ -552,8 +562,57 @@ impl MemberMat {
         }
     }
 
-    pub fn cost(self, len: f32) -> u32 {
-        (len * self.thickness() * 0.25).ceil() as u32
+    /// Matter used up by a rod `len` long: a deck, thicker, takes more.
+    pub fn cost(self, len: f32, role: MemberRole) -> u32 {
+        (len * role.thickness(self) * 0.25).ceil() as u32
+    }
+}
+
+/// What a rod is for in a bridge: the deck (tablier) is the floor the cars drive on; a girder
+/// (poutre) is structure, a truss diagonal or a post, that carries the loads but that the cars
+/// pass through, like trees.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemberRole {
+    Deck,
+    Girder,
+}
+
+impl MemberRole {
+    pub const ALL: [MemberRole; 2] = [MemberRole::Deck, MemberRole::Girder];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            MemberRole::Deck => "Tablier",
+            MemberRole::Girder => "Poutre",
+        }
+    }
+
+    pub fn id(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_id(id: u8) -> MemberRole {
+        Self::ALL.iter().copied().find(|r| r.id() == id).unwrap_or(MemberRole::Girder)
+    }
+
+    /// The role a rod drawn without one gets (old saves, built-in scenes): one lying roughly flat
+    /// (within about 20 degrees) is deck, a steeper one is structure.
+    pub fn guess(p0: Vec2, p1: Vec2) -> MemberRole {
+        let d = p1 - p0;
+        if d.y.abs() < 0.36 * d.x.abs().max(1e-3) {
+            MemberRole::Deck
+        } else {
+            MemberRole::Girder
+        }
+    }
+
+    /// How thick the rod is drawn and stamped in the world: a deck is a thick slab with cross
+    /// bracing, a girder a plain bar.
+    pub fn thickness(self, mat: MemberMat) -> f32 {
+        match self {
+            MemberRole::Deck => mat.thickness() * 1.75,
+            MemberRole::Girder => mat.thickness(),
+        }
     }
 }
 
@@ -562,6 +621,7 @@ impl MemberMat {
 pub struct Member {
     pub uid: u32,
     pub mat: MemberMat,
+    pub role: MemberRole,
     pub a: Anchor,
     pub b: Anchor,
     /// Current end positions (follow the physics once it runs).
@@ -581,6 +641,7 @@ impl Member {
         Member {
             uid: NEXT_MEMBER_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             mat,
+            role: MemberRole::guess(p0, p1),
             a,
             b,
             p0,
@@ -596,13 +657,32 @@ impl Member {
         (self.p1 - self.p0).length()
     }
 
-    /// Floor or structure? A rod lying roughly flat (within about 20 degrees) is
-    /// deck: a car drives on it and its weight rests on it. A steeper rod is
-    /// load-bearing structure (a truss diagonal, a post): it carries the loads but
-    /// does not block the car.
+    /// The same rod with the role picked in the palette.
+    pub fn with_role(mut self, role: MemberRole) -> Self {
+        self.role = role;
+        self
+    }
+
+    /// Floor or structure? The deck (tablier) is what a car drives on and rests its weight on.
+    /// A girder (poutre) is load-bearing structure (a truss diagonal, a post): it carries the
+    /// loads but does not block the car.
     pub fn is_deck(&self) -> bool {
-        let d = self.p1 - self.p0;
-        d.y.abs() < 0.36 * d.x.abs().max(1e-3)
+        self.role == MemberRole::Deck
+    }
+
+    /// Thickness in the world (cells): a deck is thicker than a girder.
+    pub fn thickness(&self) -> f32 {
+        self.role.thickness(self.mat)
+    }
+
+    /// How far the middle of the slab sits below the line between the pins. A deck's running
+    /// surface is where a girder's top would be, and its extra thickness hangs underneath, so a
+    /// deck laid at ground level is flush with the road.
+    pub fn slab_offset(&self) -> Vec2 {
+        let d = (self.p1 - self.p0).normalize_or_zero();
+        let n = vec2(-d.y, d.x);
+        let down = if n.y >= 0.0 { n } else { -n };
+        down * (self.thickness() - self.mat.thickness()) * 0.5
     }
 
     pub fn center(&self) -> Vec2 {
@@ -620,7 +700,7 @@ impl Member {
     }
 
     pub fn covers(&self, p: Vec2) -> bool {
-        self.distance_to(p) <= self.mat.thickness() / 2.0
+        self.distance_to(p - self.slab_offset()) <= self.thickness() / 2.0
     }
 
     pub fn distance_to(&self, p: Vec2) -> f32 {
@@ -630,7 +710,7 @@ impl Member {
     }
 
     pub fn bounds(&self) -> (i32, i32, i32, i32) {
-        let r = self.mat.thickness() + 1.0;
+        let r = self.thickness() + 1.0;
         (
             ((self.p0.x.min(self.p1.x) - r).floor() as i32).max(0),
             ((self.p0.y.min(self.p1.y) - r).floor() as i32).max(0),
@@ -663,7 +743,7 @@ pub fn node_at(world: &World, blocks: &[Block], members: &[Member], p: Vec2) -> 
         return Some(Anchor::Block { uid: b.uid, local: rot(-b.angle, p - b.pos) });
     }
     for m in members {
-        if m.distance_to(p) <= m.mat.thickness() / 2.0 + 3.0 {
+        if m.distance_to(p) <= m.thickness() / 2.0 + 3.0 {
             let ab = m.p1 - m.p0;
             let t = ((p - m.p0).dot(ab) / ab.length_squared().max(1.0)).clamp(0.0, 1.0);
             return Some(Anchor::Along { uid: m.uid, t });
@@ -2741,7 +2821,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_rods_are_deck_and_steep_ones_are_structure() {
+    fn a_rod_with_no_role_given_guesses_it_from_its_slope() {
         let rod = |a: Vec2, b: Vec2| Member::new(MemberMat::Steel, Anchor::Free(a), Anchor::Free(b), a, b);
         assert!(rod(vec2(0.0, 100.0), vec2(80.0, 100.0)).is_deck(), "level rod is floor");
         assert!(rod(vec2(0.0, 100.0), vec2(80.0, 112.0)).is_deck(), "a gentle ramp is still floor");
@@ -2791,6 +2871,23 @@ mod tests {
     }
 
     #[test]
+    fn the_role_picked_decides_what_the_car_rides_on_whatever_the_slope() {
+        let mut world = ground();
+        // A flat girder (a bottom chord) and a steep deck (a ramp): the role wins over the slope.
+        let (a, b) = (vec2(320.0, 250.0), vec2(400.0, 250.0));
+        let chord = Member::new(MemberMat::Steel, Anchor::Free(a), Anchor::Free(b), a, b).with_role(MemberRole::Girder);
+        let (c, d) = (vec2(500.0, 290.0), vec2(540.0, 250.0));
+        let ramp = Member::new(MemberMat::Wood, Anchor::Free(c), Anchor::Free(d), c, d).with_role(MemberRole::Deck);
+        assert!(!chord.is_deck() && ramp.is_deck());
+        assert!(ramp.thickness() > MemberMat::Wood.thickness(), "a deck is thicker than a girder");
+        assert!(MemberMat::Iron.cost(60.0, MemberRole::Deck) > MemberMat::Iron.cost(60.0, MemberRole::Girder), "and takes more matter");
+        stamp_all(&mut world, &[], &[chord, ramp]);
+        assert!(world.at(360, 250).is_hard(), "the girder is there for sand and water");
+        assert!(!world.hard_for_car(360, 250), "but a car goes through it");
+        assert!(world.hard_for_car(520, 270), "a car drives up the steep deck");
+    }
+
+    #[test]
     fn a_rod_with_no_attachment_falls_and_lands() {
         let mut world = ground();
         let mut blocks: Vec<Block> = vec![];
@@ -2811,7 +2908,7 @@ mod tests {
     #[test]
     fn bricks_clip_onto_each_other() {
         let base = Block::new(BlockKind::Brick, vec2(100.0, 295.0), 0.0);
-        // Hovering 3 cells too high and 2 cells off the stud grid: it sits on it, onto the studs.
+        // Hovering 3 cells too high and 2 cells off the stud grid: it fits onto the studs.
         let p = magnet(&[base.clone()], BlockKind::Brick, 0.0, vec2(108.0, 282.0));
         assert_eq!(p, vec2(110.0, 285.0));
         // Beside it, flush.
@@ -2826,9 +2923,13 @@ mod tests {
         assert_eq!(magnet(&[], BlockKind::Brick, 0.0, vec2(103.4, 87.2)), vec2(103.0, 87.0));
         let far = magnet(&[base.clone()], BlockKind::Brick, 0.0, vec2(143.0, 250.0));
         assert_eq!(far, vec2(143.0, 250.0));
-        // Stacked, half way between two studs: it stays where it is put.
-        let half = magnet(&[base], BlockKind::Brick, 0.0, vec2(105.0, 285.0));
-        assert_eq!(half, vec2(105.0, 285.0));
+        // Stacked, half way between two studs: it still fits onto them.
+        let half = magnet(&[base.clone()], BlockKind::Brick, 0.0, vec2(104.0, 285.0));
+        assert_eq!(half, vec2(100.0, 285.0));
+        // Fitted onto a brick, the studs win over lining up with a nearby block's edge.
+        let side = Block::new(BlockKind::Post, vec2(126.0, 270.0), 0.0);
+        let p = magnet(&[base, side], BlockKind::Brick, 0.0, vec2(110.0, 284.0));
+        assert_eq!(p, vec2(110.0, 285.0));
     }
 
     #[test]

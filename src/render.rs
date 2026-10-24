@@ -1232,17 +1232,17 @@ pub fn draw_member(m: &Member, v: View, stress: bool, time: f32) {
     let shake = n * (time * 61.0 + m.uid as f32).sin() * danger * 1.2 * v.s;
     a += shake;
     b += shake;
-    let th = m.mat.thickness() * v.s;
+    let th = m.thickness() * v.s;
+    // A deck's slab hangs under the line between its pins (its top is the road).
+    let (pa, pb) = (a, b);
+    let slab = m.slab_offset() * v.s;
+    let (a, b) = (a + slab, b + slab);
     let dark = Color::new(col.r * 0.55, col.g * 0.55, col.b * 0.55, 1.0);
     // A floor beam bends down in the middle under the weight it carries.
     let down = if n.y >= 0.0 { n } else { -n };
     let sag = if m.is_deck() { load * load * (b - a).length() * 0.08 } else { 0.0 };
-    let pts: Vec<Vec2> = (0..=8)
-        .map(|k| {
-            let t = k as f32 / 8.0;
-            a + (b - a) * t + down * sag * 4.0 * t * (1.0 - t)
-        })
-        .collect();
+    let along = |t: f32| a + (b - a) * t + down * sag * 4.0 * t * (1.0 - t);
+    let pts: Vec<Vec2> = (0..=8).map(|k| along(k as f32 / 8.0)).collect();
     let line = |off: Vec2, w: f32, c: Color| {
         for s in pts.windows(2) {
             draw_line(s[0].x + off.x, s[0].y + off.y, s[1].x + off.x, s[1].y + off.y, w, c);
@@ -1253,37 +1253,58 @@ pub fn draw_member(m: &Member, v: View, stress: bool, time: f32) {
         line(Vec2::ZERO, th * 2.6, Color::new(1.0, 0.15, 0.1, 0.35 * danger * (0.5 + 0.5 * pulse)));
     }
     line(vec2(1.0, 2.0), th, Color::new(0.0, 0.0, 0.0, 0.25));
-    line(Vec2::ZERO, th, dark);
-    line(Vec2::ZERO, th * 0.68, col);
-    line(n * (-th * 0.18), (th * 0.18).max(1.0), Color::new(1.0, 1.0, 1.0, 0.28));
-    if m.is_deck() {
-        // The floor a car drives on gets a bright running surface.
-        line(n * (-th * 0.5), (th * 0.16).max(1.2), Color::new(1.0, 0.95, 0.6, 0.9));
-    }
     let len = (b - a).length();
-    match m.mat {
-        MemberMat::Wood => {
-            let mut t = 12.0;
-            while t < len - 6.0 {
-                let u = t / len;
-                let p = a + d * t + down * sag * 4.0 * u * (1.0 - u);
-                draw_line(p.x, p.y, p.x + d.x * 5.0, p.y + d.y * 5.0, 1.0, Color::new(0.35, 0.22, 0.1, 0.6));
-                t += 14.0;
+    if m.is_deck() {
+        // The deck: a thick slab, two chords with cross bracing between them, and the bright
+        // running surface the car drives on along its top.
+        line(Vec2::ZERO, th, dark);
+        line(Vec2::ZERO, th * 0.78, Color::new(col.r * 0.8, col.g * 0.8, col.b * 0.8, 1.0));
+        let chord = (th * 0.2).max(1.2);
+        let edge = th * 0.5 - chord * 0.5;
+        line(-down * edge, chord, col);
+        line(down * edge, chord, col);
+        let brace = Color::new(col.r * 0.4, col.g * 0.4, col.b * 0.4, 1.0);
+        let panels = ((len / (th * 1.6)).round() as i32).max(1);
+        for k in 0..panels {
+            let (t0, t1) = (k as f32 / panels as f32, (k + 1) as f32 / panels as f32);
+            let (p0, p1) = (along(t0), along(t1));
+            let h = th * 0.36;
+            let w = (th * 0.09).max(1.0);
+            draw_line(p0.x - down.x * h, p0.y - down.y * h, p1.x + down.x * h, p1.y + down.y * h, w, brace);
+            draw_line(p0.x + down.x * h, p0.y + down.y * h, p1.x - down.x * h, p1.y - down.y * h, w, brace);
+            if k > 0 {
+                draw_line(p0.x - down.x * h, p0.y - down.y * h, p0.x + down.x * h, p0.y + down.y * h, w, brace);
             }
         }
-        MemberMat::Iron | MemberMat::Steel => {
-            let mut t = 8.0;
-            while t < len - 4.0 {
-                let u = t / len;
-                let p = a + d * t + down * sag * 4.0 * u * (1.0 - u);
-                draw_circle(p.x, p.y, th * 0.12 + 0.6, Color::new(1.0, 1.0, 1.0, 0.35));
-                t += 18.0;
+        line(-down * (th * 0.5), (th * 0.14).max(1.2), Color::new(1.0, 0.95, 0.6, 0.9));
+    } else {
+        line(Vec2::ZERO, th, dark);
+        line(Vec2::ZERO, th * 0.68, col);
+        line(n * (-th * 0.18), (th * 0.18).max(1.0), Color::new(1.0, 1.0, 1.0, 0.28));
+        match m.mat {
+            MemberMat::Wood => {
+                let mut t = 12.0;
+                while t < len - 6.0 {
+                    let p = along(t / len);
+                    draw_line(p.x, p.y, p.x + d.x * 5.0, p.y + d.y * 5.0, 1.0, Color::new(0.35, 0.22, 0.1, 0.6));
+                    t += 14.0;
+                }
+            }
+            MemberMat::Iron | MemberMat::Steel => {
+                let mut t = 8.0;
+                while t < len - 4.0 {
+                    let p = along(t / len);
+                    draw_circle(p.x, p.y, th * 0.12 + 0.6, Color::new(1.0, 1.0, 1.0, 0.35));
+                    t += 18.0;
+                }
             }
         }
     }
-    for p in [a, b] {
-        draw_circle(p.x, p.y, th * 0.78, Color::from_rgba(226, 228, 236, 255));
-        draw_circle(p.x, p.y, th * 0.34, Color::from_rgba(60, 64, 78, 255));
+    // The pins are the same size on a deck and on a girder.
+    let pin = m.mat.thickness() * v.s;
+    for p in [pa, pb] {
+        draw_circle(p.x, p.y, pin * 0.78, Color::from_rgba(226, 228, 236, 255));
+        draw_circle(p.x, p.y, pin * 0.34, Color::from_rgba(60, 64, 78, 255));
     }
     if stress && load > 0.2 && len > 24.0 {
         // How much of its strength the beam uses, in the middle of it.

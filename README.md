@@ -66,7 +66,7 @@ cargo run --release
 
 ## Construire
 - **Blocs façon Lego** : brique, longue, planche, poutre fer, poutre acier, cube, verre, roue. Posés librement au pixel près ;
-  près d'un autre bloc ils s'aimantent (collés contre lui, bords ou milieux alignés, sur ses plots quand on empile) et de
+  près d'un autre bloc ils s'aimantent (collés contre lui, bords ou milieux alignés ; une brique emboîtée sur une autre est toujours calée pile sur ses plots) et de
   fins pointillés montrent l'alignement (Maj = sans aimant). Pas de superposition, molette ou Q/E pour tourner. Les blocs qui se touchent sont soudés ;
   bout à bout, les tiges de même matière forment une seule pièce plus rigide.
 - **Tiges** (bois, fer, acier) : un clic fixe un bout (sol, bloc ou nœud), tire, un second clic fixe l'autre. Longueur max 110.
@@ -92,7 +92,7 @@ vide ou en sortant du monde. Leur poids pèse sur les ponts. **Réglages** (ongl
 amortisseurs, adhérence, taille des roues, solidité, poids, couleur — sur la voiture choisie ou pour les suivantes.
 
 ## Raccourcis
-Espace jouer/pause · B Béluga · W baleine · L loups · K petit garçon · R retour · Z annuler · C voiture · G monde suivant · N vide · H température · X efforts · V vent ·
+Espace jouer/pause · B Béluga · W baleine · L loups · K petit garçon · R réessayer · Z annuler · C voiture · G monde suivant · N vide · H température · X efforts · V vent ·
 Q/E/T tourner · Tab onglet · [ ] pinceau · ↑/↓ vitesse · 1-0 matières · F5/F9 sauver/charger · F11 plein écran.
 
 ## Développement
@@ -140,7 +140,7 @@ le jeu tourne simplement en silence. `--no-default-features` compile une version
 
 ## Raccourcis
 
-Espace jouer/pause · B Béluga · W baleine · L loups · K petit garçon · R retour · C voiture · Z annuler · H/X/V vues · M son · F ou F11 plein écran · Tab onglet. Poteau (brique haute) dans les blocs : plus besoin de tourner les blocs.
+Espace jouer/pause · B Béluga · W baleine · L loups · K petit garçon · R réessayer · C voiture · Z annuler · H/X/V vues · M son · F ou F11 plein écran · Tab onglet. Poteau (brique haute) dans les blocs : plus besoin de tourner les blocs.
 **Ctrl + molette** zoome sur le pointeur (jusqu'à ×8), **Ctrl + glisser** déplace la vue.
 **Échap** recule d'un cran : page Science, tracé en cours, vue zoomée (retour à la vue standard), plein écran, puis une fenêtre « Quitter AWorld ? » qui met
 la simulation en pause ; Échap y reprend le jeu, **Entrée** quitte.
@@ -236,7 +236,7 @@ et faire des loopings et des culbutes. S'il touche quoi que ce soit (sol, eau, b
   donne le point de départ, la bulle permet de jouer avec en pleine simulation.
 - **Lance-flammes** (barre d'outils, icône flamme) : garder le clic enfoncé envoie un jet à 1500 °C de la taille du
   pinceau. Le bois s'embrase, la roche rougit puis fond en lave, le fer fond, l'eau bout ; ce qui est lourd chauffe plus
-  lentement. Sa chaleur compte dans le bilan d'énergie avec celle des feux.
+  lentement. Sa chaleur compte dans le bilan d'énergie avec celle des feux. C'est lui qui allume : le feu n'est plus dans la palette des matières.
 - La palette de gauche se cache comme celle de droite : elle sort quand la souris va au bord gauche. La petite poignée en
   haut la garde dehors (et l'image se place à côté).
 - Les feuillages laissent passer l'eau : elle goutte à travers les arbres.
@@ -373,7 +373,7 @@ L'eau gèle et la glace fond à 0 °C. Pour changer d'état, une cellule doit d'
 
 ## Capteurs : thermomètre, baromètre, hygromètre
 
-Le nouvel outil **Capteur** (barre d'outils à gauche, icône thermomètre) pose une sonde dans le monde, jusqu'à 4 (A, B, C, D). Chaque sonde relève toutes les 30 étapes (une demi-seconde de jeu) la température, la pression absolue (celle de la poche de gaz, ou dans un liquide le poids de ce qui est au-dessus plus le gaz qui appuie) et l'humidité de l'air. Ses courbes des deux dernières minutes s'affichent dans une carte en bas de l'image, chaque courbe à sa propre échelle pour qu'un petit changement se voie. On y voit l'eau d'une casserole chauffer sans jamais dépasser 100 °C, une chaudière monter en pression, l'air sécher à midi. Cliquer sur une sonde l'enlève ; « Retour » efface les courbes mais garde les sondes. Les sondes ne sont pas enregistrées dans les sauvegardes.
+Le nouvel outil **Capteur** (barre d'outils à gauche, icône thermomètre) pose une sonde dans le monde, jusqu'à 4 (A, B, C, D). Chaque sonde relève toutes les 30 étapes (une demi-seconde de jeu) la température, la pression absolue (celle de la poche de gaz, ou dans un liquide le poids de ce qui est au-dessus plus le gaz qui appuie) et l'humidité de l'air. Ses courbes des deux dernières minutes s'affichent dans une carte en bas de l'image, chaque courbe à sa propre échelle pour qu'un petit changement se voie. On y voit l'eau d'une casserole chauffer sans jamais dépasser 100 °C, une chaudière monter en pression, l'air sécher à midi. Cliquer sur une sonde l'enlève ; « Réessayer » efface les courbes mais garde les sondes. Les sondes ne sont pas enregistrées dans les sauvegardes.
 
 ## Lumière et effets (shaders)
 
@@ -414,3 +414,13 @@ Le nouvel outil **Capteur** (barre d'outils à gauche, icône thermomètre) pose
 - **Arbre** : la petite flèche du bouton Bois propose « Arbre ». Un clic plante un arbre adulte (tronc, branches, feuillage, comme ceux du paysage) sur le sol sous la souris ; un pinceau plus gros le fait plus grand. Pas d'arbre dans l'eau ni sous un surplomb.
 
 `--demo out.png --logs --tab matter --states 4` montre des arbres plantés et des bûches tombées en pile.
+
+## Construction, test et défi
+Le jeu sépare maintenant clairement les trois moments, affichés dans la pastille en haut à droite :
+- **CONSTRUCTION** : rien ne bouge ; tout ce qu'on fait modifie le monde construit (le « plan »).
+- **TEST** (bouton Tester ou Espace) : le plan est mis de côté au premier lancement, puis on regarde. On peut encore bricoler, même en pause, mais rien n'est gardé : Pause puis Reprendre continue le même test, et Annuler s'arrête au plan.
+- **DÉFI** (bouton Défi) : repart du plan, compteurs Arrivées/Perdues à zéro, et verrouille la construction (les voitures, les capteurs, le lance-flammes et l'éclair restent permis).
+
+**Réessayer** (R, dans la barre du lecteur et en bas de la palette) remet le plan, remet les compteurs à zéro et revient à la construction ; en construction, il ne fait rien. Une sauvegarde faite pendant un test ou un défi enregistre le plan, jamais un monde à moitié simulé.
+
+`--demo out.png --challenge` montre le défi en cours.
