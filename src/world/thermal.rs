@@ -11,6 +11,7 @@
 
 use super::*;
 use rayon::prelude::*;
+use super::num::{ceil_i, floor_f, round_i};
 
 /// Simulation steps in one full day.
 pub const DAY_STEPS: u32 = 21_600;
@@ -1147,7 +1148,7 @@ impl World {
     fn carry_fine(cells: &[Cell], old: &[f32], i: usize, x: usize, y: usize, ox: f32, oy: f32) -> f32 {
         // The far end, bilinear, so slow air still moves by less than a cell.
         let (px, py) = (x as f32 + ox, y as f32 + oy);
-        let (fx, fy) = (px.floor(), py.floor());
+        let (fx, fy) = (floor_f(px), floor_f(py));
         let (tx, ty) = (px - fx, py - fy);
         let sx0 = (fx as i32).rem_euclid(W as i32 - 1) as usize;
         let sy0 = (fy as i32).clamp(0, H as i32 - 2) as usize;
@@ -1165,11 +1166,11 @@ impl World {
             return far;
         }
         // Every cell of the way (fewer, and the rows that happen to land on the hot layer show).
-        let n = (ox.abs().max(oy.abs()).ceil() as usize).clamp(1, 32);
+        let n = ceil_i(ox.abs().max(oy.abs())).clamp(1, 32) as usize;
         let (mut sum, mut count) = (0.0, 0.0);
         for k in 1..n {
             let f = k as f32 / n as f32;
-            let j = ((y as f32 + oy * f).round() as i32).clamp(0, H as i32 - 1) as usize * W + ((x as f32 + ox * f).round() as i32).rem_euclid(W as i32) as usize;
+            let j = round_i(y as f32 + oy * f).clamp(0, H as i32 - 1) as usize * W + round_i(x as f32 + ox * f).rem_euclid(W as i32) as usize;
             if cells[j].m != Mat::Empty {
                 return if count > 0.0 { sum / count } else { old[i] };
             }
@@ -2034,3 +2035,4 @@ mod atmosphere_tests {
         assert!(t[0] > t[coldest] + 5.0 && t[GROUND_Y as usize] > t[coldest] + 5.0);
     }
 }
+

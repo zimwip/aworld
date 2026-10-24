@@ -243,7 +243,8 @@ impl World {
             }
             count += 1;
         }
-        // Each body's places, rising, and a fingerprint of its cells.
+        // Each body's places, rising, a fingerprint of its cells, and where each place comes in
+        // its body's list.
         let mut bodies: Vec<Vec<u32>> = vec![vec![]; count as usize];
         let mut keys: Vec<u64> = vec![0; count as usize];
         for (k, &b) in body_of.iter().enumerate() {
@@ -254,14 +255,24 @@ impl World {
         for (key, b) in keys.iter_mut().zip(&bodies) {
             *key ^= b.len() as u64;
         }
+        // (Only the bodies that have to be worked out again.)
+        let mut local = std::mem::take(&mut self.stress_local);
+        local.resize(n, 0);
+        for (members, key) in bodies.iter().zip(&keys) {
+            if !self.stress_cache.contains_key(key) {
+                for (l, &k) in members.iter().enumerate() {
+                    local[k as usize] = l as u32;
+                }
+            }
+        }
         let results: Vec<std::sync::Arc<BodyStress>> = {
-            let (this, level, pos) = (&*self, &level, &pos);
+            let (this, level, pos, local) = (&*self, &level, &pos, &local);
             bodies
                 .par_iter()
                 .zip(keys.par_iter())
                 .map(|(members, key)| match this.stress_cache.get(key) {
                     Some(done) => done.clone(),
-                    None => std::sync::Arc::new(this.body_stress(order, members, level, pos)),
+                    None => std::sync::Arc::new(this.body_stress(order, members, local, level, pos)),
                 })
                 .collect()
         };
@@ -277,6 +288,7 @@ impl World {
             pos[i] = u32::MAX;
         }
         self.stress_pos = pos;
+        self.stress_local = local;
         // (The same order whatever the order of the bodies: the outermost section first, then
         // by place, among cracks under the same load.)
         cracks.sort_by(|a, b| b.level.cmp(&a.level).then(a.fibres[0].cmp(&b.fibres[0])));
@@ -342,11 +354,12 @@ impl World {
         self.level = level;
     }
 
-    /// The load on every section of one anchored body (`members`: its places in `order`, rising),
-    /// and the sections that cannot carry it, as `stress_pass` reads them.
-    fn body_stress(&self, order: &[usize], members: &[u32], level: &[u32], pos: &[u32]) -> BodyStress {
+    /// The load on every section of one anchored body (`members`: its places in `order`, rising;
+    /// `local`: where each place of `order` comes in its body's list), and the sections that
+    /// cannot carry it, as `stress_pass` reads them.
+    fn body_stress(&self, order: &[usize], members: &[u32], local: &[u32], level: &[u32], pos: &[u32]) -> BodyStress {
         let n = members.len();
-        let local = |k: u32| members.binary_search(&k).unwrap_or(0) as u32;
+        let local = |k: u32| local[k as usize];
         let mut up: Vec<u32> = (0..n as u32).collect();
         let mut mass = vec![0.0f64; n];
         let mut moment = vec![0.0f64; n];
