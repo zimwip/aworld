@@ -3340,16 +3340,30 @@ impl Game {
         if ui.checkbox(cr, "Air compressible (P V = n R T)", self.world.flow.compress, true) {
             self.world.flow.compress = !self.world.flow.compress;
         }
-        // The cells' turn on every core: about twice as fast when much is moving, but water spreads
-        // and drains a little differently (see `world/turn.rs`).
-        let pr = Rect::new(10.0, cr.y + 27.0, PANEL_W - 20.0, 24.0);
-        if ui.checkbox(pr, "Calcul sur tous les cœurs", self.world.parallel_cells, true) {
+        // Two ways of computing, side by side as toggles (the panel has no room for two more rows):
+        // the cells' turn on every core, about twice as fast when much is moving, but water spreads
+        // and drains a little differently (see `world/turn.rs`); and water at rest as a field (see
+        // `world/field.rs`), a prototype to compare with the water made of cells.
+        let half = (PANEL_W - 18.0) / 2.0;
+        let pr = Rect::new(6.0, cr.y + 27.0, half, 24.0);
+        let fr = Rect::new(12.0 + half, cr.y + 27.0, half, 24.0);
+        if ui.button(pr, "Tous les cœurs", Icon::None, self.world.parallel_cells, true, GREEN) {
             self.world.parallel_cells = !self.world.parallel_cells;
+        }
+        if ui.button(fr, "Eau en champ", Icon::None, self.world.water_field, true, BLUE) {
+            let on = !self.world.water_field;
+            self.world.set_water_field(on);
         }
         if ui.hover(pr) {
             self.hover_info = Some((
                 "Calcul sur tous les cœurs".to_string(),
                 "Jusqu'à deux fois plus vite quand beaucoup bouge, mais l'eau s'écoule un peu autrement.".to_string(),
+            ));
+        }
+        if ui.hover(fr) {
+            self.hover_info = Some((
+                "Eau en champ (prototype)".to_string(),
+                "L'eau posée devient une quantité par case, poussée par son poids ; les gouttes qui tombent restent des particules.".to_string(),
             ));
         }
     }

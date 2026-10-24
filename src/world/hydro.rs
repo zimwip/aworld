@@ -255,10 +255,13 @@ impl World {
             if !Self::inb(r.x, r.y) || self.raw(d.x, d.y) != m || self.at(r.x, r.y) != Mat::Empty {
                 continue;
             }
-            let t = self.temp[Self::idx(d.x, d.y)];
+            let (i, j) = (Self::idx(d.x, d.y), Self::idx(r.x, r.y));
+            let (t, fill) = (self.temp[i], self.fill[i]);
             self.set(d.x, d.y, Mat::Empty);
             self.set(r.x, r.y, m);
-            self.temp[Self::idx(r.x, r.y)] = t;
+            self.temp[j] = t;
+            // (Water in the field takes what the cell held with it.)
+            self.fill[j] = fill;
         }
     }
 }
