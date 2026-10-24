@@ -3350,9 +3350,22 @@ impl Game {
         if ui.button(pr, "Tous les cœurs", Icon::None, self.world.parallel_cells, true, GREEN) {
             self.world.parallel_cells = !self.world.parallel_cells;
         }
-        if ui.button(fr, "Eau en champ", Icon::None, self.world.water_field, true, BLUE) {
-            let on = !self.world.water_field;
-            self.world.set_water_field(on);
+        // The liquids' button goes round three ways: cells, the water field, the physics.
+        let label = if self.world.liquid_physics {
+            "Liquides : physique"
+        } else if self.world.water_field {
+            "Eau : champ"
+        } else {
+            "Eau : cases"
+        };
+        if ui.button(fr, label, Icon::None, self.world.water_field || self.world.liquid_physics, true, BLUE) {
+            if self.world.liquid_physics {
+                self.world.set_liquid_physics(false);
+            } else if self.world.water_field {
+                self.world.set_liquid_physics(true);
+            } else {
+                self.world.set_water_field(true);
+            }
         }
         if ui.hover(pr) {
             self.hover_info = Some((
@@ -3362,8 +3375,8 @@ impl Game {
         }
         if ui.hover(fr) {
             self.hover_info = Some((
-                "Eau en champ (prototype)".to_string(),
-                "L'eau posée devient une quantité par case, poussée par son poids ; les gouttes qui tombent restent des particules.".to_string(),
+                "Liquides : cases, champ ou physique".to_string(),
+                "Cases : chaque case d'eau est une particule. Champ (prototype) : l'eau posée devient une quantité par case, poussée par son poids. Physique (prototype) : tous les liquides ont une vitesse et une pression en unités réelles, la lave épaisse et figée en refroidissant.".to_string(),
             ));
         }
     }

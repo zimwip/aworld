@@ -78,6 +78,9 @@ impl World {
     /// Turns the field on or off. Off, a cell of water is always full: the cells under half full
     /// go and the others fill up, about as much water as there was.
     pub fn set_water_field(&mut self, on: bool) {
+        if on && self.liquid_physics {
+            self.set_liquid_physics(false);
+        }
         if !on {
             for i in 0..W * H {
                 if self.cells[i].m == Mat::Water && self.fill[i] != 0 {
@@ -567,6 +570,78 @@ mod probe {
                     eprintln!("FALL field {field} t {t}\n{}", dump(&w, 98, 258, 242, 401));
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dam {
+    use super::*;
+
+    /// A dam break in a tank 240 cells long and 50 high: the water (40 wide, 30 high) stands at the
+    /// left end. Dumps the water in each cell at a few steps, for the pictures of the proposal.
+    #[test]
+    #[ignore]
+    fn probe_dam_break() {
+        let out = std::env::var("DAM_OUT").unwrap_or_else(|_| "/tmp/dam".into());
+        for field in [false, true] {
+            let mut w = World::new_static();
+            w.water_field = field;
+            let (x0, y0, x1, y1) = (100, 400, 339, 449);
+            for y in y0 - 1..=y1 + 1 {
+                for x in x0 - 1..=x1 + 1 {
+                    let inside = (x0..=x1).contains(&x) && (y0..=y1).contains(&y);
+                    w.set(x, y, if inside { Mat::Empty } else { Mat::Brick });
+                }
+            }
+            if std::env::var("DAM_SCENE").as_deref() == Ok("wave") {
+                // A calm pool 15 cells deep with a hump of water 20 wide and 10 high in the middle.
+                for y in y1 - 14..=y1 {
+                    for x in x0..=x1 {
+                        w.set(x, y, Mat::Water);
+                    }
+                }
+                for y in y1 - 24..y1 - 14 {
+                    for x in x0 + 110..x0 + 130 {
+                        w.set(x, y, Mat::Water);
+                    }
+                }
+            } else if std::env::var("DAM_SCENE").as_deref() == Ok("chute") {
+                // A block of water 16 x 16 falling 2.5 m into a pool 15 cells deep.
+                for y in y1 - 14..=y1 {
+                    for x in x0..=x1 {
+                        w.set(x, y, Mat::Water);
+                    }
+                }
+                for y in y0 + 4..y0 + 20 {
+                    for x in x0 + 112..x0 + 128 {
+                        w.set(x, y, Mat::Water);
+                    }
+                }
+            } else {
+                for y in y1 - 29..=y1 {
+                    for x in x0..x0 + 40 {
+                        w.set(x, y, Mat::Water);
+                    }
+                }
+            }
+            w.temp.fill(15.0);
+            let mut s = String::new();
+            for t in 0..=160 {
+                if [0, 10, 20, 40, 80, 160].contains(&t) || t % 2 == 0 {
+                    s += &format!("t {t}\n");
+                    for y in y0..=y1 {
+                        for x in x0..=x1 {
+                            let i = World::idx(x, y);
+                            let q = if w.raw(x, y) == Mat::Water { w.water_fill(i) as f32 / FULL as f32 } else { 0.0 };
+                            s += &format!("{:.2} ", q);
+                        }
+                        s.push('\n');
+                    }
+                }
+                w.step();
+            }
+            std::fs::write(format!("{out}-{}.txt", if field { "champ" } else { "actuelle" }), s).unwrap();
         }
     }
 }
