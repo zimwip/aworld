@@ -166,6 +166,12 @@ impl Default for Climate {
 }
 
 impl Climate {
+    /// A copy for a strip of the cells' turn (see `turn.rs`): the rules only read it, but for the
+    /// heat they give the sky; the record of the past stays behind.
+    pub(super) fn view(&self) -> Climate {
+        Climate { history: Default::default(), ..*self }
+    }
+
     /// Heat the player puts in by hand (the flamethrower), counted with the flames.
     pub fn add_player_heat(&mut self, q: f32) {
         self.acc[2] += q;

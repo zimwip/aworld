@@ -169,3 +169,20 @@ fn bench_fingerprint() {
     }
     }
 }
+
+/// The cells' turn on every core comes out the same on one core as on four (see `turn.rs`).
+#[test]
+fn the_cells_turn_on_every_core_is_the_same_on_one_core() {
+    let run = |cores: usize| {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(cores).build().unwrap();
+        pool.install(|| {
+            let mut w = explosions();
+            w.parallel_cells = true;
+            for _ in 0..90 {
+                w.step();
+            }
+            (w.cells.iter().map(|c| c.m).collect::<Vec<_>>(), w.temp.iter().map(|t| t.to_bits()).collect::<Vec<_>>())
+        })
+    };
+    assert!(run(1) == run(4), "the turn depends on the number of cores");
+}
