@@ -3,11 +3,12 @@
 //! what. Off, it costs one test per phase (no clock is read: the web build has none).
 
 /// The phases of a step, in the order they run.
-/// After `total`, the parts of the heat pass (already counted in `chaleur`).
-pub const PHASES: [&str; 21] = [
+/// After `total`, the parts of the heat pass (already counted in `chaleur`), then the water field.
+pub const PHASES: [&str; 22] = [
     "cellules", "structures", "chutes", "corps rigides", "poches", "éjectas", "tassement", "vent",
     "écoulement air", "pression", "poussée", "saisons", "chaleur", "orage", "niveaux liquides", "total",
     "  chaleur/conduction", "  chaleur/vent", "  chaleur/air+réactions", "  chaleur/vers l'espace", "  chaleur/soleil",
+    "eau en champ",
 ];
 pub const TOTAL: usize = 15;
 pub const HEAT_CONDUCTION: usize = 16;
@@ -15,6 +16,8 @@ pub const HEAT_WIND: usize = 17;
 pub const HEAT_AIR: usize = 18;
 pub const HEAT_SPACE: usize = 19;
 pub const HEAT_SUN: usize = 20;
+/// Not in the order of the step: the water field runs right after the cells.
+pub const FIELD: usize = 21;
 
 #[derive(Clone)]
 pub struct Profile {
