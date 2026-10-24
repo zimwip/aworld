@@ -3908,7 +3908,7 @@ fn demo_magnet(g: &mut Game) {
         }
     }
     let f = floor as f32;
-    for (k, x, y) in [(BlockKind::Long, 400.0, f - 5.0), (BlockKind::Brick, 393.0, f - 15.0), (BlockKind::Post, 470.0, f - 20.0), (BlockKind::Cube, 540.0, f - 10.0)] {
+    for (k, x, y) in [(BlockKind::Long, 400.0, f - 5.0), (BlockKind::Brick, 390.0, f - 15.0), (BlockKind::Post, 470.0, f - 20.0), (BlockKind::Cube, 540.0, f - 10.0)] {
         g.blocks.push(Block::new(k, vec2(x, y), 0.0));
     }
     g.refresh_mask();
