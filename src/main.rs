@@ -1462,8 +1462,10 @@ impl Game {
             self.last = None;
             return;
         }
-        // During the challenge the world is only watched: the probes still go down.
-        if self.challenge && self.tool != Tool::Sensor {
+        // During the challenge nothing is built: the probes still go down, and the flamethrower and
+        // the lightning still put the construction to the test (the right button, which erases, does not).
+        let trial = matches!(self.tool, Tool::Sensor | Tool::Flame | Tool::Lightning);
+        if self.challenge && (!trial || right) {
             if click || rclick {
                 self.say("Défi en cours : la construction est verrouillée (Réessayer pour la reprendre)");
             }
@@ -2642,7 +2644,7 @@ impl Game {
             self.start_challenge();
         }
         if ui.hover(r) {
-            self.hover_info = Some(("Défi".to_string(), "Repart du monde construit, compteurs à zéro, et verrouille la construction : on lance les voitures et on regarde. Réessayer pour recommencer ou reprendre la construction.".to_string()));
+            self.hover_info = Some(("Défi".to_string(), "Repart du monde construit, compteurs à zéro, et verrouille la construction : on lance les voitures, et le lance-flammes, l'éclair et les capteurs restent là pour éprouver la construction. Réessayer pour recommencer ou reprendre la construction.".to_string()));
         }
         let r = place(3, &mut x);
         if ui.button(r, "", Icon::Minus, false, self.speed > 1, ACCENT) {
