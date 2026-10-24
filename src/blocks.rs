@@ -337,8 +337,6 @@ fn flat_half(kind: BlockKind, angle: f32) -> Option<Vec2> {
 
 /// Distance (cells) within which a block is pulled onto a neighbour's edge or line.
 pub const MAGNET: f32 = 5.0;
-/// Distance (cells) within which a stacked brick is pulled onto the studs below.
-const STUD_PULL: f32 = 3.0;
 /// How far apart (cells) two blocks can be and still line up with each other.
 const ALIGN_RANGE: f32 = 60.0;
 
@@ -363,12 +361,15 @@ fn pull(best: &mut Option<(f32, f32)>, from: f32, to: f32, reach: f32, bonus: f3
 }
 
 /// Free placement with a magnet: the block goes where the cursor is (on whole cells), and only when
-/// it comes near another block is it pulled flush against it, onto its edges, its middle or its studs.
+/// it comes near another block is it pulled flush against it, onto its edges or its middle. A brick
+/// that fits onto another one (on top or under it) always sits exactly on its studs, like Lego.
 pub fn magnet(blocks: &[Block], kind: BlockKind, angle: f32, at: Vec2) -> Vec2 {
     let Some(h) = box_half(kind, angle) else { return at.round() };
     let free = (at - h).round() + h;
     let studded = has_studs(kind) && quarter_turns(angle) == Some(0);
     let mut pos = free;
+    // The x of the stud grid it is fitted onto, if it is.
+    let mut seated: Option<f32> = None;
     // Up and down first (resting on a block decides which studs it sits on), then sideways.
     for vertical in [true, false] {
         let mut best = None;
@@ -398,14 +399,19 @@ pub fn magnet(blocks: &[Block], kind: BlockKind, angle: f32, at: Vec2) -> Vec2 {
                 for (a, c) in [(l, bl), (r, br), (pos.x, b.pos.x)] {
                     pull(&mut best, a, c, MAGNET, 0.0);
                 }
-                // Sitting on a brick (or under it): onto its studs, like Lego.
+                // Fitted onto a brick (or under it): on its studs, whatever else lines up.
                 let stacked = gap_x < -1.0 && ((bot - bt).abs() < 0.01 || (t - bb).abs() < 0.01);
                 if studded && stacked && has_studs(b.kind) && quarter_turns(b.angle) == Some(0) {
-                    pull(&mut best, l, bl + ((l - bl) / STUD).round() * STUD, STUD_PULL, 0.2);
+                    let x = bl + ((l - bl) / STUD).round() * STUD + h.x;
+                    if seated.map_or(true, |s| (x - pos.x).abs() < (s - pos.x).abs()) {
+                        seated = Some(x);
+                    }
                 }
             }
         }
-        if let Some((d, _)) = best {
+        if let (false, Some(x)) = (vertical, seated) {
+            pos.x = x;
+        } else if let Some((d, _)) = best {
             if vertical {
                 pos.y += d;
             } else {
@@ -418,6 +424,10 @@ pub fn magnet(blocks: &[Block], kind: BlockKind, angle: f32, at: Vec2) -> Vec2 {
         let c = Block::new(kind, p, angle);
         blocks.iter().all(|b| c.gap(b) > -0.2)
     };
+    if seated.is_some() {
+        // Fitted on studs it stays on them: the next stud along if this one is taken, else refused.
+        return [0.0, -1.0, 1.0, -2.0, 2.0].into_iter().map(|k| vec2(pos.x + k * STUD, pos.y)).find(|p| fits(*p)).unwrap_or(pos);
+    }
     [pos, vec2(free.x, pos.y), vec2(pos.x, free.y), free].into_iter().find(|p| fits(*p)).unwrap_or(pos)
 }
 
@@ -2898,7 +2908,7 @@ mod tests {
     #[test]
     fn bricks_clip_onto_each_other() {
         let base = Block::new(BlockKind::Brick, vec2(100.0, 295.0), 0.0);
-        // Hovering 3 cells too high and 2 cells off the stud grid: it sits on it, onto the studs.
+        // Hovering 3 cells too high and 2 cells off the stud grid: it fits onto the studs.
         let p = magnet(&[base.clone()], BlockKind::Brick, 0.0, vec2(108.0, 282.0));
         assert_eq!(p, vec2(110.0, 285.0));
         // Beside it, flush.
@@ -2913,9 +2923,13 @@ mod tests {
         assert_eq!(magnet(&[], BlockKind::Brick, 0.0, vec2(103.4, 87.2)), vec2(103.0, 87.0));
         let far = magnet(&[base.clone()], BlockKind::Brick, 0.0, vec2(143.0, 250.0));
         assert_eq!(far, vec2(143.0, 250.0));
-        // Stacked, half way between two studs: it stays where it is put.
-        let half = magnet(&[base], BlockKind::Brick, 0.0, vec2(105.0, 285.0));
-        assert_eq!(half, vec2(105.0, 285.0));
+        // Stacked, half way between two studs: it still fits onto them.
+        let half = magnet(&[base.clone()], BlockKind::Brick, 0.0, vec2(104.0, 285.0));
+        assert_eq!(half, vec2(100.0, 285.0));
+        // Fitted onto a brick, the studs win over lining up with a nearby block's edge.
+        let side = Block::new(BlockKind::Post, vec2(126.0, 270.0), 0.0);
+        let p = magnet(&[base, side], BlockKind::Brick, 0.0, vec2(110.0, 284.0));
+        assert_eq!(p, vec2(110.0, 285.0));
     }
 
     #[test]
