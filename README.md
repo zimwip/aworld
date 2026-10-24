@@ -419,7 +419,7 @@ Le nouvel outil **Capteur** (barre d'outils à gauche, icône thermomètre) pose
 Le jeu sépare maintenant clairement les trois moments, affichés dans la pastille en haut à droite :
 - **CONSTRUCTION** : rien ne bouge ; tout ce qu'on fait modifie le monde construit (le « plan »).
 - **TEST** (bouton Tester ou Espace) : le plan est mis de côté au premier lancement, puis on regarde. On peut encore bricoler, même en pause, mais rien n'est gardé : Pause puis Reprendre continue le même test, et Annuler s'arrête au plan.
-- **DÉFI** (bouton Défi) : repart du plan, compteurs Arrivées/Perdues à zéro, et verrouille la construction (seuls les capteurs et les voitures restent permis).
+- **DÉFI** (bouton Défi) : repart du plan, compteurs Arrivées/Perdues à zéro, et verrouille la construction (les voitures, les capteurs, le lance-flammes et l'éclair restent permis).
 
 **Réessayer** (R, dans la barre du lecteur et en bas de la palette) remet le plan, remet les compteurs à zéro et revient à la construction ; en construction, il ne fait rien. Une sauvegarde faite pendant un test ou un défi enregistre le plan, jamais un monde à moitié simulé.
 
