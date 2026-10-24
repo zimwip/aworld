@@ -81,7 +81,13 @@ cargo run --release
   Une tige posée sans attache tombe.
 - **Matériaux** : un bloc consomme des cellules de la matière dont il est fait (brique = terre, planche = bois, poutre = fer...).
   En édition on peut choisir « illimité » ; en simulation c'est toujours limité.
-- **Marteau** : casse le verre en 3 étapes (bloc → moitiés → éclats → sable) et la glace. Un choc, une chute ou une voiture aussi.
+- **Verre** : il casse en 3 étapes (bloc → moitiés → éclats → sable) sous un choc, une chute, une voiture ou une explosion.
+- **Dynamite** (outil, elle n'est plus dans la palette des matières) : un clic lâche un bâton à mèche qui tombe à travers l'air
+  et l'eau et se pose sur la matière (ou sur un autre bâton). Cliqué dans la roche, la terre ou un mur, il y reste planté et saute
+  de l'intérieur, comme dans un trou de mine. La mèche brûle 3 s quand la simulation tourne (en construction, le bâton attend et
+  fait partie du plan : Réessayer le remet). Les bâtons qui se touchent sautent en une seule charge, plus forte, et l'onde de choc
+  fait partir les bâtons voisins quelques pas plus tard (détonation par influence) : un tas saute presque d'un coup.
+  Verrouillée pendant le Défi, comme la construction (`--demo out.png --sticks --frames 120`).
 - Le **bois flotte** (une voiture peut rouler dessus, mais ça bouge), le fer et la pierre coulent.
 
 ## Voitures

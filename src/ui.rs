@@ -31,7 +31,7 @@ pub enum Icon {
     Eraser,
     Tunnel,
     Flag,
-    Hammer,
+    Dynamite,
     Cable,
     Loupe,
     Thermo,
@@ -331,9 +331,16 @@ pub fn draw_icon(icon: Icon, c: Vec2, s: f32, col: Color) {
             draw_circle(c.x, c.y + s * 0.05, s * 0.2, BG);
             draw_arc(c.x, c.y + s * 0.05, 12, s * 0.24, 180.0, th * 1.2, 180.0, Color::new(0.85, 0.42, 0.3, 1.0));
         }
-        Icon::Hammer => {
-            draw_line(c.x - s * 0.35, c.y + s * 0.4, c.x + s * 0.2, c.y - s * 0.15, th * 1.3, col);
-            draw_rectangle_ex(c.x + s * 0.18, c.y - s * 0.28, s * 0.5, s * 0.3, DrawRectangleParams { offset: vec2(0.5, 0.5), rotation: -0.7, color: col });
+        Icon::Dynamite => {
+            // A red stick, tilted, its fuse curling up to a spark.
+            let red = Color::new(0.85, 0.24, 0.2, 1.0);
+            draw_rectangle_ex(c.x - s * 0.08, c.y + s * 0.1, s * 0.75, s * 0.26, DrawRectangleParams { offset: vec2(0.5, 0.5), rotation: -0.6, color: red });
+            draw_rectangle_ex(c.x - s * 0.08, c.y + s * 0.1, s * 0.18, s * 0.26, DrawRectangleParams { offset: vec2(0.5, 0.5), rotation: -0.6, color: Color::new(0.9, 0.86, 0.76, 1.0) });
+            let top = vec2(c.x + s * 0.22, c.y - s * 0.12);
+            let tip = vec2(c.x + s * 0.4, c.y - s * 0.42);
+            draw_line(top.x, top.y, c.x + s * 0.38, c.y - s * 0.2, th * 0.8, col);
+            draw_line(c.x + s * 0.38, c.y - s * 0.2, tip.x, tip.y, th * 0.8, col);
+            draw_circle(tip.x, tip.y, s * 0.1, Color::new(1.0, 0.75, 0.25, 1.0));
         }
         Icon::Cable => {
             draw_circle(c.x - s * 0.38, c.y + s * 0.22, s * 0.16, col);

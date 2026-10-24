@@ -260,6 +260,11 @@ impl World {
         self.detonate(cx, cy, sum);
     }
 
+    /// A fuse burnt down to the explosive at (x, y): the charge it belongs to goes off now.
+    pub fn set_off(&mut self, x: i32, y: i32) {
+        self.set_off_powder(x, y);
+    }
+
     /// The charge goes off at (cx, cy): its matter becomes fields. Its gas raises the density of
     /// the air, its shock squeezes the matter around it, its work digs the crater.
     pub fn detonate(&mut self, cx: i32, cy: i32, charge: Charge) {

@@ -80,7 +80,7 @@ const fn one(m: &'static [Mat]) -> Matter {
     Matter { states: m, default: 0 }
 }
 
-pub const MATTERS: [Matter; 18] = [
+pub const MATTERS: [Matter; 17] = [
     one(&[Mat::Sand]),
     Matter { states: &[Mat::Ice, Mat::Snow, Mat::Water, Mat::Steam], default: 2 },
     one(&[Mat::Dirt]),
@@ -96,7 +96,6 @@ pub const MATTERS: [Matter; 18] = [
     one(&[Mat::Rust]),
     one(&[Mat::Saltpeter]),
     one(&[Mat::Gunpowder]),
-    one(&[Mat::Dynamite]),
     one(&[Mat::Diamond]),
     one(&[Mat::Clay]),
     one(&[Mat::Terracotta]),
