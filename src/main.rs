@@ -6,6 +6,7 @@ mod fireworks;
 mod firetruck;
 mod kid;
 mod debris;
+mod dynamite;
 mod mech;
 mod fluidgame;
 mod lens;
@@ -98,7 +99,7 @@ enum Tool {
     Select,
     Eraser,
     Tunnel,
-    Hammer,
+    Dynamite,
     Flame,
     Lightning,
     Loupe,
@@ -129,6 +130,7 @@ struct Snapshot {
     springs: Vec<Spring>,
     mech: Mechanism,
     cars: Vec<Car>,
+    sticks: Vec<dynamite::Stick>,
     arrived: u32,
     lost: u32,
 }
@@ -253,7 +255,8 @@ struct Game {
     thunder: Vec<(f32, f32)>,
     /// Pieces of exploded cars, flying and bouncing.
     debris: debris::Debris,
-    hammer_fx: Vec<(Vec2, f32)>,
+    /// Sticks of dynamite dropped in the world, their fuses burning while it runs.
+    dynamite: dynamite::Dynamite,
     time: f32,
     fullscreen: bool,
     mode: ViewMode,
@@ -372,7 +375,7 @@ impl Game {
             bolts: vec![],
             thunder: vec![],
             debris: debris::Debris::default(),
-            hammer_fx: vec![],
+            dynamite: dynamite::Dynamite::default(),
             time: 0.0,
             fullscreen: false,
             mode: ViewMode::Normal,
@@ -419,6 +422,7 @@ impl Game {
             springs: self.springs.iter().map(Spring::fresh).collect(),
             mech: self.mech.clone(),
             cars: self.cars.clone(),
+            sticks: self.dynamite.sticks.clone(),
             arrived: self.arrived,
             lost: self.lost,
         }
@@ -447,6 +451,7 @@ impl Game {
         self.mech_draft = None;
         self.spring_draft = None;
         self.cars = s.cars;
+        self.dynamite.sticks = s.sticks;
         self.arrived = s.arrived;
         self.lost = s.lost;
         self.cable_from = None;
@@ -574,6 +579,7 @@ impl Game {
         self.springs = plan.springs;
         self.mech = plan.mech;
         self.cars = plan.cars;
+        self.dynamite.sticks = plan.sticks;
         self.undo.truncate(self.plan_undo);
         self.mech_draft = None;
         self.spring_draft = None;
@@ -610,6 +616,7 @@ impl Game {
         self.member_from = None;
         self.phys = None;
         self.cars.clear();
+        self.dynamite.clear();
         self.debris.clear();
         self.selected_car = None;
         self.running = false;
@@ -882,10 +889,6 @@ impl Game {
         self.sounds.emit(Ev::Clink);
         self.crumble(i, Mat::Shard, true);
         self.booms.push(Boom { pos, t: 0.55, color: Color::new(0.7, 0.9, 1.0, 1.0) });
-    }
-
-    fn hurt_cooldown_clear(&mut self, i: usize) {
-        self.blocks[i].hurt = 0;
     }
 
     fn burn_block(&mut self, i: usize) {
@@ -1192,46 +1195,22 @@ impl Game {
         }
     }
 
-    // ----- hammer -----------------------------------------------------------
+    // ----- dynamite ---------------------------------------------------------
 
-    fn hammer(&mut self, at: Vec2) {
-        self.hammer_fx.push((at, 0.0));
-        if let Some(i) = block_at(&self.blocks, at) {
-            if self.blocks[i].kind.is_glass() {
-                self.hurt_cooldown_clear(i);
-                self.damage_block(i);
-            } else {
-                if self.phys.is_none() {
-                    self.build_physics();
-                }
-                let b = self.blocks[i].clone();
-                let dir = (b.pos - at).normalize_or_zero();
-                if let Some(p) = &mut self.phys {
-                    p.knock(&b, at, vec2(dir.x, dir.y - 0.4));
-                }
-                self.say("Le bloc est secoué (lance la simulation pour le voir bouger)");
-            }
+    /// A stick of dynamite at `at`: it falls and lies on the ground, or stays planted in the
+    /// matter it was pushed into. Its fuse burns while the simulation runs.
+    fn drop_dynamite(&mut self, at: Vec2) {
+        if self.dynamite.sticks.len() >= dynamite::MAX_STICKS {
+            self.say(format!("Pas plus de {} bâtons de dynamite à la fois", dynamite::MAX_STICKS));
             return;
         }
-        let (cx, cy) = (at.x as i32, at.y as i32);
-        let mut hit = false;
-        for dy in -3..=3 {
-            for dx in -3..=3 {
-                match self.world.raw(cx + dx, cy + dy) {
-                    Mat::Glass => {
-                        self.world.shatter(cx + dx, cy + dy);
-                        hit = true;
-                    }
-                    Mat::Ice => {
-                        self.world.set(cx + dx, cy + dy, Mat::Snow);
-                        hit = true;
-                    }
-                    _ => {}
-                }
+        self.checkpoint();
+        self.dynamite.drop(&self.world, at);
+        if !self.running {
+            self.dynamite.settle(&self.world);
+            if self.dynamite.sticks.len() == 1 {
+                self.say("Dynamite posée : sa mèche s'allumera quand la simulation tournera");
             }
-        }
-        if !hit {
-            self.say("Le marteau casse le verre et la glace");
         }
     }
 
@@ -1552,7 +1531,7 @@ impl Game {
             Tool::Shovel => self.shovel_mouse(at, click, left),
             Tool::Select => self.select_mouse(at, click, left, is_key_down(KeyCode::LeftShift)),
             Tool::Tunnel => self.world.tunnel_line(from, g, self.brush.max(2)),
-            Tool::Hammer if click => self.hammer(at),
+            Tool::Dynamite if click => self.drop_dynamite(at),
             Tool::Flame => {
                 self.world.flamethrower(g.0, g.1, self.brush.max(3));
                 if self.trucks.scorch(vec2(g.0 as f32, g.1 as f32), self.brush.max(3) as f32) {
@@ -1652,10 +1631,6 @@ impl Game {
             b.t += dt / 0.7;
         }
         self.booms.retain(|b| b.t < 1.0);
-        for h in &mut self.hammer_fx {
-            h.1 += dt / 0.35;
-        }
-        self.hammer_fx.retain(|h| h.1 < 1.0);
         if let Some((_, t)) = &mut self.toast {
             *t -= dt;
         }
@@ -1743,6 +1718,7 @@ impl Game {
 
     fn sim_step(&mut self) {
         self.world.step();
+        self.dynamite.step(&mut self.world);
         self.sensors.step(&self.world);
         let exit = self.exit;
         let was_driving: Vec<bool> = self.cars.iter().map(|c| c.fate == Fate::Driving).collect();
@@ -2106,6 +2082,7 @@ impl Game {
             }
         }
         self.debris.draw(view);
+        self.dynamite.draw(view, self.running, self.time);
         // Clods thrown out of a crater, in flight.
         let size = view.s.max(1.0);
         for p in &self.world.ejecta {
@@ -2113,14 +2090,6 @@ impl Game {
             draw_rectangle(s.x - size * 0.5, s.y - size * 0.5, size, size, mat_color(p.m));
         }
         draw_booms(&self.booms, view);
-        for (at, t) in &self.hammer_fx {
-            let s = view.to_screen(*at);
-            let angle = -1.1 + 1.6 * t;
-            let head = s + vec2(angle.sin(), -angle.cos()) * 34.0;
-            draw_line(s.x, s.y, head.x, head.y, 4.0, Color::from_rgba(150, 100, 60, 255));
-            draw_circle(head.x, head.y, 9.0, Color::from_rgba(120, 124, 140, 255));
-            draw_circle_lines(s.x, s.y, 6.0 + 26.0 * t, 2.0, Color::new(1.0, 1.0, 1.0, 1.0 - t));
-        }
         if !flat {
             renderer.draw_night(view, day, self.time);
         } else if thermal {
@@ -2255,7 +2224,10 @@ impl Game {
                     }
                 }
                 Tool::Shovel => self.draw_shovel_cursor(ui, view, at),
-                Tool::Hammer => draw_circle_lines(ui.mouse.x, ui.mouse.y, 3.5 * view.s, 1.5, ACCENT),
+                Tool::Dynamite => {
+                    let p = vec2(at.x - dynamite::LEN as f32 / 2.0, at.y - dynamite::THICK as f32 / 2.0).round();
+                    dynamite::draw_stick(view, p, 1.0, false, self.time, 0.55);
+                }
                 Tool::Flame => draw_circle_lines(ui.mouse.x, ui.mouse.y, self.brush.max(3) as f32 * view.s, 1.5, RED),
                 Tool::Lightning => {
                     draw_circle_lines(ui.mouse.x, ui.mouse.y, 5.0, 1.5, Color::new(1.0, 0.92, 0.4, 0.9));
@@ -2712,7 +2684,7 @@ impl Game {
             (Tool::Select, "Sélection", Icon::Select, "Clique un élément (bloc, tige, engrenage, câble, tuyau, rail, voiture...) : il est entouré. Glisse-le pour le déplacer ; pour une tige, un câble, un tuyau ou un rail, glisse une poignée au bout pour le retailler. Suppr l'efface. Échap désélectionne. Une voiture sélectionnée affiche ses réglages."),
             (Tool::Eraser, "Gomme", Icon::Eraser, "Efface la matière, les blocs et les câbles (clic droit aussi)."),
             (Tool::Tunnel, "Tunnel", Icon::Tunnel, "Creuse comme la gomme, mais pose une voûte de briques au-dessus du trou : le sable, la terre ou l'eau du plafond ne s'effondrent plus dedans. La roche, elle, tient toute seule et reste telle quelle ; le sol du tunnel n'est pas touché. Le pinceau règle la largeur."),
-            (Tool::Hammer, "Marteau", Icon::Hammer, "Tape sur le verre et la glace pour les casser, secoue les autres blocs."),
+            (Tool::Dynamite, "Dynamite", Icon::Dynamite, "Clique : un bâton de dynamite tombe à travers l'air et l'eau et se pose sur la matière. Clique dans la roche, la terre ou un mur pour l'y planter : il saute de l'intérieur, comme dans une carrière. Sa mèche brûle 3 s quand la simulation tourne. Des bâtons qui se touchent sautent ensemble, plus fort, et l'onde de choc fait partir aussitôt les bâtons voisins. La détonation dépasse 100 000 atm : assez pour changer le charbon de bois en diamant."),
             (Tool::Flame, "Lance-flammes", Icon::Flame, "Garde le clic enfoncé : un jet de flammes à 1500 °C. Le bois prend feu, la pierre rougit puis fond en lave, le fer fond, l'eau bout. Ce qui est lourd (pierre, eau) chauffe plus lentement. Le pinceau règle la taille du jet."),
             (Tool::Lightning, "Éclair", Icon::Bolt, "Clique : la foudre tombe du ciel (du nuage au-dessus s'il y en a un) jusqu'au pointeur. Lâchée en l'air, elle saute vers le conducteur le plus proche ; sous terre, elle frappe la surface au-dessus. Tout son trajet chauffe : l'air à des milliers de degrés, le bois, l'herbe et le charbon prennent feu. Son courant file dans le sol par le meilleur conducteur, fond le sable en tube de verre (fulgurite), fait bouillir l'eau et court dans le fer. Le tonnerre suit, d'autant plus tard que c'est loin. Les gros nuages froids font leurs propres orages : vue Électricité (E)."),
             (Tool::Loupe, "Loupe", Icon::Loupe, "Le pointeur est une loupe : une vue ronde en bas à droite montre la matière sous la croix."),
@@ -3929,6 +3901,31 @@ fn demo_magnet(g: &mut Game) {
     g.tool = Tool::Block(BlockKind::Brick);
 }
 
+/// `--sticks`: sticks of dynamite on a meadow, their fuses burning: a heap of three on the grass,
+/// one planted in the ground, one sinking in a pond (`--frames` before 180 to see them burn).
+fn demo_sticks(g: &mut Game) {
+    g.empty_world();
+    for x in 0..W as i32 {
+        g.world.set(x, 330, Mat::Grass);
+        for y in 331..H as i32 {
+            g.world.set(x, y, if y > 430 { Mat::Stone } else { Mat::Dirt });
+        }
+    }
+    for x in 600..700 {
+        for y in 330..356 {
+            g.world.set(x, y, Mat::Water);
+        }
+    }
+    for _ in 0..3 {
+        g.dynamite.drop(&g.world, vec2(300.0, 200.0));
+    }
+    g.dynamite.drop(&g.world, vec2(480.0, 360.0));
+    g.dynamite.settle(&g.world);
+    g.dynamite.drop(&g.world, vec2(650.0, 300.0));
+    g.tool = Tool::Dynamite;
+    g.set_running(true);
+}
+
 /// A meadow over rock with a big charge of powder buried in it: `--crater` lights it. With
 /// `dynamite`, the charge is a stick of dynamite packed in charcoal (it leaves diamonds).
 fn demo_crater(g: &mut Game, dynamite: bool) {
@@ -4280,6 +4277,9 @@ async fn main() {
         }
         if args.iter().any(|a| a == "--crater") {
             demo_crater(&mut game, args.iter().any(|a| a == "--dynamite"));
+        }
+        if args.iter().any(|a| a == "--sticks") {
+            demo_sticks(&mut game);
         }
         if args.iter().any(|a| a == "--topple") {
             demo_topple(&mut game);
@@ -5418,19 +5418,23 @@ mod tests {
         let mut g = Game::new();
         g.empty_world();
         g.blocks.push(Block::new(BlockKind::Glass, vec2(200.0, 100.0), 0.0));
-        g.hammer(vec2(200.0, 100.0));
+        let hit = |g: &mut Game, at: Vec2| {
+            let i = block_at(&g.blocks, at).unwrap();
+            g.damage_block(i);
+        };
+        hit(&mut g, vec2(200.0, 100.0));
         assert_eq!(g.blocks.len(), 2, "stage 1: two halves");
         assert!(g.blocks.iter().all(|b| b.kind == BlockKind::GlassHalf));
         let at = g.blocks[0].pos;
         g.blocks[0].hurt = 0;
-        g.hammer(at);
+        hit(&mut g, at);
         assert_eq!(g.blocks.len(), 5, "stage 2: one half becomes four chips");
         assert_eq!(g.blocks.iter().filter(|b| b.kind == BlockKind::GlassChip).count(), 4);
         let chip = g.blocks.iter().find(|b| b.kind == BlockKind::GlassChip).unwrap().pos;
         for b in &mut g.blocks {
             b.hurt = 0;
         }
-        g.hammer(chip);
+        hit(&mut g, chip);
         assert_eq!(g.blocks.len(), 4, "stage 3: the chip turns into shards");
         let shards = g.world.cells.iter().filter(|c| c.m == Mat::Shard).count();
         assert!(shards > 0, "shards should be left behind");
