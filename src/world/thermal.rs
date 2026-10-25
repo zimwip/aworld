@@ -694,6 +694,31 @@ impl World {
     /// One thermal tick: conduction, air and sun forcing, fixed heat sources,
     /// and every material reaction that depends on temperature.
     pub(super) fn thermal_pass(&mut self) {
+        self.heat_conduction();
+        self.heat_air_and_reactions();
+        self.heat_space_and_sun();
+        self.heat_wind();
+    }
+
+    /// The heat pass in the game: its parts spread over the three steps of its cycle, so that no
+    /// step carries the whole pass (see `after_cells`). `stage` is the step in the cycle. The
+    /// conduction and the reactions stay on the same step: a cell of water or ice that the
+    /// conduction has pushed past its change point must be held there (latent heat) before
+    /// anything reads its temperature.
+    pub(super) fn thermal_stage(&mut self, stage: u32) {
+        match stage {
+            0 => {
+                self.heat_conduction();
+                self.heat_air_and_reactions();
+            }
+            1 => self.heat_space_and_sun(),
+            2 => self.heat_wind(),
+            _ => {}
+        }
+    }
+
+    /// Part 1 of the heat pass: conduction between neighbours.
+    fn heat_conduction(&mut self) {
         // When the game has to save time the pass runs half as often (see `lod`): each run then
         // covers twice the time, so every rate is doubled to keep the same speed of change.
         let scale = self.thermal_scale();
@@ -727,31 +752,39 @@ impl World {
             });
         }
         self.prof.stop(super::prof::HEAT_CONDUCTION, clock);
-        // Every other pass, with twice the reach: the wind is slow next to the thermal clock.
-        if horizontal {
-            let clock = self.prof.start();
-            self.carry_air_heat();
-            self.prof.stop(super::prof::HEAT_WIND, clock);
-        }
-        let clock = self.prof.start();
+    }
 
+    /// The sun's warmth over the world (a gradient round the sun), the ambient air of each row,
+    /// and the surface temperature: what parts 2 and 3 of the heat pass both read.
+    fn heat_frame(&self) -> (f32, Vec<f32>, Vec<f32>, [f32; H], f32, bool) {
         // The sun radiates: the air and the ground are warmest near it and the
         // warmth fades with distance. Up in the sky it gets colder with altitude.
         let sun = self.sun();
         let (sx, sy) = self.sun_position();
         let gx: Vec<f32> = (0..W).map(|x| (-((x as f32 - sx) / (0.42 * W as f32)).powi(2)).exp()).collect();
         let gy: Vec<f32> = (0..H).map(|y| (-((y as f32 - sy) / (0.55 * H as f32)).powi(2)).exp()).collect();
-        let fixed = self.climate_fixed.is_some();
+        let mut row_amb = [0.0f32; H];
+        for (y, r) in row_amb.iter_mut().enumerate() {
+            *r = self.ambient_c(y as i32);
+        }
+        (sun, gx, gy, row_amb, self.surface_temp_c(), self.climate_fixed.is_some())
+    }
+
+    /// Part 2 of the heat pass: the air relaxes toward its profile, flames and embers hold their
+    /// heat, and the matters react to their temperature.
+    fn heat_air_and_reactions(&mut self) {
+        let scale = self.thermal_scale();
+        let ts = TS * scale;
+        let tb = tables();
+        let clock = self.prof.start();
+        let (sun, gx, gy, row_amb, _surf, fixed) = self.heat_frame();
 
         // 2. Air relaxes toward the ambient profile; fixed sources; reactions.
-        let surf = self.surface_temp_c();
         // Heat the open air took from the sky, and heat the flames gave off.
         let (mut to_cells, mut flames) = (0.0f32, 0.0f32);
-        let mut row_amb = [0.0f32; H];
         let shut = self.shut_in_means();
         for y in 0..H {
-            let base = self.ambient_c(y as i32);
-            row_amb[y] = base;
+            let base = row_amb[y];
             for x in 0..W {
                 let i = y * W + x;
                 let m = self.cells[i].m;
@@ -798,6 +831,28 @@ impl World {
         }
 
         self.prof.stop(super::prof::HEAT_AIR, clock);
+        // (For part 3, which closes the energy budget of the pass.)
+        self.heat_carry = (to_cells, flames);
+    }
+
+    /// Part 4 of the heat pass, every other pass: the wind carries the air's warmth, with twice
+    /// the reach (the wind is slow next to the thermal clock).
+    fn heat_wind(&mut self) {
+        if self.thermal_flip {
+            let clock = self.prof.start();
+            self.carry_air_heat();
+            self.prof.stop(super::prof::HEAT_WIND, clock);
+        }
+    }
+
+    /// Part 3 of the heat pass: the first surface of each column radiates to space, the sun warms
+    /// what its rays reach, and the sky settles the energy budget of the pass.
+    fn heat_space_and_sun(&mut self) {
+        let scale = self.thermal_scale();
+        let ts = TS * scale;
+        let tb = tables();
+        let (to_cells, flames) = std::mem::take(&mut self.heat_carry);
+        let (sun, gx, _gy, row_amb, surf, fixed) = self.heat_frame();
         let clock = self.prof.start();
         // 3. Day and night, the first surface each column shows the sky radiates its excess
         //    warmth to space, less so under clouds and smoke (they hold it in, like a blanket).
@@ -1047,7 +1102,11 @@ impl World {
     /// Wind also strips heat from whatever it blows over (convection): the faster, the quicker.
     /// With `lod >= 1` it works on blocks of 2 x 2 cells.
     fn carry_air_heat(&mut self) {
-        let old = self.temp.clone();
+        // (The temperatures as they were: a buffer kept from one pass to the next, so that the
+        // pass does not allocate and fault in 2 MB every time.)
+        let mut old = std::mem::take(&mut self.temp_old);
+        old.clear();
+        old.extend_from_slice(&self.temp);
         let reach = 2.0 * THERMAL_EVERY as f32 * self.thermal_scale();
         let stride = if self.lod >= 1 { 2 } else { 1 };
         let tb = tables();
@@ -1137,8 +1196,15 @@ impl World {
                 let flux = (self.temp[i] - self.temp[j]) * gust;
                 self.temp[j] += flux * tb.inv_c[m as usize];
                 self.temp[i] -= flux * tb.inv_c[Mat::Empty as usize];
+                // Warmth blown on to ice or water goes into melting or boiling it first (this
+                // part of the heat pass runs on its own step, after the reactions: a cell must not
+                // be left past its change point until the next one).
+                if flux > 0.0 && super::matter::fusion(m).is_some() {
+                    self.latent_heat(j, (j % W) as i32, (j / W) as i32, m, self.temp[j]);
+                }
             }
         }
+        self.temp_old = old;
     }
 
     /// The air that reaches cell `i` (at `x`, `y`) from `(ox, oy)` upwind, averaged along the way.

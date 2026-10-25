@@ -26,7 +26,7 @@ impl<T> Shared<T> {
     #[inline]
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn at(&self, i: usize) -> &mut T {
-        assert!(i < self.1);
+        debug_assert!(i < self.1);
         &mut *self.0.add(i)
     }
 }

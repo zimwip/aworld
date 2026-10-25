@@ -301,6 +301,8 @@ impl World {
                 prof: prof::Profile::default(),
                 air_rows: share(&self.air_rows),
                 air_sky: self.air_sky,
+                heat_carry: (0.0, 0.0),
+                temp_old: Vec::new(),
                 later: Some(Vec::new()),
             }
         }

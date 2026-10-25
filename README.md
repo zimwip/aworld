@@ -304,6 +304,8 @@ Case par case, un liquide ne fait que tomber et s'étaler, comme des grains qui 
 
 `cargo test --release cost_of_a_tick -- --ignored --nocapture` mesure le coût d'un pas de simulation (campagne : environ 3,4 ms, mer : environ 4,5 ms). La chaleur est le poste le plus lourd : la passe thermique coûte environ 6 ms tous les 3 pas (réactions et relaxation de l'air 2,7 ms, conduction 1,8 ms, transport de la chaleur par le vent jusqu'à 4 ms une passe sur deux), le vent 0,35 ms, la pression moins de 0,1 ms, le reste est l'automate de matière.
 
+`cargo test --release --bin aworld bench_scenes -- --ignored --nocapture` fait tourner cinq scènes chargées (démo, explosions, liquides, orage, incendie) et donne le temps de chaque phase du pas (`src/world/prof.rs`, aussi dans le jeu avec `AWORLD_PROFILE=1`) ; `AWORLD_BENCH_SERIES=1` imprime les pas un à un. **Les pas sont lissés** : la passe de chaleur est répartie sur les trois pas de son cycle (conduction avec l'air et les réactions, puis espace et soleil, puis le vent une fois sur deux), et les passes qui reviennent tous les quelques pas sont décalées pour ne jamais tomber ensemble (structures tous les 9 pas, poches tous les 18, orage et pression de l'air tous les 4, à des phases différentes). Avant, un pas sur trois coûtait dix fois les deux autres et le pire pas de la démo atteignait 29 ms ; il est à 13 ms pour la même moyenne.
+
 Quand les images restent lentes, le jeu simplifie d'abord la physique (`World::lod`), puis seulement après réduit la vitesse. Chaque niveau remplace un calcul par une approximation et une notification l'annonce :
 
 1. la chaleur de l'air est transportée par blocs de 2×2 cellules ;
