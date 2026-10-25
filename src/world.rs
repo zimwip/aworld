@@ -615,6 +615,8 @@ pub struct World {
     heat_carry: (f32, f32),
     /// Scratch of the wind carrying the air's warmth: the temperatures as they were.
     temp_old: Vec<f32>,
+    /// The heat the air took from the sky in the last heat pass, per cell (see `heat_air_and_reactions`).
+    heat_took: Vec<f32>,
     /// Tests (and calm sandboxes) can pin the air temperature everywhere.
     pub climate_fixed: Option<f32>,
     /// The energy budget of the world: the sun in, the sky out to space (see `thermal.rs`).
@@ -777,6 +779,7 @@ impl World {
             thermal_flip: false,
             heat_carry: (0.0, 0.0),
             temp_old: Vec::new(),
+            heat_took: Vec::new(),
             climate_fixed: None,
             climate: thermal::Climate::default(),
             revision: 1,
@@ -2510,7 +2513,7 @@ impl World {
             // Pressed against the ceiling, rising gas spreads out under it, mostly downwind (the
             // jet stream drags the top of a storm cloud out into an anvil).
             if !self.gas_may_rise_to(x, y, y - 1) {
-                let vx = self.flow.sample(x, y).0;
+                let vx = self.flow.wind_at(x, y).0;
                 let down = if vx.abs() > 0.1 && roll < 0.8 * lift.min(1.0) * 0.7 { vx.signum() as i32 } else { d };
                 for dx in [down, -down] {
                     let t = (self.edge_x(x, y, x + dx), y);
@@ -2802,7 +2805,7 @@ impl World {
         let i = Self::idx(x, y);
         let v = self.vel[i].saturating_add(GRAIN_ACCEL).min(DROP_TERMINAL);
         let fall = 1 + v as i32 / 8;
-        let wind = (self.flow.sample(x, y).0 * DROP_DRIFT).clamp(-3.0, 3.0);
+        let wind = (self.flow.wind_at(x, y).0 * DROP_DRIFT).clamp(-3.0, 3.0);
         let mut side = wind.trunc() as i32 + if (self.rand() % 1000) as f32 / 1000.0 < wind.fract().abs() { wind.signum() as i32 } else { 0 };
         let free = |w: &World, x: i32, y: i32| matches!(w.at(x, y).kind(), Kind::Empty | Kind::Gas) && w.mask_free(x, y);
         let (mut cx, mut cy) = (x, y);
@@ -5933,9 +5936,11 @@ mod science {
         // Cool air: a cloud warmed by the sun would keep its water.
         w.climate_fixed = Some(2.0);
         w.reset_temps();
-        // Steam released high up in the cold layer.
-        for x in 300..340 {
-            for y in 20..30 {
+        // Steam released high up in the cold layer: a big bank of it, so that the cloud it
+        // makes stays thick long enough to rain for sure (a drop falls from a thick cloud at
+        // one chance in `RAIN_EVERY` a step).
+        for x in 240..360 {
+            for y in 20..50 {
                 w.set(x, y, Mat::Steam);
             }
         }
@@ -6983,7 +6988,9 @@ fn flowing_water_erodes_bare_soil() {
         for x in 100..200 {
             w.set(x, 300, Mat::Grass);
         }
-        for _ in 0..200 {
+        // (A blade catches at one chance in ten per heat pass: 400 steps, so that none is
+        // left by luck.)
+        for _ in 0..400 {
             for x in 100..200 {
                 w.temp[World::idx(x, 300)] = 400.0;
             }

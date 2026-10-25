@@ -6,11 +6,16 @@
 
 use super::num::floor_f;
 use super::{Cell, World, H, W};
+use rayon::prelude::*;
 
 /// Width of a flow cell, in world cells.
 pub const CELL: usize = 8;
 pub const FW: usize = W / CELL;
 pub const FH: usize = H.div_ceil(CELL);
+/// The wind the cells read is tabled by blocks of `BLOCK` world cells (see `wind_at`).
+pub const BLOCK: usize = 4;
+const BW: usize = W / BLOCK;
+const BH: usize = H.div_ceil(BLOCK);
 
 /// Base wind at full strength, in world cells per step (a gale moves gas about this fast).
 pub const GAIN: f32 = 1.2;
@@ -58,6 +63,10 @@ pub struct Flow {
     rng: u32,
     /// Tests can pin the field.
     pub frozen: bool,
+    /// The velocity at the middle of each block of `BLOCK` world cells, in world cells per step:
+    /// what the cells' rules read (`wind_at`), tabled once a flow step rather than interpolated
+    /// for every cell of gas.
+    gusts: Vec<(f32, f32)>,
 }
 
 #[inline]
@@ -87,6 +96,7 @@ impl Flow {
             vortices: vec![],
             rng: 0x9e37_79b9,
             frozen: false,
+            gusts: vec![(0.0, 0.0); BW * BH],
         }
     }
 
@@ -315,6 +325,7 @@ impl Flow {
                 self.vy[k] = self.vy[k].clamp(-0.6, 0.6);
             }
         }
+        self.tabulate();
     }
 
     /// Compressible air: the pressure `rho * theta` (ideal gas, P V = n R T) pushes the wind from high
@@ -498,15 +509,44 @@ impl Flow {
 
     /// The air velocity at a world position, in world cells per step (bilinear, periodic in x).
     pub fn sample(&self, x: i32, y: i32) -> (f32, f32) {
-        let fx = (x as f32 + 0.5) / CELL as f32 - 0.5;
-        let fy = ((y as f32 + 0.5) / CELL as f32 - 0.5).clamp(0.0, FH as f32 - 1.001);
+        self.sample_at(x as f32 + 0.5, y as f32 + 0.5)
+    }
+
+    /// The air velocity at a position in world cells (the middle of cell x is x + 0.5).
+    fn sample_at(&self, x: f32, y: f32) -> (f32, f32) {
+        let fx = x / CELL as f32 - 0.5;
+        let fy = (y / CELL as f32 - 0.5).clamp(0.0, FH as f32 - 1.001);
         let (i0, j0) = (floor_f(fx), floor_f(fy));
         let (tx, ty) = (fx - i0, fy - j0);
-        let (i0, j0) = (i0 as i32, j0 as i32);
-        let s = |a: &[f32]| {
-            (a[at(i0, j0)] * (1.0 - tx) + a[at(i0 + 1, j0)] * tx) * (1.0 - ty) + (a[at(i0, j0 + 1)] * (1.0 - tx) + a[at(i0 + 1, j0 + 1)] * tx) * ty
-        };
+        // The four cells round it (i0 is -1 at most and i0 + 1 is FW at most: wrapped without a
+        // division, which the gas cells' many reads would feel).
+        let (i0, j0) = (i0 as i32, j0 as usize);
+        let (ia, ib) = (if i0 < 0 { FW - 1 } else { i0 as usize }, if i0 + 1 >= FW as i32 { 0 } else { (i0 + 1) as usize });
+        let (k0, k1) = (j0 * FW, (j0 + 1) * FW);
+        let s = |a: &[f32]| (a[k0 + ia] * (1.0 - tx) + a[k0 + ib] * tx) * (1.0 - ty) + (a[k1 + ia] * (1.0 - tx) + a[k1 + ib] * tx) * ty;
         (s(&self.vx) * CELL as f32, s(&self.vy) * CELL as f32)
+    }
+
+    /// The wind at a world cell as the cells' rules read it: the velocity sampled at the middle
+    /// of the cell's block of `BLOCK` × `BLOCK` cells, in world cells per step. A gas cell reads
+    /// the wind once or twice a step, and there can be a hundred thousand of them: the table is
+    /// a lookup where `sample` interpolates.
+    #[inline]
+    pub fn wind_at(&self, x: i32, y: i32) -> (f32, f32) {
+        debug_assert!(x >= 0 && x < W as i32 && y >= 0 && y < H as i32);
+        self.gusts[(y as usize / BLOCK).min(BH - 1) * BW + (x as usize / BLOCK).min(BW - 1)]
+    }
+
+    /// Tables the wind of every block (`wind_at`), after the field has changed.
+    fn tabulate(&mut self) {
+        let mut gusts = std::mem::take(&mut self.gusts);
+        gusts.par_chunks_mut(BW).enumerate().for_each(|(by, row)| {
+            let y = (by * BLOCK) as f32 + BLOCK as f32 / 2.0;
+            for (bx, g) in row.iter_mut().enumerate() {
+                *g = self.sample_at((bx * BLOCK) as f32 + BLOCK as f32 / 2.0, y);
+            }
+        });
+        self.gusts = gusts;
     }
 
     /// The solver's pressure at a world position (arbitrary units: it is the push that keeps the air
@@ -574,6 +614,7 @@ impl Flow {
         self.vx.fill(vx / CELL as f32);
         self.vy.fill(vy / CELL as f32);
         self.frozen = true;
+        self.tabulate();
     }
 
     /// Pins the field to `vx` above flow row `split` and `-vx` below it: two opposing winds.
@@ -586,6 +627,7 @@ impl Flow {
             }
         }
         self.frozen = true;
+        self.tabulate();
     }
 
     /// Sets the humidity of all the air (for tests; pin the field too, or the wind moves it).
@@ -597,6 +639,7 @@ impl Flow {
     #[cfg(test)]
     pub fn inject_vortex_for_test(&mut self, x: f32, y: f32, r: f32, gamma: f32) {
         self.swirl(Vortex { x, y, r, gamma, life: 1 }, 1.0);
+        self.tabulate();
     }
 }
 
@@ -622,7 +665,7 @@ impl World {
     /// Where the air carries a gas cell this step: along the local flow, a cell or two at most.
     /// The fractional part of the speed is decided by chance, so slow air still moves gas now and then.
     pub(super) fn wind_target(&mut self, x: i32, y: i32) -> Option<(i32, i32)> {
-        let (vx, vy) = self.flow.sample(x, y);
+        let (vx, vy) = self.flow.wind_at(x, y);
         let mut round = |v: f32| -> i32 {
             let v = v.clamp(-3.0, 3.0);
             let base = v.trunc() as i32;

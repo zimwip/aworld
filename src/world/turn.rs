@@ -312,6 +312,7 @@ impl World {
                 air_sky: self.air_sky,
                 heat_carry: (0.0, 0.0),
                 temp_old: Vec::new(),
+                heat_took: Vec::new(),
                 later: Some(Vec::new()),
             }
         }
