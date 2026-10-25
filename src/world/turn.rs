@@ -1,7 +1,8 @@
 //! The cells' turn: every cell of matter takes its turn, bottom row first, left to right or right
 //! to left by turns.
 //!
-//! It can also run on every core (`World::parallel_cells`, off unless `AWORLD_CELLS_PAR=1`). The
+//! It can also run on every core (`World::parallel_cells`: on with the physics of the liquids,
+//! else off unless `AWORLD_CELLS_PAR=1`). The
 //! world is then cut into strips one sleeping zone wide, from the top of the world to the bottom;
 //! every third strip runs at once (three rounds, side by side), each in a view of the world of its
 //! own, and in a strip the cells take their turn in the usual order. This is about twice as fast
@@ -70,9 +71,17 @@ fn mix(seed: u32, zx: u32) -> u32 {
     h | 1
 }
 
-/// Whether new worlds take the cells' turn on every core: `AWORLD_CELLS_PAR=1`.
+/// Whether new worlds take the cells' turn on every core: `AWORLD_CELLS_PAR=1`, or the physics
+/// of the liquids on (see `parallel_with_liquids`).
 pub(super) fn parallel_by_default() -> bool {
-    std::env::var_os("AWORLD_CELLS_PAR").is_some_and(|v| v != "0")
+    std::env::var_os("AWORLD_CELLS_PAR").is_some_and(|v| v != "0") || (liquid::physics_by_default() && parallel_with_liquids())
+}
+
+/// Whether the physics of the liquids turns the cells' turn on every core on (unless
+/// `AWORLD_CELLS_PAR=0`): the liquids then no longer take the cells' turn, which was what came
+/// out differently on every core.
+pub(super) fn parallel_with_liquids() -> bool {
+    std::env::var_os("AWORLD_CELLS_PAR").is_none_or(|v| v != "0")
 }
 
 #[cfg(debug_assertions)]

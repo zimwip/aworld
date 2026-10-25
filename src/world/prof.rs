@@ -9,7 +9,7 @@ pub const PHASES: [&str; 30] = [
     "écoulement air", "pression", "poussée", "saisons", "chaleur", "orage", "niveaux liquides", "total",
     "  chaleur/conduction", "  chaleur/vent", "  chaleur/air+réactions", "  chaleur/vers l'espace", "  chaleur/soleil",
     "eau en champ", "liquides physiques",
-    "  liquides/classement", "  liquides/forces", "  liquides/viscosité", "  liquides/pression", "  liquides/balayages",
+    "  liquides/classement", "  liquides/forces", "  liquides/viscosité", "  liquides/pression", "  liquides/itérations",
     "  liquides/gouttes", "  liquides/transport",
 ];
 pub const TOTAL: usize = 15;
@@ -23,12 +23,12 @@ pub const FIELD: usize = 21;
 /// Not in the order of the step either: the liquids' physics runs after the cells too.
 pub const LIQUIDS: usize = 22;
 /// The parts of the liquids' physics (already counted in `liquides physiques`), one run per
-/// sub-step; `LIQ_SWEEPS` counts one run per sweep of the pressure solver.
+/// sub-step; `LIQ_ITERATIONS` counts one run per iteration of the pressure solver.
 pub const LIQ_CLASSIFY: usize = 23;
 pub const LIQ_FORCES: usize = 24;
 pub const LIQ_VISCOSITY: usize = 25;
 pub const LIQ_PRESSURE: usize = 26;
-pub const LIQ_SWEEPS: usize = 27;
+pub const LIQ_ITERATIONS: usize = 27;
 pub const LIQ_DROPS: usize = 28;
 pub const LIQ_CARRY: usize = 29;
 

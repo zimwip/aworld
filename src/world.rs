@@ -20,6 +20,7 @@ mod par;
 mod turn;
 mod field;
 mod liquid;
+mod mgpcg;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]
@@ -2684,7 +2685,20 @@ impl World {
                 // puddle (in warm, dry air some rain never reaches the ground).
                 let airborne = if self.at(x, y + 1) == Mat::Empty { DROP_EVAPORATION } else { 1.0 };
                 let rate = airborne * dry * breeze * vapour_pressure(t) / vapour_pressure(40.0) / EVAPORATE_40C;
-                if self.chance_f(rate) {
+                // Water that may hold less than a cell dries a quarter at a time (one cell of
+                // steam's worth, as often again): the surface of a lake sinks slowly, where a
+                // whole cell gone at once would dig a hole for the water round it to splash into.
+                // A drop is tiny, and goes whole.
+                let by_quarters = self.partial_liquids() && airborne == 1.0 && self.at(x, y - 1) == Mat::Empty;
+                if by_quarters {
+                    // As much water a step, on average, as a whole cell going at `rate`: a film
+                    // thinner than a quarter goes as often again, and all at once.
+                    let taken = self.water_fill(i).min(field::FULL / VAPOUR_PER_WATER as u32).max(1);
+                    if self.chance_f(rate * field::FULL as f32 / taken as f32) {
+                        self.evaporate_quarter(x, y);
+                        return;
+                    }
+                } else if self.chance_f(rate) {
                     // The heat it takes cools the water and the air around (see `vaporize`).
                     self.vaporize(x, y);
                     return;
@@ -2893,6 +2907,36 @@ impl World {
         }
         self.set_packed(i, left as u32);
         q -= made * thermal::cap(Mat::Steam) * t + cells as f32 * thermal::latent0(Mat::Steam);
+        self.release_heat(x, y, q);
+    }
+
+    /// A quarter of a cell of water (one cell of steam's worth) leaves the water at (x, y) as a
+    /// cell of steam in the empty cell over it; the cell keeps the rest, and goes when nothing is
+    /// left. The heat is counted as in `vaporize`.
+    fn evaporate_quarter(&mut self, x: i32, y: i32) {
+        let i = Self::idx(x, y);
+        let j = Self::idx(x, y - 1);
+        let t = self.temp[i];
+        let part = field::FULL / VAPOUR_PER_WATER as u32;
+        let fill = self.water_fill(i);
+        let taken = fill.min(part);
+        // Less than a quarter makes a whole cell of steam or none, by chance: on average the
+        // water is all there.
+        let steam = taken == part || (self.rand() % part) < taken;
+        let mut q = thermal::heat_of(Mat::Water, t) * taken as f32 / field::FULL as f32;
+        if fill > taken {
+            self.put_fill(i, fill - taken);
+        } else {
+            q += self.latent[i];
+            self.set(x, y, Mat::Empty);
+            self.temp[i] = t;
+        }
+        if steam {
+            q += thermal::heat_of(Mat::Empty, self.temp[j]);
+            self.set(x, y - 1, Mat::Steam);
+            self.temp[j] = t;
+            q -= thermal::heat_of(Mat::Steam, t);
+        }
         self.release_heat(x, y, q);
     }
 
