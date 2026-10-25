@@ -230,6 +230,7 @@ impl World {
                 slabs: Vec::new(),
                 level: Vec::new(),
                 strain: share(&self.strain),
+                pushes: Vec::new(),
                 strain_key: self.strain_key,
                 stress_cache: Default::default(),
                 stress_pos: Vec::new(),

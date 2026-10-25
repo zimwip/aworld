@@ -26,6 +26,8 @@ use rayon::prelude::*;
 
 /// A cell, in metres.
 pub const CELL_M: f32 = 1.0 / 6.0;
+/// The weight of a cell of water, kN per metre of depth (ρ g h²).
+pub const CELL_OF_WATER_KN: f32 = 1000.0 * G * CELL_M * CELL_M / 1000.0;
 /// A step, in seconds.
 const DT: f32 = 1.0 / 60.0;
 const G: f32 = 9.81;
@@ -238,6 +240,44 @@ impl World {
     /// The drops of liquid in flight.
     pub fn liquid_drops(&self) -> &[Drop] {
         self.liq.drops()
+    }
+
+    /// The pressure of the liquid at (x, y) over the ambient one, Pa, while the liquids run by
+    /// their physics (None in a cell that holds no pressure).
+    pub fn liquid_pa(&self, x: usize, y: usize) -> Option<f32> {
+        let i = y * W + x;
+        (self.liquid_physics && self.liq.p.len() == W * H && self.liq.class[i] & 3 == FULLISH && self.cells[i].m.kind() == Kind::Liquid).then(|| self.liq.p[i])
+    }
+
+    /// The push of the liquids on the solid cell `i`, from the pressure on each of its wet sides,
+    /// as a weight (x, y; down positive): in cells of water, the column of water that would press
+    /// as hard (none unless the liquids run by their physics).
+    pub(super) fn liquid_push(&self, i: usize) -> (f32, f32) {
+        if !self.liquid_physics || self.liq.p.len() != W * H {
+            return (0.0, 0.0);
+        }
+        let (x, y) = (i % W, i / W);
+        let head = |j: usize| -> f32 {
+            if self.liq.class[j] & 3 == FULLISH && self.cells[j].m.kind() == Kind::Liquid {
+                (self.liq.p[j] / (1000.0 * G * CELL_M)).max(0.0)
+            } else {
+                0.0
+            }
+        };
+        let (mut fx, mut fy) = (0.0, 0.0);
+        if x > 0 {
+            fx += head(i - 1);
+        }
+        if x + 1 < W {
+            fx -= head(i + 1);
+        }
+        if y > 0 {
+            fy += head(i - W);
+        }
+        if y + 1 < H {
+            fy -= head(i + W);
+        }
+        (fx, fy)
     }
 
     /// Units of liquid in cell `i` (`field::FULL` for a full cell).
@@ -1372,5 +1412,58 @@ mod tests {
         assert!(highest < 430.0, "the spray rose to {highest}");
         let after = w.liquid_units(Mat::Water);
         assert!(after <= before && before - after < before / 10_000, "{before} -> {after}");
+    }
+
+    /// A wall of `m`, `thick` cells thick and 50 high, standing on a stone floor on the bottom of
+    /// the world, with water 50 deep against its left side when `wet`. Its strain at the foot and
+    /// whether it still stands after 3 s.
+    fn dam_wall(m: Mat, thick: i32, wet: bool) -> (u8, bool, Vec<statics::LiquidPush>) {
+        let mut w = world();
+        w.structures_fall = true;
+        let b = H as i32 - 1;
+        rect(&mut w, 100, b - 4, 400, b, Mat::Stone);
+        rect(&mut w, 99, b - 60, 99, b - 5, Mat::Stone);
+        rect(&mut w, 200, b - 54, 199 + thick, b - 5, m);
+        if wet {
+            rect(&mut w, 100, b - 54, 199, b - 5, Mat::Water);
+        }
+        w.temp.fill(15.0);
+        let mut strain = 0;
+        for t in 0..180 {
+            w.step();
+            if t == 60 {
+                strain = w.strain[World::idx(200, b - 5)];
+            }
+        }
+        let stands = (b - 54..=b - 5).all(|y| w.raw(200, y) == m);
+        (strain, stands, w.pushes.clone())
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_dam_wall() {
+        for (m, thick) in [(Mat::Stone, 4), (Mat::Stone, 2), (Mat::Brick, 2), (Mat::Glass, 1), (Mat::Wood, 1)] {
+            for wet in [false, true] {
+                let (strain, stands, pushes) = dam_wall(m, thick, wet);
+                println!("{m:?} x{thick} wet {wet}: strain {strain} stands {stands} pushes {pushes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn water_loads_the_wall_of_a_dam_and_pushes_a_thin_one_over() {
+        // A thick wall of rock, one with the floor it stands on: the water loads its foot, the
+        // stress view shows it, and it holds.
+        let (dry, stands, _) = dam_wall(Mat::Stone, 4, false);
+        assert!(dry == 0 && stands);
+        let (wet, stands, pushes) = dam_wall(Mat::Stone, 4, true);
+        assert!(wet > 20 && stands, "strain {wet}");
+        // (The water weighs on the floor: 50 cells deep over 100, about 5 000 cells of water.)
+        assert!(pushes.iter().any(|p| p.fy > 1000.0), "{pushes:?}");
+        // A thin one gives way, rock or a pane of glass; dry, it stands.
+        for (m, thick) in [(Mat::Stone, 2), (Mat::Glass, 1)] {
+            assert!(dam_wall(m, thick, false).1, "{m:?} dry");
+            assert!(!dam_wall(m, thick, true).1, "{m:?} wet");
+        }
     }
 }

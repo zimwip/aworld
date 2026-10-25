@@ -583,6 +583,9 @@ pub struct World {
     /// Load on each anchored solid cell, as a share of what it can bear (0..255 for 0..2). For the
     /// stress view.
     pub strain: Vec<u8>,
+    /// The push of the liquids on each anchored solid body, as the last check of the solids found
+    /// it (see `statics.rs`; only while the liquids run by their physics).
+    pub pushes: Vec<statics::LiquidPush>,
     /// A fingerprint of the anchored cells when their sections were last checked: they are only
     /// checked again once something changed.
     strain_key: u64,
@@ -752,6 +755,7 @@ impl World {
             slabs: Vec::new(),
             level: vec![u32::MAX; W * H],
             strain: vec![0; W * H],
+            pushes: Vec::new(),
             strain_key: 0,
             stress_cache: std::collections::HashMap::new(),
             stress_pos: Vec::new(),

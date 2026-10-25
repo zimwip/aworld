@@ -1032,6 +1032,13 @@ fn stress_color(world: &World, x: usize, y: usize) -> [u8; 4] {
         return c;
     }
     let m = world.cell_mat(x, y);
+    // A liquid that runs by its physics shows its pressure: pale near the surface, deep violet
+    // 10 m down (a full atmosphere more).
+    if let Some(pa) = world.liquid_pa(x, y) {
+        let t = (pa / 101_325.0).clamp(0.0, 1.0).sqrt();
+        let lerp = |a: f32, b: f32| (a + (b - a) * t) as u8;
+        return [lerp(150.0, 70.0), lerp(200.0, 20.0), lerp(235.0, 130.0), 230];
+    }
     if m.kind() != Kind::Static || matches!(m, Mat::Dirt | Mat::Grass) {
         return [c[0] / 3, c[1] / 3, c[2] / 3, c[3] / 2];
     }
