@@ -21,6 +21,8 @@ mod turn;
 mod field;
 mod liquid;
 mod mgpcg;
+mod gpu;
+mod mgpcg_gpu;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]

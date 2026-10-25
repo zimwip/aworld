@@ -134,6 +134,9 @@ pub struct Liquids {
     solve: (prof::Clock, u32),
     /// The pressure solver, with its grids.
     solver: mgpcg::Solver,
+    /// The same on the graphics card, for the big systems (`None` until asked for, and where
+    /// there is no card).
+    gpu: Option<Option<mgpcg_gpu::PressureGpu>>,
 }
 
 /// A drop of liquid thrown off a body (spray, a splash): it flies off the grid, under gravity
@@ -994,8 +997,10 @@ impl World {
         // cell's kind is only read from across an edge.
         let kind = |c: usize| unsafe { kinds.get(c) };
         let (diag, b, x) = (&mut f.diag, &mut f.b, &mut f.x);
-        diag.par_chunks_mut(W).zip(b.par_chunks_mut(W)).zip(x.par_chunks_mut(W)).enumerate().for_each(|(y, ((diag, b), x))| {
-            let Some((x0, x1)) = rows[y] else { return };
+        // (How many unknowns there are decides whether the card takes the system.)
+        let unknowns: usize = diag.par_chunks_mut(W).zip(b.par_chunks_mut(W)).zip(x.par_chunks_mut(W)).enumerate().map(|(y, ((diag, b), x))| {
+            let Some((x0, x1)) = rows[y] else { return 0 };
+            let mut n = 0;
             for i in x0..=x1 {
                 let c = y * W + i;
                 if kind(c) != mgpcg::FLUID {
@@ -1031,10 +1036,17 @@ impl World {
                 diag[i] = d;
                 b[i] = rhs_i;
                 x[i] = p_old[c];
+                n += 1;
             }
-        });
-        solver.coarsen();
-        let iterations = solver.solve(SETTLED, RELATIVE, MAX_ITER);
+            n
+        }).sum();
+        let gpu = if unknowns >= mgpcg_gpu::threshold() { liq.gpu.get_or_insert_with(|| mgpcg_gpu::PressureGpu::new(W, H)).as_mut() } else { None };
+        let iterations = if let Some(gpu) = gpu {
+            gpu.solve(solver.fine(), SETTLED, RELATIVE, MAX_ITER)
+        } else {
+            solver.coarsen();
+            solver.solve(SETTLED, RELATIVE, MAX_ITER)
+        };
         // The solution back into the pressures, and the solver's grid left clean.
         {
             let f = solver.fine();
