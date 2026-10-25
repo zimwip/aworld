@@ -29,6 +29,19 @@ impl<T> Shared<T> {
         debug_assert!(i < self.1);
         &mut *self.0.add(i)
     }
+
+    /// A copy of cell `i`.
+    ///
+    /// # Safety
+    /// No other thread may write cell `i` at the same time.
+    #[inline]
+    pub unsafe fn get(&self, i: usize) -> T
+    where
+        T: Copy,
+    {
+        debug_assert!(i < self.1);
+        *self.0.add(i)
+    }
 }
 
 /// Runs `f` on every band of columns (`x0..x1`), side by side.

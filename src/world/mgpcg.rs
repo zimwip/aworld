@@ -306,31 +306,43 @@ impl Level {
     }
 
     /// Leaves the level clean over its rows (everything zero, every cell `NONE`), and without
-    /// rows: what the next solve does not write must be nothing.
+    /// rows: what the next solve does not write must be nothing. One pass over the rows for all
+    /// the grids.
     fn clear(&mut self) {
-        let (w, h, rows, big) = (self.w, self.h, &self.rows, self.big());
-        rows_mut!(self.kind, w, big, |(y, row): (usize, &mut [u8])| {
-            if let Some((x0, x1)) = rows[y] {
-                row[x0..=x1].fill(NONE);
-            }
-        });
-        for buf in [&mut self.diag, &mut self.b, &mut self.x] {
-            rows_mut!(buf, w, big, |(y, row): (usize, &mut [f32])| {
+        let (w, h, rows) = (self.w, self.h, &self.rows);
+        let (kind, diag, b, x, ax, ay) = (Shared::new(&mut self.kind), Shared::new(&mut self.diag), Shared::new(&mut self.b), Shared::new(&mut self.x), Shared::new(&mut self.ax), Shared::new(&mut self.ay));
+        let row_fn = |y: usize| {
+            // SAFETY: each task clears its own row (and the row of edges over it, which no other
+            // task touches).
+            unsafe {
                 if let Some((x0, x1)) = rows[y] {
-                    row[x0..=x1].fill(0.0);
+                    for i in y * w + x0..=y * w + x1 {
+                        *kind.at(i) = NONE;
+                        *diag.at(i) = 0.0;
+                        *b.at(i) = 0.0;
+                        *x.at(i) = 0.0;
+                    }
+                    for i in y * (w + 1) + x0..=y * (w + 1) + x1 + 1 {
+                        *ax.at(i) = 0.0;
+                    }
                 }
-            });
+                let above = if y > 0 { rows[y - 1] } else { None };
+                if let Some((x0, x1)) = Self::union(above, rows[y]) {
+                    for i in y * w + x0..=y * w + x1 {
+                        *ay.at(i) = 0.0;
+                    }
+                }
+            }
+        };
+        if self.w * self.h > BIG {
+            (0..h).into_par_iter().for_each(row_fn);
+        } else {
+            (0..h).for_each(row_fn);
         }
-        rows_mut!(self.ax, w + 1, big, |(y, row): (usize, &mut [f32])| {
-            let Some((x0, x1)) = rows[y] else { return };
-            row[x0..=x1 + 1].fill(0.0);
-        });
-        rows_mut!(self.ay, w, big, |(y, row): (usize, &mut [f32])| {
-            let above = if y > 0 { rows[y - 1] } else { None };
-            let below = if y < h { rows[y] } else { None };
-            let Some((x0, x1)) = Self::union(above, below) else { return };
-            row[x0..=x1].fill(0.0);
-        });
+        // The row of edges under the last row.
+        if let Some((x0, x1)) = rows[h - 1] {
+            self.ay[h * w + x0..=h * w + x1].fill(0.0);
+        }
         self.rows.fill(None);
     }
 
@@ -492,6 +504,9 @@ impl Level {
 #[derive(Default)]
 pub struct Solver {
     pub levels: Vec<Level>,
+    /// How many levels this solve uses: as many as it takes to bring the fluid cells down to a
+    /// grid that sweeps alone (a few puddles need no hierarchy, a sea the whole of it).
+    used: usize,
     /// Conjugate gradients: the residual, the preconditioned residual and the search direction.
     r: Vec<f32>,
     z: Vec<f32>,
@@ -532,7 +547,7 @@ impl Solver {
     /// Leaves every level clean over its rows, ready for the next solve: whatever that one does
     /// not write (beside a smaller body, say) must be nothing.
     pub fn clear(&mut self) {
-        for l in &mut self.levels {
+        for l in &mut self.levels[..self.used] {
             l.clear();
         }
     }
@@ -547,6 +562,12 @@ impl Solver {
     /// Builds the coarse levels from the finest one (after it has been filled in).
     pub fn coarsen(&mut self) {
         self.levels[0].prepare();
+        let mut n = self.levels[0].nodes[0].len() + self.levels[0].nodes[1].len();
+        self.used = 1;
+        while n > COARSEST && self.used < self.levels.len() {
+            n /= 4;
+            self.used += 1;
+        }
         // What the V-cycle will read as a fixed or absent cell must be zero: a cell that held
         // fluid last solve may hold gas now.
         let f = &self.levels[0];
@@ -556,7 +577,7 @@ impl Solver {
                 row[x0..=x1].fill(0.0);
             }
         });
-        for l in 1..self.levels.len() {
+        for l in 1..self.used {
             let (fine, coarse) = self.levels.split_at_mut(l);
             coarse[0].coarsen_from(&fine[l - 1]);
         }
@@ -566,7 +587,7 @@ impl Solver {
     /// holds (zero below the finest). The sweeps after the visit below run the colours the other
     /// way round, so that the cycle is symmetric, as the conjugate gradients want it.
     fn vcycle(&mut self, l: usize, dot_b: bool) -> f32 {
-        if l + 1 == self.levels.len() {
+        if l + 1 == self.used {
             return self.levels[l].smooth(COARSEST_SWEEPS, false, true, None, dot_b);
         }
         self.levels[l].smooth(SMOOTH, false, true, None, false);

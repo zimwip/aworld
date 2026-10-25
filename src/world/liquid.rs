@@ -314,7 +314,7 @@ impl World {
         liq.ready();
         self.fly_drops(&mut liq);
         let clock = self.prof.start();
-        self.classify(&mut liq);
+        self.classify(&mut liq, false);
         self.prof.stop(prof::LIQ_CLASSIFY, clock);
         if liq.rows.iter().all(Option::is_none) {
             // No liquid runs anywhere.
@@ -350,7 +350,7 @@ impl World {
         for k in 0..sub {
             if k > 0 {
                 let clock = self.prof.start();
-                self.classify(&mut liq);
+                self.classify(&mut liq, true);
                 self.prof.stop(prof::LIQ_CLASSIFY, clock);
             }
             let clock = self.prof.start();
@@ -536,8 +536,24 @@ impl World {
     }
 
     /// What each cell is to the liquids this sub-step, and the span of each row to work on.
-    fn classify(&self, liq: &mut Liquids) {
+    fn classify(&self, liq: &mut Liquids, again: bool) {
         let awake = &self.zones.awake;
+        // Between two sub-steps, only the spans change (the liquid runs there and nowhere else),
+        // and a class reads at most the cells beside: the cells a cell further are looked at
+        // again, the rest keep their class.
+        let old = &liq.rows;
+        let range = |y: usize| -> (usize, usize) {
+            if !again {
+                return (0, W - 1);
+            }
+            let mut span: Option<(usize, usize)> = None;
+            for yy in y.saturating_sub(1)..=(y + 1).min(H - 1) {
+                if let Some((a, b)) = old[yy] {
+                    span = Some(span.map_or((a, b), |(c, d)| (a.min(c), b.max(d))));
+                }
+            }
+            span.map_or((1, 0), |(a, b)| (a.saturating_sub(1), (b + 1).min(W - 1)))
+        };
         // The first and last cell of each row that holds liquid that runs.
         let ends: Vec<(usize, usize)> = liq
             .class
@@ -545,7 +561,8 @@ impl World {
             .enumerate()
             .map(|(y, row)| {
                 let (mut first, mut last) = (usize::MAX, 0);
-                for (x, c) in row.iter_mut().enumerate() {
+                let (a, b) = range(y);
+                for (x, c) in row.iter_mut().enumerate().take(b + 1).skip(a) {
                     let i = y * W + x;
                     let run = awake[y / sleep::CS * sleep::CW + x / sleep::CS];
                     let what = if self.mask[i] != 0 {
@@ -629,10 +646,22 @@ impl World {
                 Ok((0.25 * (u[ui(x, y - 1)] + u[ui(x + 1, y - 1)] + u[ui(x, y)] + u[ui(x + 1, y)]), here))
             }
         };
+        // The grids carried are only touched near the spans: a row's edges are sampled from the
+        // rows beside, up to two cells off (a cell of carrying, and the node after).
+        let wide = |y: usize, w: usize| -> Option<(usize, usize)> {
+            let mut span: Option<(usize, usize)> = None;
+            for yy in y.saturating_sub(1)..=(y + 1).min(H - 1) {
+                if let Some((a, b)) = rows[yy] {
+                    span = Some(span.map_or((a, b), |(c, d)| (a.min(c), b.max(d))));
+                }
+            }
+            span.map(|(a, b)| (a.saturating_sub(3), (b + 4).min(w - 1)))
+        };
         // Carried forward (in the index space of each grid: edge (x, y) of `u` sits at x, y + 1/2
         // in cells, its index is (x, y)).
         liq.u2.par_chunks_mut(W + 1).enumerate().for_each(|(y, row)| {
-            row.copy_from_slice(&u[ui(0, y)..ui(0, y + 1)]);
+            let Some((a, b)) = wide(y, W + 1) else { return };
+            row[a..=b].copy_from_slice(&u[ui(a, y)..=ui(b, y)]);
             let Some((x0, x1)) = rows[y] else { return };
             for x in x0..=(x1 + 1).min(W) {
                 row[x] = match u_vel(x, y) {
@@ -642,7 +671,8 @@ impl World {
             }
         });
         liq.v2.par_chunks_mut(W).enumerate().for_each(|(y, row)| {
-            row.copy_from_slice(&v[vi(0, y)..vi(0, y + 1)]);
+            let Some((a, b)) = wide(y, W) else { return };
+            row[a..=b].copy_from_slice(&v[vi(a, y)..=vi(b, y)]);
             let Some((x0, x1)) = rows[y] else { return };
             for x in x0..=x1 {
                 row[x] = match v_vel(x, y) {
@@ -654,8 +684,8 @@ impl World {
         // Carried back, the gap corrected, then gravity and the drag of the air.
         let (uf, vf) = (&liq.u2, &liq.v2);
         liq.u3.par_chunks_mut(W + 1).enumerate().for_each(|(y, row)| {
-            row.copy_from_slice(&uf[ui(0, y)..ui(0, y + 1)]);
             let Some((x0, x1)) = rows[y] else { return };
+            row[x0..=(x1 + 1).min(W)].copy_from_slice(&uf[ui(x0, y)..=ui((x1 + 1).min(W), y)]);
             for x in x0..=(x1 + 1).min(W) {
                 let Ok((vx, vy)) = u_vel(x, y) else { continue };
                 let (px, py) = (x as f32 - vx * step, y as f32 - vy * step);
@@ -669,8 +699,8 @@ impl World {
             }
         });
         liq.v3.par_chunks_mut(W).enumerate().for_each(|(y, row)| {
-            row.copy_from_slice(&vf[vi(0, y)..vi(0, y + 1)]);
             let Some((x0, x1)) = rows[y] else { return };
+            row[x0..=x1].copy_from_slice(&vf[vi(x0, y)..=vi(x1, y)]);
             for x in x0..=x1 {
                 let Ok((vx, vy)) = v_vel(x, y) else { continue };
                 let (px, py) = (x as f32 - vx * step, y as f32 - vy * step);
@@ -689,8 +719,14 @@ impl World {
                 };
             }
         });
-        std::mem::swap(&mut liq.u, &mut liq.u3);
-        std::mem::swap(&mut liq.v, &mut liq.v3);
+        // Back into the grids, in the spans (the rest did not move).
+        let (u3, v3) = (&liq.u3, &liq.v3);
+        liq.u.par_chunks_mut(W + 1).zip(liq.v.par_chunks_mut(W)).enumerate().for_each(|(y, (u, v))| {
+            let Some((x0, x1)) = rows[y] else { return };
+            let x2 = (x1 + 1).min(W);
+            u[x0..=x2].copy_from_slice(&u3[ui(x0, y)..=ui(x2, y)]);
+            v[x0..=x1].copy_from_slice(&v3[vi(x0, y)..=vi(x1, y)]);
+        });
     }
 
     /// Smooths the velocities of thick liquids (implicit: red-black sweeps of
@@ -895,23 +931,9 @@ impl World {
         solver.ready(W, H);
         let f = solver.fine();
         f.rows[..H].copy_from_slice(&rows[..H]);
-        f.kind.par_chunks_mut(W).enumerate().for_each(|(y, row)| {
-            let Some((x0, x1)) = rows[y] else { return };
-            for x in x0..=x1 {
-                let c = class[y * W + x];
-                row[x] = if c == FULLISH | 4 {
-                    mgpcg::FLUID
-                } else if c & 3 == SOLID {
-                    mgpcg::NONE
-                } else {
-                    mgpcg::FIXED
-                };
-            }
-        });
-        let kind = &f.kind;
-        // The conductance of the edge between cells a and b, 0 unless one of them is an unknown.
-        let cond = |a: usize, b: usize| -> f32 {
-            let (ka, kb) = (kind[a], kind[b]);
+        // The conductance of the edge between cells a and b (of kinds ka, kb), 0 unless one of
+        // them is an unknown.
+        let cond = |a: usize, b: usize, ka: u8, kb: u8| -> f32 {
             if ka == mgpcg::NONE || kb == mgpcg::NONE || (ka != mgpcg::FLUID && kb != mgpcg::FLUID) {
                 0.0
             } else if class[a] & 3 == FULLISH && class[b] & 3 == FULLISH {
@@ -920,10 +942,22 @@ impl World {
                 1.0 / rho(if ka == mgpcg::FLUID { a } else { b })
             }
         };
-        f.ax.par_chunks_mut(W + 1).enumerate().for_each(|(y, row)| {
+        // The kind of each cell, and the edges along the row (one pass: an edge reads the kinds
+        // of its row alone; the cell before the span is nothing, from the last `clear`).
+        f.kind.par_chunks_mut(W).zip(f.ax.par_chunks_mut(W + 1)).enumerate().for_each(|(y, (krow, row))| {
             let Some((x0, x1)) = rows[y] else { return };
+            for x in x0..=x1 {
+                let c = class[y * W + x];
+                krow[x] = if c == FULLISH | 4 {
+                    mgpcg::FLUID
+                } else if c & 3 == SOLID {
+                    mgpcg::NONE
+                } else {
+                    mgpcg::FIXED
+                };
+            }
             for x in x0.max(1)..=(x1 + 1).min(W - 1) {
-                row[x] = cond(y * W + x - 1, y * W + x);
+                row[x] = cond(y * W + x - 1, y * W + x, krow[x - 1], krow[x]);
             }
             if x0 == 0 {
                 row[0] = 0.0;
@@ -932,6 +966,7 @@ impl World {
                 row[W] = 0.0;
             }
         });
+        let kind = &f.kind;
         f.ay.par_chunks_mut(W).enumerate().for_each(|(y, row)| {
             if y == 0 || y == H {
                 if let Some((x0, x1)) = rows[y.min(H - 1)] {
@@ -945,18 +980,25 @@ impl World {
             };
             let Some((x0, x1)) = span else { return };
             for x in x0..=x1 {
-                row[x] = cond((y - 1) * W + x, y * W + x);
+                let (a, b) = ((y - 1) * W + x, y * W + x);
+                row[x] = cond(a, b, kind[a], kind[b]);
             }
         });
         let (ax, ay) = (&f.ax, &f.ay);
         // The diagonal, the right side (the divergence, and the fixed pressures round the cell),
-        // and the start of the solution: the last pressure.
+        // and the start of the solution: the last pressure. A full cell walled in on all sides
+        // has no pressure to solve for: nothing, to the solver (it has no edge, so no other cell
+        // reads its kind in this pass).
+        let kinds = Shared::new(&mut f.kind);
+        // SAFETY (the reads below): a row only writes the kind of a cell without edges, and a
+        // cell's kind is only read from across an edge.
+        let kind = |c: usize| unsafe { kinds.get(c) };
         let (diag, b, x) = (&mut f.diag, &mut f.b, &mut f.x);
         diag.par_chunks_mut(W).zip(b.par_chunks_mut(W)).zip(x.par_chunks_mut(W)).enumerate().for_each(|(y, ((diag, b), x))| {
             let Some((x0, x1)) = rows[y] else { return };
             for i in x0..=x1 {
                 let c = y * W + i;
-                if kind[c] != mgpcg::FLUID {
+                if kind(c) != mgpcg::FLUID {
                     diag[i] = 0.0;
                     b[i] = 0.0;
                     x[i] = 0.0;
@@ -969,27 +1011,26 @@ impl World {
                         continue;
                     }
                     d += a;
-                    if kind[j] == mgpcg::FIXED {
+                    if kind(j) == mgpcg::FIXED {
                         // The fixed pressure beside: the gas over the liquid (or over its film),
                         // or the liquid that sleeps.
                         let pj = if class[j] & 3 == FULLISH { p_old[j] } else { self.gas_pa_over((j % W) as i32, (j / W) as i32) };
                         rhs_i += a * pj;
                     }
                 }
+                if d <= 0.0 {
+                    // SAFETY: the cell is this row's, and no row reads a cell without edges.
+                    unsafe {
+                        *kinds.at(c) = mgpcg::NONE;
+                    }
+                    diag[i] = 0.0;
+                    b[i] = 0.0;
+                    x[i] = 0.0;
+                    continue;
+                }
                 diag[i] = d;
                 b[i] = rhs_i;
                 x[i] = p_old[c];
-            }
-        });
-        // A full cell walled in on all sides has no pressure to solve for: nothing, to the solver.
-        f.kind.par_chunks_mut(W).zip(f.diag.par_chunks(W)).zip(f.b.par_chunks_mut(W)).zip(f.x.par_chunks_mut(W)).enumerate().for_each(|(y, (((kind, diag), b), x))| {
-            let Some((x0, x1)) = rows[y] else { return };
-            for i in x0..=x1 {
-                if kind[i] == mgpcg::FLUID && diag[i] <= 0.0 {
-                    kind[i] = mgpcg::NONE;
-                    b[i] = 0.0;
-                    x[i] = 0.0;
-                }
             }
         });
         solver.coarsen();

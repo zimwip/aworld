@@ -204,7 +204,7 @@ fn settles(m: Mat) -> bool {
 
 /// The changes by heat alone that start from `m`, in the order of `TRANSITIONS`. The heat pass
 /// asks for every reactive cell, every pass: a lookup, not a walk through the whole table.
-fn by_heat(m: Mat) -> &'static [&'static Transition] {
+pub(super) fn by_heat(m: Mat) -> &'static [&'static Transition] {
     static T: std::sync::OnceLock<Vec<Vec<&'static Transition>>> = std::sync::OnceLock::new();
     &T.get_or_init(|| {
         let mut t = vec![vec![]; 256];

@@ -331,6 +331,9 @@ struct Tables {
     reactive: [bool; NMAT],
     /// Air and gases.
     airy: [bool; NMAT],
+    /// The temperatures (open interval) where a matter with no latent heat stored cannot react:
+    /// `react` is skipped there (see `quiet_range`).
+    quiet: [(f32, f32); NMAT],
 }
 
 /// Heat flowing between cells `i` and `j` of `temp` (made of `mi` and `mj`) during one pass.
@@ -371,15 +374,73 @@ fn conduct_pair([ti, tj]: [&mut f32; 2], mi: Mat, mj: Mat, ts: f32, lod3: bool, 
     *tj -= flux * tb.inv_c[mj];
 }
 
+/// The temperatures, as an open interval, where `react` can do nothing to a cell of `m` holding no
+/// latent heat, and draws no lot: most of a quiet map (its rock, sand, grass and water at the
+/// air's temperature) is skipped by the heat pass on the strength of it. Empty for a matter that
+/// may react at any temperature (steam condenses by its dew point, glass cracks by its
+/// neighbours). Every threshold here is one that `react`, `latent_heat` or `TRANSITIONS` tests;
+/// a matter is only ever taken as quieter than it is, never the other way.
+fn quiet_range(m: Mat) -> (f32, f32) {
+    let (mut lo, mut hi) = (f32::NEG_INFINITY, f32::INFINITY);
+    // The change of state: a solid melts above its point, a liquid sets below it; water boils
+    // too, at its lowest in the deepest vacuum the pockets allow.
+    if let Some(f) = super::matter::fusion(m) {
+        if m == f.solid {
+            hi = hi.min(f.at);
+        } else {
+            lo = lo.max(f.at);
+        }
+        if m == Mat::Water {
+            hi = hi.min(super::pockets::boil_c(0.0));
+        }
+    }
+    // The changes by heat alone (`heat_change`).
+    for tr in super::matter::by_heat(m) {
+        let mut tied = false;
+        for c in tr.when {
+            match *c {
+                super::matter::Cond::TempAbove(v) => {
+                    hi = hi.min(v);
+                    tied = true;
+                }
+                super::matter::Cond::TempBelow(v) => {
+                    lo = lo.max(v);
+                    tied = true;
+                }
+                _ => {}
+            }
+        }
+        if !tied {
+            return (f32::INFINITY, f32::NEG_INFINITY);
+        }
+    }
+    // The reactions of `react` itself.
+    match m {
+        Mat::Snow => lo = lo.max(-2.0),
+        Mat::Steam | Mat::Glass => return (f32::INFINITY, f32::NEG_INFINITY),
+        // (Frost weathering happens between -8 and 6 °C: rock is taken as quiet only above.)
+        Mat::Stone => lo = lo.max(6.0),
+        Mat::Rust => hi = hi.min(SMELT_C),
+        Mat::Iron => hi = hi.min(STEEL_C),
+        Mat::Charcoal => hi = hi.min(CHARCOAL_IGNITE_C),
+        Mat::Grass | Mat::Seed | Mat::Sapling => hi = hi.min(WOOD_IGNITE_C - 40.0),
+        Mat::Oil => hi = hi.min(OIL_IGNITE_C),
+        Mat::Gunpowder | Mat::Dynamite => hi = hi.min(POWDER_IGNITE_C),
+        _ => {}
+    }
+    (lo, hi)
+}
+
 fn tables() -> &'static Tables {
     static T: std::sync::OnceLock<Tables> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        let mut t = Tables { k: [0.1; NMAT], inv_c: [1.0; NMAT], reactive: [false; NMAT], airy: [false; NMAT] };
+        let mut t = Tables { k: [0.1; NMAT], inv_c: [1.0; NMAT], reactive: [false; NMAT], airy: [false; NMAT], quiet: [(f32::INFINITY, f32::NEG_INFINITY); NMAT] };
         for m in Mat::ALL {
             let (k, c) = props(m);
             t.k[m as usize] = k;
             t.inv_c[m as usize] = 1.0 / c;
             t.airy[m as usize] = matches!(m.kind(), super::Kind::Empty | super::Kind::Gas);
+            t.quiet[m as usize] = quiet_range(m);
             t.reactive[m as usize] = matches!(
                 m,
                 Mat::Water | Mat::Ice | Mat::Snow | Mat::Hail | Mat::Steam | Mat::Lava | Mat::Molten | Mat::MoltenSteel | Mat::Stone | Mat::Sand
@@ -772,49 +833,87 @@ impl World {
 
     /// Part 2 of the heat pass: the air relaxes toward its profile, flames and embers hold their
     /// heat, and the matters react to their temperature.
+    ///
+    /// The relaxation is a formula per cell with no dependence: it runs on every core, row by
+    /// row, notes the heat each cell took, and lists the few cells with something to do in order
+    /// (a flame, an ember, a matter at a temperature where it may react: see `quiet_range`). The
+    /// reactions draw lots and change the matter around them, so they keep their order: one pass
+    /// in order over those lists, which also adds up the heat the air took in the cells' order
+    /// (the same sum, to the bit, as the single pass it replaces). What differs from that pass:
+    /// a cell that a reaction changes is seen by the relaxation as it was before, and by the
+    /// reactions after it as it is.
     fn heat_air_and_reactions(&mut self) {
         let scale = self.thermal_scale();
         let ts = TS * scale;
         let tb = tables();
         let clock = self.prof.start();
         let (sun, gx, gy, row_amb, _surf, fixed) = self.heat_frame();
-
-        // 2. Air relaxes toward the ambient profile; fixed sources; reactions.
-        // Heat the open air took from the sky, and heat the flames gave off.
-        let (mut to_cells, mut flames) = (0.0f32, 0.0f32);
         let shut = self.shut_in_means();
+        let mut took = std::mem::take(&mut self.heat_took);
+        took.resize(W * H, 0.0);
+        // 2a. The air relaxes, on every core.
+        let (cells, pocket_of, latent) = (&self.cells, &self.pocket_of, &self.latent);
+        let busy: Vec<Vec<u32>> = self
+            .temp
+            .par_chunks_mut(W)
+            .zip(took.par_chunks_mut(W))
+            .enumerate()
+            .map(|(y, (temp, took))| {
+                let base = row_amb[y];
+                let mut busy = Vec::new();
+                for x in 0..W {
+                    let i = y * W + x;
+                    let m = cells[i].m;
+                    let t = temp[x];
+                    let amb = if fixed { base } else { base + 12.0 * sun * gx[x] * gy[y] };
+                    took[x] = match m {
+                        // Air shut in a box (a greenhouse, an oven) keeps its warmth: it stirs
+                        // round the box and only leaves through the walls. What the open air
+                        // gains or loses goes to the sky.
+                        Mat::Empty if !fixed && !shut[pocket_of[i] as usize].is_nan() => {
+                            let mean = shut[pocket_of[i] as usize];
+                            temp[x] = t + (mean - t) * 0.05 * ts;
+                            0.0
+                        }
+                        Mat::Empty => {
+                            let d = (amb - t) * 0.12 * ts;
+                            temp[x] = t + d;
+                            d * C_AIR
+                        }
+                        Mat::Steam | Mat::Cloud | Mat::Snow | Mat::Hail | Mat::Smoke => {
+                            let d = (amb - t) * 0.03 * ts;
+                            temp[x] = t + d;
+                            d / tb.inv_c[m as usize]
+                        }
+                        _ => 0.0,
+                    };
+                    let (lo, hi) = tb.quiet[m as usize];
+                    if matches!(m, Mat::Fire | Mat::Ember) || (tb.reactive[m as usize] && (!(temp[x] > lo && temp[x] < hi) || latent[i] != 0.0)) {
+                        busy.push(i as u32);
+                    }
+                }
+                busy
+            })
+            .collect();
+        // 2b. In order: the heat the air took, then flames, embers and the reactions.
+        let (mut to_cells, mut flames) = (0.0f32, 0.0f32);
         for y in 0..H {
-            let base = row_amb[y];
-            for x in 0..W {
-                let i = y * W + x;
+            for v in &took[y * W..(y + 1) * W] {
+                to_cells += v;
+            }
+            for &i in &busy[y] {
+                let i = i as usize;
+                let (x, y) = ((i % W) as i32, (i / W) as i32);
                 let m = self.cells[i].m;
                 let t = self.temp[i];
-                let amb = if fixed { base } else { base + 12.0 * sun * gx[x] * gy[y] };
                 match m {
-                    // Air shut in a box (a greenhouse, an oven) keeps its warmth: it stirs round
-                    // the box and only leaves through the walls. What the open air gains or loses
-                    // goes to the sky.
-                    Mat::Empty if !fixed && !shut[self.pocket_of[i] as usize].is_nan() => {
-                        let mean = shut[self.pocket_of[i] as usize];
-                        self.temp[i] = t + (mean - t) * 0.05 * ts;
-                    }
-                    Mat::Empty => {
-                        let d = (amb - t) * 0.12 * ts;
-                        self.temp[i] = t + d;
-                        to_cells += d * C_AIR;
-                    }
-                    Mat::Steam | Mat::Cloud | Mat::Snow | Mat::Hail | Mat::Smoke => {
-                        let d = (amb - t) * 0.03 * ts;
-                        self.temp[i] = t + d;
-                        to_cells += d / tb.inv_c[m as usize];
-                    }
                     Mat::Fire => {
                         flames += FIRE_C - t;
                         self.temp[i] = FIRE_C;
                     }
                     // Embers a draught cannot reach glow hotter (and last longer, see `step_ember`).
                     Mat::Ember => {
-                        let open = Self::neighbors(x as i32, y as i32).iter().filter(|&&(nx, ny)| matches!(self.at(nx, ny).kind(), super::Kind::Empty | super::Kind::Gas)).count();
+                        let open = Self::neighbors(x, y).iter().filter(|&&(nx, ny)| matches!(self.at(nx, ny).kind(), super::Kind::Empty | super::Kind::Gas)).count();
                         // Charcoal burns hotter than wood: nothing is left in it but carbon.
                         let glow = EMBER_C + 300.0 * (1.0 - open as f32 / 4.0);
                         let coal = self.fuel[i].carbon;
@@ -825,10 +924,11 @@ impl World {
                     _ => {}
                 }
                 if tb.reactive[m as usize] {
-                    self.react(i, x as i32, y as i32, m, self.temp[i]);
+                    self.react(i, x, y, m, self.temp[i]);
                 }
             }
         }
+        self.heat_took = took;
 
         self.prof.stop(super::prof::HEAT_AIR, clock);
         // (For part 3, which closes the energy budget of the pass.)
@@ -1398,6 +1498,9 @@ impl World {
 
     /// Material changes driven by temperature. Transformations consume their
     /// inputs: water that boils is gone, steam that condenses is a cloud.
+    ///
+    /// (`quiet_range` says at which temperatures a matter cannot react at all: keep it in step
+    /// with the thresholds below and with `matter::TRANSITIONS`.)
     fn react(&mut self, i: usize, x: i32, y: i32, m: Mat, t: f32) {
         if super::matter::fusion(m).is_some() && self.latent_heat(i, x, y, m, t) {
             return;
