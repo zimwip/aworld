@@ -2063,6 +2063,26 @@ impl Game {
             let st = if self.mode == ViewMode::Stress { Some(c.stress) } else { None };
             draw_cable(&pts, view, c.snapped, true, c.mat.color(), st);
         }
+        // The push of the liquids on each solid body: an arrow where it bears, as long as the
+        // square root of the force, and the force (kN per metre of depth).
+        if self.mode == ViewMode::Stress {
+            for p in &self.world.pushes {
+                let f = (p.fx * p.fx + p.fy * p.fy).sqrt();
+                // (The steps of a slanting face each get a little push: only the faces that count.)
+                if f < 20.0 {
+                    continue;
+                }
+                let a = view.to_screen(vec2(p.x, p.y));
+                let len = (f.sqrt() * 6.0).clamp(14.0, 160.0);
+                let dir = vec2(p.fx, p.fy) / f;
+                let b = a + dir * len;
+                let col = Color::new(0.95, 0.35, 0.95, 0.95);
+                draw_line(a.x, a.y, b.x, b.y, 3.0, col);
+                let side = vec2(-dir.y, dir.x) * 6.0;
+                draw_triangle(b + dir * 4.0, b - dir * 8.0 + side, b - dir * 8.0 - side, col);
+                ui.text(&format!("{f:.0} kN/m"), b.x + 6.0, b.y - 6.0, 13, col);
+            }
+        }
         let over_ui_now = ui.over_ui();
         let inside_now = !over_ui_now && view.visible().contains(ui.mouse) && !self.show_science;
         self.draw_pipes(view, ui, inside_now);
@@ -3916,6 +3936,37 @@ fn demo_tunnel(g: &mut Game) {
     g.set_running(true);
 }
 
+/// `--dam`: two dams on bedrock, liquids by their physics. On the left a thick wall of rock holds
+/// back a deep lake; on the right a pane of glass holds a shallower one, until the water pushes
+/// it over. Best seen in the stress view (`--view efforts`).
+fn demo_dam(g: &mut Game) {
+    g.empty_world();
+    g.world.set_liquid_physics(true);
+    let floor = 440;
+    for x in 0..W as i32 {
+        for y in floor..H as i32 {
+            g.world.set(x, y, Mat::Stone);
+        }
+    }
+    let mut rect = |x0: i32, y0: i32, x1: i32, y1: i32, m: Mat| {
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                g.world.set(x, y, m);
+            }
+        }
+    };
+    rect(56, 370, 59, floor - 1, Mat::Stone);
+    rect(300, 380, 303, floor - 1, Mat::Stone);
+    rect(60, 390, 299, floor - 1, Mat::Water);
+    rect(514, 370, 519, floor - 1, Mat::Stone);
+    rect(700, 380, 700, floor - 1, Mat::Glass);
+    rect(520, 390, 699, floor - 1, Mat::Water);
+    for i in 0..W * H {
+        g.world.temp[i] = 15.0;
+    }
+    g.set_running(true);
+}
+
 /// A few bricks on flat rock, the brick tool in hand: with `--mouse` near them, the ghost is pulled
 /// into line and the guides show (`--magnet`).
 fn demo_magnet(g: &mut Game) {
@@ -4304,6 +4355,9 @@ async fn main() {
         }
         if args.iter().any(|a| a == "--tunnel") {
             demo_tunnel(&mut game);
+        }
+        if args.iter().any(|a| a == "--dam") {
+            demo_dam(&mut game);
         }
         if args.iter().any(|a| a == "--magnet") {
             demo_magnet(&mut game);

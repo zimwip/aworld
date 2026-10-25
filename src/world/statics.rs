@@ -48,6 +48,16 @@ const MAX_TIPS: usize = 4;
 
 /// The sections of one anchored body, as `stress_pass` last worked them out: the load on each of
 /// its cells (in `World::strain`'s units) and the sections that cannot carry theirs.
+/// The push of the liquids on a solid body: where it bears (cells) and how hard, kN per metre of
+/// depth (x, y; down positive).
+#[derive(Clone, Copy, Debug)]
+pub struct LiquidPush {
+    pub x: f32,
+    pub y: f32,
+    pub fx: f32,
+    pub fy: f32,
+}
+
 pub(super) struct BodyStress {
     strain: Vec<u8>,
     cracks: Vec<Crack>,
@@ -196,7 +206,11 @@ impl World {
     /// start to tip.
     pub(super) fn stress_pass(&mut self, order: &[usize], seen: &mut [bool]) {
         // Nothing changed in the anchored bodies since the last check: their loads are the same.
-        let key = order.iter().fold(order.len() as u64, |h, &i| (h ^ ((i as u64) << 8 | self.cells[i].m as u64)).wrapping_mul(0x100_0000_01b3));
+        // The push of the liquids on each cell (in cells of water, see `liquid_push`), counted in
+        // quarters of a cell in the fingerprints so that a body is worked out again when it changes.
+        let push: Vec<(f32, f32)> = if self.liquid_physics { order.par_iter().map(|&i| self.liquid_push(i)).collect() } else { Vec::new() };
+        let quarters = |k: usize| push.get(k).map_or(0, |&(fx, fy)| (((fx * 4.0).round() as i32 as u64) << 20) ^ ((fy * 4.0).round() as i32 as u64 & 0xf_ffff));
+        let key = order.iter().enumerate().fold(order.len() as u64, |h, (k, &i)| (h ^ ((i as u64) << 8 | self.cells[i].m as u64) ^ quarters(k).rotate_left(29)).wrapping_mul(0x100_0000_01b3));
         if key == self.strain_key {
             return;
         }
@@ -249,7 +263,7 @@ impl World {
         let mut keys: Vec<u64> = vec![0; count as usize];
         for (k, &b) in body_of.iter().enumerate() {
             let i = order[k];
-            keys[b as usize] = (keys[b as usize] ^ ((i as u64) << 8 | self.cells[i].m as u64)).wrapping_mul(0x100_0000_01b3);
+            keys[b as usize] = (keys[b as usize] ^ ((i as u64) << 8 | self.cells[i].m as u64) ^ quarters(k).rotate_left(29)).wrapping_mul(0x100_0000_01b3);
             bodies[b as usize].push(k as u32);
         }
         for (key, b) in keys.iter_mut().zip(&bodies) {
@@ -266,22 +280,61 @@ impl World {
             }
         }
         let results: Vec<std::sync::Arc<BodyStress>> = {
-            let (this, level, pos, local) = (&*self, &level, &pos, &local);
+            let (this, level, pos, local, push) = (&*self, &level, &pos, &local, &push);
             bodies
                 .par_iter()
                 .zip(keys.par_iter())
                 .map(|(members, key)| match this.stress_cache.get(key) {
                     Some(done) => done.clone(),
-                    None => std::sync::Arc::new(this.body_stress(order, members, local, level, pos)),
+                    None => std::sync::Arc::new(this.body_stress(order, members, local, level, pos, push)),
                 })
                 .collect()
         };
         let mut cracks: Vec<Crack> = vec![];
+        self.pushes.clear();
         for (members, done) in bodies.iter().zip(&results) {
             for (&k, &shown) in members.iter().zip(&done.strain) {
                 self.strain[order[k as usize]] = shown;
             }
             cracks.extend(done.cracks.iter().cloned());
+            // The push of the liquids on each wetted face of the body, at its centre of pressure
+            // (for the stress view): the two walls of a basin are pushed apart, which a sum over
+            // the body would hide.
+            if !push.is_empty() {
+                let mut wet: Vec<(bool, usize, usize, f32)> = vec![];
+                for &k in members {
+                    let (px, py) = push[k as usize];
+                    let i = order[k as usize];
+                    let (x, y) = (i % W, i / W);
+                    if px != 0.0 {
+                        wet.push((false, x * 2 + (px > 0.0) as usize, y, px));
+                    }
+                    if py != 0.0 {
+                        wet.push((true, y * 2 + (py > 0.0) as usize, x, py));
+                    }
+                }
+                wet.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+                let mut run = 0;
+                while run < wet.len() {
+                    let (down, line, mut at, _) = wet[run];
+                    let (mut f, mut along) = (0.0f32, 0.0f32);
+                    let mut end = run;
+                    while end < wet.len() && wet[end].0 == down && wet[end].1 == line && wet[end].2 <= at + 1 {
+                        at = wet[end].2;
+                        f += wet[end].3;
+                        along += wet[end].3 * (at as f32 + 0.5);
+                        end += 1;
+                    }
+                    let (across, along) = ((line / 2) as f32 + 0.5, along / f);
+                    let f = f * liquid::CELL_OF_WATER_KN;
+                    self.pushes.push(if down {
+                        LiquidPush { x: along, y: across, fx: 0.0, fy: f }
+                    } else {
+                        LiquidPush { x: across, y: along, fx: f, fy: 0.0 }
+                    });
+                    run = end;
+                }
+            }
         }
         self.stress_cache = keys.into_iter().zip(results).collect();
         for &i in order {
@@ -357,12 +410,16 @@ impl World {
     /// The load on every section of one anchored body (`members`: its places in `order`, rising;
     /// `local`: where each place of `order` comes in its body's list), and the sections that
     /// cannot carry it, as `stress_pass` reads them.
-    fn body_stress(&self, order: &[usize], members: &[u32], local: &[u32], level: &[u32], pos: &[u32]) -> BodyStress {
+    fn body_stress(&self, order: &[usize], members: &[u32], local: &[u32], level: &[u32], pos: &[u32], push: &[(f32, f32)]) -> BodyStress {
         let n = members.len();
         let local = |k: u32| local[k as usize];
         let mut up: Vec<u32> = (0..n as u32).collect();
+        // What each part carries: its weight (and the liquids' push down) as Σ w and Σ w·x, and
+        // the liquids' push sideways as Σ f and Σ f·y.
         let mut mass = vec![0.0f64; n];
         let mut moment = vec![0.0f64; n];
+        let mut side = vec![0.0f64; n];
+        let mut side_moment = vec![0.0f64; n];
         let mut strain = vec![0u8; n];
         fn find(up: &mut [u32], mut k: u32) -> u32 {
             while up[k as usize] != k {
@@ -386,9 +443,12 @@ impl World {
             }
             for k in lo..hi {
                 let i = cell(k);
-                let rho = density(self.cells[i].m) as f64;
-                mass[k] = rho;
-                moment[k] = rho * ((i % W) as f64 + 0.5);
+                let (fx, fy) = push.get(members[k] as usize).copied().unwrap_or((0.0, 0.0));
+                let w = density(self.cells[i].m) as f64 + fy as f64;
+                mass[k] = w;
+                moment[k] = w * ((i % W) as f64 + 0.5);
+                side[k] = fx as f64;
+                side_moment[k] = fx as f64 * ((i / W) as f64 + 0.5);
             }
             for k in lo..hi {
                 let i = cell(k);
@@ -406,6 +466,8 @@ impl World {
                         up[a as usize] = b;
                         mass[b as usize] += mass[a as usize];
                         moment[b as usize] += moment[a as usize];
+                        side[b as usize] += side[a as usize];
+                        side_moment[b as usize] += side_moment[a as usize];
                     }
                 }
             }
@@ -425,7 +487,8 @@ impl World {
                     b += 1;
                 }
                 let cells: Vec<usize> = fibres[a..b].iter().map(|&(_, k)| cell(k as usize)).collect();
-                let (load, pivot) = self.section_load(&cells, mass[root as usize], moment[root as usize]);
+                let r = root as usize;
+                let (load, pivot) = self.section_load(&cells, (mass[r], moment[r]), (side[r], side_moment[r]));
                 let shown = (load.clamp(0.0, 2.0) * 127.5) as u8;
                 for &(_, k) in &fibres[a..b] {
                     strain[k as usize] = shown;
@@ -444,6 +507,7 @@ impl World {
     /// centre of mass over the span of what it stands on.
     fn rests_on_its_base(&self, cells: &[usize], own: impl Fn(usize) -> bool) -> bool {
         let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+        let mut base = 0;
         let (mut mass, mut mx) = (0.0f32, 0.0f32);
         for &i in cells {
             let rho = density(self.cells[i].m);
@@ -457,32 +521,58 @@ impl World {
                 let x = (i % W) as i32;
                 lo = lo.min(x);
                 hi = hi.max(x);
+                base = base.max(i / W + 1);
             }
         }
         let cx = mx / mass.max(1e-6);
-        lo <= hi && cx >= lo as f32 && cx <= hi as f32 + 1.0
+        lo <= hi && cx >= lo as f32 && cx <= hi as f32 + 1.0 && self.pushed_over(cells, (lo, hi), base).is_none()
+    }
+
+    /// Whether the push of the liquids on `cells`, standing on the span `lo..=hi` of their base
+    /// (whose underside is row `base`), turns them over the edge of that span downstream: the
+    /// moment of the push about the edge beats the moment of the weight that holds them. The edge
+    /// it turns about if so.
+    fn pushed_over(&self, cells: &[usize], (lo, hi): (i32, i32), base: usize) -> Option<(f32, f32)> {
+        if !self.liquid_physics {
+            return None;
+        }
+        let pushes: Vec<(usize, (f32, f32))> = cells.iter().map(|&i| (i, self.liquid_push(i))).collect();
+        let side: f32 = pushes.iter().map(|p| p.1 .0).sum();
+        if side == 0.0 {
+            return None;
+        }
+        let edge = if side > 0.0 { hi as f32 + 1.0 } else { lo as f32 };
+        let (mut over, mut hold) = (0.0f32, 0.0f32);
+        for &(i, (fx, fy)) in &pushes {
+            let (x, y) = ((i % W) as f32 + 0.5, (i / W) as f32 + 0.5);
+            over += fx.abs() * (base as f32 - y) * if (fx > 0.0) == (side > 0.0) { 1.0 } else { -1.0 };
+            hold += (density(self.cells[i].m) + fy) * (edge - x) * side.signum();
+        }
+        (over > hold).then_some((edge, base as f32))
     }
 
     /// How loaded the section through `cells` is, as a share of what it can bear (over 1: it
-    /// cracks), given the mass and Σ mass·x of all it carries. Also the fibre it would turn about.
-    fn section_load(&self, cells: &[usize], mass: f64, moment: f64) -> (f32, usize) {
+    /// cracks), given what all it carries weighs down, Σ w and Σ w·x (its mass, and the push of
+    /// liquids on it), and pushes sideways, Σ f and Σ f·y. Also the fibre it would turn about.
+    fn section_load(&self, cells: &[usize], (mass, moment): (f64, f64), (side, side_moment): (f64, f64)) -> (f32, usize) {
         let m = self.cells[cells[0]].m;
-        if m.is_vegetation() || mass <= 0.0 {
+        if m.is_vegetation() || (mass <= 0.0 && side == 0.0) {
             return (0.0, cells[0]);
         }
         let sigma = strength(m) as f64 * 1.0e6;
         let xy = |i: usize| ((i % W) as f64 + 0.5, (i / W) as f64 + 0.5);
         let (mut worst, mut pivot) = (0.0f64, cells[0]);
-        for side in [-1.0f64, 1.0] {
+        for dir in [-1.0f64, 1.0] {
             // The edge fibre on that side, lowest first: the part beyond would turn about it.
             let p = *cells.iter().max_by(|&&a, &&b| {
                 let (ax, ay) = xy(a);
                 let (bx, by) = xy(b);
-                (side * ax + ay).total_cmp(&(side * bx + by))
+                (dir * ax + ay).total_cmp(&(dir * bx + by))
             }).unwrap();
             let (px, py) = xy(p);
-            // Moment of the weight about the edge (N·m per metre of depth, over h³)...
-            let turning = G as f64 * CELL_M as f64 * 1000.0 * side * (moment - mass * px);
+            // Moment of the weight (and of the liquids' push) about the edge (N·m per metre of
+            // depth, over h³)...
+            let turning = G as f64 * CELL_M as f64 * 1000.0 * dir * ((moment - mass * px) - (side_moment - side * py));
             if turning <= 0.0 {
                 continue;
             }
@@ -558,7 +648,11 @@ impl World {
                 (m + rho, mx + rho * ((i % W) as f32 + 0.5), my + rho * ((i / W) as f32 + 0.5))
             });
             let (cx, cy) = (mx / mass.max(1e-6), my / mass.max(1e-6));
-            let hinge = if cx < lo.0 as f32 {
+            let base = p.cells.iter().map(|&i| i / W + 1).max().unwrap_or(0);
+            let hinge = if let Some(edge) = self.pushed_over(&p.cells, (lo.0, hi.0), base) {
+                // Pushed over by the liquid against it (a wall of a dam that is too thin).
+                edge
+            } else if cx < lo.0 as f32 {
                 (lo.0 as f32, lo.1 as f32 + 1.0)
             } else if cx > hi.0 as f32 + 1.0 {
                 (hi.0 as f32 + 1.0, hi.1 as f32 + 1.0)
