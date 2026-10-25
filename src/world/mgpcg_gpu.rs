@@ -73,12 +73,25 @@ mod native {
         coarsen_edges: wgpu::ComputePipeline,
         coarsen_diag: wgpu::ComputePipeline,
         residual: wgpu::ComputePipeline,
+        start: wgpu::ComputePipeline,
         apply: wgpu::ComputePipeline,
+        alpha: wgpu::ComputePipeline,
         advance: wgpu::ComputePipeline,
+        step: wgpu::ComputePipeline,
+        undo: wgpu::ComputePipeline,
         dot_rz: wgpu::ComputePipeline,
+        rho: wgpu::ComputePipeline,
         direction: wgpu::ComputePipeline,
     }
 
+    /// The scalars of the conjugate gradients on the card (`sc` in the kernels).
+    const SC_DONE: usize = 8;
+    const SC_ITER: usize = 9;
+    const SC_N: usize = 11;
+    /// Iterations run on the card between two looks at whether it is done.
+    const BATCH: u32 = 2;
+
+    /// See `Params` in the kernels.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct Params {
@@ -87,9 +100,13 @@ mod native {
         cw: u32,
         ch: u32,
         colour: u32,
-        pad: u32,
-        alpha: f32,
-        beta: f32,
+        y0: u32,
+        rows: u32,
+        groups: u32,
+        cy0: u32,
+        crows: u32,
+        pad0: u32,
+        pad1: u32,
     }
 
     fn bytes<T: Copy>(v: &[T]) -> &[u8] {
@@ -116,15 +133,23 @@ mod native {
         cg: wgpu::BindGroup,
         /// The preconditioned residual (the V-cycle of the preconditioner starts it from zero).
         z: wgpu::Buffer,
-        partials: wgpu::Buffer,
-        partials_read: wgpu::Buffer,
+        /// The scalars of the conjugate gradients, and their copy for the CPU to read.
+        sc: wgpu::Buffer,
+        sc_read: wgpu::Buffer,
         x_read: wgpu::Buffer,
+        /// The rows sent last time (what the card holds outside them is clean): the next send
+        /// covers them too, so that what was liquid and is not any more is nothing again.
+        sent: Option<(usize, usize)>,
         /// The kinds as the card reads them (a word a cell).
         kind32: Vec<u32>,
         /// How many levels this solve uses.
         used: usize,
-        /// Workgroups of the reductions over the finest grid.
+        /// Workgroups of the reductions over the finest grid, at most.
         groups: usize,
+        /// The band of rows of each level this solve works on, and the workgroups of the
+        /// reductions over the finest band.
+        bands: Vec<(usize, usize)>,
+        line_groups: usize,
     }
 
     impl PressureGpu {
@@ -149,7 +174,7 @@ mod native {
                 }],
             });
             let level_layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("level"), entries: &(0..6).map(storage).collect::<Vec<_>>() });
-            let cg_layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("cg"), entries: &(0..5).map(storage).collect::<Vec<_>>() });
+            let cg_layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("cg"), entries: &(0..6).map(storage).collect::<Vec<_>>() });
             let layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("mgpcg"), bind_group_layouts: &[&params_layout, &level_layout, &level_layout, &cg_layout], push_constant_ranges: &[] });
             let pipeline = |entry: &str| {
                 d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(entry), layout: Some(&layout), module: &shader, entry_point: Some(entry), compilation_options: Default::default(), cache: None })
@@ -162,9 +187,14 @@ mod native {
                 coarsen_edges: pipeline("coarsen_edges"),
                 coarsen_diag: pipeline("coarsen_diag"),
                 residual: pipeline("residual"),
+                start: pipeline("start"),
                 apply: pipeline("apply"),
+                alpha: pipeline("alpha"),
                 advance: pipeline("advance"),
+                step: pipeline("step"),
+                undo: pipeline("undo"),
                 dot_rz: pipeline("dot_rz"),
+                rho: pipeline("rho"),
                 direction: pipeline("direction"),
             };
             // The hierarchy, as `Solver::ready` makes it.
@@ -187,12 +217,13 @@ mod native {
             let (r, z, s, q) = (grid("r", n), grid("z", n), grid("s", n), grid("q", n));
             let groups = n.div_ceil(WG);
             let partials = grid("partials", groups);
-            let partials_read = d.create_buffer(&wgpu::BufferDescriptor { label: Some("partials read"), size: (groups * 4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            let sc = grid("scalars", SC_N);
+            let sc_read = d.create_buffer(&wgpu::BufferDescriptor { label: Some("scalars read"), size: (SC_N * 4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
             let x_read = d.create_buffer(&wgpu::BufferDescriptor { label: Some("x read"), size: (n * 4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
             fn entries<'a>(bufs: &[&'a wgpu::Buffer]) -> Vec<wgpu::BindGroupEntry<'a>> {
                 bufs.iter().enumerate().map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() }).collect()
             }
-            let cg = d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("cg"), layout: &cg_layout, entries: &entries(&[&r, &z, &s, &q, &partials]) });
+            let cg = d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("cg"), layout: &cg_layout, entries: &entries(&[&r, &z, &s, &q, &partials, &sc]) });
             let mut levels = Vec::new();
             for (l, &(lw, lh)) in dims.iter().enumerate() {
                 let kind = grid("kind", lw * lh);
@@ -205,7 +236,7 @@ mod native {
                 let pre = (l == 0).then(|| d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("level pre"), layout: &level_layout, entries: &entries(&[&kind, &ax, &ay, &diag, &r, &z]) }));
                 levels.push(GpuLevel { w: lw, h: lh, kind, ax, ay, diag, b, x, bind, pre });
             }
-            Some(PressureGpu { gpu, levels, kernels, params, params_bind, cg, z, partials, partials_read, x_read, kind32: vec![0; n], used: 1, groups })
+            Some(PressureGpu { gpu, levels, kernels, params, params_bind, cg, z, sc, sc_read, x_read, sent: None, kind32: vec![0; n], used: 1, groups, bands: Vec::new(), line_groups: 1 })
         }
 
         /// The slot of level `l`'s parameters for `colour`, as a dynamic offset.
@@ -213,16 +244,39 @@ mod native {
             ((l * 2 + colour) as u64 * SLOT) as u32
         }
 
-        /// Writes the parameters of every level used (and `alpha`, `beta` for the finest).
-        fn write_params(&self, alpha: f32, beta: f32) {
+        /// The bands of every level from the finest one's (`y0..=y1`): half as high a level
+        /// down, a row around; then the parameters of every level used.
+        fn write_params(&mut self, y0: usize, y1: usize) {
+            self.bands.clear();
+            for lev in &self.levels {
+                let l = self.bands.len();
+                let (a, b) = (y0 >> l, y1 >> l);
+                self.bands.push((a.saturating_sub(1), (b + 1).min(lev.h - 1)));
+            }
+            let (a, b) = self.bands[0];
+            self.line_groups = ((b + 1 - a) * self.levels[0].w).div_ceil(WG);
             for l in 0..self.used {
                 let lev = &self.levels[l];
                 let (cw, ch) = if l + 1 < self.levels.len() { (self.levels[l + 1].w, self.levels[l + 1].h) } else { (lev.w.div_ceil(2), lev.h.div_ceil(2)) };
+                let (y0, y1) = self.bands[l];
+                let (cy0, cy1) = if l + 1 < self.levels.len() { self.bands[l + 1] } else { (0, 0) };
                 for colour in 0..2 {
-                    let p = Params { w: lev.w as u32, h: lev.h as u32, cw: cw as u32, ch: ch as u32, colour: colour as u32, pad: 0, alpha, beta };
+                    let p = Params { w: lev.w as u32, h: lev.h as u32, cw: cw as u32, ch: ch as u32, colour: colour as u32, y0: y0 as u32, rows: (y1 + 1 - y0) as u32, groups: self.line_groups as u32, cy0: cy0 as u32, crows: (cy1 + 1 - cy0) as u32, pad0: 0, pad1: 0 };
                     self.gpu.queue.write_buffer(&self.params, Self::slot(l, colour) as u64, bytes(&[p]));
                 }
             }
+        }
+
+        /// The workgroups of a kernel over the band of level `l`, 16 x 16 cells a group.
+        fn tiles_of(&self, l: usize) -> (u32, u32) {
+            let (y0, y1) = self.bands[l];
+            Self::tiles(self.levels[l].w, y1 + 1 - y0)
+        }
+
+        /// The same over the band of the level under `l` (a row more for the edges that close it).
+        fn under_tiles(&self, l: usize, more: usize) -> (u32, u32) {
+            let (y0, y1) = self.bands[l + 1];
+            Self::tiles(self.levels[l + 1].w + more, y1 + 1 - y0 + more)
         }
 
         /// One kernel over level `l` (its grids as group 1, the level under as group 2), with
@@ -244,17 +298,16 @@ mod native {
             (w.div_ceil(16) as u32, h.div_ceil(16) as u32)
         }
 
-        /// A kernel over the finest grid, a cell a thread in workgroups of `WG` (the reductions).
+        /// A kernel over the finest band, a cell a thread in workgroups of `WG` (the reductions).
         fn line(&self) -> (u32, u32) {
-            (self.groups as u32, 1)
+            (self.line_groups as u32, 1)
         }
 
         /// The V-cycle on level `l` (the finest as the preconditioner's set when `pre`), as
         /// `Solver::vcycle`: sweeps, the residual down, the visit below, the correction up, sweeps.
         fn vcycle(&self, enc: &mut wgpu::CommandEncoder, l: usize, pre: bool) {
             let k = &self.kernels;
-            let lev = &self.levels[l];
-            let tiles = Self::tiles(lev.w, lev.h);
+            let tiles = self.tiles_of(l);
             if l + 1 == self.used {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 for _ in 0..COARSEST_SWEEPS {
@@ -265,7 +318,7 @@ mod native {
                 return;
             }
             let under = &self.levels[l + 1];
-            let ctiles = Self::tiles(under.w, under.h);
+            let ctiles = self.under_tiles(l, 0);
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 for _ in 0..SMOOTH {
@@ -286,33 +339,6 @@ mod native {
             }
         }
 
-        /// Submits the work encoded and reads the partial sums back, added up in order.
-        fn finish_sum(&self, mut enc: wgpu::CommandEncoder) -> f32 {
-            self.finish(&mut enc);
-            self.partials_back().iter().sum()
-        }
-
-        /// The same, keeping the largest.
-        fn finish_max(&self, mut enc: wgpu::CommandEncoder) -> f32 {
-            self.finish(&mut enc);
-            self.partials_back().iter().copied().fold(0.0, f32::max)
-        }
-
-        fn finish(&self, enc: &mut wgpu::CommandEncoder) {
-            enc.copy_buffer_to_buffer(&self.partials, 0, &self.partials_read, 0, (self.groups * 4) as u64);
-            let enc = std::mem::replace(enc, self.gpu.device.create_command_encoder(&Default::default()));
-            self.gpu.queue.submit([enc.finish()]);
-        }
-
-        fn partials_back(&self) -> Vec<f32> {
-            let slice = self.partials_read.slice(..);
-            slice.map_async(wgpu::MapMode::Read, |_| {});
-            self.gpu.device.poll(wgpu::Maintain::Wait);
-            let out: Vec<f32> = slice.get_mapped_range().chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-            self.partials_read.unmap();
-            out
-        }
-
         fn encoder(&self) -> wgpu::CommandEncoder {
             self.gpu.device.create_command_encoder(&Default::default())
         }
@@ -320,13 +346,23 @@ mod native {
         /// Solves the finest level `fine` (filled in as for `Solver::solve`) on the card, from
         /// the `x` it holds, to the same stopping rules; the solution is left in `fine.x`.
         /// Returns the iterations.
+        ///
+        /// The card is waited for as little as can be: the scalars of the conjugate gradients
+        /// stay on it, and the CPU only looks every `BATCH` iterations at whether it is done.
         pub fn solve(&mut self, fine: &mut Level, tol: f32, rel: f32, max_iter: u32) -> u32 {
             let (w, h) = (fine.w, fine.h);
             debug_assert!(w == self.levels[0].w && h == self.levels[0].h);
-            let n = w * h;
-            // The finest level goes up whole; the card builds the coarse ones.
-            self.kind32.par_iter_mut().zip(&fine.kind).for_each(|(d, &s)| *d = s as u32);
-            let fluid = fine.kind.par_iter().filter(|&&k| k == super::super::mgpcg::FLUID).count();
+            // The rows to send: the ones that hold the system, and the ones sent last time.
+            let Some(y0) = fine.rows.iter().position(Option::is_some) else { return 0 };
+            let y1 = fine.rows.iter().rposition(Option::is_some).unwrap();
+            let (sy0, sy1) = match self.sent {
+                Some((a, b)) => (a.min(y0), b.max(y1)),
+                None => (0, h - 1),
+            };
+            self.sent = Some((y0, y1));
+            let band = sy0 * w..(sy1 + 1) * w;
+            self.kind32[band.clone()].par_iter_mut().zip(&fine.kind[band.clone()]).for_each(|(d, &s)| *d = s as u32);
+            let fluid = fine.kind[band.clone()].par_iter().filter(|&&k| k == super::super::mgpcg::FLUID).count();
             let mut nodes = fluid;
             self.used = 1;
             while nodes > COARSEST && self.used < self.levels.len() {
@@ -335,115 +371,86 @@ mod native {
             }
             let q = &self.gpu.queue;
             let l0 = &self.levels[0];
-            q.write_buffer(&l0.kind, 0, bytes(&self.kind32));
-            q.write_buffer(&l0.ax, 0, bytes(&fine.ax));
-            q.write_buffer(&l0.ay, 0, bytes(&fine.ay));
-            q.write_buffer(&l0.diag, 0, bytes(&fine.diag));
-            q.write_buffer(&l0.b, 0, bytes(&fine.b));
-            q.write_buffer(&l0.x, 0, bytes(&fine.x));
-            self.write_params(0.0, 0.0);
+            let at = |rows: usize| (rows * 4) as u64;
+            q.write_buffer(&l0.kind, at(band.start), bytes(&self.kind32[band.clone()]));
+            q.write_buffer(&l0.diag, at(band.start), bytes(&fine.diag[band.clone()]));
+            q.write_buffer(&l0.b, at(band.start), bytes(&fine.b[band.clone()]));
+            q.write_buffer(&l0.x, at(band.start), bytes(&fine.x[band.clone()]));
+            let xband = sy0 * (w + 1)..(sy1 + 1) * (w + 1);
+            q.write_buffer(&l0.ax, at(xband.start), bytes(&fine.ax[xband]));
+            let yband = sy0 * w..(sy1 + 2) * w;
+            q.write_buffer(&l0.ay, at(yband.start), bytes(&fine.ay[yband]));
+            // rho, s·q, alpha, beta, step, best, tol, rel, done, iterations, undo.
+            q.write_buffer(&self.sc, 0, bytes(&[0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, tol, rel, 0.0, 0.0, 0.0]));
+            self.write_params(sy0, sy1);
             let k = &self.kernels;
+            let line = self.line();
+            // The coarse levels, the first residual, the tolerance, and the first direction.
             let mut enc = self.encoder();
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 for l in 0..self.used - 1 {
-                    let under = &self.levels[l + 1];
-                    let ctiles = Self::tiles(under.w, under.h);
+                    let ctiles = self.under_tiles(l, 0);
                     self.run(&mut pass, &k.coarsen_kind, l, 0, false, ctiles);
-                    self.run(&mut pass, &k.coarsen_edges, l, 0, false, Self::tiles(under.w + 1, under.h + 1));
+                    self.run(&mut pass, &k.coarsen_edges, l, 0, false, self.under_tiles(l, 1));
                     self.run(&mut pass, &k.coarsen_diag, l, 0, false, ctiles);
                 }
-                // r = b - A x, and how far the pressure is from settled.
-                self.run(&mut pass, &k.residual, 0, 0, false, self.line());
+                self.run(&mut pass, &k.residual, 0, 0, false, line);
+                self.run(&mut pass, &k.start, 0, 0, false, (1, 1));
             }
-            let step0 = self.finish_max(enc);
-            let tol = tol.max(rel * step0);
-            let mut iterations = 0;
-            let mut best = step0;
-            if step0 >= tol {
-                // z = M⁻¹ r, s = z, rho = r · z.
-                let mut rho = self.precondition();
-                let mut enc = self.encoder();
-                {
-                    let mut pass = enc.begin_compute_pass(&Default::default());
-                    self.run(&mut pass, &k.direction, 0, 0, false, self.line());
-                    // q = A s, and s · q.
-                    self.run(&mut pass, &k.apply, 0, 0, false, self.line());
-                }
-                let mut sq = self.finish_sum(enc);
-                while iterations < max_iter {
-                    iterations += 1;
-                    if !(sq > 0.0) || !rho.is_finite() {
-                        break;
-                    }
-                    let alpha = rho / sq;
-                    // x += alpha s, r -= alpha q, and how far from settled now.
-                    let step = self.advance(alpha);
-                    if step < tol {
-                        break;
-                    }
-                    // Running away (a singular system): the step is undone and the solve stops.
-                    if !(step <= 8.0 * best) {
-                        self.advance(-alpha);
-                        break;
-                    }
-                    best = best.min(step);
-                    let rho2 = self.precondition();
-                    let beta = rho2 / rho;
-                    rho = rho2;
-                    // s = z + beta s, then q = A s and s · q for the next step.
-                    self.write_params(0.0, beta);
-                    let mut enc = self.encoder();
+            self.precondition(&mut enc);
+            let mut done = 0;
+            while done < max_iter {
+                // `BATCH` iterations, each: s = z + beta s; q = A s; alpha; x and r advanced; the
+                // step looked at; the advance undone if it ran away; z = M⁻¹ r; rho and beta.
+                // (The card counts the iterations it really did: once done, a kernel does nothing.)
+                for _ in 0..BATCH.min(max_iter - done) {
                     {
                         let mut pass = enc.begin_compute_pass(&Default::default());
-                        self.run(&mut pass, &k.direction, 0, 0, false, self.line());
-                        self.run(&mut pass, &k.apply, 0, 0, false, self.line());
+                        self.run(&mut pass, &k.direction, 0, 0, false, line);
+                        self.run(&mut pass, &k.apply, 0, 0, false, line);
+                        self.run(&mut pass, &k.alpha, 0, 0, false, (1, 1));
+                        self.run(&mut pass, &k.advance, 0, 0, false, line);
+                        self.run(&mut pass, &k.step, 0, 0, false, (1, 1));
+                        self.run(&mut pass, &k.undo, 0, 0, false, line);
                     }
-                    sq = self.finish_sum(enc);
+                    self.precondition(&mut enc);
+                }
+                enc.copy_buffer_to_buffer(&self.sc, 0, &self.sc_read, 0, (SC_N * 4) as u64);
+                let sc = self.read(std::mem::replace(&mut enc, self.encoder()), &self.sc_read, SC_N);
+                done = sc[SC_ITER] as u32;
+                if sc[SC_DONE] != 0.0 {
+                    break;
                 }
             }
-            // The solution back.
-            let mut enc = self.encoder();
-            enc.copy_buffer_to_buffer(&self.levels[0].x, 0, &self.x_read, 0, (n * 4) as u64);
-            q.submit([enc.finish()]);
-            let slice = self.x_read.slice(..);
+            // The solution back (the rows of the system).
+            let n = (y1 + 1 - y0) * w;
+            enc.copy_buffer_to_buffer(&self.levels[0].x, at(y0 * w), &self.x_read, 0, at(n));
+            let x = self.read(enc, &self.x_read, n);
+            fine.x[y0 * w..(y1 + 1) * w].copy_from_slice(&x);
+            done
+        }
+
+        /// Submits what is encoded, then reads `n` numbers back from a staging buffer.
+        fn read(&self, enc: wgpu::CommandEncoder, from: &wgpu::Buffer, n: usize) -> Vec<f32> {
+            self.gpu.queue.submit([enc.finish()]);
+            let slice = from.slice(..(n * 4) as u64);
             slice.map_async(wgpu::MapMode::Read, |_| {});
             self.gpu.device.poll(wgpu::Maintain::Wait);
-            {
-                let data = slice.get_mapped_range();
-                fine.x.par_chunks_mut(w).zip(data.par_chunks_exact(w * 4)).for_each(|(row, src)| {
-                    for (d, c) in row.iter_mut().zip(src.chunks_exact(4)) {
-                        *d = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                    }
-                });
-            }
-            self.x_read.unmap();
-            iterations
+            let out: Vec<f32> = slice.get_mapped_range().chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            from.unmap();
+            out
         }
 
-        /// x += alpha s, r -= alpha q; returns the largest Jacobi step left.
-        fn advance(&self, alpha: f32) -> f32 {
-            self.write_params(alpha, 0.0);
-            let mut enc = self.encoder();
-            {
-                let mut pass = enc.begin_compute_pass(&Default::default());
-                self.run(&mut pass, &self.kernels.advance, 0, 0, false, self.line());
-            }
-            self.finish_max(enc)
-        }
-
-        /// z = M⁻¹ r: a V-cycle from zero on the finest level with r as its right side. Returns
-        /// r · z.
-        fn precondition(&self) -> f32 {
-            let mut enc = self.encoder();
+        /// z = M⁻¹ r: a V-cycle from zero on the finest level with r as its right side, then
+        /// rho = r · z and beta.
+        fn precondition(&self, enc: &mut wgpu::CommandEncoder) {
             // (z is the fine `x` of the preconditioner's set.)
             enc.clear_buffer(&self.z, 0, None);
-            self.vcycle(&mut enc, 0, true);
-            {
-                let mut pass = enc.begin_compute_pass(&Default::default());
-                self.run(&mut pass, &self.kernels.dot_rz, 0, 0, false, self.line());
-            }
-            self.finish_sum(enc)
+            self.vcycle(enc, 0, true);
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            self.run(&mut pass, &self.kernels.dot_rz, 0, 0, false, self.line());
+            self.run(&mut pass, &self.kernels.rho, 0, 0, false, (1, 1));
         }
     }
 }
