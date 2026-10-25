@@ -23,8 +23,9 @@ use rayon::prelude::*;
 pub const OPEN_POCKET: u32 = 40_000;
 /// How many times more gas a cell of steam holds than a cell of air (boiling water swells a lot).
 pub const STEAM_N: f32 = 8.0;
-/// Pockets and liquid pressure are re-read every this many steps.
-pub const POCKETS_EVERY: u32 = 16;
+/// Pockets and liquid pressure are re-read every this many steps (a multiple of 6, so that the
+/// pass always falls on the same part of the heat cycle, see `after_cells`).
+pub const POCKETS_EVERY: u32 = 18;
 /// Atmospheres per cell of water depth (the same scale as the pressure view).
 pub const ATM_PER_CELL: f32 = 1.0 / 60.0;
 /// A liquid shoots out sideways once the pressure behind a hole is worth this many cells of head.

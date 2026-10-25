@@ -4,11 +4,13 @@
 
 /// The phases of a step, in the order they run.
 /// After `total`, the parts of the heat pass (already counted in `chaleur`), then the water field.
-pub const PHASES: [&str; 23] = [
+pub const PHASES: [&str; 30] = [
     "cellules", "structures", "chutes", "corps rigides", "poches", "éjectas", "tassement", "vent",
     "écoulement air", "pression", "poussée", "saisons", "chaleur", "orage", "niveaux liquides", "total",
     "  chaleur/conduction", "  chaleur/vent", "  chaleur/air+réactions", "  chaleur/vers l'espace", "  chaleur/soleil",
     "eau en champ", "liquides physiques",
+    "  liquides/classement", "  liquides/forces", "  liquides/viscosité", "  liquides/pression", "  liquides/itérations",
+    "  liquides/gouttes", "  liquides/transport",
 ];
 pub const TOTAL: usize = 15;
 pub const HEAT_CONDUCTION: usize = 16;
@@ -20,6 +22,15 @@ pub const HEAT_SUN: usize = 20;
 pub const FIELD: usize = 21;
 /// Not in the order of the step either: the liquids' physics runs after the cells too.
 pub const LIQUIDS: usize = 22;
+/// The parts of the liquids' physics (already counted in `liquides physiques`), one run per
+/// sub-step; `LIQ_ITERATIONS` counts one run per iteration of the pressure solver.
+pub const LIQ_CLASSIFY: usize = 23;
+pub const LIQ_FORCES: usize = 24;
+pub const LIQ_VISCOSITY: usize = 25;
+pub const LIQ_PRESSURE: usize = 26;
+pub const LIQ_ITERATIONS: usize = 27;
+pub const LIQ_DROPS: usize = 28;
+pub const LIQ_CARRY: usize = 29;
 
 #[derive(Clone)]
 pub struct Profile {
@@ -94,12 +105,18 @@ impl Profile {
 
     #[inline]
     pub fn stop(&mut self, phase: usize, clock: Clock) {
+        self.stop_n(phase, clock, 1);
+    }
+
+    /// `stop`, counting `n` runs (a loop of sweeps timed as a whole).
+    #[inline]
+    pub fn stop_n(&mut self, phase: usize, clock: Clock, n: u32) {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(t) = clock {
             self.ns[phase] += t.elapsed().as_nanos() as u64;
-            self.runs[phase] += 1;
+            self.runs[phase] += n;
         }
         #[cfg(target_arch = "wasm32")]
-        let _ = (phase, clock);
+        let _ = (phase, clock, n);
     }
 }

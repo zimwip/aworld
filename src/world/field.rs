@@ -105,7 +105,7 @@ impl World {
     }
 
     #[inline]
-    fn put_fill(&mut self, i: usize, q: u32) {
+    pub(super) fn put_fill(&mut self, i: usize, q: u32) {
         self.fill[i] = if q == FULL { 0 } else { q };
     }
 

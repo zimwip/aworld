@@ -6,7 +6,8 @@
 //! ```
 //!
 //! `AWORLD_BENCH_STEPS` sets how many steps each scene is measured over (300 by default),
-//! `AWORLD_BENCH_SCENE` runs only the scene of that name.
+//! `AWORLD_BENCH_SCENE` runs only the scene of that name, `AWORLD_BENCH_SERIES=1` also prints
+//! the time of the first 96 measured steps one by one (to see the steps that stick out).
 
 use super::*;
 use std::time::Instant;
@@ -119,6 +120,7 @@ fn bench_scenes() {
         w.prof.on = true;
         w.prof.reset();
         let mut worst = 0f64;
+        let mut series = String::new();
         let t = Instant::now();
         for i in 0..steps {
             if let Some(f) = each {
@@ -126,7 +128,11 @@ fn bench_scenes() {
             }
             let s = Instant::now();
             w.step();
-            worst = worst.max(s.elapsed().as_secs_f64() * 1000.0);
+            let ms = s.elapsed().as_secs_f64() * 1000.0;
+            worst = worst.max(ms);
+            if i < 96 {
+                series += &format!("{ms:5.1}{}", if i % 16 == 15 { "\n" } else { " " });
+            }
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0 / steps as f64;
         let awake = w.zones.awake.iter().filter(|&&a| a).count();
@@ -134,6 +140,9 @@ fn bench_scenes() {
             "\n=== {name}: {ms:.2} ms/pas en moyenne, pire pas {worst:.1} ms, {awake}/{} zones éveillées à la fin",
             w.zones.awake.len()
         );
+        if std::env::var_os("AWORLD_BENCH_SERIES").is_some() {
+            eprintln!("{series}");
+        }
         eprint!("{}", w.prof.report());
     }
 }

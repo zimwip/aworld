@@ -20,6 +20,7 @@ mod par;
 mod turn;
 mod field;
 mod liquid;
+mod mgpcg;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]
@@ -609,6 +610,11 @@ pub struct World {
     /// When false the sun stands still.
     pub day_cycle: bool,
     thermal_flip: bool,
+    /// What part 2 of the heat pass hands part 3 (heat the open air took from the sky, heat the
+    /// flames gave off), when the pass is spread over the steps of its cycle.
+    heat_carry: (f32, f32),
+    /// Scratch of the wind carrying the air's warmth: the temperatures as they were.
+    temp_old: Vec<f32>,
     /// Tests (and calm sandboxes) can pin the air temperature everywhere.
     pub climate_fixed: Option<f32>,
     /// The energy budget of the world: the sun in, the sky out to space (see `thermal.rs`).
@@ -723,7 +729,9 @@ pub struct World {
     pub prof: prof::Profile,
     /// `ambient_c` of every row, worked out once when the cells take their turn (gas asks for it
     /// at every move); empty outside it. During the turn only the drift of the sky can change
-    /// (heat given off as vapour condenses): the table holds while it is still `air_sky`.
+    /// (heat given off as vapour condenses), by a few thousandths of a degree: the table holds for
+    /// the whole turn, and `air_sky` is what the sky was when it was built (the strips of a
+    /// parallel turn add their drift to it).
     air_rows: Vec<f32>,
     air_sky: f32,
     /// In the view of a strip of the cells' turn, the rules it puts off to the end of the turn
@@ -767,6 +775,8 @@ impl World {
             clock: DAY_STEPS / 5,
             day_cycle: true,
             thermal_flip: false,
+            heat_carry: (0.0, 0.0),
+            temp_old: Vec::new(),
             climate_fixed: None,
             climate: thermal::Climate::default(),
             revision: 1,
@@ -1642,16 +1652,28 @@ impl World {
     /// `ambient_c(y)`, from the table of the cells' turn when it is on.
     #[inline]
     fn air_c(&self, y: i32) -> f32 {
+        // (The table holds for the whole turn: the sky's reservoir moves by a few thousandths
+        // of a degree at most during one, and recomputing the profile for every cell of gas
+        // once it had moved cost 6 % of a turn full of clouds.)
         match self.air_rows.get(y.clamp(0, H as i32 - 1) as usize) {
-            Some(&t) if self.climate.sky_dev.to_bits() == self.air_sky.to_bits() => t,
-            _ => self.ambient_c(y),
+            Some(&t) => t,
+            None => self.ambient_c(y),
         }
     }
 
     /// Everything after the cells: falling pieces, wind, pressure, heat, the clock.
     fn after_cells(&mut self) {
         self.ticks = self.ticks.wrapping_add(1);
-        if self.structures_fall && self.ticks % 8 == 0 {
+        // The passes that come back every few steps are set on different steps, so that the
+        // heavy ones never fall together, and the heat pass is spread over the three steps of its
+        // cycle (conduction with the air and the reactions, then space and the sun, then the wind
+        // carrying heat every other cycle): a step costs about the same as the next, instead of
+        // one step in three carrying everything. The structures come back every 9 steps (on
+        // 9k + 1: always beside space and the sun, the lightest part of the heat), the pockets
+        // every 18 (on 18k + 5: never with the structures, and on an odd step: on the steps of
+        // `level_liquids` the U-tubes and siphons stop levelling, see their tests), the storm
+        // every 4 (on 4k), the air's pressure every 4 (on 4k + 1).
+        if self.structures_fall && self.ticks % 9 == 1 {
             timed!(self, 1, self.structure_pass());
         }
         if self.structures_fall && self.ticks % 2 == 0 {
@@ -1660,7 +1682,7 @@ impl World {
         if self.structures_fall {
             timed!(self, 3, self.step_slabs());
         }
-        if self.ticks % pockets::POCKETS_EVERY == pockets::POCKETS_EVERY / 2 {
+        if self.ticks % pockets::POCKETS_EVERY == 5 {
             timed!(self, 4, self.update_pockets());
         }
         timed!(self, 5, self.step_ejecta());
@@ -1669,16 +1691,15 @@ impl World {
         }
         timed!(self, 7, self.update_wind());
         timed!(self, 8, self.update_flow());
-        if self.ticks % 4 == 0 {
+        if self.ticks % 4 == 1 {
             timed!(self, 9, self.update_pressure());
         }
         timed!(self, 10, self.pressure_push());
         if self.ticks % 64 == 0 {
             timed!(self, 11, self.update_season_cache());
         }
-        if self.ticks % (thermal::THERMAL_EVERY * self.thermal_scale() as u32) == 0 {
-            timed!(self, 12, self.thermal_pass());
-        }
+        let cycle = thermal::THERMAL_EVERY * self.thermal_scale() as u32;
+        timed!(self, 12, self.thermal_stage(self.ticks % cycle));
         timed!(self, 13, self.storm_step());
         if self.day_cycle {
             self.clock = self.clock.wrapping_add(1);
@@ -2664,7 +2685,20 @@ impl World {
                 // puddle (in warm, dry air some rain never reaches the ground).
                 let airborne = if self.at(x, y + 1) == Mat::Empty { DROP_EVAPORATION } else { 1.0 };
                 let rate = airborne * dry * breeze * vapour_pressure(t) / vapour_pressure(40.0) / EVAPORATE_40C;
-                if self.chance_f(rate) {
+                // Water that may hold less than a cell dries a quarter at a time (one cell of
+                // steam's worth, as often again): the surface of a lake sinks slowly, where a
+                // whole cell gone at once would dig a hole for the water round it to splash into.
+                // A drop is tiny, and goes whole.
+                let by_quarters = self.partial_liquids() && airborne == 1.0 && self.at(x, y - 1) == Mat::Empty;
+                if by_quarters {
+                    // As much water a step, on average, as a whole cell going at `rate`: a film
+                    // thinner than a quarter goes as often again, and all at once.
+                    let taken = self.water_fill(i).min(field::FULL / VAPOUR_PER_WATER as u32).max(1);
+                    if self.chance_f(rate * field::FULL as f32 / taken as f32) {
+                        self.evaporate_quarter(x, y);
+                        return;
+                    }
+                } else if self.chance_f(rate) {
                     // The heat it takes cools the water and the air around (see `vaporize`).
                     self.vaporize(x, y);
                     return;
@@ -2873,6 +2907,36 @@ impl World {
         }
         self.set_packed(i, left as u32);
         q -= made * thermal::cap(Mat::Steam) * t + cells as f32 * thermal::latent0(Mat::Steam);
+        self.release_heat(x, y, q);
+    }
+
+    /// A quarter of a cell of water (one cell of steam's worth) leaves the water at (x, y) as a
+    /// cell of steam in the empty cell over it; the cell keeps the rest, and goes when nothing is
+    /// left. The heat is counted as in `vaporize`.
+    fn evaporate_quarter(&mut self, x: i32, y: i32) {
+        let i = Self::idx(x, y);
+        let j = Self::idx(x, y - 1);
+        let t = self.temp[i];
+        let part = field::FULL / VAPOUR_PER_WATER as u32;
+        let fill = self.water_fill(i);
+        let taken = fill.min(part);
+        // Less than a quarter makes a whole cell of steam or none, by chance: on average the
+        // water is all there.
+        let steam = taken == part || (self.rand() % part) < taken;
+        let mut q = thermal::heat_of(Mat::Water, t) * taken as f32 / field::FULL as f32;
+        if fill > taken {
+            self.put_fill(i, fill - taken);
+        } else {
+            q += self.latent[i];
+            self.set(x, y, Mat::Empty);
+            self.temp[i] = t;
+        }
+        if steam {
+            q += thermal::heat_of(Mat::Empty, self.temp[j]);
+            self.set(x, y - 1, Mat::Steam);
+            self.temp[j] = t;
+            q -= thermal::heat_of(Mat::Steam, t);
+        }
         self.release_heat(x, y, q);
     }
 
