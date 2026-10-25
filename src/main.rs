@@ -2089,6 +2089,12 @@ impl Game {
             let s = view.to_screen(vec2(p.x, p.y));
             draw_rectangle(s.x - size * 0.5, s.y - size * 0.5, size, size, mat_color(p.m));
         }
+        // Drops of liquid in flight (spray, splashes): the more liquid, the bigger.
+        for d in self.world.liquid_drops() {
+            let s = view.to_screen(vec2(d.x, d.y));
+            let r = size * (0.35 + 0.65 * (d.q as f32 / 65536.0).min(1.0).sqrt());
+            draw_rectangle(s.x - r * 0.5, s.y - r * 0.5, r, r, mat_color(d.m));
+        }
         draw_booms(&self.booms, view);
         if !flat {
             renderer.draw_night(view, day, self.time);
