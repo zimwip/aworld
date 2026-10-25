@@ -49,6 +49,12 @@ const HOLDS: u32 = 2;
 /// Liquid away from any full cell (drops, spray, a film) goes no faster than this, m/s: the air
 /// holds it back (rain falls at about this speed).
 const SPRAY: f32 = 9.0;
+/// Liquid thrown at the air faster than this (m/s) comes off as drops.
+const THROW: f32 = 2.0;
+/// The most of a cell that comes off as drops in a sub-step, thrown sideways or up.
+const THROW_SHARE: f32 = 0.5;
+/// What the drag of the air leaves of a drop's speed after a step.
+const DROP_DRAG: f32 = 0.998;
 /// At most this many sub-steps a step (fast flows take smaller ones).
 const MAX_SUB: usize = 4;
 
@@ -99,6 +105,8 @@ pub struct Liquids {
     /// Scratch for the advection and the viscosity.
     u2: Vec<f32>,
     v2: Vec<f32>,
+    u3: Vec<f32>,
+    v3: Vec<f32>,
     /// Viscosity of each cell, m²/s (0: not thick), and whether any cell was thick.
     nu: Vec<f32>,
     thick: bool,
@@ -110,6 +118,24 @@ pub struct Liquids {
     fv: Vec<i64>,
     want: Vec<Mat>,
     scale: Vec<f64>,
+    /// The drops in flight.
+    drops: Vec<Drop>,
+}
+
+/// A drop of liquid thrown off a body (spray, a splash): it flies off the grid, under gravity
+/// and the drag of the air, until it lands back in liquid or on the ground.
+#[derive(Clone)]
+pub struct Drop {
+    /// Where it is, in cells.
+    pub x: f32,
+    pub y: f32,
+    /// Its velocity, m/s (down positive).
+    vx: f32,
+    vy: f32,
+    pub m: Mat,
+    /// Units of liquid (`field::FULL` a cell).
+    pub q: u32,
+    t: f32,
 }
 
 impl Liquids {
@@ -122,6 +148,8 @@ impl Liquids {
             self.rows = vec![None; H + 1];
             self.u2 = vec![0.0; (W + 1) * H];
             self.v2 = vec![0.0; W * (H + 1)];
+            self.u3 = vec![0.0; (W + 1) * H];
+            self.v3 = vec![0.0; W * (H + 1)];
             self.nu = vec![0.0; W * H];
             self.rhs = vec![0.0; W * H];
             self.fu = vec![0; (W + 1) * H];
@@ -129,6 +157,11 @@ impl Liquids {
             self.want = vec![Mat::Empty; W * H];
             self.scale = vec![1.0; W * H];
         }
+    }
+
+    /// The drops in flight.
+    pub fn drops(&self) -> &[Drop] {
+        &self.drops
     }
 
     /// Forgets every flow (a new world, a load).
@@ -162,6 +195,15 @@ fn sample(a: &[f32], w: usize, h: usize, x: f32, y: f32) -> f32 {
     at(x0, y0) * (1.0 - fx) * (1.0 - fy) + at(x0 + 1, y0) * fx * (1.0 - fy) + at(x0, y0 + 1) * (1.0 - fx) * fy + at(x0 + 1, y0 + 1) * fx * fy
 }
 
+/// The least and the most of the four nodes of grid `a` around (x, y) (as `sample` reads them).
+fn around(a: &[f32], w: usize, h: usize, x: f32, y: f32) -> (f32, f32) {
+    let x = x.clamp(0.0, (w - 1) as f32 - 0.001);
+    let y = y.clamp(0.0, (h - 1) as f32 - 0.001);
+    let (x0, y0) = (x as usize, y as usize);
+    let n = [a[y0 * w + x0], a[y0 * w + x0 + 1], a[(y0 + 1) * w + x0], a[(y0 + 1) * w + x0 + 1]];
+    (n.iter().copied().fold(f32::MAX, f32::min), n.iter().copied().fold(f32::MIN, f32::max))
+}
+
 impl World {
     /// Turns the physics of liquids on or off. Off, a cell of liquid is always full again: the
     /// cells under half full go and the others fill up, about as much as there was.
@@ -169,6 +211,14 @@ impl World {
         if on {
             self.set_water_field(false);
         } else {
+            // The drops in flight come down where they are (a cell for at least half of one).
+            for d in std::mem::take(&mut self.liq.drops) {
+                let (x, y) = (d.x as i32, d.y as i32);
+                if d.q >= field::FULL / 2 && Self::inb(x, y) && self.raw(x, y) == Mat::Empty && self.mask_free(x, y) {
+                    self.set(x, y, d.m);
+                    self.temp[Self::idx(x, y)] = d.t;
+                }
+            }
             for i in 0..W * H {
                 if self.cells[i].m.kind() == Kind::Liquid && self.fill[i] != 0 {
                     if self.fill[i] < field::FULL / 2 {
@@ -183,6 +233,11 @@ impl World {
         }
         self.liq.clear();
         self.liquid_physics = on;
+    }
+
+    /// The drops of liquid in flight.
+    pub fn liquid_drops(&self) -> &[Drop] {
+        self.liq.drops()
     }
 
     /// Units of liquid in cell `i` (`field::FULL` for a full cell).
@@ -201,6 +256,7 @@ impl World {
     pub(super) fn step_liquids(&mut self) {
         let mut liq = std::mem::take(&mut self.liq);
         liq.ready();
+        self.fly_drops(&mut liq);
         self.classify(&mut liq);
         if liq.rows.iter().all(Option::is_none) {
             // No liquid runs anywhere.
@@ -240,9 +296,170 @@ impl World {
             self.forces(&mut liq, dt);
             self.viscosity(&mut liq, dt);
             self.pressure(&mut liq, dt);
+            self.throw_drops(&mut liq);
             self.carry_liquids(&mut liq, dt);
         }
         self.liq = liq;
+    }
+
+    /// Liquid thrown at the air faster than `THROW` comes off as drops: a share of the cell that
+    /// grows with the speed, all of it when it falls into the air, and so do the crumbs left
+    /// alone in the air (a thin film with air under it and no body beside it).
+    fn throw_drops(&mut self, liq: &mut Liquids) {
+        let (class, rows, u, v) = (&liq.class, &liq.rows, &liq.u, &liq.v);
+        let world: &World = self;
+        let throws: Vec<(usize, u32, f32, f32, f32, f32)> = (0..H)
+            .into_par_iter()
+            .flat_map_iter(|y| {
+                let (x0, x1) = rows[y].unwrap_or((1, 0));
+                (x0..=x1).filter_map(move |x| {
+                    let i = y * W + x;
+                    if class[i] & 3 < WET || class[i] & 4 == 0 {
+                        return None;
+                    }
+                    // Air, or the thin film of spray over a surface.
+                    let air = |nx: usize, ny: usize| {
+                        nx < W && ny < H && {
+                            let j = ny * W + nx;
+                            match class[j] & 3 {
+                                AIR => world.cells[j].m == Mat::Empty,
+                                WET => world.cells[j].m == world.cells[i].m && world.liquid_fill(j) < field::FULL / 4,
+                                _ => false,
+                            }
+                        }
+                    };
+                    // The speed out of the cell into the air on each side: right, left, down, up.
+                    let outs = [
+                        (if air(x + 1, y) { u[ui(x + 1, y)] } else { 0.0 }, 0.5, 0.0),
+                        (if air(x.wrapping_sub(1), y) { -u[ui(x, y)] } else { 0.0 }, -0.5, 0.0),
+                        (if air(x, y + 1) { v[vi(x, y + 1)] } else { 0.0 }, 0.0, 0.5),
+                        (if air(x, y.wrapping_sub(1)) { -v[vi(x, y)] } else { 0.0 }, 0.0, -0.5),
+                    ];
+                    let (k, &(speed, ox, oy)): (usize, &(f32, f32, f32)) = outs.iter().enumerate().max_by(|a, b| a.1 .0.total_cmp(&b.1 .0))?;
+                    let fill = world.liquid_fill(i).min(field::FULL);
+                    let (mut vx, mut vy) = (0.5 * (u[ui(x, y)] + u[ui(x + 1, y)]), 0.5 * (v[vi(x, y)] + v[vi(x, y + 1)]));
+                    // It leaves at the speed of the side it goes out by.
+                    match k {
+                        0 | 1 => vx = speed * ox.signum(),
+                        _ => vy = speed * oy.signum(),
+                    }
+                    let mut share = if speed > THROW { ((speed - THROW) / THROW).min(1.0) * THROW_SHARE } else { 0.0 };
+                    if k == 2 {
+                        // Falling: a body of liquid holds together (its bottom does not peel
+                        // off), but a thin stream or a lip with nothing over it breaks into drops.
+                        let held = y > 0 && class[i - W] & 3 == FULLISH;
+                        share = if held { 0.0 } else if speed > THROW { 1.0 } else { 0.0 };
+                    }
+                    let lone = fill < field::FULL / 4
+                        && air(x, y + 1)
+                        && [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)].iter().all(|&(nx, ny)| nx >= W || ny >= H || class[ny * W + nx] & 3 != FULLISH);
+                    if lone && vx.hypot(vy) > 0.5 {
+                        share = 1.0;
+                    }
+                    let q = (fill as f32 * share) as u32;
+                    (q > field::FULL / 50).then_some((i, q, x as f32 + 0.5 + ox, y as f32 + 0.5 + oy, vx, vy))
+                })
+            })
+            .collect();
+        for (i, q, x, y, vx, vy) in throws {
+            let left = self.liquid_fill(i).saturating_sub(q);
+            let (m, t) = (self.cells[i].m, self.temp[i]);
+            // What the cell is now, for the carrying that follows.
+            let run = liq.class[i] & 4;
+            if left == 0 {
+                self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
+                self.clear_states(i);
+                self.vel[i] = 0;
+                liq.class[i] = AIR | run;
+            } else {
+                self.fill[i] = left;
+                if left < field::FULL / HOLDS {
+                    liq.class[i] = WET | run;
+                }
+            }
+            // A little scatter, so that a sheet of spray breaks up.
+            let jitter = |r: u32| (r % 1000) as f32 / 1000.0 - 0.5;
+            let (jx, jy) = (jitter(self.rand()), jitter(self.rand()));
+            liq.drops.push(Drop { x, y, vx: vx + jx, vy: vy + jy, m, q, t });
+            self.revision += 1;
+            self.zones.wake(i);
+        }
+    }
+
+    /// Moves the drops in flight a step; those that land go back into the liquid (or make a cell
+    /// of it on the ground) with their speed and their heat.
+    fn fly_drops(&mut self, liq: &mut Liquids) {
+        if liq.drops.is_empty() {
+            return;
+        }
+        let mut drops = std::mem::take(&mut liq.drops);
+        let s = DT / CELL_M;
+        drops.retain_mut(|d| {
+            d.vy += G * DT;
+            d.vx *= DROP_DRAG;
+            d.vy *= DROP_DRAG;
+            let (dx, dy) = (d.vx * s, d.vy * s);
+            let n = dx.abs().max(dy.abs()).ceil().max(1.0) as usize;
+            for _ in 0..n {
+                let (nx, ny) = (d.x + dx / n as f32, d.y + dy / n as f32);
+                let (ix, iy) = (nx.floor() as i32, ny.floor() as i32);
+                if ix < 0 || ix >= W as i32 || iy >= H as i32 {
+                    // Off the side or the bottom of the world: gone.
+                    return false;
+                }
+                if iy >= 0 {
+                    let j = Self::idx(ix, iy);
+                    let c = self.cells[j].m;
+                    if c == d.m && self.mask[j] == 0 && self.liquid_fill(j) >= field::FULL / 2 {
+                        self.land_drop(liq, d, j);
+                        return false;
+                    }
+                    if self.mask[j] != 0 || !matches!(c.kind(), Kind::Empty | Kind::Gas) && c != d.m {
+                        // Against the ground, a wall or another liquid: it stays in the last free cell.
+                        let (px, py) = (d.x.floor() as i32, d.y.floor() as i32);
+                        if Self::inb(px, py) {
+                            self.land_drop(liq, d, Self::idx(px, py));
+                        }
+                        return false;
+                    }
+                }
+                (d.x, d.y) = (nx, ny);
+            }
+            true
+        });
+        liq.drops = drops;
+    }
+
+    /// Drop `d` lands in cell `j` (liquid of its own, or a free cell).
+    fn land_drop(&mut self, liq: &mut Liquids, d: &Drop, j: usize) {
+        let had = if self.cells[j].m == d.m { self.liquid_fill(j) } else { 0 };
+        if had == 0 {
+            if !matches!(self.cells[j].m.kind(), Kind::Empty | Kind::Gas) || self.mask[j] != 0 {
+                return;
+            }
+            self.cells[j] = Cell { m: d.m, stamp: self.frame };
+            self.clear_states(j);
+            self.latent[j] = 0.0;
+            self.vel[j] = 0;
+            self.temp[j] = d.t;
+        } else {
+            self.temp[j] = (self.temp[j] * had as f32 + d.t * d.q as f32) / (had + d.q) as f32;
+        }
+        let q = had + d.q;
+        self.fill[j] = if q == field::FULL { 0 } else { q };
+        // Its speed goes to the edges of the cell, in proportion to what it brings.
+        if liq.u.len() == (W + 1) * H {
+            let w = d.q as f32 / q as f32;
+            let (x, y) = (j % W, j / W);
+            for e in [ui(x, y), ui(x + 1, y)] {
+                liq.u[e] += w * (d.vx - liq.u[e]);
+            }
+            for e in [vi(x, y), vi(x, y + 1)] {
+                liq.v[e] += w * (d.vy - liq.v[e]);
+            }
+        }
+        self.revision += 1;
+        self.zones.wake(j);
     }
 
     /// What each cell is to the liquids this sub-step, and the span of each row to work on.
@@ -293,7 +510,9 @@ impl World {
     }
 
     /// Gravity and the carrying of the velocities along the flow, on the edges near liquid in
-    /// the zones that run.
+    /// the zones that run. The carrying is second order (MacCormack: carried forward, carried
+    /// back, and half the gap corrected, kept within what was around): a plain carrying smears the
+    /// velocities out, so that waves die and splashes never rise.
     fn forces(&self, liq: &mut Liquids, dt: f32) {
         let class = &liq.class;
         let kind = |x: i32, y: i32| if x < 0 || y < 0 || x >= W as i32 || y >= H as i32 { SOLID } else { class[y as usize * W + x as usize] & 3 };
@@ -301,64 +520,96 @@ impl World {
         let wet = |c: u8| c >= WET;
         let step = dt / CELL_M;
         let rows = &liq.rows;
-        // Rightward edges: (x, y) between cells (x - 1, y) and (x, y).
-        {
-            let (u, v) = (&liq.u, &liq.v);
-            liq.u2.par_chunks_mut(W + 1).enumerate().for_each(|(y, row)| {
-                row.copy_from_slice(&u[ui(0, y)..ui(0, y + 1)]);
-                let Some((x0, x1)) = rows[y] else { return };
-                for x in x0..=x1 + 1 {
-                    let (xi, yi) = (x as i32, y as i32);
-                    let (a, b) = (kind(xi - 1, yi), kind(xi, yi));
-                    let here = u[ui(x, y)];
-                    row[x] = if a == SOLID || b == SOLID {
-                        0.0
-                    } else if !(wet(a) || wet(b)) || !(runs(xi - 1, yi) || runs(xi, yi)) {
-                        if wet(a) || wet(b) { here } else { 0.0 }
-                    } else {
-                        // The downward velocity here: the mean of the four edges around.
-                        let vy = 0.25 * (v[vi(x - 1, y)] + v[vi(x, y)] + v[vi(x - 1, y + 1)] + v[vi(x, y + 1)]);
-                        // Where it was a sub-step ago, in the index space of `u` (edge (x, y) sits
-                        // at x, y + 1/2 in cells; its index is (x, y)).
-                        let to = sample(u, W + 1, H, x as f32 - here * step, y as f32 - vy * step);
-                        // Away from any full cell, liquid in the air is slowed by it (drops and
-                        // spray, at most as fast as falling rain).
-                        if a != FULLISH && b != FULLISH { to.clamp(-SPRAY, SPRAY) } else { to }
-                    };
-                }
-            });
-        }
-        // Downward edges: (x, y) between cells (x, y - 1) and (x, y).
-        {
-            let (u, v) = (&liq.u, &liq.v);
-            liq.v2.par_chunks_mut(W).enumerate().for_each(|(y, row)| {
-                row.copy_from_slice(&v[vi(0, y)..vi(0, y + 1)]);
-                let Some((x0, x1)) = rows[y] else { return };
-                for x in x0..=x1 {
-                    let (xi, yi) = (x as i32, y as i32);
-                    let (a, b) = (kind(xi, yi - 1), kind(xi, yi));
-                    let here = v[vi(x, y)];
-                    row[x] = if a == SOLID || b == SOLID {
-                        0.0
-                    } else if !(wet(a) || wet(b)) || !(runs(xi, yi - 1) || runs(xi, yi)) {
-                        if wet(a) || wet(b) { here } else { 0.0 }
-                    } else {
-                        let ux = 0.25 * (u[ui(x, y - 1)] + u[ui(x + 1, y - 1)] + u[ui(x, y)] + u[ui(x + 1, y)]);
-                        let fall = sample(v, W, H + 1, x as f32 - ux * step, y as f32 - here * step) + G * dt;
-                        if a != FULLISH && b != FULLISH {
-                            // A film lying on liquid or on the ground goes no faster than what is
-                            // under it (it has nowhere to fall).
-                            let fall = fall.clamp(-SPRAY, SPRAY);
-                            if a < WET && b == WET && matches!(kind(xi, yi + 1), SOLID | FULLISH) { fall.min(v[vi(x, y + 1)].max(0.0)) } else { fall }
-                        } else {
-                            fall
-                        }
-                    };
-                }
-            });
-        }
-        std::mem::swap(&mut liq.u, &mut liq.u2);
-        std::mem::swap(&mut liq.v, &mut liq.v2);
+        let (u, v) = (&liq.u, &liq.v);
+        // The velocity (along x, y) of each edge that is carried, or the value an edge that is
+        // not carried takes (0 on a wall or in the air, its own speed in liquid that sleeps).
+        let u_vel = |x: usize, y: usize| -> Result<(f32, f32), f32> {
+            let (xi, yi) = (x as i32, y as i32);
+            let (a, b) = (kind(xi - 1, yi), kind(xi, yi));
+            let here = u[ui(x, y)];
+            if a == SOLID || b == SOLID {
+                Err(0.0)
+            } else if !(wet(a) || wet(b)) || !(runs(xi - 1, yi) || runs(xi, yi)) {
+                Err(if wet(a) || wet(b) { here } else { 0.0 })
+            } else {
+                // The downward velocity here: the mean of the four edges around.
+                Ok((here, 0.25 * (v[vi(x - 1, y)] + v[vi(x, y)] + v[vi(x - 1, y + 1)] + v[vi(x, y + 1)])))
+            }
+        };
+        let v_vel = |x: usize, y: usize| -> Result<(f32, f32), f32> {
+            let (xi, yi) = (x as i32, y as i32);
+            let (a, b) = (kind(xi, yi - 1), kind(xi, yi));
+            let here = v[vi(x, y)];
+            if a == SOLID || b == SOLID {
+                Err(0.0)
+            } else if !(wet(a) || wet(b)) || !(runs(xi, yi - 1) || runs(xi, yi)) {
+                Err(if wet(a) || wet(b) { here } else { 0.0 })
+            } else {
+                Ok((0.25 * (u[ui(x, y - 1)] + u[ui(x + 1, y - 1)] + u[ui(x, y)] + u[ui(x + 1, y)]), here))
+            }
+        };
+        // Carried forward (in the index space of each grid: edge (x, y) of `u` sits at x, y + 1/2
+        // in cells, its index is (x, y)).
+        liq.u2.par_chunks_mut(W + 1).enumerate().for_each(|(y, row)| {
+            row.copy_from_slice(&u[ui(0, y)..ui(0, y + 1)]);
+            let Some((x0, x1)) = rows[y] else { return };
+            for x in x0..=(x1 + 1).min(W) {
+                row[x] = match u_vel(x, y) {
+                    Ok((vx, vy)) => sample(u, W + 1, H, x as f32 - vx * step, y as f32 - vy * step),
+                    Err(keep) => keep,
+                };
+            }
+        });
+        liq.v2.par_chunks_mut(W).enumerate().for_each(|(y, row)| {
+            row.copy_from_slice(&v[vi(0, y)..vi(0, y + 1)]);
+            let Some((x0, x1)) = rows[y] else { return };
+            for x in x0..=x1 {
+                row[x] = match v_vel(x, y) {
+                    Ok((vx, vy)) => sample(v, W, H + 1, x as f32 - vx * step, y as f32 - vy * step),
+                    Err(keep) => keep,
+                };
+            }
+        });
+        // Carried back, the gap corrected, then gravity and the drag of the air.
+        let (uf, vf) = (&liq.u2, &liq.v2);
+        liq.u3.par_chunks_mut(W + 1).enumerate().for_each(|(y, row)| {
+            row.copy_from_slice(&uf[ui(0, y)..ui(0, y + 1)]);
+            let Some((x0, x1)) = rows[y] else { return };
+            for x in x0..=(x1 + 1).min(W) {
+                let Ok((vx, vy)) = u_vel(x, y) else { continue };
+                let (px, py) = (x as f32 - vx * step, y as f32 - vy * step);
+                let back = sample(uf, W + 1, H, x as f32 + vx * step, y as f32 + vy * step);
+                let (lo, hi) = around(u, W + 1, H, px, py);
+                let to = (uf[ui(x, y)] + 0.5 * (u[ui(x, y)] - back)).clamp(lo, hi);
+                // Away from any full cell, liquid in the air is slowed by it (drops and spray, at
+                // most as fast as falling rain).
+                let (a, b) = (kind(x as i32 - 1, y as i32), kind(x as i32, y as i32));
+                row[x] = if a != FULLISH && b != FULLISH { to.clamp(-SPRAY, SPRAY) } else { to };
+            }
+        });
+        liq.v3.par_chunks_mut(W).enumerate().for_each(|(y, row)| {
+            row.copy_from_slice(&vf[vi(0, y)..vi(0, y + 1)]);
+            let Some((x0, x1)) = rows[y] else { return };
+            for x in x0..=x1 {
+                let Ok((vx, vy)) = v_vel(x, y) else { continue };
+                let (px, py) = (x as f32 - vx * step, y as f32 - vy * step);
+                let back = sample(vf, W, H + 1, x as f32 + vx * step, y as f32 + vy * step);
+                let (lo, hi) = around(v, W, H + 1, px, py);
+                let fall = (vf[vi(x, y)] + 0.5 * (v[vi(x, y)] - back)).clamp(lo, hi) + G * dt;
+                let (xi, yi) = (x as i32, y as i32);
+                let (a, b) = (kind(xi, yi - 1), kind(xi, yi));
+                row[x] = if a != FULLISH && b != FULLISH {
+                    // A film lying on liquid or on the ground goes no faster than what is under it
+                    // (it has nowhere to fall).
+                    let fall = fall.clamp(-SPRAY, SPRAY);
+                    if a < WET && b == WET && matches!(kind(xi, yi + 1), SOLID | FULLISH) { fall.min(v[vi(x, y + 1)].max(0.0)) } else { fall }
+                } else {
+                    fall
+                };
+            }
+        });
+        std::mem::swap(&mut liq.u, &mut liq.u3);
+        std::mem::swap(&mut liq.v, &mut liq.v3);
     }
 
     /// Smooths the velocities of thick liquids (implicit: red-black sweeps of
@@ -662,7 +913,7 @@ impl World {
                 return 0;
             }
             let (from, to, sign) = if vel > 0.0 { (a, b, 1) } else { (b, a, -1) };
-            if class[from] & 3 < WET {
+            if class[from] & 3 < WET || self.cells[from].m.kind() != Kind::Liquid {
                 return 0;
             }
             // Into air (only an empty cell takes liquid: a gas stays where it is) or the same liquid.
@@ -879,7 +1130,8 @@ impl World {
     /// Units of liquid in all the world, by liquid (for the tests).
     #[cfg(test)]
     pub(super) fn liquid_units(&self, m: Mat) -> u64 {
-        (0..W * H).filter(|&i| self.cells[i].m == m).map(|i| self.liquid_fill(i) as u64).sum()
+        let flying: u64 = self.liq.drops.iter().filter(|d| d.m == m).map(|d| d.q as u64).sum();
+        (0..W * H).filter(|&i| self.cells[i].m == m).map(|i| self.liquid_fill(i) as u64).sum::<u64>() + flying
     }
 }
 
@@ -921,15 +1173,25 @@ mod tests {
         w
     }
 
+    /// A block of water 16 x 16 let go 2.5 m over a pool 15 cells deep, in the same tank.
+    fn chute() -> World {
+        let mut w = world();
+        tank(&mut w, 100, 400, 339, 449);
+        rect(&mut w, 100, 435, 339, 449, Mat::Water);
+        rect(&mut w, 212, 404, 227, 419, Mat::Water);
+        w.temp.fill(15.0);
+        w
+    }
+
     #[test]
     #[ignore]
     fn probe_dam() {
-        let mut w = dam(Mat::Water);
+        let mut w = if std::env::var("DAM_SCENE").as_deref() == Ok("chute") { chute() } else { dam(Mat::Water) };
         let before = w.liquid_units(Mat::Water);
         let mut dump = String::new();
         for t in 1..=120 {
             w.step();
-            if t % 20 == 0 {
+            if t % 10 == 0 {
                 dump += &format!("t {t}\n");
                 for y in 400..=449 {
                     for x in 100..=339 {
@@ -938,9 +1200,12 @@ mod tests {
                     }
                     dump.push('\n');
                 }
+                for d in w.liquid_drops() {
+                    dump += &format!("p {:.2} {:.2} {:.3}\n", d.x - 100.0, d.y - 400.0, d.q as f32 / field::FULL as f32);
+                }
             }
             if t % 10 == 0 {
-                println!("{:.2} s: front {:.1} m, water {:.4}", t as f32 / 60.0, front(&w, Mat::Water, 100, 400, 339, 449) as f32 * CELL_M, w.liquid_units(Mat::Water) as f64 / before as f64);
+                println!("{:.2} s: front {:.1} m, drops {}, water {:.4}", t as f32 / 60.0, front(&w, Mat::Water, 100, 400, 339, 449) as f32 * CELL_M, w.liquid_drops().len(), w.liquid_units(Mat::Water) as f64 / before as f64);
             }
         }
         if let Ok(out) = std::env::var("DAM_OUT") {
@@ -1090,5 +1355,22 @@ mod tests {
             })
         };
         assert!(run(1) == run(4));
+    }
+
+    #[test]
+    fn a_block_of_water_falling_in_a_pool_splashes_and_none_is_lost() {
+        let mut w = chute();
+        let before = w.liquid_units(Mat::Water);
+        // The block lands after about 0.6 s; then drops fly up over the pool (its top is 435).
+        let mut highest = f32::MAX;
+        for t in 0..90 {
+            w.step();
+            if t > 40 {
+                highest = w.liquid_drops().iter().map(|d| d.y).fold(highest, f32::min);
+            }
+        }
+        assert!(highest < 430.0, "the spray rose to {highest}");
+        let after = w.liquid_units(Mat::Water);
+        assert!(after <= before && before - after < before / 10_000, "{before} -> {after}");
     }
 }
