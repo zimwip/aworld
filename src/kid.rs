@@ -206,10 +206,16 @@ fn floor(world: &World, x: i32, y: i32) -> bool {
     world.hard_for_car(x, y) || world.at(x, y).kind() == Kind::Liquid
 }
 
+/// Whether the cell (x, y) holds him up when his feet were on row `feet`: a floor, or a tree he
+/// comes down on (or steps up onto, `climb` rows at most). He walks through a trunk.
+fn bears(world: &World, x: i32, y: i32, feet: i32, climb: i32) -> bool {
+    floor(world, x, y) || world.bears(x.clamp(0, W as i32 - 1), y, feet as f32, climb as f32)
+}
+
 /// The ground he can stand on in column `x` near row `y`: the first floor cell with room above it,
 /// from `up` cells above to `down` cells below.
 fn ground_near(world: &World, x: i32, y: i32, up: i32, down: i32) -> Option<i32> {
-    ((y - up)..=(y + down)).find(|&gy| floor(world, x, gy) && !floor(world, x, gy - 1))
+    ((y - up)..=(y + down)).find(|&gy| bears(world, x, gy, y, up) && !floor(world, x, gy - 1))
 }
 
 /// The ground seen from the sky over column `x` (None over water or a bottomless hole).
@@ -518,7 +524,7 @@ impl Kids {
         }
         let landed = if k.vy > 0.0 {
             let x = (k.x as i32).clamp(0, W as i32 - 1);
-            ((k.y as i32)..=(ny as i32).max(k.y as i32)).find(|&gy| floor(world, x, gy) && !floor(world, x, gy - 1))
+            ((k.y as i32)..=(ny as i32).max(k.y as i32)).find(|&gy| bears(world, x, gy, k.y as i32, 0) && !floor(world, x, gy - 1))
         } else {
             None
         };
@@ -1159,6 +1165,47 @@ mod tests {
         run(&mut kids, &world, 5.0);
         let k = kids.kid.as_ref().unwrap();
         assert!(k.x < W as f32 - 50.0, "back into the world: {}", k.x);
+    }
+
+    #[test]
+    fn he_walks_through_a_tree_and_stands_on_its_crown() {
+        let mut world = flat(400);
+        // A trunk from the ground up, under a crown.
+        for y in 330..400 {
+            for x in 300..306 {
+                world.set(x, y, Mat::Trunk);
+            }
+        }
+        for y in 310..330 {
+            for x in 270..340 {
+                world.set(x, y, Mat::Leaf);
+            }
+        }
+        let mut kids = Kids::new();
+        assert!(kids.summon(&world));
+        let k = kids.kid.as_mut().unwrap();
+        (k.x, k.y, k.dir, k.trick_in, k.stay) = (250.0, 400.0, 1.0, 1000.0, 1000.0);
+        let mut max_x: f32 = 0.0;
+        for _ in 0..60 * 6 {
+            kids.update(1.0 / 60.0, &world, &Sights::default());
+            let k = kids.kid.as_ref().expect("still here");
+            max_x = max_x.max(k.x);
+            if !k.air {
+                assert!((k.y - 400.0).abs() < 1.5, "he stays on the ground under the tree: {}", k.y);
+            }
+        }
+        assert!(max_x > 320.0, "through the trunk: {max_x}");
+        // Dropped over the crown, he lands on top of it.
+        let k = kids.kid.as_mut().unwrap();
+        (k.x, k.y, k.vx, k.vy, k.air, k.act) = (300.0, 250.0, 0.0, 0.0, true, Act::Jump);
+        for _ in 0..60 {
+            kids.update(1.0 / 60.0, &world, &Sights::default());
+            if !kids.kid.as_ref().unwrap().air {
+                break;
+            }
+        }
+        let k = kids.kid.as_ref().unwrap();
+        assert!(!k.air && (k.y - 310.0).abs() < 1.5, "on the crown: y {} air {}", k.y, k.air);
     }
 
     #[test]

@@ -173,12 +173,13 @@ impl World {
                     || self.soil_drinks((x, y + 1))
                     || self.soil_drinks((x - 1, y))
                     || self.soil_drinks((x + 1, y))
-                    || self.at(x, y + 1).is_vegetation()
                     || free(self.at(x, y + 1))
                     || free(self.at(x - 1, y + 1))
                     || free(self.at(x + 1, y + 1))
                     || free(self.at(x - 1, y))
                     || free(self.at(x + 1, y))
+                    // Thin matter beside it with room past it: it runs through (`step_liquid`).
+                    || [-1, 1].iter().any(|&d| self.past_thin(x, y, d).is_some_and(|px| self.at(px, y) == Mat::Empty))
             }
             _ => true,
         }

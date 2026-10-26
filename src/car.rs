@@ -269,7 +269,7 @@ fn soft_share(world: &World, c: Vec2, r: f32) -> f32 {
         for dx in -ri..=ri {
             if (dx * dx + dy * dy) as f32 <= reach * reach {
                 let m = world.at(c.x.floor() as i32 + dx, c.y.floor() as i32 + dy);
-                if m.is_hard() && !m.is_vegetation() {
+                if m.is_hard() && !m.one_way() {
                     ground += 1;
                     soft += softness(m);
                 }
@@ -288,37 +288,42 @@ fn cross(a: Vec2, b: Vec2) -> f32 {
     a.x * b.y - a.y * b.x
 }
 
-/// Outward normal of the hard cells touching a circle, if any.
-/// Hard for the car, except glass it is going fast enough to smash.
-fn solid(world: &World, fast: bool, x: i32, y: i32) -> bool {
+/// How far up (cells) a wheel climbs onto the top of a tree it rolls against.
+const TREE_CLIMB: f32 = 3.5;
+
+/// Hard for a wheel whose bottom was at row `feet` before the car moved, except glass it is going
+/// fast enough to smash. A tree holds the wheel up only from above (`World::bears`): the car
+/// drives through a trunk, and on a crown it comes down on.
+fn solid(world: &World, fast: bool, feet: f32, x: i32, y: i32) -> bool {
     if fast && world.at(x, y) == Mat::Glass {
         return false;
     }
-    world.hard_for_car(x, y)
+    world.bears(x, y, feet, TREE_CLIMB)
 }
 
-fn probe(world: &World, fast: bool, c: Vec2, radius: f32) -> Option<Vec2> {
+/// Outward normal of the hard cells touching a circle, if any.
+fn probe(world: &World, fast: bool, feet: f32, c: Vec2, radius: f32) -> Option<Vec2> {
     let mut sum = Vec2::ZERO;
     for k in 0..SAMPLES {
         let a = k as f32 / SAMPLES as f32 * std::f32::consts::TAU;
         let d = vec2(a.cos(), a.sin());
         let p = c + d * radius;
-        if solid(world, fast, p.x.floor() as i32, p.y.floor() as i32) {
+        if solid(world, fast, feet, p.x.floor() as i32, p.y.floor() as i32) {
             sum -= d;
         }
     }
     (sum.length() > 1e-3).then(|| sum.normalize())
 }
 
-fn overlaps(world: &World, fast: bool, c: Vec2, radius: f32) -> bool {
+fn overlaps(world: &World, fast: bool, feet: f32, c: Vec2, radius: f32) -> bool {
     for k in 0..SAMPLES {
         let a = k as f32 / SAMPLES as f32 * std::f32::consts::TAU;
         let p = c + vec2(a.cos(), a.sin()) * radius;
-        if solid(world, fast, p.x.floor() as i32, p.y.floor() as i32) {
+        if solid(world, fast, feet, p.x.floor() as i32, p.y.floor() as i32) {
             return true;
         }
     }
-    solid(world, fast, c.x.floor() as i32, c.y.floor() as i32)
+    solid(world, fast, feet, c.x.floor() as i32, c.y.floor() as i32)
 }
 
 impl Car {
@@ -449,20 +454,22 @@ impl Car {
             let r = self.wheel_r(i);
             let anchor = self.anchor(i);
             let at = |e: f32| anchor + down * e;
+            // Where the bottom of the wheel was: a tree under it holds it up.
+            let feet = self.wheels[i].pos.y + r;
 
             // Find how far the wheel can extend before touching the ground.
             let mut ext = travel_len;
             let mut depth = 0.0;
             let mut contact = false;
-            if overlaps(world, fast, at(travel_len), r) {
+            if overlaps(world, fast, feet, at(travel_len), r) {
                 contact = true;
                 let mut e = travel_len;
-                while e >= 0.0 && overlaps(world, fast, at(e), r) {
+                while e >= 0.0 && overlaps(world, fast, feet, at(e), r) {
                     e -= 0.3;
                 }
                 if e < 0.0 {
                     let mut d = 0.0;
-                    while d < r * 2.0 && overlaps(world, fast, at(-d), r) {
+                    while d < r * 2.0 && overlaps(world, fast, feet, at(-d), r) {
                         d += 0.3;
                     }
                     depth = d;
@@ -484,7 +491,7 @@ impl Car {
             let mut ft = 0.0;
             if contact {
                 touching += 1;
-                let n = probe(world, fast, pos, r + 1.0).unwrap_or(-down);
+                let n = probe(world, fast, feet, pos, r + 1.0).unwrap_or(-down);
                 let ra = anchor - self.p;
                 let va = self.v + vec2(-ra.y, ra.x) * self.omega;
                 let vn = va.dot(n);
@@ -765,6 +772,40 @@ mod tests {
             }
         }
         w
+    }
+
+    #[test]
+    fn cars_drive_through_a_trunk_and_land_on_a_crown() {
+        for kind in ModelKind::ALL {
+            let mut w = flat_world();
+            for y in 160..240 {
+                for x in 200..209 {
+                    w.set(x, y, Mat::Trunk);
+                }
+            }
+            let mut car = Car::new(kind, (40, 216));
+            for _ in 0..600 {
+                car.step(&w, None);
+                if car.p.x > 260.0 {
+                    break;
+                }
+            }
+            assert_eq!(car.fate, Fate::Driving, "{kind:?}");
+            assert!(car.p.x > 260.0, "{kind:?} got through the trunk: {}", car.p.x);
+            // A wide crown, the car dropped on it from above: it stays on top.
+            let mut w = flat_world();
+            for y in 150..170 {
+                for x in 0..600 {
+                    w.set(x, y, Mat::Leaf);
+                }
+            }
+            let mut car = Car::new(kind, (100, 100));
+            for _ in 0..300 {
+                car.step(&w, None);
+            }
+            assert!(car.p.y < 150.0, "{kind:?} sank through the crown: {}", car.p.y);
+            assert!(car.wheels.iter().any(|w| w.contact), "{kind:?} rests on the leaves");
+        }
     }
 
     #[test]

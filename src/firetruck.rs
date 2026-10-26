@@ -108,7 +108,8 @@ fn ground_near(world: &World, x: i32, y: i32) -> Option<i32> {
         if world.at(x, gy).kind() == Kind::Liquid && !solid(world, x, gy - 1) {
             return None;
         }
-        if solid(world, x, gy) && !solid(world, x, gy - 1) && !solid(world, x, gy - 2) {
+        // It drives through a tree, and over a crown it comes onto from above.
+        if world.bears(x, gy, y as f32, 6.0) && !solid(world, x, gy - 1) && !solid(world, x, gy - 2) {
             return Some(gy);
         }
     }
