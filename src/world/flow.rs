@@ -612,10 +612,10 @@ impl Flow {
         let fy = (y / CELL as f32 - 0.5).clamp(0.0, FH as f32 - 1.001);
         let (i0, j0) = (floor_f(fx), floor_f(fy));
         let (tx, ty) = (fx - i0, fy - j0);
-        // The four cells round it (i0 is -1 at most and i0 + 1 is FW at most: wrapped without a
-        // division, which the gas cells' many reads would feel).
+        // The four cells round it, wrapped (a plane flying in from off the screen, a drop on
+        // its way out of the world, ask for the wind beyond the edges).
         let (i0, j0) = (i0 as i32, j0 as usize);
-        let (ia, ib) = (if i0 < 0 { FW - 1 } else { i0 as usize }, if i0 + 1 >= FW as i32 { 0 } else { (i0 + 1) as usize });
+        let (ia, ib) = (i0.rem_euclid(FW as i32) as usize, (i0 + 1).rem_euclid(FW as i32) as usize);
         let (k0, k1) = (j0 * FW, (j0 + 1) * FW);
         let s = |a: &[f32]| (a[k0 + ia] * (1.0 - tx) + a[k0 + ib] * tx) * (1.0 - ty) + (a[k1 + ia] * (1.0 - tx) + a[k1 + ib] * tx) * ty;
         (s(&self.vx) * CELL as f32, s(&self.vy) * CELL as f32)
