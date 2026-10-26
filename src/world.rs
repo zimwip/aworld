@@ -1710,6 +1710,9 @@ impl World {
         if audit {
             marks.push(("liquides", self.water_units_audit()));
         }
+        if audit {
+            marks.push(("liquides", self.water_units_audit()));
+        }
         self.after_cells();
         if audit {
             marks.push(("après les cellules", self.water_units_audit()));

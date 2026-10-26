@@ -18,6 +18,9 @@ mod native {
         pub queue: wgpu::Queue,
         /// The card's name, for the log.
         pub name: String,
+        /// Whether the card can stamp the time between its kernels (asked for with
+        /// `AWORLD_DEBUG_CARD`, where the card offers it).
+        pub timestamps: bool,
     }
 
     /// How the card is wanted: off, as the size of the work decides, or for everything.
@@ -56,8 +59,10 @@ mod native {
             let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor { backends: wgpu::Backends::PRIMARY, ..Default::default() });
             let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() }))?;
             let info = adapter.get_info();
+            let stamps = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+            let timestamps = std::env::var_os("AWORLD_DEBUG_CARD").is_some() && adapter.features().contains(stamps);
             let (device, queue) = pollster::block_on(adapter.request_device(
-                &wgpu::DeviceDescriptor { label: Some("aworld"), required_features: wgpu::Features::empty(), required_limits: limits(&adapter.limits()), memory_hints: wgpu::MemoryHints::Performance },
+                &wgpu::DeviceDescriptor { label: Some("aworld"), required_features: if timestamps { stamps } else { wgpu::Features::empty() }, required_limits: limits(&adapter.limits()), memory_hints: wgpu::MemoryHints::Performance },
                 None,
             ))
             .ok()?;
@@ -67,7 +72,7 @@ mod native {
             if std::env::var_os("AWORLD_PROFILE").is_some() || wanted() == Use::Always {
                 eprintln!("aworld: GPU: {name}");
             }
-            Some(Gpu { device, queue, name })
+            Some(Gpu { device, queue, name, timestamps })
         })
         .as_ref()
     }
