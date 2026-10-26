@@ -236,6 +236,7 @@ impl World {
         self.bolts.append(&mut v.bolts);
         self.falling.append(&mut v.falling);
         self.slabs.append(&mut v.slabs);
+        self.liq.drops.append(&mut v.liq.drops);
         later.extend(v.later.take().unwrap_or_default());
         self.zones.absorb(&v.zones);
         drop(std::mem::replace(&mut v.zones, sleep::Zones::none()));
@@ -309,6 +310,7 @@ impl World {
                 lod: self.lod,
                 parallel_cells: true,
                 liquid_physics: self.liquid_physics,
+                // (The drops the cells make in the turn, the rain sweeping a cloud, `absorb` takes.)
                 liq: Default::default(),
                 fill: share(&self.fill),
                 pocket_of: share(&self.pocket_of),

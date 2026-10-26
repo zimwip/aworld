@@ -3065,6 +3065,21 @@ impl World {
             if into && self.raw(x, y + 1) == Mat::Cloud && self.chance(DROP_SWEEP) && self.gather_vapour(x, y + 1) {
                 let j = Self::idx(x, y + 1);
                 let t = self.temp[j].max(self.temp[i]);
+                if self.liquid_physics {
+                    // With the physical liquids, the water swept up flies on as a drop of theirs,
+                    // at the drop's speed, and the drop goes on falling: put in the cell under
+                    // the drop, it left the drop lying on it (water over water is the solver's,
+                    // which cannot push water into a cloud), and it rained on from under the
+                    // drop sweeping the next cell: the rain left behind it columns of water
+                    // standing in the cloud, thousands of cells that the solver worked on and
+                    // that drained a cell a tick from the bottom.
+                    let speed = self.vel[i] as f32 / FALL_UNIT as f32 * CELL_M / STEP;
+                    self.liq.drops.push(liquid::Drop { x: x as f32 + 0.5, y: y as f32 + 0.5, vx: 0.0, vy: speed, m: Mat::Water, q: field::FULL, t });
+                    self.set(x, y + 1, Mat::Empty);
+                    self.temp[j] = t;
+                    self.fall_drop(x, y);
+                    return;
+                }
                 self.set(x, y + 1, Mat::Water);
                 self.temp[j] = t;
                 return;
@@ -3830,8 +3845,9 @@ impl World {
     /// The upward part of a bounce.
     /// Whether a piece is under a liquid it is lighter than and can come up a row through it:
     /// every cell over it is air, gas or such a liquid, one of them liquid in a body of liquid
-    /// (not a stray drop), and one of the cells under it liquid too (immersed, not a puddle
-    /// lying on a block in the air).
+    /// (not a stray drop), and one of the cells under it liquid in a body too (immersed, not a
+    /// puddle lying on a block in the air, nor a block of ice in the sky with a stray drop
+    /// caught over it and one under).
     fn buoyed(&self, piece: &Piece) -> bool {
         let in_piece = |i: usize| piece.cells.binary_search_by(|p| i.cmp(p)).is_ok();
         let lighter = |j: usize| self.mask[j] == 0 && self.cells[j].m.kind() == Kind::Liquid && piece.density < density(self.cells[j].m);
@@ -3887,7 +3903,9 @@ impl World {
                         // but a stray drop or a puff of liquid in mid-air does not hold it up.
                         // Settled sand or earth holds up a log the same way.
                         Kind::Liquid | Kind::Powder => {
-                            if piece.density >= density(self.cells[target].m) {
+                            // (A film of liquid, under half a cell, never holds a piece up: one
+                            // caught in a notch of a block of ice held the block up in the sky.)
+                            if piece.density >= density(self.cells[target].m) || (self.cells[target].m.kind() == Kind::Liquid && self.liquid_fill(target) < field::FULL / liquid::HOLDS) {
                                 true
                             } else {
                                 let under = target + W();

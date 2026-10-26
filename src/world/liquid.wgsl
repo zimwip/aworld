@@ -1126,6 +1126,25 @@ fn carry_commit(@builtin(global_invocation_id) id: vec3<u32>) {
     let c = band_cell(id.x);
     if c == 0xffffffffu { return; }
     let q = qnew[c];
+    let xx = c % P.w;
+    let yy = c / P.w;
+    // A cell fed most from above, holding a quarter, with air under it: its bottom edge takes
+    // the speed of the liquid that comes in (see the CPU). Done by the cell under it, which
+    // owns its top edge, whether or not anything came into it: the cell above also reads that
+    // edge, and the one below reads this one's, so a cell writing its bottom edge raced with
+    // its neighbours (the lake, the bubble and the ice in the sky came out differently from
+    // one run to the next).
+    if raw_kind(c) == K_EMPTY && yy > 0u && (code[c] & MASKED) == 0u {
+        let a = c - P.w;
+        let qa = qnew[a];
+        if qa != -2147483647 - 1 && qa >= i32(FULL / 4u) {
+            let ins = vec4<i32>(fu[ui(xx, yy - 1u)], -fu[ui(xx + 1u, yy - 1u)], fv[a], -fv[c]);
+            if ins.z > 0 && ins.z >= ins.x && ins.z >= ins.y && ins.z > ins.w {
+                let sp = v[a];
+                if abs(v[c]) < abs(sp) { v[c] = sp; }
+            }
+        }
+    }
     if q == -2147483647 - 1 { return; }
     if q <= 0 {
         if raw_kind(c) == K_LIQUID {
@@ -1139,33 +1158,6 @@ fn carry_commit(@builtin(global_invocation_id) id: vec3<u32>) {
     let nm = mnew[c];
     if nm != 0xffu {
         code[c] = (code[c] & ~0xffu) | nm;
-    }
-    if u32(q) >= FULL / 4u {
-        // The edge across from the one that feeds the cell most, if it is in the air, takes
-        // the speed of the liquid that comes in (see the CPU).
-        let xx = c % P.w;
-        let yy = c / P.w;
-        let ins = vec4<i32>(fu[ui(xx, yy)], -fu[ui(xx + 1u, yy)], fv[c], -fv[c + P.w]);
-        var k = 0u;
-        var best = ins.x;
-        if ins.y > best { k = 1u; best = ins.y; }
-        if ins.z > best { k = 2u; best = ins.z; }
-        if ins.w > best { k = 3u; best = ins.w; }
-        if best > 0 {
-            if k == 0u && xx + 1u < P.w && raw_kind(c + 1u) == K_EMPTY && (code[c + 1u] & MASKED) == 0u {
-                let sp = u[ui(xx, yy)];
-                if abs(u[ui(xx + 1u, yy)]) < abs(sp) { u[ui(xx + 1u, yy)] = sp; }
-            } else if k == 1u && xx > 0u && raw_kind(c - 1u) == K_EMPTY && (code[c - 1u] & MASKED) == 0u {
-                let sp = u[ui(xx + 1u, yy)];
-                if abs(u[ui(xx, yy)]) < abs(sp) { u[ui(xx, yy)] = sp; }
-            } else if k == 2u && yy + 1u < P.h && raw_kind(c + P.w) == K_EMPTY && (code[c + P.w] & MASKED) == 0u {
-                let sp = v[c];
-                if abs(v[c + P.w]) < abs(sp) { v[c + P.w] = sp; }
-            } else if k == 3u && yy > 0u && raw_kind(c - P.w) == K_EMPTY && (code[c - P.w] & MASKED) == 0u {
-                let sp = v[c + P.w];
-                if abs(v[c]) < abs(sp) { v[c] = sp; }
-            }
-        }
     }
     temp[c] = tnew[c];
     fill[c] = u32(q);

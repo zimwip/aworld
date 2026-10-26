@@ -1626,24 +1626,19 @@ impl World {
                     self.latent[i] = 0.0;
                     self.vel[i] = 0;
                 }
-                // The edge across from the one that feeds the cell most, if it is in the air,
-                // takes the speed of the liquid that comes in once the cell holds a quarter: an
-                // edge in the air is at rest, and the front of a body falling through the air
-                // was slowed by every cell it wetted (the fresh edge under it read its own
-                // rest), which the pressure passed on to the whole body: it fell at four fifths
-                // of g and slowing. (Not before the quarter: a wisp wetting the next cell at the
-                // body's speed, and that one the next, ran ahead of the body as a trail of
-                // films that broke into drops, a third of the body in a second.)
-                if let Some((k, speed)) = feed.filter(|_| q as u32 >= field::FULL / 4) {
+                // A cell fed most from above, with air under it, once it holds a quarter: its
+                // bottom edge takes the speed of the liquid that comes in. An edge in the air
+                // is at rest, and the front of a body falling through the air was slowed by
+                // every cell it wetted (the fresh edge under it read its own rest), which the
+                // pressure passed on to the whole body: it fell at four fifths of g and
+                // slowing. (Not before the quarter: a wisp wetting the next cell at the body's
+                // speed, and that one the next, ran ahead of the body as a trail of films that
+                // broke into drops, a third of the body in a second. Only from above: done on
+                // the side edges too, it pumped the waves the wind raises, on the card.)
+                if let Some((2, speed)) = feed.filter(|_| q as u32 >= field::FULL / 4) {
                     let (x, y) = (i % W(), i / W());
-                    let (far, edge) = match k {
-                        0 => ((x + 1 < W()).then_some(i + 1), (true, ui(x + 1, y))),
-                        1 => ((x > 0).then_some(i - 1), (true, ui(x, y))),
-                        2 => ((y + 1 < H()).then_some(i + W()), (false, vi(x, y + 1))),
-                        _ => ((y > 0).then_some(i - W()), (false, vi(x, y))),
-                    };
-                    if far.is_some_and(|j| self.cells[j].m == Mat::Empty && self.mask[j] == 0) {
-                        let slot = if edge.0 { &mut liq.u[edge.1] } else { &mut liq.v[edge.1] };
+                    if y + 1 < H() && self.cells[i + W()].m == Mat::Empty && self.mask[i + W()] == 0 {
+                        let slot = &mut liq.v[vi(x, y + 1)];
                         if slot.abs() < speed.abs() {
                             *slot = speed;
                         }

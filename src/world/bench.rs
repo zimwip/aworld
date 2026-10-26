@@ -55,6 +55,95 @@ fn liquids() -> World {
     w
 }
 
+/// Water painted over a big cloud in the open sky (Thomas's scene of 26 October): where the
+/// water goes, what the solver takes for a wall, and what a step costs.
+///
+/// ```text
+/// cargo test --release --bin aworld cloud_probe -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn cloud_probe() {
+    let mut w = countryside();
+    w.set_liquid_physics(true);
+    for y in 120..400 {
+        for x in 300..900 {
+            w.set(x, y, Mat::Cloud);
+        }
+    }
+    for y in 100..120 {
+        for x in 350..850 {
+            w.set(x, y, Mat::Water);
+        }
+    }
+    w.prof.on = true;
+    let dt: f32 = std::env::var("AWORLD_PROBE_DT").ok().and_then(|s| s.parse().ok()).unwrap_or(STEP);
+    let mut spent = 0.0;
+    let steps: usize = std::env::var("AWORLD_PROBE_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    for k in 0..=steps {
+        if k % 60 == 0 {
+            let (mut water, mut over_gas, mut walls, mut rain, mut rows, mut still) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+            let (mut top, mut bottom) = (usize::MAX, 0usize);
+            for i in 0..W() * (H() - 1) {
+                let m = w.cells[i].m;
+                if m == Mat::Water {
+                    water += 1;
+                    rows += i / W();
+                    still += (w.vel[i] == 0) as usize;
+                    top = top.min(i / W());
+                    bottom = bottom.max(i / W());
+                    if w.cells[i + W()].m.kind() == Kind::Gas {
+                        over_gas += 1;
+                    }
+                    if w.liquid_class(i % W(), i / W()).is_some_and(|c| c & 3 == super::liquid::AIR) {
+                        rain += 1;
+                    }
+                }
+                if m.kind() == Kind::Gas && w.liquid_class(i % W(), i / W()).is_some_and(|c| c & 3 == super::liquid::SOLID) {
+                    walls += 1;
+                }
+            }
+            eprintln!(
+                "{:.1} s : {water} cellules d'eau (rangs {top}..{bottom}, moyen {}, {still} immobiles) dont {over_gas} sur du gaz et {rain} en pluie, {} gouttes, {walls} cases de gaz prises pour une paroi, {:.1} ms/pas",
+                k as f32 * dt,
+                rows / water.max(1),
+                w.liq.drops.len(),
+                if k > 0 { spent * 1000.0 / 60.0 } else { 0.0 }
+            );
+            spent = 0.0;
+        }
+        let t = Instant::now();
+        w.step_dt(dt);
+        spent += t.elapsed().as_secs_f64();
+    }
+    eprint!("{}", w.prof.report().lines().take(10).map(|l| format!("{l}\n")).collect::<String>());
+}
+
+/// A small slab of water over a cloud, tick by tick: the row of each cell of the middle column
+/// and its speed.
+#[test]
+#[ignore]
+fn slab_probe() {
+    let mut w = World::new_static();
+    w.set_liquid_physics(true);
+    for y in 60..120 {
+        for x in 80..140 {
+            w.set(x, y, Mat::Cloud);
+        }
+    }
+    for y in 55..60 {
+        for x in 100..120 {
+            w.set(x, y, Mat::Water);
+        }
+    }
+    for k in 0..40 {
+        let col: Vec<String> = (40..130).filter(|&y| w.raw(110, y) == Mat::Water).map(|y| format!("{y}:{}", w.vel[World::idx(110, y)])).collect();
+        let gas_in: usize = (55..60).flat_map(|y| (100..120).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y).kind() == Kind::Gas).count();
+        eprintln!("tick {k}: {} (gaz dans la dalle {gas_in}, gouttes {})", col.join(" "), w.liq.drops.len());
+        w.step();
+    }
+}
+
 /// A big charged storm cloud over the valley, and a bolt every few steps.
 fn storm() -> World {
     let mut w = countryside();
