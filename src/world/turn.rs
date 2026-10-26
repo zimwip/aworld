@@ -29,12 +29,20 @@ pub const REACH: i32 = 32;
 const STRIP_ZONES: usize = (REACH as usize).div_ceil(sleep::CS);
 /// Columns across a strip, and strips across the world.
 const STRIP_W: usize = STRIP_ZONES * sleep::CS;
-const STRIPS: usize = sleep::CW / STRIP_ZONES;
+#[allow(non_snake_case)]
+fn STRIPS() -> usize {
+    sleep::CW() / STRIP_ZONES
+}
 /// Strips of a round are this many strips from one another. Between two of them lie
 /// `ROUNDS - 1` strips, which their reach shares out; the world wraps round at the sides, so the
 /// number of strips is a multiple of it.
 const ROUNDS: usize = 3;
-const _: () = assert!(sleep::CW % STRIP_ZONES == 0 && STRIPS % ROUNDS == 0 && 2 * REACH as usize <= (ROUNDS - 1) * STRIP_W);
+const _: () = assert!(2 * REACH as usize <= (ROUNDS - 1) * STRIP_W);
+
+/// The strips fill the world's width, in whole rounds (see `GRID_W`).
+pub(super) fn check_strips() {
+    assert!(sleep::CW() % STRIP_ZONES == 0 && STRIPS() % ROUNDS == 0, "a world {} cells wide does not cut into strips", W());
+}
 
 /// A rule put off to the end of the turn: it reaches too far to run beside other strips.
 #[derive(Clone, Copy, Debug)]
@@ -102,7 +110,7 @@ thread_local! {
 #[track_caller]
 pub(super) fn guard(x: i32) {
     if let Some((x0, x1)) = STRIP.with(|t| t.get()) {
-        let d = |a: i32| a.rem_euclid(W as i32).min((-a).rem_euclid(W as i32));
+        let d = |a: i32| a.rem_euclid(W() as i32).min((-a).rem_euclid(W() as i32));
         let off = if (x0..x1).contains(&x) { 0 } else { d(x - x0).min(d(x - (x1 - 1))) };
         assert!(off <= REACH, "a rule of the cells' turn reached column {x}, {off} columns off its strip {x0}..{x1}");
     }
@@ -111,7 +119,7 @@ pub(super) fn guard(x: i32) {
 impl World {
     /// Every cell of matter takes its turn, bottom row first.
     pub(super) fn step_cells(&mut self) {
-        self.air_rows = (0..H as i32).map(|y| self.ambient_c(y)).collect();
+        self.air_rows = (0..H() as i32).map(|y| self.ambient_c(y)).collect();
         self.air_sky = self.climate.sky_dev;
         self.zones.begin();
         if self.parallel_cells {
@@ -124,15 +132,15 @@ impl World {
 
     fn cells_in_order(&mut self) {
         let ltr = self.frame & 1 == 0;
-        for y in (0..H as i32).rev() {
-            let zrow = y as usize / sleep::CS * sleep::CW;
-            for zi in 0..sleep::CW {
-                let zx = if ltr { zi } else { sleep::CW - 1 - zi };
+        for y in (0..H() as i32).rev() {
+            let zrow = y as usize / sleep::CS * sleep::CW();
+            for zi in 0..sleep::CW() {
+                let zx = if ltr { zi } else { sleep::CW() - 1 - zi };
                 let zone = zrow + zx;
                 if !self.zones.awake[zone] {
                     continue;
                 }
-                let (x0, x1) = ((zx * sleep::CS) as i32, ((zx + 1) * sleep::CS).min(W) as i32);
+                let (x0, x1) = ((zx * sleep::CS) as i32, ((zx + 1) * sleep::CS).min(W()) as i32);
                 for i in 0..x1 - x0 {
                     let x = if ltr { x0 + i } else { x1 - 1 - i };
                     self.cell_turn(x, y, zone);
@@ -147,9 +155,9 @@ impl World {
         let mut later = Vec::new();
         for k in 0..ROUNDS {
             let round = if ltr { k } else { ROUNDS - 1 - k };
-            let strips: Vec<usize> = (round..STRIPS)
+            let strips: Vec<usize> = (round..STRIPS())
                 .step_by(ROUNDS)
-                .filter(|&s| (0..sleep::CH).any(|zy| (s * STRIP_ZONES..(s + 1) * STRIP_ZONES).any(|zx| self.zones.awake[zy * sleep::CW + zx])))
+                .filter(|&s| (0..sleep::CH()).any(|zy| (s * STRIP_ZONES..(s + 1) * STRIP_ZONES).any(|zx| self.zones.awake[zy * sleep::CW() + zx])))
                 .collect();
             let views: Vec<ManuallyDrop<World>> = match strips.len() {
                 0 => continue,
@@ -186,16 +194,16 @@ impl World {
     fn strip_turn(&self, s: usize, ltr: bool, seed: u32) -> ManuallyDrop<World> {
         let mut v = ManuallyDrop::new(self.view(mix(seed, s as u32)));
         #[cfg(debug_assertions)]
-        STRIP.with(|t| t.set(Some(((s * STRIP_W) as i32, ((s + 1) * STRIP_W).min(W) as i32))));
-        for y in (0..H as i32).rev() {
-            let zrow = y as usize / sleep::CS * sleep::CW;
+        STRIP.with(|t| t.set(Some(((s * STRIP_W) as i32, ((s + 1) * STRIP_W).min(W()) as i32))));
+        for y in (0..H() as i32).rev() {
+            let zrow = y as usize / sleep::CS * sleep::CW();
             for j in 0..STRIP_ZONES {
                 let zx = s * STRIP_ZONES + if ltr { j } else { STRIP_ZONES - 1 - j };
                 let zone = zrow + zx;
                 if !v.zones.awake[zone] {
                     continue;
                 }
-                let (x0, x1) = ((zx * sleep::CS) as i32, ((zx + 1) * sleep::CS).min(W) as i32);
+                let (x0, x1) = ((zx * sleep::CS) as i32, ((zx + 1) * sleep::CS).min(W()) as i32);
                 for i in 0..x1 - x0 {
                     let x = if ltr { x0 + i } else { x1 - 1 - i };
                     v.cell_turn(x, y, zone);

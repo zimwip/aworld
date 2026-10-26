@@ -53,7 +53,7 @@ impl Stick {
 
 /// Does the cell hold a stick up? Solids, powders and blocks do; air and liquids do not.
 fn holds(world: &World, x: i32, y: i32) -> bool {
-    if !(0..W as i32).contains(&x) || !(0..H as i32).contains(&y) {
+    if !(0..W() as i32).contains(&x) || !(0..H() as i32).contains(&y) {
         return false;
     }
     matches!(world.raw(x, y).kind(), Kind::Static | Kind::Powder) || world.block_at_cell(x, y).is_some()
@@ -71,7 +71,7 @@ impl Dynamite {
             return false;
         }
         let (x, y) = ((at.x - LEN as f32 / 2.0).round() as i32, (at.y - THICK as f32 / 2.0).round() as i32);
-        let x = x.clamp(0, W as i32 - LEN);
+        let x = x.clamp(0, W() as i32 - LEN);
         let planted = holds(world, at.x as i32, at.y as i32);
         self.sticks.push(Stick { x, y, vy: 0.0, carry: 0.0, fuse: FUSE, planted });
         true
@@ -124,12 +124,12 @@ impl Dynamite {
             }
         }
         // Past the bottom of the world: gone.
-        self.sticks.retain(|s| s.y < H as i32 + 4);
+        self.sticks.retain(|s| s.y < H() as i32 + 4);
     }
 
     /// While building nothing runs: a stick dropped in the air is put straight where it would land.
     pub fn settle(&mut self, world: &World) {
-        for _ in 0..H {
+        for _ in 0..H() {
             if (0..self.sticks.len()).all(|i| self.sticks[i].planted || self.supported(world, i)) {
                 break;
             }
@@ -239,8 +239,8 @@ mod tests {
     /// Stone from y = 300 down.
     fn ground() -> World {
         let mut w = World::new_static();
-        for x in 0..W as i32 {
-            for y in 300..H as i32 {
+        for x in 0..W() as i32 {
+            for y in 300..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn a_stick_falls_through_air_and_water_and_rests_on_the_ground() {
         let mut w = ground();
-        for x in 0..W as i32 {
+        for x in 0..W() as i32 {
             for y in 260..300 {
                 w.set(x, y, Mat::Water);
             }
@@ -306,7 +306,7 @@ mod tests {
         }
         assert!(d.sticks.iter().all(|s| s.planted && s.x == d.sticks[0].x && s.y == d.sticks[0].y));
         run(&mut d, &mut w, FUSE as usize + 2);
-        (280..680).map(|x| (300..H as i32).filter(|&y| w.raw(x, y) != Mat::Stone).count()).sum()
+        (280..680).map(|x| (300..H() as i32).filter(|&y| w.raw(x, y) != Mat::Stone).count()).sum()
     }
 
     #[test]

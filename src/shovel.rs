@@ -65,7 +65,7 @@ impl Game {
         seen.truncate(cap);
         let mut heat = 0.0;
         for &(x, y) in &seen {
-            heat += self.world.temp[y as usize * world::W + x as usize];
+            heat += self.world.temp[y as usize * world::W() + x as usize];
             self.world.set(x, y, Mat::Empty);
         }
         let count = seen.len() as u32;
@@ -92,7 +92,7 @@ impl Game {
             }
             let Some((x, y, _)) = best else { break };
             self.world.set(x, y, load.mat);
-            self.world.temp[y as usize * world::W + x as usize] = load.temp;
+            self.world.temp[y as usize * world::W() + x as usize] = load.temp;
             load.count -= 1;
             poured += 1;
         }

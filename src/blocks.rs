@@ -185,8 +185,8 @@ impl Block {
         (
             ((self.pos.x - r).floor() as i32).max(0),
             ((self.pos.y - r).floor() as i32).max(0),
-            ((self.pos.x + r).ceil() as i32).min(W as i32 - 1),
-            ((self.pos.y + r).ceil() as i32).min(H as i32 - 1),
+            ((self.pos.x + r).ceil() as i32).min(W() as i32 - 1),
+            ((self.pos.y + r).ceil() as i32).min(H() as i32 - 1),
         )
     }
 
@@ -267,7 +267,7 @@ pub fn stamp_blocks(world: &mut World, blocks: &[Block]) {
 pub fn placement_ok(world: &World, blocks: &[Block], cand: &Block, ignore: Option<usize>) -> bool {
     let (x0, y0, x1, y1) = cand.bounds();
     let r = cand.half().length();
-    if cand.pos.x - r < 0.0 || cand.pos.x + r > W as f32 || cand.pos.y - r < 0.0 || cand.pos.y + r > H as f32 {
+    if cand.pos.x - r < 0.0 || cand.pos.x + r > W() as f32 || cand.pos.y - r < 0.0 || cand.pos.y + r > H() as f32 {
         return false;
     }
     for y in y0..=y1 {
@@ -714,8 +714,8 @@ impl Member {
         (
             ((self.p0.x.min(self.p1.x) - r).floor() as i32).max(0),
             ((self.p0.y.min(self.p1.y) - r).floor() as i32).max(0),
-            ((self.p0.x.max(self.p1.x) + r).ceil() as i32).min(W as i32 - 1),
-            ((self.p0.y.max(self.p1.y) + r).ceil() as i32).min(H as i32 - 1),
+            ((self.p0.x.max(self.p1.x) + r).ceil() as i32).min(W() as i32 - 1),
+            ((self.p0.y.max(self.p1.y) + r).ceil() as i32).min(H() as i32 - 1),
         )
     }
 }
@@ -889,7 +889,7 @@ pub fn anchor_at(world: &World, blocks: &[Block], p: Vec2) -> Option<Anchor> {
     }
     // The edges of the world are solid to hang things from.
     // Near any edge of the world, including the top of the sky: it snaps to the edge.
-    let (w, h) = (W as f32, H as f32);
+    let (w, h) = (W() as f32, H() as f32);
     let near = BORDER_REACH;
     if p.x < near {
         return Some(Anchor::Ground(vec2(0.0, p.y.clamp(0.0, h))));
@@ -2069,8 +2069,8 @@ impl Physics {
             let r = b.half().length() + reach;
             let (x0, y0) = (((b.pos.x - r) / TILE as f32).floor() as i32, ((b.pos.y - r) / TILE as f32).floor() as i32);
             let (x1, y1) = (((b.pos.x + r) / TILE as f32).floor() as i32, ((b.pos.y + r) / TILE as f32).floor() as i32);
-            for ty in y0.max(0)..=y1.min(H as i32 / TILE) {
-                for tx in x0.max(0)..=x1.min(W as i32 / TILE) {
+            for ty in y0.max(0)..=y1.min(H() as i32 / TILE) {
+                for tx in x0.max(0)..=x1.min(W() as i32 / TILE) {
                     wanted.insert((tx, ty));
                 }
             }
@@ -2809,9 +2809,9 @@ mod tests {
         let world = World::new_static();
         for (p, want) in [
             (vec2(9.0, 200.0), Anchor::Ground(vec2(0.0, 200.0))),
-            (vec2(W as f32 - 12.0, 150.0), Anchor::Ground(vec2(W as f32, 150.0))),
+            (vec2(W() as f32 - 12.0, 150.0), Anchor::Ground(vec2(W() as f32, 150.0))),
             (vec2(400.0, 10.0), Anchor::Ground(vec2(400.0, 0.0))),
-            (vec2(400.0, H as f32 - 9.0), Anchor::Ground(vec2(400.0, H as f32))),
+            (vec2(400.0, H() as f32 - 9.0), Anchor::Ground(vec2(400.0, H() as f32))),
         ] {
             assert_eq!(node_at(&world, &[], &[], p), Some(want), "click at {p:?}");
         }

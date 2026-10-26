@@ -66,7 +66,7 @@ pub struct Wolves {
 /// The natural ground under a column (soil, rock, sand, snow), if nothing else lies on it:
 /// wolves do not perch on a building, in a fire or under water. Trees are looked through.
 fn ground_at(world: &World, x: i32) -> Option<i32> {
-    for y in 0..H as i32 {
+    for y in 0..H() as i32 {
         let m = world.at(x, y);
         if matches!(m.kind(), Kind::Empty | Kind::Gas) || m.is_vegetation() {
             continue;
@@ -81,7 +81,7 @@ fn ground_at(world: &World, x: i32) -> Option<i32> {
 /// wolves side by side. Gives the leader's spot and the ground under each wolf (leader, the
 /// one behind it, the cub in front), for a pack facing `dir`.
 fn find_spot(world: &World, dir: f32) -> Option<Vec<(f32, f32)>> {
-    let mut tops: Vec<(i32, i32)> = (40..W as i32 - 40).step_by(2).filter_map(|x| ground_at(world, x).map(|y| (x, y))).collect();
+    let mut tops: Vec<(i32, i32)> = (40..W() as i32 - 40).step_by(2).filter_map(|x| ground_at(world, x).map(|y| (x, y))).collect();
     tops.sort_by_key(|&(x, y)| (y, x));
     tops.into_iter().filter(|&(x, y)| !near_fire(world, x, y)).find_map(|(px, py)| {
         OFFSETS
@@ -123,7 +123,7 @@ impl Wolves {
         if self.pack.is_some() {
             return false;
         }
-        let moon_x = world.moon_position().map_or(W as f32 * 0.5, |p| p.0);
+        let moon_x = world.moon_position().map_or(W() as f32 * 0.5, |p| p.0);
         let Some((px, _)) = find_perch(world).or_else(|| find_spot(world, -1.0).map(|s| (s[0].0 as i32, 0))) else { return false };
         let facing = if moon_x >= px as f32 { 1.0 } else { -1.0 };
         let Some((dir, spot)) = [facing, -facing].into_iter().find_map(|d| find_spot(world, d).map(|s| (d, s))) else { return false };
@@ -325,10 +325,10 @@ mod tests {
 
     fn hill() -> World {
         let mut w = World::new_static();
-        for x in 0..W as i32 {
+        for x in 0..W() as i32 {
             // A hill peaking at x = 600.
             let top = 400 - (60 - (x - 600).abs() / 4).max(0);
-            for y in top..H as i32 {
+            for y in top..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }

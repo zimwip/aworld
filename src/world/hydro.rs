@@ -55,7 +55,7 @@ impl World {
     /// take its place (a drinking straw with a finger on top), and the levelling has not let it go.
     pub(super) fn held(&self, x: i32, y: i32) -> bool {
         // Over the bottom edge of the world there is nothing to hold it against: it falls out.
-        if !Self::inb(x, y) || y + 1 >= H as i32 || self.released[Self::idx(x, y)] {
+        if !Self::inb(x, y) || y + 1 >= H() as i32 || self.released[Self::idx(x, y)] {
             return false;
         }
         let m = self.raw(x, y);
@@ -86,12 +86,12 @@ impl World {
         seen.fill(false);
         // Seeds only in the zones that ran: a body that lies wholly in sleeping zones has not
         // changed, it is at rest.
-        for zone in 0..sleep::CW * sleep::CH {
+        for zone in 0..sleep::CW() * sleep::CH() {
             if !self.zones.awake[zone] {
                 continue;
             }
-            let (zx, zy) = (zone % sleep::CW * sleep::CS, zone / sleep::CW * sleep::CS);
-            for start in (zy..(zy + sleep::CS).min(H)).flat_map(|y| (zx..(zx + sleep::CS).min(W)).map(move |x| y * W + x)) {
+            let (zx, zy) = (zone % sleep::CW() * sleep::CS, zone / sleep::CW() * sleep::CS);
+            for start in (zy..(zy + sleep::CS).min(H())).flat_map(|y| (zx..(zx + sleep::CS).min(W())).map(move |x| y * W() + x)) {
                 let m = self.cells[start].m;
                 if seen[start] || m.kind() != Kind::Liquid {
                     continue;
@@ -107,11 +107,11 @@ impl World {
     fn level_from(&mut self, start: usize, m: Mat, seen: &mut [bool], stack: &mut Vec<usize>, surf: &mut Vec<usize>, mouths: &mut Vec<usize>) {
         surf.clear();
         mouths.clear();
-        let mut top = H as i32;
+        let mut top = H() as i32;
         seen[start] = true;
         stack.push(start);
         while let Some(i) = stack.pop() {
-            let (x, y) = ((i % W) as i32, (i / W) as i32);
+            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
             top = top.min(y);
             let (above, below) = (self.at(x, y - 1), self.at(x, y + 1));
             if free(above) && below == m {
@@ -160,7 +160,7 @@ impl World {
         while l >= 0 && self.raw(l, y) == m {
             l -= 1;
         }
-        while r < W as i32 && self.raw(r, y) == m {
+        while r < W() as i32 && self.raw(r, y) == m {
             r += 1;
         }
         (l, r)
@@ -171,7 +171,7 @@ impl World {
     fn closed_runs(&self, list: &[usize], m: Mat, width: i32, mut keep: impl FnMut(i32, i32)) {
         let mut run: Option<(i32, i32, i32, bool)> = None;
         for &i in list {
-            let (x, y) = ((i % W) as i32, (i / W) as i32);
+            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
             let closed = match run {
                 Some((ry, _, r, c)) if ry == y && x < r => c,
                 _ => {
@@ -197,12 +197,12 @@ impl World {
         // Taking from a surface lowers it: only a calm one, from shore to shore (not the top of a
         // ripple, nor a heap still spreading). Putting on a surface raises it.
         let mut from = Vec::new();
-        self.closed_runs(surf, m, W as i32, |x, y| from.push(Spot { head: (H as i32 - y) as f32 + gas(self, x, y - 1, -1), x, y }));
+        self.closed_runs(surf, m, W() as i32, |x, y| from.push(Spot { head: (H() as i32 - y) as f32 + gas(self, x, y - 1, -1), x, y }));
         let mut to: Vec<Spot> = surf
             .iter()
-            .map(|&i| ((i % W) as i32, (i / W) as i32))
+            .map(|&i| ((i % W()) as i32, (i / W()) as i32))
             .filter(|&(x, y)| self.at(x, y - 1) == Mat::Empty)
-            .map(|(x, y)| Spot { head: (H as i32 - y + 1) as f32 + gas(self, x, y - 1, -1), x, y: y - 1 })
+            .map(|(x, y)| Spot { head: (H() as i32 - y + 1) as f32 + gas(self, x, y - 1, -1), x, y: y - 1 })
             .collect();
         // The mouths of full pipes and narrow holes. The liquid in one is held up while the body
         // pushes it out (and it runs out there), or while it has nowhere to go. The highest of
@@ -211,7 +211,7 @@ impl World {
         // pressure of the air on it can hold breaks: its mouths let go.
         let mut open = Vec::new();
         self.closed_runs(mouths, m, HOLD_WIDTH, |x, y| {
-            let head = (H as i32 - y - 1) as f32 + gas(self, x, y + 1, 1);
+            let head = (H() as i32 - y - 1) as f32 + gas(self, x, y + 1, 1);
             open.push((x, y, head));
         });
         for &(x, y, head) in &open {
@@ -220,7 +220,7 @@ impl World {
         from.sort_unstable_by(|a, b| b.head.total_cmp(&a.head));
         let Some(&high) = from.first() else { return };
         let lift = self.gas_from(high.x, high.y - 1, -1) / (rho * ATM_PER_CELL);
-        let broken = (H as i32 - top) as f32 > high.head + lift;
+        let broken = (H() as i32 - top) as f32 > high.head + lift;
         for &(x, y, head) in &open {
             if broken || head + 1.0 > high.head && (x, y) != (high.x, high.y) {
                 let i = Self::idx(x, y);
@@ -356,7 +356,7 @@ mod tests {
         assert!((l - r).abs() <= 3, "oil at {l} / {r}\n{}", dump(&oil, 100, 360, 160, 455));
         // Lava (in a hot vessel, so that it does not set) has only begun to climb the other side in three times as long.
         let mut lava = vessels(Mat::Lava, 60);
-        for i in 0..W * H {
+        for i in 0..W() * H() {
             if matches!(lava.cells[i].m, Mat::Lava | Mat::Brick) {
                 lava.temp[i] = thermal::LAVA_C;
             }
@@ -419,7 +419,7 @@ mod tests {
     fn a_full_pipe_ending_on_the_bottom_of_the_world_drains_out_of_it() {
         // A tank whose pipe goes down to the last row: the liquid leaves the world there.
         let mut w = World::new_static();
-        let b = H as i32 - 1;
+        let b = H() as i32 - 1;
         rect(&mut w, 300, b - 80, 340, b, Mat::Stone);
         rect(&mut w, 305, b - 80, 335, b - 20, Mat::Empty);
         rect(&mut w, 319, b - 19, 320, b, Mat::Empty);

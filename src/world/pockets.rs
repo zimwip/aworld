@@ -122,9 +122,9 @@ impl World {
         // the weight of each liquid cell (atm).
         // (Row by row, side by side: each cell only reads itself.)
         let (cells, mask) = (&self.cells, &self.mask);
-        self.cls.par_chunks_mut(W).zip(self.liq_w.par_chunks_mut(W)).enumerate().for_each(|(y, (cls, liq_w))| {
-            for x in 0..W {
-                let i = y * W + x;
+        self.cls.par_chunks_mut(W()).zip(self.liq_w.par_chunks_mut(W())).enumerate().for_each(|(y, (cls, liq_w))| {
+            for x in 0..W() {
+                let i = y * W() + x;
                 let m = cells[i].m;
                 cls[x] = if mask[i] != 0 {
                     0
@@ -146,7 +146,7 @@ impl World {
         self.pocket_of.fill(0);
         self.pockets.clear();
         let through = |c: u8| c == 1 || c == 2;
-        for start in 0..W * H {
+        for start in 0..W() * H() {
             if self.pocket_of[start] != 0 || !through(self.cls[start]) {
                 continue;
             }
@@ -157,15 +157,15 @@ impl World {
                 if self.pocket_of[i] != 0 {
                     continue;
                 }
-                let row = i - i % W;
+                let row = i - i % W();
                 let (mut a, mut b) = (i, i);
                 while a > row && self.pocket_of[a - 1] == 0 && through(self.cls[a - 1]) {
                     a -= 1;
                 }
-                while b + 1 < row + W && self.pocket_of[b + 1] == 0 && through(self.cls[b + 1]) {
+                while b + 1 < row + W() && self.pocket_of[b + 1] == 0 && through(self.cls[b + 1]) {
                     b += 1;
                 }
-                if a == row || b == row + W - 1 || row == 0 || row == (H - 1) * W {
+                if a == row || b == row + W() - 1 || row == 0 || row == (H() - 1) * W() {
                     p.open = true;
                 }
                 for k in a..=b {
@@ -178,8 +178,8 @@ impl World {
                     }
                 }
                 // One seed per run of free cells in the rows above and below.
-                for other in [row.wrapping_sub(W), row + W] {
-                    if other >= W * H {
+                for other in [row.wrapping_sub(W()), row + W()] {
+                    if other >= W() * H() {
                         continue;
                     }
                     let mut open_run = false;
@@ -211,20 +211,20 @@ impl World {
         // is tallied in one go.)
         let npockets = self.pockets.len();
         let bands = if npockets > 20_000 { 1 } else { rayon::current_num_threads().clamp(1, 16) };
-        let band_rows = H.div_ceil(bands);
+        let band_rows = H().div_ceil(bands);
         let tallies: Vec<Vec<Held>> = (0..bands)
             .into_par_iter()
             .map(|band| {
                 let mut held = vec![Held::default(); npockets];
-                for i in band * band_rows * W..((band + 1) * band_rows).min(H) * W {
+                for i in band * band_rows * W()..((band + 1) * band_rows).min(H()) * W() {
                     let c = self.cls[i];
                     if c != 0 && c != 3 {
                         continue;
                     }
                     let strength = if c == 0 && self.mask[i] == 0 { wall_strength(self.cells[i].m) } else { None };
-                    let x = i % W;
-                    for j in [i.wrapping_sub(W), if x + 1 < W { i + 1 } else { usize::MAX }, i + W, if x > 0 { i - 1 } else { usize::MAX }] {
-                        if j >= W * H {
+                    let x = i % W();
+                    for j in [i.wrapping_sub(W()), if x + 1 < W() { i + 1 } else { usize::MAX }, i + W(), if x > 0 { i - 1 } else { usize::MAX }] {
+                        if j >= W() * H() {
                             continue;
                         }
                         let id = self.pocket_of[j];
@@ -340,7 +340,7 @@ impl World {
     fn update_liquid_pressure(&mut self) {
         // Which rows hold liquid.
         // (`liq_w` and `cls` are filled by `update_pockets`.)
-        let rows: Vec<bool> = (0..H).map(|y| self.cls[y * W..(y + 1) * W].contains(&3)).collect();
+        let rows: Vec<bool> = (0..H()).map(|y| self.cls[y * W()..(y + 1) * W()].contains(&3)).collect();
         // Down each column from the gas above (row by row, all columns at once). NaN: no gas
         // above, only walls.
         // (Each column on its own, the columns side by side; then each row on its own.)
@@ -349,9 +349,9 @@ impl World {
             let (cls, pocket_of, pockets, wt) = (&self.cls, &self.pocket_of, &self.pockets, &self.liq_w);
             super::par::column_bands(|xs| {
                 let mut above = vec![f32::NAN; xs.len()];
-                for y in 0..H {
+                for y in 0..H() {
                     for (a, x) in above.iter_mut().zip(xs.clone()) {
-                        let i = y * W + x;
+                        let i = y * W() + x;
                         // SAFETY: a band only reaches its own columns.
                         let p = unsafe { p.at(i) };
                         if wt[i] > 0.0 {
@@ -373,14 +373,14 @@ impl World {
         // Then shared: sideways at the same depth, down and up with the weight of each cell.
         let wt = &self.liq_w;
         for _ in 0..2 {
-            self.liq_p.par_chunks_mut(W).enumerate().filter(|(y, _)| rows[*y]).for_each(|(y, p)| {
-                let wt = &wt[y * W..(y + 1) * W];
-                for i in 1..W {
+            self.liq_p.par_chunks_mut(W()).enumerate().filter(|(y, _)| rows[*y]).for_each(|(y, p)| {
+                let wt = &wt[y * W()..(y + 1) * W()];
+                for i in 1..W() {
                     if wt[i] > 0.0 && wt[i - 1] > 0.0 && p[i - 1] > p[i] {
                         p[i] = p[i - 1];
                     }
                 }
-                for i in (0..W - 1).rev() {
+                for i in (0..W() - 1).rev() {
                     if wt[i] > 0.0 && wt[i + 1] > 0.0 && p[i + 1] > p[i] {
                         p[i] = p[i + 1];
                     }
@@ -389,23 +389,23 @@ impl World {
             let p = super::par::Shared::new(&mut self.liq_p);
             super::par::column_bands(|xs| {
                 // SAFETY (both sweeps): a band only reaches its own columns.
-                for y in (1..H).filter(|&y| rows[y] && rows[y - 1]) {
+                for y in (1..H()).filter(|&y| rows[y] && rows[y - 1]) {
                     for x in xs.clone() {
-                        let i = y * W + x;
-                        if wt[i] > 0.0 && wt[i - W] > 0.0 {
-                            let up = unsafe { *p.at(i - W) };
+                        let i = y * W() + x;
+                        if wt[i] > 0.0 && wt[i - W()] > 0.0 {
+                            let up = unsafe { *p.at(i - W()) };
                             let here = unsafe { p.at(i) };
                             *here = here.max(up + wt[i]);
                         }
                     }
                 }
-                for y in (0..H - 1).rev().filter(|&y| rows[y] && rows[y + 1]) {
+                for y in (0..H() - 1).rev().filter(|&y| rows[y] && rows[y + 1]) {
                     for x in xs.clone() {
-                        let i = y * W + x;
-                        if wt[i] > 0.0 && wt[i + W] > 0.0 {
-                            let down = unsafe { *p.at(i + W) };
+                        let i = y * W() + x;
+                        if wt[i] > 0.0 && wt[i + W()] > 0.0 {
+                            let down = unsafe { *p.at(i + W()) };
                             let here = unsafe { p.at(i) };
-                            *here = here.max(down - wt[i + W]);
+                            *here = here.max(down - wt[i + W()]);
                         }
                     }
                 }
@@ -432,7 +432,7 @@ impl World {
             if excess <= strength || excess * (p.cells as f32) < BURST_ENERGY {
                 continue;
             }
-            let (x, y) = ((wall % W) as i32, (wall / W) as i32);
+            let (x, y) = ((wall % W()) as i32, (wall / W()) as i32);
             self.burst(x, y, excess, p.cells);
             self.bursts.push((x, y, p.pressure));
             // Opened: the pocket is part of the open air until the next count.
@@ -636,7 +636,7 @@ mod tests {
         for x in x0..=x1 {
             for y in y0..=y1 {
                 w.set(x, y, m);
-                w.temp[y as usize * W + x as usize] = t;
+                w.temp[y as usize * W() + x as usize] = t;
             }
         }
     }

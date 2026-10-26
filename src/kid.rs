@@ -202,14 +202,14 @@ pub struct Kids {
 }
 
 fn floor(world: &World, x: i32, y: i32) -> bool {
-    let x = x.clamp(0, W as i32 - 1);
+    let x = x.clamp(0, W() as i32 - 1);
     world.hard_for_car(x, y) || world.at(x, y).kind() == Kind::Liquid
 }
 
 /// Whether the cell (x, y) holds him up when his feet were on row `feet`: a floor, or a tree he
 /// comes down on (or steps up onto, `climb` rows at most). He walks through a trunk.
 fn bears(world: &World, x: i32, y: i32, feet: i32, climb: i32) -> bool {
-    floor(world, x, y) || world.bears(x.clamp(0, W as i32 - 1), y, feet as f32, climb as f32)
+    floor(world, x, y) || world.bears(x.clamp(0, W() as i32 - 1), y, feet as f32, climb as f32)
 }
 
 /// The ground he can stand on in column `x` near row `y`: the first floor cell with room above it,
@@ -220,8 +220,8 @@ fn ground_near(world: &World, x: i32, y: i32, up: i32, down: i32) -> Option<i32>
 
 /// The ground seen from the sky over column `x` (None over water or a bottomless hole).
 fn ground_from_top(world: &World, x: i32) -> Option<i32> {
-    let x = x.clamp(0, W as i32 - 1);
-    (0..H as i32).find(|&y| floor(world, x, y)).filter(|&y| world.at(x, y).kind() != Kind::Liquid)
+    let x = x.clamp(0, W() as i32 - 1);
+    (0..H() as i32).find(|&y| floor(world, x, y)).filter(|&y| world.at(x, y).kind() != Kind::Liquid)
 }
 
 impl Kids {
@@ -253,16 +253,16 @@ impl Kids {
         let left_first = self.rand() < 0.5;
         let mut start = None;
         for left in [left_first, !left_first] {
-            let edge = if left { 0 } else { W as i32 - 1 };
+            let edge = if left { 0 } else { W() as i32 - 1 };
             if let Some(y) = ground_from_top(world, edge) {
-                let x = if left { -10.0 } else { W as f32 + 10.0 };
+                let x = if left { -10.0 } else { W() as f32 + 10.0 };
                 start = Some((x, y as f32, if left { 1.0 } else { -1.0 }, false));
                 break;
             }
         }
         if start.is_none() {
             for _ in 0..20 {
-                let x = self.between(60.0, W as f32 - 60.0);
+                let x = self.between(60.0, W() as f32 - 60.0);
                 if ground_from_top(world, x as i32).is_some() {
                     start = Some((x, -30.0, if self.rand() < 0.5 { 1.0 } else { -1.0 }, true));
                     break;
@@ -423,7 +423,7 @@ impl Kids {
             }
         }
         // Gone off a side of the world on his way home, or fell out of it.
-        if (k.age > k.stay && (k.x < -14.0 || k.x > W as f32 + 14.0)) || k.y > H as f32 + 40.0 {
+        if (k.age > k.stay && (k.x < -14.0 || k.x > W() as f32 + 14.0)) || k.y > H() as f32 + 40.0 {
             return;
         }
         k.talk_in -= dt;
@@ -444,14 +444,14 @@ impl Kids {
     fn walk(&mut self, k: &mut Kid, world: &World, dt: f32, pace: f32) -> bool {
         let leaving = k.age > k.stay;
         // Out of the world (coming in, or going home), the edge row is the ground.
-        let col = |x: f32| (x as i32).clamp(0, W as i32 - 1);
+        let col = |x: f32| (x as i32).clamp(0, W() as i32 - 1);
         let in_liquid = world.at(col(k.x), k.y as i32).kind() == Kind::Liquid;
         let speed = SPEED * pace * if in_liquid { 0.5 } else { 1.0 };
         k.stride += speed * dt;
         // He turns round before an edge of the world, except on the way home. Only when walking
         // towards it: near an edge (or still outside, coming in) he always walks back in.
         let ahead_x = k.x + k.dir * 3.0;
-        let outwards = (k.dir < 0.0 && ahead_x < 8.0) || (k.dir > 0.0 && ahead_x > W as f32 - 8.0);
+        let outwards = (k.dir < 0.0 && ahead_x < 8.0) || (k.dir > 0.0 && ahead_x > W() as f32 - 8.0);
         if !leaving && outwards {
             k.dir = -k.dir;
             return false;
@@ -510,12 +510,12 @@ impl Kids {
         k.vy += GRAVITY * dt;
         let (nx, ny) = (k.x + k.vx * dt, k.y + k.vy * dt);
         // He bumps into walls (not on the way up: he jumps over them) and ceilings.
-        if k.vy >= 0.0 && (2..14).any(|d| floor(world, nx as i32 + k.dir as i32 * 3, ny as i32 - d)) && (0.0..W as f32).contains(&nx) {
+        if k.vy >= 0.0 && (2..14).any(|d| floor(world, nx as i32 + k.dir as i32 * 3, ny as i32 - d)) && (0.0..W() as f32).contains(&nx) {
             k.vx = 0.0;
         } else {
             k.x = nx;
         }
-        if k.vy < 0.0 && floor(world, k.x as i32, ny as i32 - HEIGHT as i32) && (0.0..W as f32).contains(&k.x) {
+        if k.vy < 0.0 && floor(world, k.x as i32, ny as i32 - HEIGHT as i32) && (0.0..W() as f32).contains(&k.x) {
             k.vy = 0.0;
         }
         if k.act == Act::Flip {
@@ -523,7 +523,7 @@ impl Kids {
             k.angle = (k.angle + k.dir * TAU * dt / 0.72).clamp(-TAU, TAU);
         }
         let landed = if k.vy > 0.0 {
-            let x = (k.x as i32).clamp(0, W as i32 - 1);
+            let x = (k.x as i32).clamp(0, W() as i32 - 1);
             ((k.y as i32)..=(ny as i32).max(k.y as i32)).find(|&gy| bears(world, x, gy, k.y as i32, 0) && !floor(world, x, gy - 1))
         } else {
             None
@@ -556,7 +556,7 @@ impl Kids {
         let y = k.y as i32;
         let flat = (4..=30).step_by(4).all(|d| {
             let x = (k.x + k.dir * d as f32) as i32;
-            (0..W as i32).contains(&x) && ground_near(world, x, y, 2, 2).map_or(false, |g| world.at(x, g).kind() != Kind::Liquid) && !(3..=24).any(|h| floor(world, x, y - h))
+            (0..W() as i32).contains(&x) && ground_near(world, x, y, 2, 2).map_or(false, |g| world.at(x, g).kind() != Kind::Liquid) && !(3..=24).any(|h| floor(world, x, y - h))
         });
         if !flat {
             return;
@@ -591,7 +591,7 @@ impl Kids {
 
     fn go_home(&mut self, k: &mut Kid) {
         // He walks to the nearer side; if he is stuck far from it, he leaps away.
-        let home = if k.x < W as f32 / 2.0 { -1.0 } else { 1.0 };
+        let home = if k.x < W() as f32 / 2.0 { -1.0 } else { 1.0 };
         if k.age > k.stay + 25.0 || k.stay == 0.0 {
             k.act = Act::Leap;
             k.act_t = 0.0;
@@ -677,8 +677,8 @@ impl Kids {
     fn remark(&mut self, k: &Kid, world: &World, sights: &Sights) -> String {
         let mut count = [0u32; Mat::ALL.len()];
         let (cx, cy) = (k.x as i32, k.y as i32);
-        for y in ((cy - 120).max(0)..(cy + 30).min(H as i32)).step_by(3) {
-            for x in ((cx - 150).max(0)..(cx + 150).min(W as i32)).step_by(3) {
+        for y in ((cy - 120).max(0)..(cy + 30).min(H() as i32)).step_by(3) {
+            for x in ((cx - 150).max(0)..(cx + 150).min(W() as i32)).step_by(3) {
                 count[world.raw(x, y) as usize] += 1;
             }
         }
@@ -1067,8 +1067,8 @@ mod tests {
     /// A flat stone floor across the world at row `ground`.
     fn flat(ground: i32) -> World {
         let mut w = World::new_static();
-        for x in 0..W as i32 {
-            for y in ground..H as i32 {
+        for x in 0..W() as i32 {
+            for y in ground..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -1136,7 +1136,7 @@ mod tests {
             let k = kids.kid.as_mut().unwrap();
             if (k.dir > 0.0) != left {
                 // Come in by the other side.
-                k.x = W as f32 - k.x;
+                k.x = W() as f32 - k.x;
                 k.dir = -k.dir;
             }
             k.stay = 1000.0;
@@ -1144,9 +1144,9 @@ mod tests {
             for _ in 0..60 * 40 {
                 kids.update(1.0 / 60.0, &world, &Sights::default());
                 let k = kids.kid.as_ref().expect("still here");
-                far = far.max(if left { k.x } else { W as f32 - k.x });
+                far = far.max(if left { k.x } else { W() as f32 - k.x });
             }
-            assert!(far > W as f32 / 2.0, "from the {} side, he got only {far} cells in", if left { "left" } else { "right" });
+            assert!(far > W() as f32 / 2.0, "from the {} side, he got only {far} cells in", if left { "left" } else { "right" });
         }
     }
 
@@ -1156,7 +1156,7 @@ mod tests {
         let mut kids = Kids::new();
         assert!(kids.summon(&world));
         let k = kids.kid.as_mut().unwrap();
-        k.x = W as f32 - 6.0;
+        k.x = W() as f32 - 6.0;
         k.y = 400.0;
         k.dir = 1.0;
         k.age = 10.0;
@@ -1164,7 +1164,7 @@ mod tests {
         k.trick_in = 1000.0;
         run(&mut kids, &world, 5.0);
         let k = kids.kid.as_ref().unwrap();
-        assert!(k.x < W as f32 - 50.0, "back into the world: {}", k.x);
+        assert!(k.x < W() as f32 - 50.0, "back into the world: {}", k.x);
     }
 
     #[test]

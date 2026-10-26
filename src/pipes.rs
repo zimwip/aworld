@@ -9,7 +9,9 @@
 //! locks (basins joined by valved pipes), siphons that run over a hump, and their limit: a column of
 //! liquid cannot be sucked higher than the atmosphere can hold it, and then the siphon breaks.
 
-use crate::world::{Kind, Mat, World, H, W};
+use crate::world::{Kind, Mat, World, H};
+#[cfg(test)]
+use crate::world::W;
 
 /// How high (in cells) the atmosphere can hold a column of liquid: the limit of a siphon's hump
 /// above the surface it draws from.
@@ -33,7 +35,7 @@ pub trait Env {
     fn liquid_at(&self, p: (f32, f32)) -> Option<(Mat, f32)>;
     /// Height above the bottom of the world.
     fn elevation(&self, p: (f32, f32)) -> f32 {
-        H as f32 - p.1
+        H() as f32 - p.1
     }
     /// Removes one cell of liquid next to `p`.
     fn take_liquid(&mut self, p: (f32, f32)) -> Option<Mat>;
@@ -61,7 +63,7 @@ impl Env for World {
         while y > 0 && is_liquid(self.raw(x, y - 1)) {
             y -= 1;
         }
-        Some((m, H as f32 - y as f32))
+        Some((m, H() as f32 - y as f32))
     }
 
     fn take_liquid(&mut self, p: (f32, f32)) -> Option<Mat> {
@@ -467,8 +469,6 @@ fn dist(a: (f32, f32), b: (f32, f32)) -> f32 {
     ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
 }
 
-#[allow(dead_code)]
-const _: usize = W;
 
 #[cfg(test)]
 mod tests {
@@ -478,9 +478,9 @@ mod tests {
     /// bottom of the world), on a static floor.
     fn vessels(left_level: i32, right_level: i32) -> World {
         let mut w = World::new_static();
-        let floor = H as i32 - 20;
-        for x in 0..W as i32 {
-            for y in floor..H as i32 {
+        let floor = H() as i32 - 20;
+        for x in 0..W() as i32 {
+            for y in floor..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -494,7 +494,7 @@ mod tests {
                     w.set(x, y, Mat::Stone);
                 }
             }
-            for y in (H as i32 - level)..floor {
+            for y in (H() as i32 - level)..floor {
                 for x in x0..x1 {
                     w.set(x, y, Mat::Water);
                 }
@@ -504,12 +504,12 @@ mod tests {
     }
 
     fn water_in(w: &World, x0: i32, x1: i32) -> usize {
-        (0..H as i32).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water).count()
+        (0..H() as i32).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water).count()
     }
 
     fn surface(w: &World, x: i32) -> f32 {
-        let y = (0..H as i32).find(|&y| w.raw(x, y) == Mat::Water).unwrap_or(H as i32);
-        H as f32 - y as f32
+        let y = (0..H() as i32).find(|&y| w.raw(x, y) == Mat::Water).unwrap_or(H() as i32);
+        H() as f32 - y as f32
     }
 
     fn run(p: &mut Plumbing, w: &mut World, steps: usize) -> Vec<Event> {
@@ -532,7 +532,7 @@ mod tests {
     /// A pipe from deep in the left vessel to deep in the right one, with a hump of `rise` above
     /// the water between them (given as three straight pipes).
     fn u_tube(p: &mut Plumbing, rise: f32) {
-        let low = (H as f32) - 40.0; // y of the pipe ends, well under the surface of both vessels
+        let low = (H() as f32) - 40.0; // y of the pipe ends, well under the surface of both vessels
         let top = low - rise;
         let mut u = uids();
         p.add_pipe((140.0, low), (140.0, top), 1, &mut u);
@@ -561,7 +561,7 @@ mod tests {
         let mut w = vessels(90, 20);
         let mut p = Plumbing::default();
         u_tube(&mut p, 90.0 - 20.0 + 20.0 + 20.0); // top at elevation 40 + rise
-        let crest = p.pipes.iter().map(|q| H as f32 - q.a.1.min(q.b.1)).fold(0.0f32, f32::max);
+        let crest = p.pipes.iter().map(|q| H() as f32 - q.a.1.min(q.b.1)).fold(0.0f32, f32::max);
         assert!(crest > 90.0 + 15.0, "the hump is above the water: {crest}");
         run(&mut p, &mut w, 5000);
         let (l, r) = (surface(&w, 130), surface(&w, 330));
@@ -629,10 +629,10 @@ mod tests {
         let mut w = vessels(100, 30);
         let mut p = Plumbing::default();
         p.add_pipe((200.0, 200.0), (260.0, 300.0), 1, &mut uids());
-        let before = water_in(&w, 0, W as i32);
+        let before = water_in(&w, 0, W() as i32);
         run(&mut p, &mut w, 300);
         // Only a few cells evaporate from the open vessels.
-        let after = water_in(&w, 0, W as i32);
+        let after = water_in(&w, 0, W() as i32);
         assert!(after <= before && after + 5 >= before, "{before} -> {after}");
     }
 
