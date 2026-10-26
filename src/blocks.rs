@@ -1078,7 +1078,6 @@ pub struct Spring {
     pub p1: Vec2,
     /// How far it is stretched (0 = at rest, 1 = about to snap).
     pub stress: f32,
-    pub snapped: bool,
     bead: Option<RigidBodyHandle>,
     joint: Option<ImpulseJointHandle>,
 }
@@ -1097,7 +1096,6 @@ impl Spring {
             p0,
             p1,
             stress: 0.0,
-            snapped: false,
             bead: None,
             joint: None,
         }
@@ -1108,7 +1106,7 @@ impl Spring {
     }
 
     pub fn fresh(&self) -> Spring {
-        Spring { bead: None, joint: None, stress: 0.0, snapped: false, ..self.clone() }
+        Spring { bead: None, joint: None, stress: 0.0, ..self.clone() }
     }
 
     pub fn attached_to(&self, uid: u32) -> bool {

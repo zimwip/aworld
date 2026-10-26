@@ -359,21 +359,6 @@ mod boom {
         w
     }
 
-    fn dump(w: &World, title: &str) {
-        eprintln!("--- {title}");
-        for y in (290..400).step_by(5) {
-            let row: String = (360..600).step_by(3).map(|x| match w.cells[y * W + x].m {
-                Mat::Water => '~',
-                Mat::Sand => 's',
-                Mat::Stone => '#',
-                Mat::Steam | Mat::Cloud => 'o',
-                Mat::Empty => '.',
-                _ => '?',
-            }).collect();
-            eprintln!("{y:3} {row}");
-        }
-    }
-
     #[test]
     fn a_shallow_underwater_blast_throws_a_plume_a_deep_one_does_not() {
         let spray = |depth: i32| {

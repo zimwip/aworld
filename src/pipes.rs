@@ -228,6 +228,7 @@ impl Plumbing {
         self.pipes.is_empty()
     }
 
+    #[cfg(test)]
     pub fn pipe_index(&self, uid: u32) -> Option<usize> {
         self.pipes.iter().position(|p| p.uid == uid)
     }

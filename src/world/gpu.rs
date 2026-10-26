@@ -69,10 +69,11 @@ mod native {
             // A lost device (the driver gave up) must not take the game with it.
             device.on_uncaptured_error(Box::new(|e| eprintln!("aworld: GPU: {e}")));
             let name = format!("{} ({:?})", info.name, info.backend);
+            let gpu = Gpu { device, queue, name, timestamps };
             if std::env::var_os("AWORLD_PROFILE").is_some() || wanted() == Use::Always {
-                eprintln!("aworld: GPU: {name}");
+                eprintln!("aworld: GPU: {}", gpu.name);
             }
-            Some(Gpu { device, queue, name, timestamps })
+            Some(gpu)
         })
         .as_ref()
     }

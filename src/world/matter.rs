@@ -26,6 +26,8 @@ use super::{density, Kind, Mat, World, H, W};
 pub enum Cond {
     /// Temperature of the cell, °C.
     TempAbove(f32),
+    /// (No change uses it yet; the thermal rules already handle it.)
+    #[allow(dead_code)]
     TempBelow(f32),
     /// Lasting pressure at the cell (the weight of what is above it), atm.
     PressureAbove(f32),
@@ -48,15 +50,13 @@ pub struct Transition {
     pub latent: f32,
     /// 1: at once. N: one chance in N per step while the conditions hold (slow changes).
     pub every: u32,
-    /// Whether the matter changes back when the conditions no longer hold.
-    pub reversible: bool,
 }
 
 use Cond::*;
 
 /// A change by heat alone, with no latent heat, that does not go back.
 const fn heat(from: Mat, to: Mat, when: &'static [Cond], every: u32) -> Transition {
-    Transition { from, to, when, latent: 0.0, every, reversible: false }
+    Transition { from, to, when, latent: 0.0, every }
 }
 
 /// Every change of matter but the changes of state with a latent heat (`FUSIONS`) and the
@@ -83,22 +83,22 @@ pub const TRANSITIONS: &[Transition] = &[
     heat(Mat::DeadLeaf, Mat::Charcoal, &[TempAbove(WOOD_IGNITE_C), NoAir], 40),
     // Weight.
     // Soil under standing water soaks into silt.
-    Transition { from: Mat::Dirt, to: Mat::Mud, when: &[Under(Kind::Liquid)], latent: 0.0, every: 60_000, reversible: false },
+    Transition { from: Mat::Dirt, to: Mat::Mud, when: &[Under(Kind::Liquid)], latent: 0.0, every: 60_000 },
     // Buried mud squeezed by the weight above it loses its water and sets into clay.
-    Transition { from: Mat::Mud, to: Mat::Clay, when: &[PressureAbove(1.6)], latent: 0.0, every: 80_000, reversible: false },
+    Transition { from: Mat::Mud, to: Mat::Clay, when: &[PressureAbove(1.6)], latent: 0.0, every: 80_000 },
     // Clay and sand under a great weight become rock: shale and sandstone.
-    Transition { from: Mat::Clay, to: Mat::Stone, when: &[PressureAbove(3.0)], latent: 0.0, every: 400_000, reversible: false },
-    Transition { from: Mat::Sand, to: Mat::Stone, when: &[PressureAbove(3.2)], latent: 0.0, every: 400_000, reversible: false },
+    Transition { from: Mat::Clay, to: Mat::Stone, when: &[PressureAbove(3.0)], latent: 0.0, every: 400_000 },
+    Transition { from: Mat::Sand, to: Mat::Stone, when: &[PressureAbove(3.2)], latent: 0.0, every: 400_000 },
     // Deep snow is pressed into ice by its own weight (how glaciers form).
-    Transition { from: Mat::Snow, to: Mat::Ice, when: &[PressureAbove(1.08)], latent: 0.0, every: 20_000, reversible: false },
+    Transition { from: Mat::Snow, to: Mat::Ice, when: &[PressureAbove(1.08)], latent: 0.0, every: 20_000 },
     // A detonation packs soil tight and snow into ice, and fuses sand into rock.
-    Transition { from: Mat::Dirt, to: Mat::Clay, when: &[ShockAbove(5_000.0)], latent: 0.0, every: 1, reversible: false },
-    Transition { from: Mat::Grass, to: Mat::Clay, when: &[ShockAbove(5_000.0)], latent: 0.0, every: 1, reversible: false },
-    Transition { from: Mat::Snow, to: Mat::Ice, when: &[ShockAbove(200.0)], latent: 0.0, every: 1, reversible: false },
-    Transition { from: Mat::Sand, to: Mat::Stone, when: &[ShockAbove(30_000.0)], latent: 0.0, every: 1, reversible: false },
+    Transition { from: Mat::Dirt, to: Mat::Clay, when: &[ShockAbove(5_000.0)], latent: 0.0, every: 1 },
+    Transition { from: Mat::Grass, to: Mat::Clay, when: &[ShockAbove(5_000.0)], latent: 0.0, every: 1 },
+    Transition { from: Mat::Snow, to: Mat::Ice, when: &[ShockAbove(200.0)], latent: 0.0, every: 1 },
+    Transition { from: Mat::Sand, to: Mat::Stone, when: &[ShockAbove(30_000.0)], latent: 0.0, every: 1 },
     // Carbon squeezed while white hot: diamond. It stays diamond afterwards (it is metastable).
-    Transition { from: Mat::Charcoal, to: Mat::Diamond, when: &[ShockAbove(50_000.0), TempAbove(1_500.0)], latent: 0.0, every: 1, reversible: false },
-    Transition { from: Mat::Charcoal, to: Mat::Diamond, when: &[PressureAbove(50_000.0), TempAbove(1_500.0)], latent: 0.0, every: 1, reversible: false },
+    Transition { from: Mat::Charcoal, to: Mat::Diamond, when: &[ShockAbove(50_000.0), TempAbove(1_500.0)], latent: 0.0, every: 1 },
+    Transition { from: Mat::Charcoal, to: Mat::Diamond, when: &[PressureAbove(50_000.0), TempAbove(1_500.0)], latent: 0.0, every: 1 },
 ];
 
 /// The solid and the liquid state of one matter, the temperature where one turns into the other,

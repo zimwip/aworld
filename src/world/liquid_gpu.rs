@@ -164,7 +164,8 @@ mod native {
         code: wgpu::Buffer,
         fill: wgpu::Buffer,
         temp: wgpu::Buffer,
-        gaspa: wgpu::Buffer,
+        /// Only the kernels read it, through `binds`.
+        _gaspa: wgpu::Buffer,
         tables: wgpu::Buffer,
         class: wgpu::Buffer,
         p: wgpu::Buffer,
@@ -341,7 +342,7 @@ mod native {
                 code,
                 fill,
                 temp,
-                gaspa,
+                _gaspa: gaspa,
                 tables,
                 class,
                 p,
