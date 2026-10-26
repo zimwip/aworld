@@ -542,6 +542,8 @@ const SNOW_CREEP: u32 = 8;
 pub const VAPOUR_PER_WATER: usize = 4;
 /// The fastest a raindrop falls (eighths of a cell per step): a little faster than a grain of dust.
 const DROP_TERMINAL: u8 = 40;
+/// A bubble of gas in a liquid climbs a cell one step in this many (a metre a second).
+const BUBBLE_RISE: u32 = 10;
 /// How much of the wind's speed a falling drop takes on sideways.
 const DROP_DRIFT: f32 = 0.8;
 /// How many times faster a drop in mid-air evaporates than the same water lying in a puddle.
@@ -2621,6 +2623,22 @@ impl World {
     /// cold gas draws together. Returns true if the cell moved.
     fn buoyancy(&mut self, x: i32, y: i32) -> bool {
         let i = Self::idx(x, y);
+        // A bubble: gas with liquid over it rises through the liquid (Archimedes), about half a
+        // metre a second, straight up or slantwise; the liquid takes its place. (The physical
+        // liquids treat a gas cell as a wall, so without this a bubble stayed shut in.)
+        if self.liquid_physics && self.at(x, y - 1).kind() == Kind::Liquid {
+            // (A bubble keeps its zone awake: it moves too seldom to do so by itself.)
+            self.zones.wake(i);
+            if self.chance(BUBBLE_RISE) {
+                let d = self.dir();
+                for dx in [0, d, -d] {
+                    if self.at(x + dx, y - 1).kind() == Kind::Liquid && self.mask_free(x + dx, y - 1) && self.mask[i] == 0 {
+                        self.swap((x, y), (x + dx, y - 1));
+                        return true;
+                    }
+                }
+            }
+        }
         // Foliage is no lid: gas under leaves and branches slips up through them to the open air
         // above (a tree breathes; the steam of a pond under it does not stay trapped).
         if matches!(self.at(x, y - 1), Mat::Leaf | Mat::Branch | Mat::Sapling) && self.chance(2) {

@@ -448,7 +448,9 @@ fn back_v(@builtin(global_invocation_id) id: vec3<u32>) {
     let a = kind_at(xi, yi - 1);
     let bb = kind_at(xi, yi);
     var was = clamp(v2[e] + 0.5 * (v[e] - back), lh.x, lh.y);
-    if a != bb { was = was / (1.0 + CALM * P.dt); }
+    // (Not a surface that falls: liquid over air, or liquid under air with air under it.)
+    let falls = (a >= WET && bb == AIR) || (a == AIR && bb >= WET && kind_at(xi, yi + 1) == AIR);
+    if a != bb && !falls { was = was / (1.0 + CALM * P.dt); }
     let fall = was + G * P.dt;
     if a != FULLISH && bb != FULLISH {
         let f = clamp(fall, -LAUNCH, SPRAY);

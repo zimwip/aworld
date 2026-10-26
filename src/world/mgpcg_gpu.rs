@@ -152,6 +152,21 @@ mod native {
         Stamper { set: None, marks, max: 0 }
     }
 
+    /// A compute pass of the solver, remembering what is bound.
+    struct Pass<'a> {
+        pass: wgpu::ComputePass<'a>,
+        params: Option<(usize, usize)>,
+        level: Option<(usize, bool)>,
+        under: Option<usize>,
+        cg: bool,
+    }
+
+    impl<'a> Pass<'a> {
+        fn new(enc: &'a mut wgpu::CommandEncoder) -> Self {
+            Pass { pass: enc.begin_compute_pass(&Default::default()), params: None, level: None, under: None, cg: false }
+        }
+    }
+
     pub struct PressureGpu {
         gpu: &'static Gpu,
         levels: Vec<GpuLevel>,
@@ -313,15 +328,28 @@ mod native {
         /// One kernel over level `l` (its grids as group 1, the level under as group 2), with
         /// `groups` workgroups.
         #[allow(clippy::too_many_arguments)]
-        fn run(&self, pass: &mut wgpu::ComputePass, pipeline: &wgpu::ComputePipeline, l: usize, colour: usize, pre: bool, groups: (u32, u32)) {
+        fn run(&self, pass: &mut Pass, pipeline: &wgpu::ComputePipeline, l: usize, colour: usize, pre: bool, groups: (u32, u32)) {
             let lev = &self.levels[l];
             let under = &self.levels[(l + 1).min(self.levels.len() - 1)];
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &self.params_bind, &[Self::slot(l, colour)]);
-            pass.set_bind_group(1, if pre { lev.pre.as_ref().unwrap() } else { &lev.bind }, &[]);
-            pass.set_bind_group(2, &under.bind, &[]);
-            pass.set_bind_group(3, &self.cg, &[]);
-            pass.dispatch_workgroups(groups.0, groups.1, 1);
+            pass.pass.set_pipeline(pipeline);
+            // (Each group set only when what it binds changes: the launches share the layout.)
+            if pass.params != Some((l, colour)) {
+                pass.pass.set_bind_group(0, &self.params_bind, &[Self::slot(l, colour)]);
+                pass.params = Some((l, colour));
+            }
+            if pass.level != Some((l, pre)) {
+                pass.pass.set_bind_group(1, if pre { lev.pre.as_ref().unwrap() } else { &lev.bind }, &[]);
+                pass.level = Some((l, pre));
+            }
+            if pass.under != Some(l) {
+                pass.pass.set_bind_group(2, &under.bind, &[]);
+                pass.under = Some(l);
+            }
+            if !pass.cg {
+                pass.pass.set_bind_group(3, &self.cg, &[]);
+                pass.cg = true;
+            }
+            pass.pass.dispatch_workgroups(groups.0, groups.1, 1);
         }
 
         /// The workgroups of a kernel over every cell of a `w` x `h` grid, 16 x 16 a group.
@@ -341,14 +369,14 @@ mod native {
             let tiles = self.tiles_of(l);
             if l + 1 == self.used {
                 // All the coarsest level's sweeps in one launch (one workgroup).
-                let mut pass = enc.begin_compute_pass(&Default::default());
+                let mut pass = Pass::new(enc);
                 self.run(&mut pass, &k.coarsest, l, 0, pre, (1, 1));
                 return;
             }
             let under = &self.levels[l + 1];
             let ctiles = self.under_tiles(l, 0);
             {
-                let mut pass = enc.begin_compute_pass(&Default::default());
+                let mut pass = Pass::new(enc);
                 for _ in 0..SMOOTH {
                     for colour in 0..2 {
                         self.run(&mut pass, &k.smooth, l, colour, pre, tiles);
@@ -364,7 +392,7 @@ mod native {
             if l == 0 {
                 stamps.at(enc, "pression: niveaux grossiers");
             }
-            let mut pass = enc.begin_compute_pass(&Default::default());
+            let mut pass = Pass::new(enc);
             self.run(&mut pass, &k.prolong, l, 0, pre, tiles);
             for _ in 0..SMOOTH {
                 for colour in [1, 0] {
@@ -421,7 +449,7 @@ mod native {
             time("1000 lancements d'un noyau d'un fil", n, "lancement", &mut || {
                 let mut enc = self.encoder();
                 {
-                    let mut pass = enc.begin_compute_pass(&Default::default());
+                    let mut pass = Pass::new(&mut enc);
                     for _ in 0..n {
                         self.run(&mut pass, &k.rho, 0, 0, false, (1, 1));
                     }
@@ -434,7 +462,7 @@ mod native {
             time(&format!("100 balayages de la grille {w}x{h}"), n, "balayage", &mut || {
                 let mut enc = self.encoder();
                 {
-                    let mut pass = enc.begin_compute_pass(&Default::default());
+                    let mut pass = Pass::new(&mut enc);
                     for _ in 0..n {
                         for colour in 0..2 {
                             self.run(&mut pass, &k.smooth, 0, colour, false, tiles);
@@ -448,7 +476,7 @@ mod native {
             time(&format!("100 réductions sur la grille {w}x{h}"), n, "réduction", &mut || {
                 let mut enc = self.encoder();
                 {
-                    let mut pass = enc.begin_compute_pass(&Default::default());
+                    let mut pass = Pass::new(&mut enc);
                     for _ in 0..n {
                         self.run(&mut pass, &k.dot_rz, 0, 0, false, line);
                         self.run(&mut pass, &k.rho, 0, 0, false, (1, 1));
@@ -590,7 +618,7 @@ mod native {
             let k = &self.kernels;
             let line = self.line();
             {
-                let mut pass = enc.begin_compute_pass(&Default::default());
+                let mut pass = Pass::new(enc);
                 for l in 0..self.used - 1 {
                     let ctiles = self.under_tiles(l, 0);
                     self.run(&mut pass, &k.coarsen_kind, l, 0, false, ctiles);
@@ -612,7 +640,7 @@ mod native {
             let line = self.line();
             for _ in 0..n {
                 {
-                    let mut pass = enc.begin_compute_pass(&Default::default());
+                    let mut pass = Pass::new(enc);
                     self.run(&mut pass, &k.direction, 0, 0, false, line);
                     self.run(&mut pass, &k.apply, 0, 0, false, line);
                     self.run(&mut pass, &k.alpha, 0, 0, false, (1, 1));
@@ -659,7 +687,7 @@ mod native {
             // (z is the fine `x` of the preconditioner's set.)
             enc.clear_buffer(&self.z, 0, None);
             self.vcycle(enc, 0, true, stamps);
-            let mut pass = enc.begin_compute_pass(&Default::default());
+            let mut pass = Pass::new(enc);
             self.run(&mut pass, &self.kernels.dot_rz, 0, 0, false, self.line());
             self.run(&mut pass, &self.kernels.rho, 0, 0, false, (1, 1));
             drop(pass);
