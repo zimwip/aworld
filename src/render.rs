@@ -373,8 +373,8 @@ pub struct Renderer {
 
 /// Cells per texel of the light map.
 pub const LS: usize = 6;
-const LW: usize = W / LS;
-const LH: usize = H / LS;
+pub const LW: usize = W / LS;
+pub const LH: usize = H / LS;
 
 /// Fully cloudy, one square of the light map lets this fraction of the sunlight through, as the
 /// simulation does (it takes 20 % per cell of cloud).
