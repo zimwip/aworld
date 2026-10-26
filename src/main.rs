@@ -38,7 +38,7 @@ use mech::{GearSize, Mechanism};
 use mechgame::MechDraft;
 use sound::{Ev, Mix, Sounds};
 use ui::{draw_icon, rrect, Drawer, Icon, Ui, ACCENT, BG, BLUE, DIM, GREEN, PANEL, RED, TEXT, TILE, TILE_HOT};
-use world::{Biome, Mat, PaintRule, Season, World, H, W};
+use world::{Balance, Biome, Mat, PaintRule, Season, World, H, W};
 
 /// Simulation steps per second at speed x1 (the rigid bodies use the same 1/60 s step).
 const STEPS_PER_SECOND: f32 = 60.0;
@@ -2187,6 +2187,106 @@ impl Game {
 
     /// The just-for-fun visitors (Beluga, whale, fire engine...), drawn over the world in every
     /// view mode, not only the normal one. A new cameo is drawn here.
+    /// The free bodies (not held by anything fixed) in the stress view: the centre of mass, the
+    /// weight and the push of the liquids there and their sum, what it rests on (green: the
+    /// vertical through the centre of mass falls on it; red: beyond it, it tips over the edge),
+    /// and the moment of the weight about that edge. The bodies in flight show their centre of
+    /// mass and velocity.
+    fn draw_free_bodies(&self, view: View, ui: &Ui) {
+        let arrow = |a: Vec2, d: Vec2, len: f32, col: Color| {
+            let b = a + d * len;
+            draw_line(a.x, a.y, b.x, b.y, 3.0, col);
+            let side = vec2(-d.y, d.x) * 6.0;
+            draw_triangle(b + d * 4.0, b - d * 8.0 + side, b - d * 8.0 - side, col);
+        };
+        // The centre of mass: a circle quartered black and white.
+        let centre = |c: Vec2, r: f32| {
+            draw_circle(c.x, c.y, r, WHITE);
+            draw_triangle(c, c + vec2(r, 0.0), c + vec2(0.0, -r), BLACK);
+            draw_triangle(c, c + vec2(-r, 0.0), c + vec2(0.0, r), BLACK);
+            draw_circle_lines(c.x, c.y, r, 1.5, BLACK);
+        };
+        let length = |f: f32| (f.sqrt() * 4.0).clamp(18.0, 140.0);
+        // Text on a dark band, readable over the sky.
+        let label = |s: &str, x: f32, y: f32, col: Color| {
+            draw_rectangle(x - 3.0, y - 12.0, ui.text_w(s, 13) + 6.0, 16.0, Color::new(0.0, 0.0, 0.0, 0.55));
+            ui.text(s, x, y, 13, col);
+        };
+        // The vertical through the centre of mass, dashed, down to row `y`.
+        let plumb = |c: Vec2, y: f32| {
+            let mut at = c.y;
+            while at < y {
+                draw_line(c.x, at, c.x, (at + 6.0).min(y), 1.5, Color::new(1.0, 1.0, 1.0, 0.7));
+                at += 12.0;
+            }
+        };
+        for b in &self.world.bodies {
+            if b.cells < 30 {
+                continue;
+            }
+            let col = match b.state {
+                Balance::Rests => Color::new(0.35, 0.95, 0.45, 0.95),
+                Balance::Hangs => Color::new(1.0, 0.85, 0.3, 0.95),
+                Balance::Tips | Balance::Waits => Color::new(1.0, 0.35, 0.3, 0.95),
+            };
+            let c = view.to_screen(vec2(b.c.0, b.c.1));
+            let foot = view.to_screen(vec2(b.c.0, b.base));
+            // What it rests on, and the vertical through its centre of mass down to it.
+            let (l, r) = (view.to_screen(vec2(b.span.0, b.base)), view.to_screen(vec2(b.span.1, b.base)));
+            draw_line(l.x, l.y, r.x, r.y, 4.0, col);
+            plumb(c, foot.y);
+            if let Some(h) = b.hinge {
+                let h = view.to_screen(vec2(h.0, h.1));
+                draw_triangle(h, h + vec2(-7.0, 11.0), h + vec2(7.0, 11.0), col);
+            }
+            // The forces at the centre of mass: the weight, the push of the liquids, their sum.
+            let down = vec2(0.0, 1.0);
+            arrow(c, down, length(b.weight), Color::new(1.0, 1.0, 1.0, 0.9));
+            let p = vec2(b.push.0, b.push.1);
+            if p.length() > 1.0 {
+                arrow(c, p.normalize(), length(p.length()), Color::new(0.95, 0.35, 0.95, 0.95));
+                let sum = p + down * b.weight;
+                arrow(c, sum.normalize(), length(sum.length()), Color::new(0.3, 0.85, 1.0, 0.95));
+            }
+            centre(c, 7.0);
+            let state = match b.state {
+                Balance::Rests => format!("tient : marge {:.0} kN·m/m", -b.moment),
+                Balance::Hangs => "accroché au-dessus de son centre".to_string(),
+                Balance::Tips => format!("bascule {} : {:.0} kN·m/m", if b.hinge.is_some_and(|h| h.0 < b.c.0) { "à droite" } else { "à gauche" }, b.moment),
+                Balance::Waits => format!("devrait basculer : {:.0} kN·m/m", b.moment),
+            };
+            label(&format!("{:.1} t/m · poids {:.0} kN/m", b.weight / 9.81, b.weight), c.x + 12.0, c.y - 18.0, WHITE);
+            label(&state, c.x + 12.0, c.y - 1.0, col);
+        }
+        let red = Color::new(1.0, 0.35, 0.3, 0.95);
+        for s in &self.world.slabs {
+            let c = view.to_screen(vec2(s.c.0, s.c.1));
+            let big = s.cells().count() >= 30;
+            if let (Some(h), true) = (s.edge(), big) {
+                // Tipping over its edge: the weight, and its moment about the edge.
+                let h = view.to_screen(vec2(h.0, h.1));
+                draw_triangle(h, h + vec2(-7.0, 11.0), h + vec2(7.0, 11.0), red);
+                plumb(c, h.y);
+                arrow(c, vec2(0.0, 1.0), length(s.weight()), Color::new(1.0, 1.0, 1.0, 0.9));
+            } else {
+                let v = vec2(s.v.0, s.v.1);
+                if v.length() > 0.05 {
+                    arrow(c, v.normalize(), (v.length() * 30.0).clamp(14.0, 120.0), Color::new(0.3, 0.85, 1.0, 0.95));
+                }
+            }
+            centre(c, 6.0);
+            if big {
+                let turns = s.spin * 60.0 / std::f32::consts::TAU;
+                label(&format!("{:.1} t/m · poids {:.0} kN/m", s.weight() / 9.81, s.weight()), c.x + 12.0, c.y - 18.0, WHITE);
+                let what = match s.edge() {
+                    Some(h) => format!("bascule {} : {:.0} kN·m/m · {turns:.2} tr/s", if h.0 < s.c.0 { "à droite" } else { "à gauche" }, s.moment().abs()),
+                    None => format!("en vol · {turns:.2} tr/s"),
+                };
+                label(&what, c.x + 12.0, c.y - 1.0, if s.edge().is_some() { red } else { Color::new(0.3, 0.85, 1.0, 0.95) });
+            }
+        }
+    }
+
     fn draw_cameos(&self, view: View) {
         self.planes.draw(view, self.time);
         self.whales.draw(view);
@@ -2258,6 +2358,7 @@ impl Game {
                 draw_triangle(b + dir * 4.0, b - dir * 8.0 + side, b - dir * 8.0 - side, col);
                 ui.text(&format!("{f:.0} kN/m"), b.x + 6.0, b.y - 6.0, 13, col);
             }
+            self.draw_free_bodies(view, ui);
         }
         let over_ui_now = ui.over_ui();
         let inside_now = !over_ui_now && view.visible().contains(ui.mouse) && !self.show_science;
@@ -3751,7 +3852,7 @@ impl Game {
                 }
                 ui.text("détendu", bar.x, bar.y + 25.0, 11, DIM);
                 ui.text("casse", bar.x + bar.w - 28.0, bar.y + 25.0, 11, DIM);
-                ui.wrapped("Rouge = chargé. Solides : part de la résistance de la section qui porte le reste (au-delà, elle casse). Mécanique : anneau = dents, arc = couple, F = force, % = charge moteur.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
+                ui.wrapped("Rouge = chargé. Solides : part de la résistance de la section qui porte le reste (au-delà, elle casse). Solides libres : centre de gravité, poids, appui (vert : tient, rouge : bascule) et moment. Mécanique : anneau = dents, arc = couple, F = force, % = charge moteur.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
             }
             ViewMode::Simulation => {
                 ui.wrapped("Le panneau « Simulation » choisit le fond (matière, classes, pressions, diff du dernier pas) et les couches (zones, vitesses, gouttes, carte), et fait avancer le monde pas à pas (touche « . »).", bar.x, bar.y + 4.0, bar.w, 11, DIM);
@@ -4211,6 +4312,34 @@ fn demo_tunnel(g: &mut Game) {
     g.world.line((20, y), (460, y), 9, Mat::Empty);
     g.world.tunnel_line((500, y), (940, y), 9);
     g.tool = Tool::Tunnel;
+    g.set_running(true);
+}
+
+/// `--balance`: free bodies on bedrock, for the stress view: a block of stone centred on a
+/// pedestal (it holds), a plank resting off-centre on a post (it holds, just), and a ball of
+/// stone on a long arm whose foot stands in a pit of sand: its centre of mass is far beyond its
+/// foot, and it tips over.
+fn demo_balance(g: &mut Game) {
+    g.empty_world();
+    let floor = 470;
+    let rect = |g: &mut Game, x0: i32, y0: i32, x1: i32, y1: i32, m: Mat| {
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                g.world.set(x, y, m);
+            }
+        }
+    };
+    rect(g, 0, floor, W() as i32 - 1, H() as i32 - 1, Mat::Stone);
+    rect(g, 600, floor, 700, floor + 10, Mat::Sand);
+    rect(g, 60, 400, 120, floor - 1, Mat::Glass);
+    rect(g, 70, 370, 110, 399, Mat::Stone);
+    rect(g, 800, 380, 806, floor - 1, Mat::Glass);
+    rect(g, 770, 374, 830, 379, Mat::Wood);
+    g.world.paint(330, 230, 45, Mat::Stone);
+    g.world.line((370, 240), (650, 470), 8, Mat::Stone);
+    for i in 0..W() * H() {
+        g.world.temp[i] = 15.0;
+    }
     g.set_running(true);
 }
 
@@ -4699,6 +4828,9 @@ async fn main() {
         }
         if args.iter().any(|a| a == "--tunnel") {
             demo_tunnel(&mut game);
+        }
+        if args.iter().any(|a| a == "--balance") {
+            demo_balance(&mut game);
         }
         if args.iter().any(|a| a == "--dam") {
             demo_dam(&mut game);

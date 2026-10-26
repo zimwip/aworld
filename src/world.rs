@@ -36,7 +36,7 @@ pub mod inspect;
 mod bench;
 #[cfg(test)]
 mod edges;
-pub use statics::Slab;
+pub use statics::{Balance, Slab};
 pub use storm::{Bolt, BREAKDOWN, GROUND_BREAKDOWN, QS, QW, QH};
 pub use thermal::{air_pressure_atm, Season, DAY_STEPS};
 
@@ -667,6 +667,8 @@ pub struct World {
     frame: u8,
     rng: u32,
     seen: Vec<bool>,
+    /// Scratch of `structure_pass`: the cells a chain of matter joins to the base of the world.
+    ground: Vec<bool>,
     stack: Vec<usize>,
     /// Mouths of full pipes the levelling lets go (see `hydro.rs`), and the list of them to clear.
     released: Vec<bool>,
@@ -682,6 +684,9 @@ pub struct World {
     /// The push of the liquids on each anchored solid body, as the last check of the solids found
     /// it (see `statics.rs`; only while the liquids run by their physics).
     pub pushes: Vec<statics::LiquidPush>,
+    /// The free bodies resting on something, with their centre of mass and what turns them (for
+    /// the stress view, see `statics::tip_pass`).
+    pub bodies: Vec<statics::FreeBody>,
     /// A fingerprint of the anchored cells when their sections were last checked: they are only
     /// checked again once something changed.
     strain_key: u64,
@@ -858,6 +863,7 @@ impl World {
             frame: 0,
             rng: 0x1234_5678,
             seen: vec![false; W() * H()],
+            ground: vec![false; W() * H()],
             stack: Vec::new(),
             released: vec![false; W() * H()],
             released_list: Vec::new(),
@@ -866,6 +872,7 @@ impl World {
             level: vec![u32::MAX; W() * H()],
             strain: vec![0; W() * H()],
             pushes: Vec::new(),
+            bodies: Vec::new(),
             strain_key: 0,
             stress_cache: std::collections::HashMap::new(),
             stress_pos: Vec::new(),
@@ -996,7 +1003,7 @@ impl World {
     /// copy is never stepped. Every field is named, so that a new one has to be sorted here.
     pub fn copy_picture(&mut self, from: &World) {
         let World {
-            cells, frame, rng, seen: _, stack: _, released: _, released_list: _, falling, slabs, level: _, strain, pushes, strain_key, stress_cache: _,
+            cells, frame, rng, seen: _, ground: _, stack: _, released: _, released_list: _, falling, slabs, level: _, strain, pushes, bodies, strain_key, stress_cache: _,
             stress_pos: _, stress_local: _, ticks, log, paint_log, temp, clock, dt, tick_time, heat_stage, day_cycle, thermal_flip, heat_carry, temp_old: _, heat_took: _,
             climate_fixed, climate, revision, wind, wind_max, wind_changes, windiness, wind_clock, biome, leaf_rgb, autumn, grass_rgb,
             structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, dp,
@@ -1013,6 +1020,7 @@ impl World {
         self.slabs.clone_from(slabs);
         self.strain.clone_from(strain);
         self.pushes.clone_from(pushes);
+        self.bodies.clone_from(bodies);
         self.strain_key = *strain_key;
         self.ticks = *ticks;
         self.log.clone_from(log);
@@ -3653,6 +3661,8 @@ impl World {
         let mut level = std::mem::take(&mut self.level);
         seen.fill(false);
         level.fill(u32::MAX);
+        // What a chain of matter joins to the base of the world (see `anchors`).
+        self.spread_ground(true, &[]);
         // Bodies in flight are moved by their own physics.
         for s in &self.slabs {
             for &i in s.cells() {
@@ -3687,6 +3697,8 @@ impl World {
             }
         }
         self.level = level;
+        // Now without the free bodies: what they can rest on (see `tip_pass`).
+        self.spread_ground(false, &[]);
         self.stress_pass(&order, &mut seen);
         // A piece that was already falling keeps its speed (sampled cells are enough).
         let mut speeds: std::collections::HashMap<usize, (f32, f32)> = std::collections::HashMap::new();
@@ -3732,6 +3744,46 @@ impl World {
         self.tip_pass(free);
     }
 
+    /// Whether cell `i` carries weight down to what is under it: any solid, grains, liquid, or a
+    /// block. Unless `free`, the solid bodies not held by anything fixed do not count.
+    fn carries(&self, i: usize, free: bool) -> bool {
+        let m = self.cells[i].m;
+        if self.mask[i] != 0 {
+            return true;
+        }
+        matches!(m.kind(), Kind::Static | Kind::Powder | Kind::Liquid) && (free || !Self::structural(m) || self.level[i] != u32::MAX)
+    }
+
+    /// Marks in `ground` the cells a chain of matter that carries (see `carries`) joins to the
+    /// base of the world; with `from`, adds to it what joins to those cells.
+    pub(super) fn spread_ground(&mut self, free: bool, from: &[usize]) {
+        let mut ground = std::mem::take(&mut self.ground);
+        ground.resize(W() * H(), false);
+        let mut stack: Vec<usize> = Vec::new();
+        if from.is_empty() {
+            ground.fill(false);
+            stack.extend((W() * (H() - 1)..W() * H()).filter(|&i| self.carries(i, free)));
+        } else {
+            stack.extend(from.iter().copied());
+        }
+        for &i in &stack {
+            ground[i] = true;
+        }
+        while let Some(i) = stack.pop() {
+            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+            for (nx, ny) in Self::neighbors(x, y) {
+                if Self::inb(nx, ny) {
+                    let j = Self::idx(nx, ny);
+                    if !ground[j] && self.carries(j, free) {
+                        ground[j] = true;
+                        stack.push(j);
+                    }
+                }
+            }
+        }
+        self.ground = ground;
+    }
+
     /// Whether cell `i` is solid and held by something fixed: the base of the world, a tunnel's
     /// vault (it is bolted into the ground around it), or, for a tree, the ground its roots grow in.
     fn anchors(&self, i: usize) -> bool {
@@ -3739,14 +3791,23 @@ impl World {
         if !Self::structural(m) || self.mask[i] != 0 {
             return false;
         }
-        if i / W() == H() - 1 || m == Mat::Vault {
+        if i / W() == H() - 1 {
             return true;
+        }
+        // (A vault holds if it is bolted into earth or rock, or a chain of matter joins it to the
+        // base of the world; the ground a tree grows in, only in the second case. One painted in
+        // the sky holds nothing.)
+        if m == Mat::Vault {
+            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+            return self.ground[i] || Self::neighbors(x, y).iter().any(|&(nx, ny)| matches!(self.raw(nx, ny), Mat::Dirt | Mat::Grass | Mat::Mud | Mat::Stone | Mat::Clay));
         }
         if matches!(m, Mat::Trunk | Mat::Sapling) {
             // Roots: a tree holds to the ground it stands on.
             let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+            let held = |(x, y): (i32, i32)| Self::inb(x, y) && self.ground[Self::idx(x, y)];
             let ground = |m: Mat| m.is_hard() && !m.is_vegetation();
-            return ground(self.raw(x, y + 1)) || Self::neighbors(x, y).iter().any(|&(nx, ny)| matches!(self.raw(nx, ny), Mat::Dirt | Mat::Grass | Mat::Mud));
+            return (ground(self.raw(x, y + 1)) && held((x, y + 1)))
+                || Self::neighbors(x, y).iter().any(|&(nx, ny)| matches!(self.raw(nx, ny), Mat::Dirt | Mat::Grass | Mat::Mud) && held((nx, ny)));
         }
         false
     }
@@ -3888,9 +3949,11 @@ impl World {
                         // Archimedes: a piece heavier than the liquid (rock, iron) sinks through
                         // it, pushing it aside; a lighter one (ice, wood) floats on a body of it,
                         // but a stray drop or a puff of liquid in mid-air does not hold it up.
-                        // Settled sand or earth holds up a log the same way.
+                        // Settled grains as heavy as water or more hold up any solid (a heap of
+                        // sand bears a rock); light ones (dead leaves, ash) give way like a liquid.
                         Kind::Liquid | Kind::Powder => {
-                            if piece.density >= density(self.cells[target].m) {
+                            let m = self.cells[target].m;
+                            if (m.kind() == Kind::Liquid || density(m) < 1.0) && piece.density >= density(m) {
                                 true
                             } else {
                                 // (A drop caught in a notch of the piece rests on the piece

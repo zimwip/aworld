@@ -54,7 +54,7 @@ const FALL: f32 = 0.12;
 /// the ground and warms it.
 const CRACK_SHARE: f32 = 0.0005;
 /// Bodies larger than this many cells do not tip as a whole (they are mountains).
-const MAX_SLAB: usize = 40_000;
+const MAX_SLAB: usize = 150_000;
 /// At most this many bodies start to tip in one pass.
 const MAX_TIPS: usize = 4;
 /// A falling body of this many cells falls as a rigid body that can turn (see `tip_pass`);
@@ -195,6 +195,40 @@ pub struct Slab {
     contact: u16,
 }
 
+/// At most this many free bodies are shown in the stress view.
+const MAX_SHOWN: usize = 64;
+
+/// How a free body resting on something stands, as `tip_pass` last found it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Balance {
+    /// Its centre of mass is over what it rests on.
+    Rests,
+    /// It tips over its edge.
+    Tips,
+    /// It should tip, but hangs by a part above its centre of mass.
+    Hangs,
+    /// It should tip, and will once there is room (too many bodies tip at once, or it is a mountain).
+    Waits,
+}
+
+/// A free body (not held by anything fixed) resting on something, for the stress view: its
+/// centre of mass (cells), how many cells, its weight and the push of the liquids on it (kN per
+/// metre of depth), the span of what it rests on (x, cells) and the underside of it (row), the
+/// edge it turns over if it does, and the moment of its weight about that edge (kN·m per metre:
+/// positive, it tips; negative, what holds it about the nearer edge).
+#[derive(Clone, Debug)]
+pub struct FreeBody {
+    pub c: (f32, f32),
+    pub cells: usize,
+    pub weight: f32,
+    pub push: (f32, f32),
+    pub span: (f32, f32),
+    pub base: f32,
+    pub hinge: Option<(f32, f32)>,
+    pub moment: f32,
+    pub state: Balance,
+}
+
 /// What a body in flight ran into.
 struct Hit {
     /// Whether all of it was liquid.
@@ -212,6 +246,21 @@ const MAX_POINTS: usize = 16;
 impl Slab {
     pub fn cells(&self) -> impl Iterator<Item = &usize> {
         self.drawn.iter().map(|d| &d.0)
+    }
+
+    /// Its weight, kN per metre of depth.
+    pub fn weight(&self) -> f32 {
+        self.mass * G * CELL_M * CELL_M
+    }
+
+    /// The edge it still turns on, if it does (cells).
+    pub fn edge(&self) -> Option<(f32, f32)> {
+        self.hinge
+    }
+
+    /// The moment of its weight about the edge it turns on, kN·m per metre (positive: clockwise).
+    pub fn moment(&self) -> f32 {
+        self.hinge.map_or(0.0, |h| self.weight() * (self.c.0 - h.0) * CELL_M)
     }
 
     /// The pose it has after `dt` of a step: turned about its edge, or moved and turned about
@@ -659,6 +708,10 @@ impl World {
     /// their centre of mass beyond the cells they rest on tip over the last of them.
     pub(super) fn tip_pass(&mut self, free: Vec<Piece>) {
         let mut tips = 0;
+        self.bodies.clear();
+        // From the bottom up: a body holds what rests on it only once it is held itself.
+        let mut free = free;
+        free.sort_by_cached_key(|p| std::cmp::Reverse(p.cells.iter().copied().max().unwrap_or(0)));
         for mut p in free {
             p.cells.sort_unstable_by(|a, b| b.cmp(a));
             if self.piece_can_move(&p, 1) {
@@ -672,24 +725,28 @@ impl World {
             }
             let in_piece = |i: usize| p.cells.binary_search_by(|q| i.cmp(q)).is_ok();
             let (mut lo, mut hi) = ((i32::MAX, 0), (i32::MIN, 0));
-            let (mut loose, mut firm) = (false, false);
+            let mut firm = false;
             for &i in &p.cells {
                 let t = i + W();
                 if t >= W() * H() || in_piece(t) {
+                    continue;
+                }
+                // Only what a chain of matter joins to the base of the world holds it up.
+                if !self.ground[t] {
                     continue;
                 }
                 let under = self.cells[t].m;
                 if self.mask[t] == 0 {
                     // Firm ground holds it up; a liquid buoys it (it floats, see `drop_structures`),
                     // but only where it dips in: a long arm reaching out beyond tips it over all the same.
+                    // Leaves and twigs give way under it (see `crush_foliage`): they hold nothing up.
+                    if matches!(under, Mat::Leaf | Mat::Branch | Mat::Sapling) {
+                        continue;
+                    }
                     match under.kind() {
                         Kind::Static | Kind::Powder => firm = true,
                         Kind::Liquid => {}
                         _ => continue,
-                    }
-                    // Leaves and twigs give way under it (see `crush_foliage`).
-                    if matches!(under, Mat::Leaf | Mat::Branch | Mat::Sapling) {
-                        loose = true;
                     }
                 } else {
                     firm = true;
@@ -702,14 +759,8 @@ impl World {
                     hi = (x, y);
                 }
             }
-            if loose || lo.0 == i32::MAX {
+            if lo.0 == i32::MAX {
                 self.falling.push(p);
-                continue;
-            }
-            if tips >= MAX_TIPS || p.cells.len() > MAX_SLAB {
-                if !firm {
-                    self.falling.push(p);
-                }
                 continue;
             }
             let (mass, mx, my) = p.cells.iter().fold((0.0f32, 0.0f32, 0.0f32), |(m, mx, my), &i| {
@@ -718,25 +769,63 @@ impl World {
             });
             let (cx, cy) = (mx / mass.max(1e-6), my / mass.max(1e-6));
             let base = p.cells.iter().map(|&i| i / W() + 1).max().unwrap_or(0);
-            let hinge = if let Some(edge) = self.pushed_over(&p.cells, (lo.0, hi.0), base) {
+            let pushed = self.pushed_over(&p.cells, (lo.0, hi.0), base);
+            let hinge = if let Some(edge) = pushed {
                 // Pushed over by the liquid against it (a wall of a dam that is too thin).
-                edge
+                Some(edge)
             } else if cx < lo.0 as f32 {
-                (lo.0 as f32, lo.1 as f32 + 1.0)
+                Some((lo.0 as f32, lo.1 as f32 + 1.0))
             } else if cx > hi.0 as f32 + 1.0 {
-                (hi.0 as f32 + 1.0, hi.1 as f32 + 1.0)
+                Some((hi.0 as f32 + 1.0, hi.1 as f32 + 1.0))
             } else {
-                if !firm {
-                    self.falling.push(p);
-                }
-                continue;
+                None
             };
-            // Hooked by a part above its centre of mass, it hangs there instead.
-            if cy > hinge.1 {
-                continue;
+            // For the stress view: what holds it and what turns it.
+            let w = mass * G * CELL_M * CELL_M;
+            let push = if self.liquid_physics {
+                p.cells.iter().fold((0.0f32, 0.0f32), |a, &i| {
+                    let f = self.liquid_push(i);
+                    (a.0 + f.0, a.1 + f.1)
+                })
+            } else {
+                (0.0, 0.0)
+            };
+            let span = (lo.0 as f32, hi.0 as f32 + 1.0);
+            // The moment of the weight about the edge it turns over (positive: it tips), or how
+            // far it is from tipping (negative: the moment that holds it, about the nearer edge).
+            let moment = match hinge {
+                Some(h) => w * (cx - h.0).abs() * CELL_M,
+                None => -w * (cx - span.0).min(span.1 - cx) * CELL_M,
+            };
+            let hooked = hinge.is_some_and(|h| cy > h.1);
+            let state = if hinge.is_none() {
+                Balance::Rests
+            } else if hooked {
+                Balance::Hangs
+            } else if tips >= MAX_TIPS || p.cells.len() > MAX_SLAB {
+                Balance::Waits
+            } else {
+                Balance::Tips
+            };
+            if self.bodies.len() < MAX_SHOWN {
+                self.bodies.push(FreeBody { c: (cx, cy), cells: p.cells.len(), weight: w, push: (push.0 * liquid::CELL_OF_WATER_KN, push.1 * liquid::CELL_OF_WATER_KN), span, base: base as f32, hinge, moment, state });
             }
-            self.loosen(p.cells, Some(hinge), (0.0, 0.0), 0.0);
-            tips += 1;
+            if state != Balance::Tips && firm {
+                self.spread_ground(false, &p.cells);
+            }
+            match state {
+                Balance::Tips => {
+                    self.loosen(p.cells, hinge, (0.0, 0.0), 0.0);
+                    tips += 1;
+                }
+                // Hooked by a part above its centre of mass, it hangs there instead.
+                Balance::Hangs => {}
+                Balance::Rests | Balance::Waits => {
+                    if !firm {
+                        self.falling.push(p);
+                    }
+                }
+            }
         }
     }
 
@@ -817,9 +906,10 @@ impl World {
         let n = fastest.ceil().clamp(1.0, 8.0) as i32;
         let mut touched = false;
         let mut slipping = false;
+        let mut rehinged = 0;
         for _ in 0..n {
             let (c, angle) = s.pose_after(1.0 / n as f32);
-            let hit = match self.place(s, c, angle) {
+            let hit = match self.place(s, c, angle, 0.0) {
                 Ok(()) => {
                     s.c = c;
                     s.angle = angle;
@@ -831,6 +921,21 @@ impl World {
                 // Into a liquid: it floats or sinks as a plain falling piece.
                 self.land(s, true);
                 return false;
+            }
+            // Tipping over onto the ground just beyond its edge, further towards its centre of
+            // mass: that is its edge now, and it goes on turning about it (a body sunk in sand or
+            // with a rounded foot rolls over it).
+            if let Some(h) = s.hinge {
+                if rehinged < 4 {
+                    if let Some(p) = Self::next_edge(s, &hit, h) {
+                        let (a, b) = ((s.c.0 - h.0, s.c.1 - h.1), (s.c.0 - p.0, s.c.1 - p.1));
+                        // Its angular momentum about the new edge is kept.
+                        s.spin *= (s.inertia + s.mass * (a.0 * b.0 + a.1 * b.1)) / (s.inertia + s.mass * (b.0 * b.0 + b.1 * b.1));
+                        s.hinge = Some(p);
+                        rehinged += 1;
+                        continue;
+                    }
+                }
             }
             // It hit something firm: from now on it is a free body, and the hit pushes it back
             // at the point of contact, which turns it about its centre of mass.
@@ -846,7 +951,7 @@ impl World {
             // What is left of the step, with the new velocity: it slides or rolls on along the
             // surface. Should that run into something too, it waits for the next step.
             let (c, angle) = s.pose_after(1.0 / n as f32);
-            match self.place(s, c, angle) {
+            match self.place(s, c, angle, 0.3) {
                 Ok(()) => {
                     s.c = c;
                     s.angle = angle;
@@ -866,7 +971,7 @@ impl World {
                 // its centre of mass is not over what it rests on, it tips over again). Nearly
                 // square to the grid, it settles square (a turned body loses its straight edges).
                 let square = (s.angle / FRAC_PI_2).round() * FRAC_PI_2;
-                if (s.angle - square).abs() < 0.06 && self.place(s, s.c, square).is_ok() {
+                if (s.angle - square).abs() < 0.06 && self.place(s, s.c, square, 0.0).is_ok() {
                     s.angle = square;
                 }
                 self.land(s, false);
@@ -876,6 +981,19 @@ impl World {
             s.rest = 0;
         }
         true
+    }
+
+    /// The edge a body turning about `h` turns about next, having come down on `hit`: the point
+    /// it touched furthest over towards its centre of mass, if all it touched lies under it and
+    /// its centre of mass is still beyond that point (else it comes to rest on it).
+    fn next_edge(s: &Slab, hit: &Hit, h: (f32, f32)) -> Option<(f32, f32)> {
+        let side = (s.c.0 - h.0).signum();
+        if hit.points.is_empty() || hit.points.iter().any(|&(p, n)| n.1 > -0.3 || p.1 < s.c.1) {
+            return None;
+        }
+        let p = hit.points.iter().map(|&(p, _)| p).max_by(|a, b| ((a.0 - h.0) * side).total_cmp(&((b.0 - h.0) * side)))?;
+        let p = (p.0 + 0.5 * side, p.1 - 0.5);
+        ((p.0 - h.0) * side > 0.0 && (s.c.0 - p.0) * side > 0.0).then_some(p)
     }
 
     /// A body hit something firm (`hit`). If the blow is hard enough it breaks (see
@@ -900,21 +1018,7 @@ impl World {
         if worst * ms > 2.0 && self.thuds.len() < 8 {
             self.thuds.push((at.0 as i32, at.1 as i32, (worst * ms / 3.0).min(4.0)));
         }
-        // How hard each part hits: the speed it brings into the surface.
-        if worst * ms > 0.3 && s.parts.iter().any(|p| rubble(p.cell.m).is_some()) {
-            let cells: Vec<usize> = s.drawn.iter().map(|d| d.0).collect();
-            let vel: Vec<(f32, f32)> = cells.iter().map(|&i| {
-                let v = s.velocity_at(((i % W()) as f32 + 0.5, (i / W()) as f32 + 0.5));
-                let into = dot(v, n).min(0.0) * ms;
-                (into * n.0, into * n.1)
-            }).collect();
-            if let Some(pieces) = self.fracture(&cells, &vel) {
-                let drawn: HashSet<u32> = s.drawn.iter().map(|d| d.1).collect();
-                self.fill_in(s, &drawn);
-                self.fly_apart(s, pieces, n);
-                return None;
-            }
-        }
+        let before = (s.v, s.spin);
         // A slow touch does not bounce (else a body at rest would hop under its own weight).
         let e = if worst > 3.0 * FALL { (restitution(s.parts[0].cell.m) + restitution(hit.m)) / 2.0 } else { 0.0 };
         struct Contact {
@@ -955,6 +1059,23 @@ impl World {
                 push(s, k.r, (dj * k.t.0, dj * k.t.1));
             }
         }
+        // How hard each part was hit: the jolt the contacts gave it (the change of its velocity,
+        // as the speed it brought into them). The parts near the blow take it all; those far
+        // off on a long arm turning about the point of contact hardly feel it.
+        if worst * ms > 0.3 && s.parts.iter().any(|p| rubble(p.cell.m).is_some()) {
+            let cells: Vec<usize> = s.drawn.iter().map(|d| d.0).collect();
+            let (dv, dw) = ((s.v.0 - before.0 .0, s.v.1 - before.0 .1), s.spin - before.1);
+            let vel: Vec<(f32, f32)> = cells.iter().map(|&i| {
+                let r = ((i % W()) as f32 + 0.5 - s.c.0, (i / W()) as f32 + 0.5 - s.c.1);
+                ((dv.0 - dw * r.1) * ms / (1.0 + e), (dv.1 + dw * r.0) * ms / (1.0 + e))
+            }).collect();
+            if let Some(pieces) = self.fracture(&cells, &vel) {
+                let drawn: HashSet<u32> = s.drawn.iter().map(|d| d.1).collect();
+                self.fill_in(s, &drawn);
+                self.fly_apart(s, pieces, n);
+                return None;
+            }
+        }
         let slipping = contacts.iter().any(|k| {
             let vt = dot(at(s, k.r), k.t);
             k.jn > 0.0 && vt.abs() > 0.01
@@ -964,7 +1085,10 @@ impl World {
 
     /// Draws the body at a new pose, unless that runs into something: then Err, with what it ran
     /// into.
-    fn place(&mut self, s: &mut Slab, c: (f32, f32), angle: f32) -> Result<(), Hit> {
+    /// Parts that would press into something while their point barely moves (`slack`, cells per
+    /// step: a body rolling over the point it rests on, which the grid cannot quite follow) are
+    /// left out for now instead of stopping it; they come back once there is room.
+    fn place(&mut self, s: &mut Slab, c: (f32, f32), angle: f32, slack: f32) -> Result<(), Hit> {
         let (sn, cs) = angle.sin_cos();
         // (Sorted, not hashed: the cells are then always looked at in the same order, and the
         // same throw lands the same way every time.)
@@ -994,15 +1118,24 @@ impl World {
         let mut crushed = vec![];
         let mut soft = true;
         let mut hits: Vec<usize> = vec![];
+        // Which part of the body covers the centre of cell (x, y), if any.
+        let covers = |x: i32, y: i32| {
+            let q = (x as f32 + 0.5 - c.0, y as f32 + 0.5 - c.1);
+            s.home.get(&((s.c0.0 + q.0 * cs + q.1 * sn).floor() as i32, (s.c0.1 - q.0 * sn + q.1 * cs).floor() as i32)).copied()
+        };
         for &t in &around {
-            // Which part of the body covers the centre of this cell, if any.
-            let q = ((t % W()) as f32 + 0.5 - c.0, (t / W()) as f32 + 0.5 - c.1);
-            let home = ((s.c0.0 + q.0 * cs + q.1 * sn).floor() as i32, (s.c0.1 - q.0 * sn + q.1 * cs).floor() as i32);
-            let Some(&k) = s.home.get(&home) else { continue };
+            let (tx, ty) = ((t % W()) as i32, (t / W()) as i32);
+            let Some(k) = covers(tx, ty) else { continue };
             // Air gives way; while it turns slowly on its edge, so do water and loose grains
-            // (they are pushed aside). In flight they stop it.
+            // (they are pushed aside). In flight, water stops it, and grains only where the body
+            // comes down on them: those beside it are pushed aside (a body sunk in sand is not
+            // held fast by the sand around it).
             let m = self.cells[t].m;
-            let yields = free_for_slab(m) || (s.hinge.is_some() && matches!(m.kind(), Kind::Liquid | Kind::Powder));
+            // Leaves and twigs give way under it as well (see `crush_foliage`).
+            let yields = free_for_slab(m)
+                || matches!(m, Mat::Leaf | Mat::Branch | Mat::Sapling)
+                || (s.hinge.is_some() && matches!(m.kind(), Kind::Liquid | Kind::Powder))
+                || (m.kind() == Kind::Powder && covers(tx, ty - 1).is_none());
             if own.contains(&t) || (self.mask[t] == 0 && yields) {
                 drawn.push((t, k));
                 continue;
@@ -1012,6 +1145,11 @@ impl World {
                 let p = ((t % W()) as f32 + 0.5, (t / W()) as f32 + 0.5);
                 if (p.0 - h.0).powi(2) + (p.1 - h.1).powi(2) < 6.25 {
                     crushed.push((k, p));
+                    continue;
+                }
+            } else if slack > 0.0 {
+                let v = s.velocity_at((tx as f32 + 0.5, ty as f32 + 0.5));
+                if v.0 * v.0 + v.1 * v.1 < slack * slack {
                     continue;
                 }
             }
@@ -1149,7 +1287,8 @@ impl World {
                 let l = (v.0 * v.0 + v.1 * v.1).sqrt().max(1e-6);
                 (-v.0 / l, -v.1 / l)
             };
-            ((x as f32 + 0.5, y as f32 + 0.5), n)
+            // On the face of the cell it ran into, towards the body.
+            ((x as f32 + 0.5 + 0.5 * n.0, y as f32 + 0.5 + 0.5 * n.1), n)
         }).collect();
         Hit { soft, points, m }
     }
@@ -1552,6 +1691,101 @@ mod tests {
         let top = wood.iter().map(|c| c.1).min().unwrap();
         assert!(bottom >= 8, "it lies on a face: {bottom} cells on the ground");
         assert!(top >= 449 - 17, "it does not stand on a corner: top at {top}");
+    }
+
+    /// A ball of stone on a long arm whose foot stands in a pit of sand: its centre of mass is
+    /// far beyond its foot. With `leaves`, a tree stands under the ball, its crown just touching.
+    fn ball_on_an_arm(leaves: bool) -> World {
+        let mut w = world(470);
+        for x in 560..640 {
+            for y in 470..480 {
+                w.set(x, y, Mat::Sand);
+            }
+        }
+        w.paint(250, 200, 40, Mat::Stone);
+        w.line((290, 200), (600, 466), 8, Mat::Stone);
+        if leaves {
+            for x in 230..270 {
+                for y in 241..245 {
+                    w.set(x, y, Mat::Leaf);
+                }
+            }
+            // (Held by a branch from a trunk off to the side.)
+            for x in 150..230 {
+                w.set(x, 244, Mat::Branch);
+            }
+            for x in 148..150 {
+                for y in 244..470 {
+                    w.set(x, y, Mat::Trunk);
+                }
+            }
+        }
+        w
+    }
+
+    #[test]
+    fn a_ball_on_an_arm_standing_in_sand_tips_over() {
+        for leaves in [false, true] {
+            let mut w = ball_on_an_arm(leaves);
+            // (The statics run every few steps.)
+            while w.bodies.is_empty() {
+                w.step();
+            }
+            let b = w.bodies.iter().find(|b| b.cells > 5000).expect("the ball and its arm are one free body");
+            assert!(b.c.0 < 400.0 && b.span.0 > 550.0, "its centre of mass is far beyond its foot: {b:?}");
+            assert!(b.moment > 0.0 && matches!(b.state, Balance::Tips), "{b:?}");
+            run(&mut w, 300);
+            assert_ne!(w.raw(250, 200), Mat::Stone, "the ball came down (leaves under it: {leaves})");
+        }
+    }
+
+    #[test]
+    fn a_block_centred_on_a_pedestal_shows_what_holds_it() {
+        let mut w = world(450);
+        for x in 100..140 {
+            for y in 430..450 {
+                w.set(x, y, Mat::Glass);
+            }
+        }
+        for x in 110..130 {
+            for y in 420..430 {
+                w.set(x, y, Mat::Ice);
+            }
+        }
+        while w.bodies.is_empty() {
+            w.step();
+        }
+        let b = w.bodies.iter().find(|b| b.cells == 200).expect("the block");
+        assert_eq!(b.state, Balance::Rests);
+        assert!((b.c.0 - 120.0).abs() < 0.01 && (b.c.1 - 425.0).abs() < 0.01, "{b:?}");
+        // 200 cells of ice of 5 cm: 0.46 t per metre, 4.5 kN/m; its centre of mass is 10 cells
+        // (0.5 m) from either edge of what it rests on.
+        assert!((b.weight - 200.0 * 0.92 * 0.0025 * 9.81).abs() < 0.1, "{}", b.weight);
+        assert!((b.moment + b.weight * 0.5).abs() < 0.05, "{}", b.moment);
+    }
+
+    #[test]
+    fn a_vault_painted_in_the_sky_holds_nothing_up() {
+        let mut w = world(450);
+        // One cell of vault, and a block of glass resting on it: nothing joins them to the ground.
+        w.set(300, 300, Mat::Vault);
+        for x in 290..310 {
+            for y in 290..300 {
+                w.set(x, y, Mat::Glass);
+            }
+        }
+        // The same in a tunnel's wall: there it holds.
+        for y in 380..450 {
+            w.set(500, y, Mat::Vault);
+        }
+        for x in 490..510 {
+            for y in 370..380 {
+                w.set(x, y, Mat::Glass);
+            }
+        }
+        run(&mut w, 300);
+        assert_ne!(w.raw(300, 295), Mat::Glass, "the block fell");
+        assert_eq!(w.raw(500, 375), Mat::Glass, "the vault joined to the ground holds its block");
     }
 
     #[test]
