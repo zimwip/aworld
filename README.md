@@ -247,7 +247,11 @@ et faire des loopings et des culbutes. S'il touche quoi que ce soit (sol, eau, b
   sur la pastille ouvre le **bilan d'énergie** (un second clic le referme) : soleil entrant, sortie vers l'espace, chaleur
   des feux, courbe de la chaleur du monde sur 24 h, et trois curseurs (*Soleil*, *Sortie vers l'espace*, *Nuages et fumée
   gardent*) avec un bouton *Revenir au neutre*. La bulle reprend aussi *Temps*, *Saison* et *Vent* : l'onglet Monde
-  donne le point de départ, la bulle permet de jouer avec en pleine simulation.
+  donne le point de départ, la bulle permet de jouer avec en pleine simulation. En bas, **Matières du monde** : le
+  volume de chaque matière présente, de la plus abondante à la moins (une cellule est un cube de 17 cm, 4,6 L ; une
+  cellule de liquide compte ce qu'elle contient vraiment, la vapeur tassée compte toute sa vapeur), chacune avec sa
+  courbe sur 24 h. Compté toutes les demi-secondes, et à chaque relevé de la chaleur pour les courbes
+  (`--demo out.png --climate --advance 1200`).
 - **Lance-flammes** (barre d'outils, icône flamme) : garder le clic enfoncé envoie un jet à 1500 °C de la taille du
   pinceau. Le bois s'embrase, la roche rougit puis fond en lave, le fer fond, l'eau bout ; ce qui est lourd chauffe plus
   lentement. Sa chaleur compte dans le bilan d'énergie avec celle des feux. C'est lui qui allume : le feu n'est plus dans la palette des matières.

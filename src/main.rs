@@ -45,6 +45,9 @@ const STEPS_PER_SECOND: f32 = 60.0;
 const PANEL_W: f32 = 244.0;
 /// No top bar any more: the world starts at the very top.
 const TOP_H: f32 = 0.0;
+/// Height of the materials' table at the foot of the world's menu, and its rows per column.
+const VOLUMES_H: f32 = 196.0;
+const VOLUMES_ROWS: usize = 7;
 /// Width of the sliding views palette on the right, and of its always-visible tab.
 const VIEWS_W: f32 = 176.0;
 const VIEWS_TAB: f32 = 22.0;
@@ -308,6 +311,8 @@ struct Game {
     unlimited: bool,
     unlimited_sim: bool,
     census: [u32; world::NMAT],
+    /// How much of each material the world holds, counted every half second (`World::volumes`).
+    volumes: [f32; world::NMAT],
     show_science: bool,
     hover_info: Option<(String, String)>,
 }
@@ -423,6 +428,7 @@ impl Game {
             unlimited: true,
             unlimited_sim: false,
             census: [0; world::NMAT],
+            volumes: [0.0; world::NMAT],
             show_science: false,
             hover_info: None,
         }
@@ -1734,7 +1740,8 @@ impl Game {
             eprint!("--- profil sur 600 pas (vitesse x{}, simplification {})\n{report}", self.speed, self.world.lod);
         }
         if (self.time * 2.0) as u32 != ((self.time - dt) * 2.0) as u32 {
-            let n = self.world.census();
+            let (n, v) = self.world.volumes();
+            self.volumes = v;
             self.heat_cells = n[Mat::Fire as usize] + n[Mat::Lava as usize] / 3 + n[Mat::Ember as usize] / 2;
         }
         let rpm = self
@@ -2513,12 +2520,13 @@ impl Game {
     /// last day, and the settings of the sun and of the escape to space.
     fn draw_climate_menu(&mut self, ui: &mut Ui) {
         let pill = self.hud_hit;
-        let r = Rect::new(pill.x, pill.y + pill.h + 6.0, 640.0, 332.0);
+        let r = Rect::new(pill.x, pill.y + pill.h + 6.0, 640.0, 332.0 + VOLUMES_H);
         ui.layer("climate");
         // From under the pill, which stays clickable to close the menu.
         ui.claim("climate", Rect::new(r.x, pill.y + pill.h, r.w, r.y + r.h - pill.y - pill.h));
         rrect(r, 14.0, Color::new(0.06, 0.07, 0.13, 0.94));
-        self.draw_live_weather(ui, Rect::new(r.x + 340.0, r.y, r.w - 340.0, r.h));
+        self.draw_live_weather(ui, Rect::new(r.x + 340.0, r.y, r.w - 340.0, r.h - VOLUMES_H));
+        self.draw_volumes(ui, Rect::new(r.x, r.y + r.h - VOLUMES_H, r.w, VOLUMES_H));
         let (x, w) = (r.x + 14.0, 340.0 - 28.0);
         let c = &self.world.climate;
         ui.text("Bilan d'énergie (par heure)", x, r.y + 24.0, 16, ACCENT);
@@ -2567,9 +2575,59 @@ impl Game {
         let c = &mut self.world.climate;
         (c.sun_gain, c.space_gain, c.greenhouse) = (vals[0], vals[1], vals[2]);
         let neutral = (c.sun_gain - 1.0).abs() < 0.01 && (c.space_gain - 1.0).abs() < 0.01 && (c.greenhouse - 1.0).abs() < 0.01;
-        if ui.button(Rect::new(x, r.y + r.h - 36.0, w, 26.0), "Revenir au neutre", Icon::None, neutral, !neutral, GREEN) {
+        if ui.button(Rect::new(x, r.y + r.h - VOLUMES_H - 36.0, w, 26.0), "Revenir au neutre", Icon::None, neutral, !neutral, GREEN) {
             c.reset_settings();
             self.say("Le soleil et le ciel reprennent leur cycle habituel".to_string());
+        }
+    }
+
+    /// At the foot of the world's menu: how much of each material the world holds, the most first,
+    /// each with its curve over the last day (counted with the heat, every quarter of an hour).
+    fn draw_volumes(&mut self, ui: &mut Ui, r: Rect) {
+        let x = r.x + 14.0;
+        draw_line(x, r.y + 2.0, r.x + r.w - 14.0, r.y + 2.0, 1.0, Color::new(1.0, 1.0, 1.0, 0.12));
+        ui.text("Matières du monde", x, r.y + 26.0, 16, ACCENT);
+        let litres = world::CELL_M.powi(3) * 1000.0;
+        let note = format!("une cellule : un cube de {:.0} cm, {:.1} L  ·  courbes : dernières 24 h", world::CELL_M * 100.0, litres);
+        ui.text(&note, x + 156.0, r.y + 25.0, 12, DIM);
+        let mut mats: Vec<(Mat, f32)> = Mat::ALL.iter().map(|&m| (m, self.volumes[m as usize])).filter(|&(m, v)| m != Mat::Empty && v > 0.0).collect();
+        mats.sort_by(|a, b| b.1.total_cmp(&a.1));
+        if mats.is_empty() {
+            ui.text("Le monde est vide : rien que de l'air.", x, r.y + 52.0, 13, DIM);
+            return;
+        }
+        let shown = if mats.len() > VOLUMES_ROWS * 2 { VOLUMES_ROWS * 2 - 1 } else { mats.len() };
+        let past = &self.world.climate.volumes;
+        let col_w = (r.w - 28.0 - 16.0) / 2.0;
+        for (k, &(m, v)) in mats.iter().take(shown).enumerate() {
+            let cx = x + (k / VOLUMES_ROWS) as f32 * (col_w + 16.0);
+            let y = r.y + 36.0 + (k % VOLUMES_ROWS) as f32 * 20.0;
+            let col = mat_color(m);
+            rrect(Rect::new(cx, y + 4.0, 11.0, 11.0), 3.0, col);
+            ui.text(info(m).name, cx + 17.0, y + 14.0, 13, TEXT);
+            let text = volume_label(v * litres);
+            ui.text(&text, cx + 200.0 - ui.text_w(&text, 13), y + 14.0, 13, TEXT);
+            // Its curve: the samples of the last day, then what there is now.
+            let h: Vec<f32> = past.iter().map(|s| s[m as usize]).chain(std::iter::once(v)).collect();
+            let g = Rect::new(cx + 210.0, y + 2.0, col_w - 210.0, 15.0);
+            if h.len() >= 2 {
+                let (lo, hi) = h.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+                let span = (hi - lo).max(hi * 0.02).max(1.0);
+                let mid = 0.5 * (hi + lo);
+                let pt = |i: usize, v: f32| vec2(g.x + g.w * i as f32 / 96.0, g.y + g.h * 0.5 - (v - mid) / span * g.h);
+                let line = Color::new(col.r * 0.8 + 0.2, col.g * 0.8 + 0.2, col.b * 0.8 + 0.2, 0.9);
+                for i in 1..h.len() {
+                    let (a, b) = (pt(i - 1, h[i - 1]), pt(i, h[i]));
+                    draw_line(a.x, a.y, b.x, b.y, 1.5, line);
+                }
+            }
+        }
+        if shown < mats.len() {
+            let rest: f32 = mats[shown..].iter().map(|m| m.1).sum();
+            let (cx, y) = (x + col_w + 16.0, r.y + 36.0 + (VOLUMES_ROWS - 1) as f32 * 20.0);
+            ui.text(&format!("{} autres", mats.len() - shown), cx + 17.0, y + 14.0, 13, DIM);
+            let text = volume_label(rest * litres);
+            ui.text(&text, cx + 200.0 - ui.text_w(&text, 13), y + 14.0, 13, DIM);
         }
     }
 
@@ -3895,6 +3953,17 @@ impl Game {
         if ui.pressed && !area.contains(ui.mouse) {
             self.show_science = false;
         }
+    }
+}
+
+/// A volume in litres as the menu shows it: litres up to a cubic metre, then cubic metres.
+fn volume_label(l: f32) -> String {
+    if l < 1000.0 {
+        format!("{:.0} L", l.max(1.0))
+    } else if l < 10_000.0 {
+        format!("{:.1} m³", l / 1000.0).replace('.', ",")
+    } else {
+        format!("{:.0} m³", l / 1000.0)
     }
 }
 
