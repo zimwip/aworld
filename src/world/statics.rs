@@ -165,7 +165,7 @@ impl Slab {
     }
 
     /// Velocity of the point `p` of the body, cells per step.
-    fn velocity_at(&self, p: (f32, f32)) -> (f32, f32) {
+    pub(super) fn velocity_at(&self, p: (f32, f32)) -> (f32, f32) {
         match self.hinge {
             Some(h) => (-self.spin * (p.1 - h.1), self.spin * (p.0 - h.0)),
             None => (self.v.0 - self.spin * (p.1 - self.c.1), self.v.1 + self.spin * (p.0 - self.c.0)),

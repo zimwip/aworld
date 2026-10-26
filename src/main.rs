@@ -21,6 +21,7 @@ mod select;
 mod sensors;
 mod shovel;
 mod simthread;
+mod simview;
 mod science;
 mod sound;
 mod ui;
@@ -298,6 +299,8 @@ struct Game {
     mix: Mix,
     /// The load on each block's welds (the stress view), when the physics is in another thread.
     stress_seen: Option<std::collections::HashMap<u32, f32>>,
+    /// The simulation view: its panel, its layers and its step by step.
+    simview: simview::SimView,
     beam_broke: bool,
     broken_members: Vec<u32>,
     /// Building does not use up the world's materials: one choice for the editing
@@ -414,6 +417,7 @@ impl Game {
             sim_acc: 0.0,
             mix: Mix::default(),
             stress_seen: None,
+            simview: simview::SimView::new(),
             beam_broke: false,
             broken_members: vec![],
             unlimited: true,
@@ -1292,6 +1296,10 @@ impl Game {
             let run = !self.running;
             self.set_running(run);
         }
+        // In the simulation view, "." takes one step and shows what it changed.
+        if self.mode == ViewMode::Simulation && is_key_pressed(KeyCode::Period) {
+            self.step_by_step(1);
+        }
         if is_key_pressed(KeyCode::R) {
             self.reset();
         }
@@ -1798,6 +1806,21 @@ impl Game {
         self.thunder.retain(|t| t.0 > 0.0);
     }
 
+    /// The simulation view's step by step: `n` steps, the world paused after them, and what they
+    /// changed kept for its diff.
+    fn step_by_step(&mut self, n: usize) {
+        if !self.running {
+            // Takes the plan and builds the physics, as a start would.
+            self.set_running(true);
+        }
+        self.running = false;
+        self.simview.before_steps(&self.world);
+        for _ in 0..n {
+            self.sim_step();
+        }
+        self.simview.after_steps(&self.world);
+    }
+
     fn sim_step(&mut self) {
         // Each part's time goes to the metrics panel (Ctrl+D; see `metrics.rs`).
         let mut clock = self.metrics.start();
@@ -2129,7 +2152,6 @@ impl Game {
         // The thermal and pressure views paint the whole picture themselves.
         let flat = thermal || matches!(self.mode, ViewMode::Pressure | ViewMode::Humidity | ViewMode::Electric | ViewMode::Simulation);
         let render_mode = match self.mode {
-            ViewMode::Simulation => RenderMode::Simulation,
             ViewMode::Thermal => RenderMode::Thermal,
             ViewMode::Pressure => RenderMode::Pressure,
             ViewMode::Humidity => RenderMode::Humidity,
@@ -2141,7 +2163,11 @@ impl Game {
             let moon = backdrop::Moon { arc: self.world.moon_arc(), age: self.world.moon_age(), light: self.world.moon_light(), wink: self.wolves.wink() };
             backdrop::draw_sky(view, self.world.biome, phase, self.world.year_phase(), self.world.wind, self.time, self.world.season(), moon);
         }
-        renderer.draw_world(&self.world, view, render_mode, self.time);
+        if self.mode == ViewMode::Simulation {
+            self.simview.draw_back(&self.world, view);
+        } else {
+            renderer.draw_world(&self.world, view, render_mode, self.time);
+        }
         if !flat {
             renderer.draw_gas(&self.world, view);
         }
@@ -2232,7 +2258,7 @@ impl Game {
             self.draw_wind_field(view);
         }
         if self.mode == ViewMode::Simulation {
-            self.draw_simulation(view, ui);
+            self.simview.draw_layers(&self.world, view, ui);
         }
         // What the little boy says, over the night and the science views so it can be read.
         self.kids.draw_bubble(view, ui);
@@ -2652,6 +2678,13 @@ impl Game {
         self.draw_corner_buttons(ui, sw);
         self.draw_launch_bar(ui, sw);
         self.draw_views(ui, sw, sh);
+        if self.mode == ViewMode::Simulation {
+            match self.simview.panel(ui, &self.world, self.running, sw, sh) {
+                simview::Ask::Run(run) => self.set_running(run),
+                simview::Ask::Steps(n) => self.step_by_step(n),
+                simview::Ask::None => {}
+            }
+        }
         self.draw_remote_menu(ui, sw);
         self.draw_player(ui, sw, sh);
         if self.climate_menu {
@@ -3583,11 +3616,7 @@ impl Game {
                 ui.wrapped("Rouge = chargé. Solides : part de la résistance de la section qui porte le reste (au-delà, elle casse). Mécanique : anneau = dents, arc = couple, F = force, % = charge moteur.", bar.x, bar.y + 42.0, bar.w, 11, DIM);
             }
             ViewMode::Simulation => {
-                for (i, (col, label)) in [(Color::from_rgba(40, 96, 230, 255), "liquide plein"), (Color::from_rgba(130, 200, 245, 255), "film, embruns"), (Color::from_rgba(245, 220, 70, 255), "goutte des cellules"), (Color::from_rgba(96, 84, 60, 255), "paroi (gaz à l'air)")].iter().enumerate() {
-                    draw_rectangle(bar.x, bar.y + i as f32 * 16.0, 12.0, 12.0, *col);
-                    ui.text(label, bar.x + 18.0, bar.y + 10.0 + i as f32 * 16.0, 11, DIM);
-                }
-                ui.wrapped("Zones : vert = tourne, gris = dort. Flèches : vitesse du liquide (grille MAC, 1 m/s = 1 cellule). Points : gouttes en vol avec leur vitesse. Orange : les lignes que la carte traite.", bar.x, bar.y + 70.0, bar.w, 11, DIM);
+                ui.wrapped("Le panneau « Simulation » choisit le fond (matière, classes, pressions, diff du dernier pas) et les couches (zones, vitesses, gouttes, carte), et fait avancer le monde pas à pas (touche « . »).", bar.x, bar.y + 4.0, bar.w, 11, DIM);
             }
             ViewMode::Wind => {
                 let w = &self.world;
@@ -3736,74 +3765,6 @@ impl Game {
                 draw_triangle(b, b - dir * 6.0 + side * 3.6, b - dir * 6.0 - side * 3.6, col);
             }
         }
-    }
-
-    /// The simulation view's overlay: the zones (green where they run), the rows the card
-    /// works on, the liquid's velocity on the MAC grid, and the drops in flight with their
-    /// velocity.
-    fn draw_simulation(&self, view: View, ui: &mut Ui) {
-        use world::sleep::{CH, CS, CW};
-        let w = &self.world;
-        let vis = view.visible();
-        // The zones.
-        for zy in 0..CH {
-            for zx in 0..CW {
-                let r = Rect::new((zx * CS) as f32, (zy * CS) as f32, CS as f32, CS as f32);
-                if !vis.overlaps(&r) {
-                    continue;
-                }
-                let a = view.to_screen(vec2(r.x, r.y));
-                let runs = w.zones.runs(zy * CW + zx);
-                let col = if runs { Color::new(0.3, 1.0, 0.4, 0.55) } else { Color::new(0.6, 0.6, 0.6, 0.18) };
-                draw_rectangle_lines(a.x, a.y, r.w * view.s, r.h * view.s, if runs { 1.5 } else { 1.0 }, col);
-            }
-        }
-        // The card's band.
-        if let Some((y0, y1)) = w.liquid_card_rows() {
-            let col = Color::new(1.0, 0.6, 0.2, 0.8);
-            for y in [y0 as f32, y1 as f32 + 1.0] {
-                let (a, b) = (view.to_screen(vec2(0.0, y)), view.to_screen(vec2(W as f32, y)));
-                draw_line(a.x, a.y, b.x, b.y, 1.5, col);
-            }
-            let a = view.to_screen(vec2(vis.x.max(0.0) + 2.0, y0 as f32));
-            ui.text(&format!("carte : lignes {y0} à {y1}"), a.x, a.y - 4.0, 12, col);
-        }
-        // The velocities, one arrow per cell when close, sparser from afar.
-        let step = (5.0 / view.s).ceil().max(1.0) as usize;
-        let (x0, y0) = (vis.x.max(0.0) as usize / step * step, vis.y.max(0.0) as usize / step * step);
-        let (x1, y1) = (((vis.x + vis.w).max(0.0) as usize + 1).min(W), ((vis.y + vis.h).max(0.0) as usize + 1).min(H));
-        let mut y = y0;
-        while y < y1 {
-            let mut x = x0;
-            while x < x1 {
-                if let (Some(class), Some((vx, vy))) = (w.liquid_class(x, y), w.liquid_velocity(x, y)) {
-                    let speed = (vx * vx + vy * vy).sqrt();
-                    if class & 3 >= world::liquid_class::WET && class & 4 != 0 && speed > 0.02 {
-                        let c = view.to_screen(vec2(x as f32 + 0.5, y as f32 + 0.5));
-                        let dir = vec2(vx, vy) / speed;
-                        let len = (speed * view.s).clamp(3.0, 40.0 * view.s.max(1.0));
-                        let b = c + dir * len;
-                        let col = Color::new(1.0, 1.0, 1.0, (0.35 + speed * 0.2).min(0.95));
-                        draw_line(c.x, c.y, b.x, b.y, 1.2, col);
-                        draw_circle(c.x, c.y, 1.2, col);
-                    }
-                }
-                x += step;
-            }
-            y += step;
-        }
-        // The drops.
-        for d in w.liquid_drops() {
-            let (vx, vy) = World::drop_velocity(d);
-            let a = view.to_screen(vec2(d.x, d.y));
-            let b = view.to_screen(vec2(d.x + vx, d.y + vy));
-            let col = Color::new(1.0, 0.9, 0.3, 0.9);
-            draw_line(a.x, a.y, b.x, b.y, 1.0, col);
-            draw_circle(a.x, a.y, (2.0 * view.s.max(0.6)).min(5.0), col);
-        }
-        let awake = w.zones.awake_count();
-        let text = format!("{} zones tournent, {} gouttes en vol{}", awake, w.liquid_drops().len(), if w.liquid_card_rows().is_some() { ", liquides sur la carte" } else { "" });
-        ui.text(&text, 12.0, screen_height() - 14.0, 13, TEXT);
     }
 
     /// "Leave the game?": left and right pick a button, Enter validates it, Esc goes back.
@@ -4495,6 +4456,25 @@ async fn main() {
             Some("simulation") => ViewMode::Simulation,
             _ => ViewMode::Normal,
         };
+        // `--sim-back`: the simulation view's background.
+        if let Some(b) = arg("--sim-back") {
+            use simview::{Back, DiffOf};
+            use world::inspect::Field;
+            game.simview.back = match b.as_str() {
+                "matiere" => Back::Matter,
+                "liquides-pa" => Back::Pressure(Field::LiquidPa),
+                "liquides-atm" => Back::Pressure(Field::LiquidAtm),
+                "air" => Back::Pressure(Field::Air),
+                "poussee" => Back::Pressure(Field::Push),
+                "poches" => Back::Pressure(Field::Pockets),
+                "diff-remplissage" => Back::Diff(DiffOf::Fill),
+                "diff-temperature" => Back::Diff(DiffOf::Temp),
+                "diff-pression" => Back::Diff(DiffOf::Pressure),
+                "diff-vitesse" => Back::Diff(DiffOf::Velocity),
+                _ => Back::Classes,
+            };
+            game.simview.velocity[3] = args.iter().any(|a| a == "--sim-air");
+        }
         if args.iter().any(|a| a == "--palette") {
             game.views = Drawer::new(true);
         }
@@ -4762,6 +4742,20 @@ async fn main() {
         if shot.is_some() && frame == 330 && args.iter().any(|a| a == "--clouds") {
             for (x, y, r) in [(150, 150, 12), (175, 158, 10), (420, 130, 14), (450, 138, 10), (700, 160, 12), (735, 152, 13), (870, 140, 11)] {
                 game.world.paint(x, y, r, Mat::Cloud);
+            }
+        }
+        // `--pour x`: a heap of sand and a ball of water in the air over x, shortly before the shot.
+        if shot.is_some() && frame == 320 {
+            if let Some(x) = arg("--pour").and_then(|v| v.parse::<i32>().ok()) {
+                let y = ground_y(&game.world, x) as i32;
+                game.world.paint(x - 14, y - 40, 8, Mat::Sand);
+                game.world.paint(x + 14, y - 46, 9, Mat::Water);
+            }
+        }
+        // `--sim-steps n`: the simulation view's step by step, n steps just before the shot.
+        if shot.is_some() && frame == 352 {
+            if let Some(n) = arg("--sim-steps").and_then(|v| v.parse::<usize>().ok()) {
+                game.step_by_step(n);
             }
         }
         if shot.is_some() && frame == 245 && args.iter().any(|a| a == "--bridge") {
@@ -5357,6 +5351,21 @@ mod tests {
         // Going back to the drawing board puts the water where it was.
         g.reset();
         assert!((level(&g, 130) - before.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn a_step_by_step_pauses_and_keeps_the_diff() {
+        let mut g = Game::new();
+        g.world.paint(300, 60, 4, Mat::Sand);
+        g.step_by_step(1);
+        assert!(!g.running, "the world stays paused after the step");
+        let stats = g.simview.stats.as_ref().expect("the step's diff");
+        assert_eq!(stats.to, stats.from + 1);
+        // The grains in the air fell: their cells changed matter.
+        assert!(stats.changed[0].0 > 0);
+        g.step_by_step(10);
+        let stats = g.simview.stats.as_ref().unwrap();
+        assert_eq!(stats.to, stats.from + 10);
     }
 
     fn drag_from_to(g: &mut Game, from: Vec2, to: Vec2) {
