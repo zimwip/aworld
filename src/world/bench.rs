@@ -277,3 +277,64 @@ fn water_over_time_probe() {
         eprintln!("{line}");
     }
 }
+
+/// How fast things fall from rest: a block of water, a drop, sand, in cells after each tenth of a
+/// second (the probe for the same gravity for all).
+#[test]
+#[ignore]
+fn falls_probe() {
+    // The centre of the matter (weighted by its fill for a liquid), and its lowest cell.
+    let lowest = |w: &World, m: Mat| {
+        let (mut s, mut n, mut low) = (0f64, 0f64, 0);
+        for i in (0..W() * H()).filter(|&i| w.cells[i].m == m) {
+            let f = if m.kind() == Kind::Liquid { w.liquid_fill(i) as f64 } else { 1.0 };
+            s += f * (i / W()) as f64;
+            n += f;
+            low = low.max(i / W());
+        }
+        format!("{:.1} (bas {low})", s / n.max(1.0))
+    };
+    let mut w = World::new_static();
+    w.liquid_physics = true;
+    for y in 40..50 {
+        for x in 100..110 {
+            w.set(x, y, Mat::Water);
+        }
+        for x in 300..310 {
+            w.set(x, y, Mat::Sand);
+        }
+    }
+    w.liq.drops.push(super::liquid::Drop { x: 500.5, y: 49.5, vx: 0.0, vy: 0.0, m: Mat::Water, q: field::FULL, t: 15.0 });
+    let mut line = String::new();
+    for k in 0..=60 {
+        if k % 6 == 0 {
+            let drop = w.liq.drops.first().map_or(-1.0, |d| d.y);
+            line += &format!("t={:.1}s eau {} goutte {:.0} sable {}\n", k as f32 / 60.0, lowest(&w, Mat::Water), drop, lowest(&w, Mat::Sand));
+        }
+        w.step();
+    }
+    eprintln!("{line}");
+}
+
+/// Everything falls by the same gravity, whatever the length of the steps: a block of sand
+/// dropped from rest goes down about ½ g t² (29 cells of 1/6 m in a second, a little less with
+/// the drag), and keeps together on the way.
+#[test]
+fn a_block_of_sand_falls_by_gravity_at_any_step() {
+    for ticks in [1.0f32, 2.0, 0.5] {
+        let mut w = World::new_static();
+        for y in 40..50 {
+            for x in 300..310 {
+                w.set(x, y, Mat::Sand);
+            }
+        }
+        let dt = ticks * STEP;
+        for _ in 0..(1.0 / dt).round() as u32 {
+            w.step_dt(dt);
+        }
+        let ys: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Sand).map(|i| i / W()).collect();
+        let (low, high) = (*ys.iter().max().unwrap(), *ys.iter().min().unwrap());
+        assert!((24..=31).contains(&(low - 49)), "steps of 1/{:.0} s: the bottom fell {} cells in a second", 1.0 / dt, low - 49);
+        assert!(low - high <= 12, "steps of 1/{:.0} s: the block spread over {} rows", 1.0 / dt, low - high + 1);
+    }
+}

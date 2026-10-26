@@ -539,7 +539,7 @@ impl World {
             for x in x0..=x1 {
                 let i = y * W() + x;
                 if liq.class[i] & 3 >= WET && self.vel[i] != 0 && !self.lone_liquid(x as i32, y as i32) {
-                    let speed = self.vel[i] as f32 / 8.0 * CELL_M / DT;
+                    let speed = self.vel[i] as f32 / super::FALL_UNIT as f32 * CELL_M / DT;
                     liq.v[vi(x, y + 1)] = liq.v[vi(x, y + 1)].max(speed);
                     liq.v[vi(x, y)] = liq.v[vi(x, y)].max(speed);
                     self.vel[i] = 0;
@@ -2160,6 +2160,7 @@ mod tests {
             // 40 cells (6.7 m) at first; after 1 s a real front of water 5 m deep is about 13 m
             // out (the cells' water was at 36).
             let f = front(&w, m, 100, 400, 339, 449) as f32 * CELL_M;
+            eprintln!("DAM {m:?}: front {f} m");
             assert!((9.0..15.0).contains(&f), "{m:?}: {f} m");
             // (Water also dries a little into the air: that is water too.)
             let after = w.liquid_units(m) + w.gone + if m == Mat::Water { w.dried } else { 0 };
@@ -2334,6 +2335,7 @@ mod tests {
             }
         }
         // Waves a cell or two high (a pond a few tens of metres wide, a gale's waves made bigger).
+        eprintln!("WAVES rough {rough} cells");
         assert!(rough > 1.0 && rough < 5.0, "{rough} cells");
         // More water at the downwind end than at the upwind one.
         let h = levels(&w);
