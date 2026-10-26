@@ -1,4 +1,4 @@
-//! Liquids by their physics (`World::liquid_physics`, an option, off unless `AWORLD_LIQUIDS=1`).
+//! Liquids by their physics (`World::liquid_physics`, on unless `AWORLD_LIQUIDS=0`).
 //!
 //! Every liquid (water, oil, lava, the melts) is moved here by real forces in real units: a
 //! velocity in m/s on each edge between two cells (a "MAC" grid: the velocity lives where the
@@ -79,9 +79,9 @@ pub(super) const CRUMB: u32 = 8;
 /// the model alone (no surface tension, no breaking) would keep them for ever.
 pub(super) const CALM: f32 = 3.0;
 
-/// Whether new worlds take their liquids by physics: `AWORLD_LIQUIDS=1`.
+/// Whether new worlds take their liquids by physics: yes, unless `AWORLD_LIQUIDS=0`.
 pub(super) fn physics_by_default() -> bool {
-    std::env::var_os("AWORLD_LIQUIDS").is_some_and(|v| v != "0")
+    !std::env::var_os("AWORLD_LIQUIDS").is_some_and(|v| v == "0")
 }
 
 /// What a cell is to the liquids.
@@ -280,6 +280,10 @@ impl World {
         }
         self.liq.clear();
         self.liquid_physics = on;
+        if !on {
+            // The liquids take the cells' turn again: that turn runs on every core only if asked.
+            self.parallel_cells = std::env::var_os("AWORLD_CELLS_PAR").is_some_and(|v| v != "0");
+        }
     }
 
     /// The drops of liquid in flight.

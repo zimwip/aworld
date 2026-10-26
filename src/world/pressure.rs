@@ -425,6 +425,7 @@ mod boom {
     fn a_falling_body_does_not_blow_the_ground_away_before_it_lands() {
         for (seed, x) in [(7, 300), (7, 520), (11, 420)] {
             let mut w = World::new();
+            w.set_liquid_physics(false);
             w.generate(seed);
             // Long enough for the air to settle into its layers (low pressure near the ground).
             for _ in 0..300 {

@@ -702,7 +702,7 @@ pub struct World {
     /// `turn.rs`). Off unless `AWORLD_CELLS_PAR=1`.
     pub parallel_cells: bool,
     /// Whether every liquid moves by real forces (velocities, pressure, viscosity, see
-    /// `liquid.rs`). Off unless `AWORLD_LIQUIDS=1`.
+    /// `liquid.rs`). On unless `AWORLD_LIQUIDS=0`.
     pub liquid_physics: bool,
     /// The velocities and pressure of the liquids (see `liquid.rs`).
     liq: liquid::Liquids,
@@ -868,6 +868,9 @@ impl World {
         w.structures_fall = false;
         w.climate_fixed = Some(15.0);
         w.reset_temps();
+        // (The cells' liquids, as these scenes were written and checked; a test of the
+        // physical liquids says so, as `liquid::tests::world` does.)
+        w.set_liquid_physics(false);
         w
     }
 

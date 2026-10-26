@@ -47,7 +47,7 @@ pub struct Patch {
 mod native {
     use super::super::gpu::{gpu, Gpu};
     use super::super::liquid::*;
-    use super::super::mgpcg_gpu::{PressureGpu, SC_DONE, SC_ITER, SC_N};
+    use super::super::mgpcg_gpu::{PressureGpu, Stamper, SC_DONE, SC_ITER, SC_N};
     use super::super::*;
     use super::Patch;
     use rayon::prelude::*;
@@ -399,12 +399,13 @@ mod native {
 
     /// The most time stamps a step writes (one before the first kernel, one after each phase of
     /// each sub-step, one after the copies back).
-    const MAX_STAMPS: usize = 2 + 5 * MAX_SUB + 2;
+    const MAX_STAMPS: usize = 2 + 5 * MAX_SUB + 2 + 2 + 4 * (MAX_ITER as usize + 1);
     /// The card's time in each phase, in ns, summed over the steps (`AWORLD_DEBUG_CARD`).
-    static CARD: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
-    const PHASES: [&str; 6] = ["envoi", "forces", "viscosité", "pression", "transport", "retour"];
+    static CARD: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+    const PHASES: [&str; 10] = ["envoi", "forces", "viscosité", "pression", "pression: préparation", "pression: gradients", "pression: lissage fin", "pression: niveaux grossiers", "transport", "retour"];
     /// The audit of the water at the collect (`AWORLD_DEBUG_MASS`).
     static AUDIT: [std::sync::atomic::AtomicI64; 5] = [const { std::sync::atomic::AtomicI64::new(0) }; 5];
+    static DBG_ITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static DBG: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
     fn tick(k: usize, t: std::time::Instant) -> std::time::Instant {
         DBG[k].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -449,6 +450,7 @@ mod native {
                 .collect();
             card.fastest = (0..groups).map(|g| f32::from_bits(word(pend.partials_at + g))).fold(0.0f32, f32::max);
             let iterations = f32::from_bits(word(pend.sc_at + SC_ITER)) as u32;
+            DBG_ITER.fetch_add(iterations as u64, std::sync::atomic::Ordering::Relaxed);
             if card.stamps.is_some() && pend.marks.len() > 1 {
                 // The card's time in each phase: the stamps' differences, in ns.
                 let period = card.gpu.queue.get_timestamp_period() as f64;
@@ -750,17 +752,12 @@ mod native {
             let (nu_, nv) = (rows * (W + 1), rows * W);
             let (ubytes, vbytes) = (at(y0 * (W + 1))..at((y1 + 1) * (W + 1)), at(y0 * W)..at((y1 + 1) * W));
             let mut enc = card.encoder();
-            // The time stamps, where asked for: one at the start, one at the end of each phase.
+            // The time stamps, where asked for: one at the start, one at the end of each phase
+            // (and inside the pressure's solve, its parts).
             let mut marks: Vec<&'static str> = Vec::new();
-            let mut stamp_at = |enc: &mut wgpu::CommandEncoder, marks: &mut Vec<&'static str>, what: &'static str| {
-                if let Some((set, _)) = &card.stamps {
-                    if marks.len() < MAX_STAMPS {
-                        enc.write_timestamp(set, marks.len() as u32);
-                        marks.push(what);
-                    }
-                }
-            };
-            stamp_at(&mut enc, &mut marks, "début");
+            let mut stamps = Stamper { set: card.stamps.as_ref().map(|(set, _)| set), marks: &mut marks, max: MAX_STAMPS };
+            let stamp_at = |enc: &mut wgpu::CommandEncoder, stamps: &mut Stamper, what: &'static str| stamps.at(enc, what);
+            stamp_at(&mut enc, &mut stamps, "début");
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 if !sent.is_empty() {
@@ -770,7 +767,7 @@ mod native {
                     card.run(&mut pass, &k.patch, 0, patches.len());
                 }
             }
-            stamp_at(&mut enc, &mut marks, "envoi");
+            stamp_at(&mut enc, &mut stamps, "envoi");
             for s in 0..sub {
                 {
                     let mut pass = enc.begin_compute_pass(&Default::default());
@@ -782,7 +779,7 @@ mod native {
                 }
                 enc.copy_buffer_to_buffer(&card.u3, ubytes.start, &card.u, ubytes.start, ubytes.end - ubytes.start);
                 enc.copy_buffer_to_buffer(&card.v3, vbytes.start, &card.v, vbytes.start, vbytes.end - vbytes.start);
-                stamp_at(&mut enc, &mut marks, "forces");
+                stamp_at(&mut enc, &mut stamps, "forces");
                 if thick {
                     {
                         let mut pass = enc.begin_compute_pass(&Default::default());
@@ -802,7 +799,7 @@ mod native {
                         }
                     }
                     drop(pass);
-                    stamp_at(&mut enc, &mut marks, "viscosité");
+                    stamp_at(&mut enc, &mut stamps, "viscosité");
                 }
                 if s + 1 == sub {
                     {
@@ -811,13 +808,13 @@ mod native {
                         card.run(&mut pass, &k.system_edges, 0, ncell);
                         card.run(&mut pass, &k.assemble, 0, ncell);
                     }
-                    card.pressure.solve_fixed(&mut enc, y0, y1, fullish, SETTLED, RELATIVE, card.iters);
+                    card.pressure.solve_fixed(&mut enc, y0, y1, fullish, SETTLED, RELATIVE, card.iters, &mut stamps);
                     let mut pass = enc.begin_compute_pass(&Default::default());
                     card.run(&mut pass, &k.take_pressure, 0, ncell);
                     card.run(&mut pass, &k.push_u, 0, nu_);
                     card.run(&mut pass, &k.push_v, 0, nv);
                     drop(pass);
-                    stamp_at(&mut enc, &mut marks, "pression");
+                    stamp_at(&mut enc, &mut stamps, "pression");
                 }
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 card.run(&mut pass, &k.throw_find, 0, ncell);
@@ -830,7 +827,7 @@ mod native {
                 card.run(&mut pass, &k.carry_commit, 0, ncell);
                 card.run(&mut pass, &k.overflow, 0, W);
                 drop(pass);
-                stamp_at(&mut enc, &mut marks, "transport");
+                stamp_at(&mut enc, &mut stamps, "transport");
             }
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
@@ -862,8 +859,9 @@ mod native {
             enc.copy_buffer_to_buffer(card.pressure.scalars(), 0, &card.read, off, (SC_N * 4) as u64);
             off += (SC_N * 4) as u64;
             // The copies back are timed too, then the stamps are resolved and copied last.
-            stamp_at(&mut enc, &mut marks, "retour");
+            stamp_at(&mut enc, &mut stamps, "retour");
             let stamps_at = off as usize / 4;
+            drop(stamps);
             if let Some((set, buf)) = &card.stamps {
                 if marks.len() > 1 {
                     enc.resolve_query_set(set, 0..marks.len() as u32, buf, 0);
@@ -882,7 +880,7 @@ mod native {
                 eprintln!("carte, ms/pas: bande {:.2}, différences {:.2} ({} cellules envoyées), écritures {:.2}, encodage {:.2}, soumission {:.2}, attente {:.2}, lecture {:.2} ({} cellules reçues)", ms(0), ms(1), sent.len(), ms(2), ms(3), ms(4), ms(5), ms(6), DBG[7].load(std::sync::atomic::Ordering::Relaxed));
                 if card.stamps.is_some() {
                     let line: Vec<String> = PHASES.iter().enumerate().map(|(k, name)| format!("{name} {:.2}", CARD[k].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / stamp as f64)).collect();
-                    eprintln!("carte, ms/pas sur la carte: {} ({} lignes, {} sous-pas, {} itérations)", line.join(", "), rows, sub, card.iters);
+                    eprintln!("carte, ms/pas sur la carte: {} ({} lignes, {} sous-pas, {} itérations, {:.2} en moyenne)", line.join(", "), rows, sub, card.iters, DBG_ITER.load(std::sync::atomic::Ordering::Relaxed) as f64 / stamp as f64);
                 } else {
                     eprintln!("carte: pas d'horodatage (la carte ne l'offre pas)");
                 }
