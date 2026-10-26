@@ -4471,19 +4471,16 @@ async fn main() {
         // `--sim-back`: the simulation view's background.
         if let Some(b) = arg("--sim-back") {
             use simview::{Back, DiffOf};
-            use world::inspect::Field;
             game.simview.back = match b.as_str() {
                 "matiere" => Back::Matter,
-                "liquides-pa" => Back::Pressure(Field::LiquidPa),
-                "liquides-atm" => Back::Pressure(Field::LiquidAtm),
-                "air" => Back::Pressure(Field::Air),
-                "poussee" => Back::Pressure(Field::Push),
-                "poches" => Back::Pressure(Field::Pockets),
+                "pression" => Back::Pressure,
+                "air" => Back::Air,
+                "calcul" => Back::Classes,
                 "diff-remplissage" => Back::Diff(DiffOf::Fill),
                 "diff-temperature" => Back::Diff(DiffOf::Temp),
                 "diff-pression" => Back::Diff(DiffOf::Pressure),
                 "diff-vitesse" => Back::Diff(DiffOf::Velocity),
-                _ => Back::Classes,
+                _ => Back::Matter,
             };
             game.simview.velocity[3] = args.iter().any(|a| a == "--sim-air");
         }

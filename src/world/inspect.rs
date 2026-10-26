@@ -75,33 +75,6 @@ pub enum Field {
     LiquidAtm,
     /// The air's pressure over the ambient one, atm, one value a flow cell (`flow.rs`).
     Air,
-    /// The excess pressure that pushes liquids and loose matter, atm, a flow cell
-    /// (`pressure.rs`: the air's, passed on whole into the liquids).
-    Push,
-    /// The pressure of the closed pockets of gas, absolute, atm (`pockets.rs`; 1 in the open).
-    Pockets,
-}
-
-impl Field {
-    pub const ALL: [Field; 5] = [Field::LiquidPa, Field::LiquidAtm, Field::Air, Field::Push, Field::Pockets];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Field::LiquidPa => "liquides, physique (Pa)",
-            Field::LiquidAtm => "liquides, cellules (atm)",
-            Field::Air => "air, flux (atm)",
-            Field::Push => "air qui pousse (atm)",
-            Field::Pockets => "poches de gaz (atm)",
-        }
-    }
-
-    /// The value the field is measured from: its colours go either side of it.
-    pub fn rest(self) -> f32 {
-        match self {
-            Field::LiquidAtm | Field::Pockets => 1.0,
-            _ => 0.0,
-        }
-    }
 }
 
 impl World {
@@ -166,9 +139,7 @@ impl World {
         match field {
             Field::LiquidPa => self.liquid_pa(x, y),
             Field::LiquidAtm => (m.kind() == Kind::Liquid && !self.liquid_physics).then(|| self.liq_p[i]),
-            Field::Air => (!self.flow.is_solid(fi, fj) && self.flow.compress).then(|| self.flow.excess_at_cell(fi, fj)),
-            Field::Push => (!matches!(m.kind(), Kind::Static | Kind::Powder)).then(|| self.dp.get(fj * FW + fi).copied()).flatten(),
-            Field::Pockets => self.pocket_at(x as i32, y as i32).and_then(|k| self.pockets.get(k)).map(|p| p.pressure),
+            Field::Air => (matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) && !self.flow.is_solid(fi, fj) && self.flow.compress).then(|| self.flow.excess_at_cell(fi, fj)),
         }
     }
 
@@ -259,8 +230,8 @@ mod tests {
         assert!(w.field_value(Field::LiquidAtm, 220, 270).is_none());
         assert!(w.field_value(Field::LiquidPa, 220, 290).is_none(), "no physics, no liquid pressure");
         // The open air is a pocket at one atmosphere; the ground is in no pocket.
-        assert_eq!(w.field_value(Field::Pockets, 220, 100), Some(1.0));
-        assert!(w.field_value(Field::Pockets, 220, 300).is_none());
-        assert!(w.field_value(Field::Push, 220, 300).is_none());
+        assert_eq!(w.pocket_info(220, 100).map(|p| (p.2, p.3)), Some((1.0, true)));
+        assert!(w.pocket_info(220, 300).is_none());
+        assert!(w.field_value(Field::Air, 220, 300).is_none(), "no air in the ground");
     }
 }

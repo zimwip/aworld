@@ -35,8 +35,8 @@ impl DiffOf {
     fn label(self) -> &'static str {
         match self {
             DiffOf::Matter => "matière",
-            DiffOf::Fill => "rempl.",
-            DiffOf::Temp => "temp.",
+            DiffOf::Fill => "liquide",
+            DiffOf::Temp => "chaleur",
             DiffOf::Pressure => "pression",
             DiffOf::Velocity => "vitesse",
         }
@@ -61,8 +61,11 @@ pub enum Back {
     Matter,
     /// What each cell is to the liquids (`liquid.rs`).
     Classes,
-    /// A pressure field (`world::inspect::Field`).
-    Pressure(Field),
+    /// The pressure that pushes on walls: in the liquids and in the closed pockets of gas, Pa
+    /// over the open air.
+    Pressure,
+    /// The air's pressure, from its flow (`flow.rs`), Pa over the ambient one.
+    Air,
     /// What the last step changed.
     Diff(DiffOf),
 }
@@ -212,7 +215,7 @@ pub struct SimView {
 impl SimView {
     pub fn new() -> SimView {
         SimView {
-            back: Back::Classes,
+            back: Back::Matter,
             zones: true,
             card: true,
             flying: true,
@@ -285,7 +288,8 @@ impl SimView {
         self.values.par_iter_mut().enumerate().for_each(|(i, v)| {
             let (x, y) = (i % W, i / W);
             *v = match back {
-                Back::Pressure(f) => w.field_value(f, x, y).map_or(f32::NAN, |p| p - f.rest()),
+                Back::Pressure => pressure_pa(w, x, y),
+                Back::Air => w.field_value(Field::Air, x, y).map_or(f32::NAN, |p| p * ATM),
                 Back::Diff(of) => match (before, after) {
                     (Some(b), Some(a)) => b.delta(a, of, i),
                     _ => f32::NAN,
@@ -304,7 +308,7 @@ impl SimView {
             *mags.select_nth_unstable_by(k, f32::total_cmp).1
         };
         let image = self.image.get_or_insert_with(|| Image::gen_image_color(W as u16, H as u16, BLACK));
-        let (values, scale) = (&self.values, self.scale);
+        let (values, scale, top) = (&self.values, self.scale, self.top);
         let after = self.after.as_ref();
         image.get_image_data_mut().par_iter_mut().enumerate().for_each(|(i, px)| {
             let (x, y) = (i % W, i / W);
@@ -317,10 +321,12 @@ impl SimView {
             *px = match back {
                 Back::Matter => dim(5),
                 Back::Classes => class_color(w, x, y, dim(3)),
-                Back::Pressure(_) | Back::Diff(DiffOf::Fill | DiffOf::Temp | DiffOf::Pressure) => {
+                Back::Pressure | Back::Air | Back::Diff(DiffOf::Fill | DiffOf::Temp | DiffOf::Pressure) => {
                     let v = values[i];
                     if v.is_nan() || (matches!(back, Back::Diff(_)) && v == 0.0) {
                         dim(2)
+                    } else if matches!(back, Back::Pressure | Back::Air) {
+                        diverging(log_scale(v, top))
                     } else if v.abs() > 10.0 * scale {
                         WILD
                     } else {
@@ -485,7 +491,8 @@ impl SimView {
         const PW: f32 = 300.0;
         let mut ask = Ask::None;
         let lines = self.readout(w);
-        let h = 30.0 + 98.0 + 20.0 + 8.0 * 22.0 + 30.0 + 20.0 + 3.0 * 22.0 + 50.0 + 58.0 + 14.0 + lines.len() as f32 * 15.0 + 10.0;
+        // As tall as what it held last frame (its content changes with the choices).
+        let h = self.rect.h.max(200.0);
         let pos = self.pos.unwrap_or(vec2(sw - 22.0 - PW - 10.0, 52.0));
         let pos = vec2(pos.x.clamp(0.0, (sw - PW).max(0.0)), pos.y.clamp(0.0, (sh - 30.0).max(0.0)));
         let r = Rect::new(pos.x, pos.y, PW, h);
@@ -523,63 +530,56 @@ impl SimView {
             ask = Ask::Steps(10);
         }
         y += 32.0;
-        let card = if w.liquid_card_rows().is_some() { " · liquides sur la carte" } else { "" };
-        let flying = format!("{} gouttes, {} éclats, {} débris, {} étincelles", w.liquid_drops().len(), w.ejecta_motion().count(), self.particles[0], self.particles[1]);
-        ui.text(&format!("{} zones tournent{card}", w.zones.awake_count()), x, y + 10.0, 11, TEXT);
-        ui.text(&format!("En vol : {flying}"), x, y + 24.0, 11, TEXT);
-        y += 28.0;
         let note = match &self.stats {
-            Some(s) => format!("Diff du pas {} au pas {}. Touche point : un pas.", s.from, s.to),
-            None => "Un pas met le monde en pause, puis le fond montre ce qu'il a changé. Touche point : un pas.".to_string(),
+            Some(s) => format!("Les « Changements » comparent le pas {} au pas {}. Touche point : un pas.", s.from, s.to),
+            None => "« 1 pas » avance le monde d'un pas puis le met en pause ; le fond « Changements » montre alors ce qu'il a modifié. Touche point : un pas.".to_string(),
         };
-        ui.wrapped(&note, x, y + 10.0, cw, 11, DIM);
-        y += 38.0;
+        y += ui.wrapped(&note, x, y + 10.0, cw, 11, DIM) + 4.0;
 
         // The background.
-        ui.text("Fond", x, y + 12.0, 13, ACCENT);
+        ui.text("Le fond montre", x, y + 12.0, 13, ACCENT);
         y += 20.0;
         let diff = match self.back {
             Back::Diff(of) => of,
             _ => DiffOf::Matter,
         };
-        let mut row = |ui: &mut Ui, y: &mut f32, label: &str, b: Back| {
-            if ui.checkbox(Rect::new(x, *y, cw, 20.0), label, self.back == b || matches!((self.back, b), (Back::Diff(_), Back::Diff(_))), true) {
+        let mut choices = vec![
+            ("La matière", Back::Matter),
+            ("La pression (liquides, poches de gaz)", Back::Pressure),
+            ("La pression de l'air", Back::Air),
+            ("Les changements du dernier pas", Back::Diff(diff)),
+        ];
+        // Only the liquids moving by their physics have classes.
+        if w.liquid_physics {
+            choices.insert(1, ("Le calcul des liquides (plein, film, goutte)", Back::Classes));
+        } else if self.back == Back::Classes {
+            self.back = Back::Matter;
+        }
+        for (label, b) in choices {
+            let on = self.back == b || matches!((self.back, b), (Back::Diff(_), Back::Diff(_)));
+            if ui.checkbox(Rect::new(x, y, cw, 20.0), label, on, true) {
                 self.back = b;
-            }
-            *y += 22.0;
-        };
-        row(ui, &mut y, "Matière", Back::Matter);
-        row(ui, &mut y, "Classes des liquides (liquid.rs)", Back::Classes);
-        for f in Field::ALL {
-            row(ui, &mut y, &format!("Pression : {}", f.label()), Back::Pressure(f));
-        }
-        row(ui, &mut y, "Diff du dernier pas :", Back::Diff(diff));
-        let tw = cw / 5.0;
-        for (k, of) in DiffOf::ALL.iter().enumerate() {
-            let on = self.back == Back::Diff(*of);
-            let b = Rect::new(x + k as f32 * tw, y, tw - 3.0, 22.0);
-            let n = self.stats.as_ref().map(|s| s.changed[k].0);
-            ui.force_size = Some(11);
-            if ui.button(b, of.label(), Icon::None, on, true, GREEN) {
-                self.back = Back::Diff(*of);
-            }
-            ui.force_size = None;
-            if let Some(n) = n {
-                ui.text_center(&count(n), b.x + b.w / 2.0, b.y + 33.0, 10, if n > 0 { TEXT } else { DIM });
-            }
-        }
-        y += 40.0;
-
-        // The layers.
-        ui.text("Couches", x, y + 12.0, 13, ACCENT);
-        y += 20.0;
-        for (label, on) in [("Zones éveillées (sleep.rs)", &mut self.zones), ("Particules en vol (gouttes, éclats, débris…)", &mut self.flying), ("Lignes traitées par la carte", &mut self.card)] {
-            if ui.checkbox(Rect::new(x, y, cw, 20.0), label, *on, true) {
-                *on = !*on;
             }
             y += 22.0;
         }
-        ui.text("Vitesses (flèche : 1 m/s = 1 case)", x, y + 12.0, 12, TEXT);
+        if let Back::Diff(_) = self.back {
+            let tw = cw / 5.0;
+            for (k, of) in DiffOf::ALL.iter().enumerate() {
+                let on = self.back == Back::Diff(*of);
+                let b = Rect::new(x + k as f32 * tw, y, tw - 3.0, 22.0);
+                ui.force_size = Some(11);
+                if ui.button(b, of.label(), Icon::None, on, true, GREEN) {
+                    self.back = Back::Diff(*of);
+                }
+                ui.force_size = None;
+            }
+            y += 26.0;
+        }
+        self.legend(ui, x, y, cw);
+        y += 58.0;
+
+        // The layers.
+        ui.text("Flèches de vitesse (1 m/s = 1 case)", x, y + 12.0, 13, ACCENT);
         y += 18.0;
         let kw = cw / 5.0;
         for (k, (label, col)) in KINDS.iter().enumerate() {
@@ -590,18 +590,31 @@ impl SimView {
             }
             ui.force_size = None;
         }
-        y += 32.0;
-
-        // The legend of the background.
-        self.legend(ui, x, y, cw);
-        y += 58.0;
+        y += 28.0;
+        let flying = w.liquid_drops().len() + w.ejecta_motion().count() + self.particles[0] + self.particles[1];
+        let card = w.liquid_card_rows().is_some();
+        let mut layers = vec![
+            (format!("Zones de calcul actives ({})", w.zones.awake_count()), &mut self.zones),
+            (format!("Particules en vol ({flying})"), &mut self.flying),
+        ];
+        if card {
+            layers.push(("Lignes que la carte graphique calcule".to_string(), &mut self.card));
+        }
+        for (label, on) in layers {
+            if ui.checkbox(Rect::new(x, y, cw, 20.0), &label, *on, true) {
+                *on = !*on;
+            }
+            y += 22.0;
+        }
+        y += 4.0;
 
         // The cell under the pointer.
-        ui.text("Sous la souris", x, y + 12.0, 13, ACCENT);
+        ui.text("La case sous la souris", x, y + 12.0, 13, ACCENT);
         y += 14.0;
         for (k, (l, col)) in lines.iter().enumerate() {
             ui.text(l, x, y + 12.0 + k as f32 * 15.0, 12, *col);
         }
+        self.rect.h = y + 14.0 + lines.len() as f32 * 15.0 + 10.0 - r.y;
         ask
     }
 
@@ -616,7 +629,7 @@ impl SimView {
         };
         match self.back {
             Back::Matter => {
-                ui.wrapped("La matière, atténuée : les couches se lisent par-dessus.", x, y + 10.0, cw, 11, DIM);
+                ui.wrapped("Le monde, atténué, pour lire les flèches et les zones par-dessus.", x, y + 10.0, cw, 11, DIM);
             }
             Back::Classes => {
                 for (k, (c, label)) in [((40, 96, 230), "plein"), ((130, 200, 245), "film"), ((245, 220, 70), "goutte"), ((96, 84, 60), "paroi")].iter().enumerate() {
@@ -624,18 +637,32 @@ impl SimView {
                     draw_rectangle(bx, y, 10.0, 10.0, Color::from_rgba(c.0, c.1, c.2, 255));
                     ui.text(label, bx + 14.0, y + 10.0, 11, DIM);
                 }
-                ui.wrapped("Plus sombre : sa zone dort. Classes vides : physique des liquides éteinte (AWORLD_LIQUIDS=1).", x, y + 24.0, cw, 10, DIM);
+                ui.wrapped("Un liquide plein porte une pression, un film suit le courant, une goutte tombe seule. Plus sombre : le calcul dort là.", x, y + 24.0, cw, 10, DIM);
             }
-            Back::Pressure(f) => {
-                let s = self.scale;
-                let fmt = |v: f32| match f {
-                    Field::LiquidPa => format!("{:+.0} Pa", v),
-                    _ => format!("{:+.4} atm", v),
-                };
-                let rest = f.rest();
-                let mid = if rest == 0.0 { "0".to_string() } else { format!("{rest} atm") };
-                ramp(ui, format!("{} (autour de {mid})", fmt(-s)), fmt(s), &|t| diverging(t));
-                self.wild(ui, x, y + 38.0, &fmt(self.top));
+            Back::Pressure | Back::Air => {
+                if self.top == 0.0 {
+                    let text = if self.back == Back::Pressure { "Rien n'est sous pression : ni liquide, ni poche de gaz fermée en vue." } else { "L'air est partout à la pression ambiante." };
+                    ui.wrapped(text, x, y + 10.0, cw, 11, DIM);
+                } else {
+                    // A logarithmic scale: a pond (a few kPa) and a closed pocket (hundreds) both show.
+                    let top = self.top;
+                    ramp(ui, format!("{} : moins que l'air libre", pa(-top)), format!("plus : {}", pa(top)), &|t| diverging(t));
+                    for p in [100.0, 1000.0, 10_000.0, 100_000.0] {
+                        if p < top {
+                            for sign in [-1.0, 1.0] {
+                                let t = log_scale(sign * p, top);
+                                let tx = x + (t + 1.0) / 2.0 * cw;
+                                draw_line(tx, y, tx, y + 10.0, 1.0, Color::new(0.0, 0.0, 0.0, 0.6));
+                            }
+                            if p < 1000.0 {
+                                continue;
+                            }
+                            let tx = x + (log_scale(p, top) + 1.0) / 2.0 * cw;
+                            let label = pa(p).trim_start_matches('+').to_string();
+                            ui.text(&label, tx - ui.text_w(&label, 9) / 2.0, y + 36.0, 9, DIM);
+                        }
+                    }
+                }
             }
             Back::Diff(of) => {
                 let (unit, _) = of.unit();
@@ -721,17 +748,16 @@ impl SimView {
             None if m.kind() == Kind::Static => out.push(("vitesse : aucune (solide immobile)".into(), DIM)),
             None => {}
         }
-        for f in Field::ALL {
-            if let Some(v) = w.field_value(f, x, y) {
-                let text = match f {
-                    Field::LiquidPa => format!("p {} : {v:+.1} Pa", f.label()),
-                    _ => format!("p {} : {v:.4}", f.label()),
-                };
-                out.push((text, DIM));
-            }
+        let p = pressure_pa(w, x, y);
+        if !p.is_nan() {
+            let from = if w.field_value(Field::LiquidPa, x, y).is_some() { "liquid.rs" } else if m.kind() == Kind::Liquid { "pockets.rs" } else { "poche fermée" };
+            out.push((format!("pression : {} sur l'air libre ({from})", pa(p)), TEXT));
+        }
+        if let Some(a) = w.field_value(Field::Air, x, y) {
+            out.push((format!("pression de l'air : {} (flow.rs)", pa(a * ATM)), DIM));
         }
         if let Some((k, cells, p, open)) = w.pocket_info(x, y) {
-            out.push((format!("poche {k} : {cells} cases, {p:.3} atm, {}", if open { "à l'air libre" } else { "fermée" }), DIM));
+            out.push((format!("poche de gaz {k} : {cells} cases, {p:.3} atm, {}", if open { "ouverte" } else { "fermée" }), DIM));
         }
         // The same cell at the step before.
         if let (Some(b), Some(a)) = (&self.before, &self.after) {
@@ -767,6 +793,42 @@ pub enum Ask {
     Run(bool),
     /// Take that many steps, then stay paused.
     Steps(usize),
+}
+
+/// One atmosphere, Pa.
+const ATM: f32 = 101_325.0;
+
+/// The pressure that pushes on walls at (x, y), Pa over the open air: in a liquid (by its physics,
+/// or the cells' own count), or in a closed pocket of gas; NaN elsewhere.
+fn pressure_pa(w: &World, x: usize, y: usize) -> f32 {
+    if let Some(p) = w.field_value(Field::LiquidPa, x, y) {
+        return p;
+    }
+    if let Some(atm) = w.field_value(Field::LiquidAtm, x, y) {
+        return (atm - 1.0) * ATM;
+    }
+    match w.pocket_info(x, y) {
+        Some((_, _, p, false)) => (p - 1.0) * ATM,
+        _ => f32::NAN,
+    }
+}
+
+/// Where `v` falls on a logarithmic scale up to `top` either side of 0, as -1..1 (100 Pa makes
+/// the first step).
+fn log_scale(v: f32, top: f32) -> f32 {
+    let l = |v: f32| (1.0 + v.abs() / 100.0).ln();
+    v.signum() * l(v) / l(top).max(1e-6)
+}
+
+/// A pressure, in Pa or kPa.
+fn pa(v: f32) -> String {
+    if v.abs() >= 10_000.0 {
+        format!("{:+.0} kPa", v / 1000.0)
+    } else if v.abs() >= 1000.0 {
+        format!("{:+.1} kPa", v / 1000.0)
+    } else {
+        format!("{:+.0} Pa", v)
+    }
 }
 
 /// A value more than ten times the scale of the colours.
