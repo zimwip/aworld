@@ -4098,6 +4098,8 @@ impl World {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn a_simplified_simulation_still_melts_sand_and_cools_a_hot_stone() {
@@ -4201,8 +4203,6 @@ impl World {
             w.lod = 0;
         }
     }
-mod tests {
-    use super::*;
 
     #[test]
     fn every_liquid_moves_by_one_rule_the_thinner_the_further() {

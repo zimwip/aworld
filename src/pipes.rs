@@ -428,7 +428,7 @@ impl Plumbing {
         }
 
         // Liquid goes in at the inlets and comes out at the outlets (open ends only).
-        for (n, node) in nodes.iter().enumerate() {
+        for (_n, node) in nodes.iter().enumerate() {
             if node.ends.len() != 1 {
                 continue;
             }

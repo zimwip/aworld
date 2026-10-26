@@ -2721,7 +2721,7 @@ impl Game {
         let h = 36.0;
         let y = bar.y + (bar.h - h) / 2.0;
         let mut x = bar.x + pad;
-        let mut place = |i: usize, x: &mut f32| -> Rect {
+        let place = |i: usize, x: &mut f32| -> Rect {
             let r = Rect::new(*x, y, widths[i], h);
             *x += widths[i] + gap;
             r
@@ -4305,7 +4305,7 @@ fn demo_bridge(g: &mut Game) {
 fn demo_mech(g: &mut Game) {
     let gx = 450.0;
     let gy = ground_y(&g.world, 450) as f32;
-    let mut click = |g: &mut Game, tool: Tool, x: f32, y: f32| {
+    let click = |g: &mut Game, tool: Tool, x: f32, y: f32| {
         g.tool = tool;
         g.mech_click(vec2(x, y));
     };
