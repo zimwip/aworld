@@ -15,7 +15,7 @@ use crate::render::View;
 use crate::science::info;
 use crate::ui::{draw_icon, rrect, Icon, Ui, ACCENT, DIM, GREEN, TEXT};
 use crate::world::inspect::{Field, Motion, Source, FULL};
-use crate::world::liquid_class::{AIR, FULLISH, WET};
+use crate::world::liquid_class::{AIR, FULLISH, SOLID, WET};
 use crate::world::sleep::{CH, CS, CW};
 use crate::world::{self, Kind, Mat, World, H, W};
 
@@ -184,6 +184,14 @@ pub struct SimView {
     /// Which layers are drawn over it.
     pub zones: bool,
     pub card: bool,
+    /// The liquids the solver of `liquid.rs` moves, and the gas it takes for a wall.
+    pub solver: bool,
+    /// That layer's picture, its revision, and how many cells it marks (full, film, drops left
+    /// to the cells, gas taken for a wall).
+    solver_image: Option<Image>,
+    solver_texture: Option<Texture2D>,
+    solver_key: Option<u64>,
+    solver_counts: [usize; 4],
     pub flying: bool,
     /// The particles of the game in flight last drawn, by kind (`PARTICLES`).
     particles: [usize; 2],
@@ -218,6 +226,11 @@ impl SimView {
             back: Back::Matter,
             zones: true,
             card: true,
+            solver: true,
+            solver_image: None,
+            solver_texture: None,
+            solver_key: None,
+            solver_counts: [0; 4],
             flying: true,
             particles: [0; 2],
             velocity: [true, true, false, false, true],
@@ -276,6 +289,64 @@ impl SimView {
             self.key = Some(key);
         }
         if let Some(t) = &self.texture {
+            draw_texture_ex(t, view.ox, view.oy, WHITE, DrawTextureParams { dest_size: Some(vec2(W as f32 * view.s, H as f32 * view.s)), ..Default::default() });
+        }
+    }
+
+    /// The solver's liquids over the background: full cells in blue, films in light blue, drops
+    /// it leaves to the cells in yellow, and in orange a gas it takes for a wall beside its
+    /// liquid (a cloud or steam in the open: the liquid rests on it as on the ground). Fainter
+    /// where the calculation sleeps.
+    fn draw_solver(&mut self, w: &World, view: View) {
+        if self.solver_key != Some(w.revision) || self.solver_texture.is_none() {
+            let image = self.solver_image.get_or_insert_with(|| Image::gen_image_color(W as u16, H as u16, BLANK));
+            let px = image.get_image_data_mut();
+            let class = |x: usize, y: usize| w.liquid_class(x, y).unwrap_or(SOLID);
+            let liquid = |x: usize, y: usize| w.cell_mat(x, y).kind() == Kind::Liquid;
+            let counts = px
+                .par_chunks_mut(W)
+                .enumerate()
+                .map(|(y, row)| {
+                    let mut n = [0usize; 4];
+                    for (x, out) in row.iter_mut().enumerate() {
+                        let c = class(x, y);
+                        let m = w.cell_mat(x, y);
+                        let a = |a: u8| if c & 4 != 0 { a } else { a / 2 };
+                        *out = match (m.kind(), c & 3) {
+                            (Kind::Liquid, FULLISH) => {
+                                n[0] += 1;
+                                [60, 140, 255, a(150)]
+                            }
+                            (Kind::Liquid, WET) => {
+                                n[1] += 1;
+                                [150, 215, 255, a(140)]
+                            }
+                            (Kind::Liquid, AIR) => {
+                                n[2] += 1;
+                                [255, 220, 60, 200]
+                            }
+                            (Kind::Gas, SOLID) if [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)].iter().any(|&(nx, ny)| nx < W && ny < H && liquid(nx, ny)) => {
+                                n[3] += 1;
+                                [255, 110, 0, 230]
+                            }
+                            _ => [0, 0, 0, 0],
+                        };
+                    }
+                    n
+                })
+                .reduce(|| [0; 4], |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]);
+            self.solver_counts = counts;
+            match &self.solver_texture {
+                Some(t) => t.update(image),
+                None => {
+                    let t = Texture2D::from_image(image);
+                    t.set_filter(FilterMode::Nearest);
+                    self.solver_texture = Some(t);
+                }
+            }
+            self.solver_key = Some(w.revision);
+        }
+        if let Some(t) = &self.solver_texture {
             draw_texture_ex(t, view.ox, view.oy, WHITE, DrawTextureParams { dest_size: Some(vec2(W as f32 * view.s, H as f32 * view.s)), ..Default::default() });
         }
     }
@@ -375,6 +446,9 @@ impl SimView {
         let vis = Rect::new(a.x, a.y, b.x - a.x, b.y - a.y);
         let p = view.to_world(ui.mouse);
         self.hover = (!ui.over_ui() && area.contains(ui.mouse) && p.x >= 0.0 && p.y >= 0.0 && (p.x as usize) < W && (p.y as usize) < H).then(|| (p.x as usize, p.y as usize));
+        if self.solver && w.liquid_physics {
+            self.draw_solver(w, view);
+        }
         if self.zones {
             for zy in 0..CH {
                 for zx in 0..CW {
@@ -593,6 +667,24 @@ impl SimView {
         y += 28.0;
         let flying = w.liquid_drops().len() + w.ejecta_motion().count() + self.particles[0] + self.particles[1];
         let card = w.liquid_card_rows().is_some();
+        if w.liquid_physics {
+            let [full, film, drops, walls] = self.solver_counts;
+            if ui.checkbox(Rect::new(x, y, cw, 20.0), &format!("Liquides du solveur ({})", full + film), self.solver, true) {
+                self.solver = !self.solver;
+            }
+            y += 22.0;
+            if self.solver {
+                let keys = [((60, 140, 255), format!("plein {}", count(full))), ((150, 215, 255), format!("film {}", count(film))), ((255, 220, 60), format!("goutte {}", count(drops)))];
+                for (k, (c, label)) in keys.iter().enumerate() {
+                    let bx = x + 8.0 + k as f32 * (cw - 8.0) / 3.0;
+                    draw_rectangle(bx, y + 2.0, 9.0, 9.0, Color::from_rgba(c.0, c.1, c.2, 255));
+                    ui.text(label, bx + 13.0, y + 11.0, 11, DIM);
+                }
+                draw_rectangle(x + 8.0, y + 17.0, 9.0, 9.0, Color::from_rgba(255, 110, 0, 255));
+                ui.text(&format!("gaz pris pour une paroi : {} cases", count(walls)), x + 21.0, y + 26.0, 11, if walls > 0 { TEXT } else { DIM });
+                y += 32.0;
+            }
+        }
         let mut layers = vec![
             (format!("Zones de calcul actives ({})", w.zones.awake_count()), &mut self.zones),
             (format!("Particules en vol ({flying})"), &mut self.flying),
