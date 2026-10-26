@@ -15,6 +15,7 @@ pub const CH: usize = H.div_ceil(CS);
 
 /// The state of the zones: which run this step, which were woken for the next one, and which
 /// hold a cell that can change on its own.
+#[derive(Clone)]
 pub struct Zones {
     pub(super) awake: Vec<bool>,
     woke: Vec<bool>,

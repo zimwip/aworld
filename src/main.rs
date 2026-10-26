@@ -19,6 +19,7 @@ mod save;
 mod select;
 mod sensors;
 mod shovel;
+mod simthread;
 mod science;
 mod sound;
 mod ui;
@@ -288,6 +289,10 @@ struct Game {
     /// Simulation steps owed to the clock: the world runs 60 steps a second (times the speed)
     /// whatever the screen's refresh rate.
     sim_acc: f32,
+    /// What the world sounds like, from its last update.
+    mix: Mix,
+    /// The load on each block's welds (the stress view), when the physics is in another thread.
+    stress_seen: Option<std::collections::HashMap<u32, f32>>,
     beam_broke: bool,
     broken_members: Vec<u32>,
     /// Building does not use up the world's materials: one choice for the editing
@@ -303,6 +308,11 @@ impl Game {
     fn new() -> Self {
         let mut world = World::new();
         let (entry, exit) = world.generate_biome(1, Biome::Countryside);
+        Self::with_world(world, entry, exit)
+    }
+
+    /// A game around `world`, as it starts.
+    fn with_world(world: World, entry: (i32, i32), exit: (i32, i32)) -> Self {
         Game {
             science_fresh: false,
             sounds: Sounds::silent(),
@@ -396,6 +406,8 @@ impl Game {
             slow_frames: 0,
             fps: fps::Fps::new(),
             sim_acc: 0.0,
+            mix: Mix::default(),
+            stress_seen: None,
             beam_broke: false,
             broken_members: vec![],
             unlimited: true,
@@ -1555,14 +1567,47 @@ impl Game {
 
     // ----- simulation -------------------------------------------------------
 
+    /// One frame of the world on a single thread (the web, `--demo`, the tests): the world's
+    /// update, its steps, and the sound.
     fn update(&mut self, dt: f32) {
+        self.tick_toast(dt);
+        if let Some(steps) = self.update_world(dt, dt) {
+            // macroquad's clock: std's has none in the browser.
+            let start = get_time();
+            for _ in 0..steps {
+                self.sim_step();
+            }
+            self.after_steps(dt, steps, get_time() - start);
+        }
+        let mix = self.mix;
+        self.sounds.update(dt, &mix);
+    }
+
+    /// The message at the bottom fades out.
+    fn tick_toast(&mut self, dt: f32) {
+        if let Some((_, t)) = &mut self.toast {
+            *t -= dt;
+        }
+        if self.toast.as_ref().map_or(false, |t| t.1 <= 0.0) {
+            self.toast = None;
+        }
+    }
+
+    /// Everything that lives in the world but its steps, for `dt` seconds: the visitors, the
+    /// simplifications that keep it smooth... The steps owed to the clock, or None while paused.
+    /// `pace` is how long an update takes: the frame on one thread, the work of the last update
+    /// in the simulation thread (a slow screen does not slow that one down).
+    /// On the desktop it runs in the simulation thread (see `simthread.rs`): it must not touch
+    /// what only the screen owns (the camera, the menus); its messages and sounds go to the screen
+    /// with the next picture.
+    fn update_world(&mut self, dt: f32, pace: f32) -> Option<usize> {
         self.time += dt;
         self.shake *= 0.88f32.powf(dt * 60.0);
         if self.shake < 0.15 {
             self.shake = 0.0;
         }
-        // Keep the game smooth: if frames stay slow while simulating, run fewer steps per frame.
-        self.frame_ema = self.frame_ema * 0.92 + dt * 0.08;
+        // Keep the game smooth: if updates stay slow while simulating, run fewer steps each.
+        self.frame_ema = self.frame_ema * 0.92 + pace * 0.08;
         if self.running && self.frame_ema > 0.026 {
             self.slow_frames += 1;
         } else {
@@ -1638,18 +1683,12 @@ impl Game {
             b.t += dt / 0.7;
         }
         self.booms.retain(|b| b.t < 1.0);
-        if let Some((_, t)) = &mut self.toast {
-            *t -= dt;
-        }
-        if self.toast.as_ref().map_or(false, |t| t.1 <= 0.0) {
-            self.toast = None;
-        }
         if !self.running {
             let (blocks, members) = (&self.blocks, &self.members);
             self.mech.follow_mounts(|a| anchor_world(a, blocks, members));
             self.refresh_reel_anchors();
-            self.sounds.update(dt, &Mix::default());
-            return;
+            self.mix = Mix::default();
+            return None;
         }
         // A fixed time step: 60 steps a second at x1, the same on a 60 Hz or a 144 Hz screen. A
         // machine that cannot keep up catches up a little, then lets the time go (and the frame
@@ -1659,11 +1698,13 @@ impl Game {
         let max = self.speed * 2;
         let steps = owed.min(max);
         self.sim_acc = if owed > max { 0.0 } else { self.sim_acc - steps as f32 };
-        let start = get_time();
-        for _ in 0..steps {
-            self.sim_step();
-        }
-        self.fps.steps(get_time() - start, steps);
+        Some(steps)
+    }
+
+    /// After the `steps` steps of an update of `dt` seconds, that took `seconds`: the profile, the
+    /// lightning and what the world sounds like.
+    fn after_steps(&mut self, dt: f32, steps: usize, seconds: f64) {
+        self.fps.steps(seconds, steps);
         // `AWORLD_PROFILE=1`: every 600 steps, where the time of a step went (see `world/prof.rs`).
         if self.world.prof.on || std::env::var_os("AWORLD_PROFILE").is_some_and(|v| v != "0") {
             self.world.prof.on = true;
@@ -1683,13 +1724,12 @@ impl Game {
             .map(|c| 0.12 + 0.88 * (c.v.length() / c.kind.model().top_speed).min(1.0))
             .fold(None, |a: Option<f32>, r| Some(a.map_or(r, |a| a.max(r))));
         self.update_lightning(dt);
-        let mix = Mix {
+        self.mix = Mix {
             wind: ((self.world.wind.abs() - 0.55) / 0.45).clamp(0.0, 1.0),
             water: (self.world.take_water_flow() as f32 / (dt * 3600.0 * self.speed as f32).max(1.0)).sqrt().min(1.0),
             fire: (self.heat_cells as f32 / 150.0).sqrt().min(1.0),
             rpm,
         };
-        self.sounds.update(dt, &mix);
     }
 
     /// New bolts of lightning go on the screen; their thunder comes a little later, the later the
@@ -2056,7 +2096,7 @@ impl Game {
         }
         // The cameos show in every view, the thermal, pressure and humidity ones included.
         self.draw_cameos(view);
-        let stress = if self.mode == ViewMode::Stress { self.phys.as_ref().map(|p| p.stress(&self.blocks)) } else { None };
+        let stress = if self.mode == ViewMode::Stress { self.phys.as_ref().map(|p| p.stress(&self.blocks)).or_else(|| self.stress_seen.clone()) } else { None };
         for b in &self.blocks {
             let st = stress.as_ref().map(|m| m.get(&b.uid).copied().unwrap_or(0.0));
             draw_block(b, view, st);
@@ -4411,6 +4451,11 @@ async fn main() {
     });
     let mut frame = 0u32;
     let mut frame_time = 0.0f32;
+    // The world runs in its own thread on the desktop (see `simthread.rs`). Not on the web (no
+    // threads there), nor for the screenshots, which count their frames (unless `--threads`: the
+    // shot is then taken as the screen sees it); `--one-thread` keeps the one loop, to compare.
+    let threads = if shot.is_some() { args.iter().any(|a| a == "--threads") } else { !args.iter().any(|a| a == "--one-thread") };
+    let mut sim = (cfg!(not(target_arch = "wasm32")) && threads).then(|| simthread::SimThread::start(&mut game));
 
     loop {
         let (sw, sh) = (screen_width(), screen_height());
@@ -4420,6 +4465,11 @@ async fn main() {
         if shot.is_some() {
             ui.freeze(demo_mouse.unwrap_or(vec2(-1000.0, -1000.0)), args.iter().any(|a| a == "--stroke"));
         }
+        // The latest picture of the world, or the world itself for a frame that may change it.
+        let lent = sim.as_mut().and_then(|s| {
+            let edit = simthread::input_may_edit(&game, &ui);
+            s.frame(&mut game, edit)
+        });
         game.handle_keys();
         game.handle_camera(base, &ui);
         // `--zoom n,x,y`: n wheel notches in, on the screen point x, y.
@@ -4433,7 +4483,15 @@ async fn main() {
         }
         let view = game.camera.apply(base);
         game.handle_mouse(view, &ui);
-        game.update(get_frame_time().min(0.05));
+        let dt = get_frame_time().min(0.05);
+        if sim.is_some() {
+            // The world updates in its thread: here, only what belongs to the screen.
+            game.tick_toast(dt);
+            let mix = game.mix;
+            game.sounds.update(dt, &mix);
+        } else {
+            game.update(dt);
+        }
         // `--boom`: an explosion 25 cells under the water surface at x (default 360), shortly before the shot.
         if shot.is_some() && frame == 357 && args.iter().any(|a| a == "--boom") {
             let x = arg("--boom").and_then(|v| v.parse().ok()).unwrap_or(360);
@@ -4577,6 +4635,9 @@ async fn main() {
         ui.begin_windows(view.visible());
         game.draw_ui(&mut ui, sw, sh);
         ui.end_windows();
+        if let (Some(s), Some(world)) = (sim.as_mut(), lent) {
+            s.give_back(&mut game, world);
+        }
 
         frame += 1;
         frame_time += get_frame_time();

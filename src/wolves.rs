@@ -56,7 +56,7 @@ pub enum News {
     Fact,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Wolves {
     pub pack: Option<Pack>,
     /// The night (day number) they last came: once a night is enough.
