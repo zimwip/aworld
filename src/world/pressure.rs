@@ -180,6 +180,12 @@ impl World {
                         if !matches!(m.kind(), Kind::Liquid | Kind::Powder) {
                             continue;
                         }
+                        // (The physical liquids are pushed by the gas pressure in their own step,
+                        // which may be running on the graphics card right now: a cell moved here
+                        // behind its back would be counted twice or lost.)
+                        if m.kind() == Kind::Liquid && self.liquid_physics {
+                            continue;
+                        }
                         let quiet = if m.kind() == Kind::Liquid { QUIET } else { QUIET_LOOSE };
                         let p = ((g - quiet) * PUSH / density(m).max(0.2)).min(1.0);
                         if p <= 0.0 {
@@ -419,6 +425,7 @@ mod boom {
     fn a_falling_body_does_not_blow_the_ground_away_before_it_lands() {
         for (seed, x) in [(7, 300), (7, 520), (11, 420)] {
             let mut w = World::new();
+            w.set_liquid_physics(false);
             w.generate(seed);
             // Long enough for the air to settle into its layers (low pressure near the ground).
             for _ in 0..300 {

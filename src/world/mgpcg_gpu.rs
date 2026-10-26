@@ -29,7 +29,7 @@ pub fn threshold() -> usize {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{PressureGpu, SC_DONE, SC_ITER, SC_N};
+pub use native::{PressureGpu, Stamper, SC_DONE, SC_ITER, SC_N};
 
 #[cfg(target_arch = "wasm32")]
 pub struct PressureGpu;
@@ -123,8 +123,34 @@ mod native {
     /// stride the card accepts for a dynamic offset.
     const SLOT: u64 = 256;
     const COARSEST: usize = 1024;
+    // (A coarsest level of 4096 or 8192 nodes, or one sweep instead of two, each cost a third
+    // to two thirds more iterations on the scene "liquides": the launches saved were lost.)
     const SMOOTH: usize = 2;
     const WG: usize = 256;
+
+    /// Time stamps the card writes between kernels, when the liquids' step is being timed
+    /// (`AWORLD_DEBUG_CARD`): the set, and what each stamp so far marks the end of.
+    pub struct Stamper<'a> {
+        pub set: Option<&'a wgpu::QuerySet>,
+        pub marks: &'a mut Vec<&'static str>,
+        pub max: usize,
+    }
+
+    impl Stamper<'_> {
+        pub fn at(&mut self, enc: &mut wgpu::CommandEncoder, what: &'static str) {
+            if let Some(set) = self.set {
+                if self.marks.len() < self.max {
+                    enc.write_timestamp(set, self.marks.len() as u32);
+                    self.marks.push(what);
+                }
+            }
+        }
+    }
+
+    /// A stamper that stamps nothing (the steps that are not timed).
+    pub fn no_stamps<'a>(marks: &'a mut Vec<&'static str>) -> Stamper<'a> {
+        Stamper { set: None, marks, max: 0 }
+    }
 
     pub struct PressureGpu {
         gpu: &'static Gpu,
@@ -310,7 +336,7 @@ mod native {
 
         /// The V-cycle on level `l` (the finest as the preconditioner's set when `pre`), as
         /// `Solver::vcycle`: sweeps, the residual down, the visit below, the correction up, sweeps.
-        fn vcycle(&self, enc: &mut wgpu::CommandEncoder, l: usize, pre: bool) {
+        fn vcycle(&self, enc: &mut wgpu::CommandEncoder, l: usize, pre: bool, stamps: &mut Stamper) {
             let k = &self.kernels;
             let tiles = self.tiles_of(l);
             if l + 1 == self.used {
@@ -331,13 +357,23 @@ mod native {
                 self.run(&mut pass, &k.restrict, l, 0, pre, ctiles);
             }
             enc.clear_buffer(&under.x, 0, None);
-            self.vcycle(enc, l + 1, false);
+            if l == 0 {
+                stamps.at(enc, "pression: lissage fin");
+            }
+            self.vcycle(enc, l + 1, false, stamps);
+            if l == 0 {
+                stamps.at(enc, "pression: niveaux grossiers");
+            }
             let mut pass = enc.begin_compute_pass(&Default::default());
             self.run(&mut pass, &k.prolong, l, 0, pre, tiles);
             for _ in 0..SMOOTH {
                 for colour in [1, 0] {
                     self.run(&mut pass, &k.smooth, l, colour, pre, tiles);
                 }
+            }
+            drop(pass);
+            if l == 0 {
+                stamps.at(enc, "pression: lissage fin");
             }
         }
 
@@ -424,8 +460,9 @@ mod native {
             let n = 10;
             time(&format!("10 cycles en V ({} niveaux)", self.used), n, "cycle", &mut || {
                 let mut enc = self.encoder();
+                let mut marks = Vec::new();
                 for _ in 0..n {
-                    self.precondition(&mut enc);
+                    self.precondition(&mut enc, &mut no_stamps(&mut marks));
                 }
                 self.wait(enc);
             });
@@ -532,10 +569,12 @@ mod native {
         /// `BATCH` iterations at a time until done or `max_iter`. Returns the iterations and
         /// the encoder for what comes after.
         fn iterate(&self, mut enc: wgpu::CommandEncoder, max_iter: u32) -> (u32, wgpu::CommandEncoder) {
-            self.begin(&mut enc);
+            let mut marks = Vec::new();
+            let mut stamps = no_stamps(&mut marks);
+            self.begin(&mut enc, &mut stamps);
             let mut done = 0;
             while done < max_iter {
-                self.iterations(&mut enc, BATCH.min(max_iter - done));
+                self.iterations(&mut enc, BATCH.min(max_iter - done), &mut stamps);
                 enc.copy_buffer_to_buffer(&self.sc, 0, &self.sc_read, 0, (SC_N * 4) as u64);
                 let sc = self.read(std::mem::replace(&mut enc, self.encoder()), &self.sc_read, SC_N);
                 done = sc[SC_ITER] as u32;
@@ -547,7 +586,7 @@ mod native {
         }
 
         /// The coarse levels, the first residual, the tolerance, and the first direction.
-        fn begin(&self, enc: &mut wgpu::CommandEncoder) {
+        fn begin(&self, enc: &mut wgpu::CommandEncoder, stamps: &mut Stamper) {
             let k = &self.kernels;
             let line = self.line();
             {
@@ -561,13 +600,14 @@ mod native {
                 self.run(&mut pass, &k.residual, 0, 0, false, line);
                 self.run(&mut pass, &k.start, 0, 0, false, (1, 1));
             }
-            self.precondition(enc);
+            stamps.at(enc, "pression: préparation");
+            self.precondition(enc, stamps);
         }
 
         /// `n` iterations, each: s = z + beta s; q = A s; alpha; x and r advanced; the step
         /// looked at; the advance undone if it ran away; z = M⁻¹ r; rho and beta. (The card
         /// counts the iterations it really did: once done, a kernel does nothing.)
-        fn iterations(&self, enc: &mut wgpu::CommandEncoder, n: u32) {
+        fn iterations(&self, enc: &mut wgpu::CommandEncoder, n: u32, stamps: &mut Stamper) {
             let k = &self.kernels;
             let line = self.line();
             for _ in 0..n {
@@ -580,7 +620,8 @@ mod native {
                     self.run(&mut pass, &k.step, 0, 0, false, (1, 1));
                     self.run(&mut pass, &k.undo, 0, 0, false, line);
                 }
-                self.precondition(enc);
+                stamps.at(enc, "pression: gradients");
+                self.precondition(enc, stamps);
             }
         }
 
@@ -588,11 +629,11 @@ mod native {
         /// `n` iterations encoded and no look at the card in between (for a step the CPU does
         /// not wait for): the scalars (`scalars`) say afterwards how many it took and whether
         /// it was done.
-        pub fn solve_fixed(&mut self, enc: &mut wgpu::CommandEncoder, y0: usize, y1: usize, fluid: usize, tol: f32, rel: f32, n: u32) {
+        pub fn solve_fixed(&mut self, enc: &mut wgpu::CommandEncoder, y0: usize, y1: usize, fluid: usize, tol: f32, rel: f32, n: u32, stamps: &mut Stamper) {
             self.sent = None;
             self.prepare(y0, y1, fluid, tol, rel);
-            self.begin(enc);
-            self.iterations(enc, n);
+            self.begin(enc, stamps);
+            self.iterations(enc, n, stamps);
         }
 
         /// The scalars of the conjugate gradients (`SC_N` numbers: the iterations at `SC_ITER`,
@@ -614,14 +655,18 @@ mod native {
 
         /// z = M⁻¹ r: a V-cycle from zero on the finest level with r as its right side, then
         /// rho = r · z and beta.
-        fn precondition(&self, enc: &mut wgpu::CommandEncoder) {
+        fn precondition(&self, enc: &mut wgpu::CommandEncoder, stamps: &mut Stamper) {
             // (z is the fine `x` of the preconditioner's set.)
             enc.clear_buffer(&self.z, 0, None);
-            self.vcycle(enc, 0, true);
+            self.vcycle(enc, 0, true, stamps);
             let mut pass = enc.begin_compute_pass(&Default::default());
             self.run(&mut pass, &self.kernels.dot_rz, 0, 0, false, self.line());
             self.run(&mut pass, &self.kernels.rho, 0, 0, false, (1, 1));
+            drop(pass);
+            stamps.at(enc, "pression: gradients");
         }
+
+
     }
 }
 

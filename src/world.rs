@@ -30,6 +30,7 @@ mod mgpcg;
 mod gpu;
 mod mgpcg_gpu;
 mod liquid_gpu;
+pub mod inspect;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]
@@ -648,6 +649,8 @@ pub struct World {
     pub revision: u64,
     /// Water dried into the air since the start, in units of fill (the volume tests count it).
     pub dried: u64,
+    /// Liquid that left the world by its sides since the start, in units of fill.
+    pub gone: u64,
     /// Wind, -1 (left) to 1 (right).
     pub wind: f32,
     /// The player's wind controls: strongest wind (0..1), how fast the direction keeps changing
@@ -700,7 +703,7 @@ pub struct World {
     /// `turn.rs`). Off unless `AWORLD_CELLS_PAR=1`.
     pub parallel_cells: bool,
     /// Whether every liquid moves by real forces (velocities, pressure, viscosity, see
-    /// `liquid.rs`). Off unless `AWORLD_LIQUIDS=1`.
+    /// `liquid.rs`). On unless `AWORLD_LIQUIDS=0`.
     pub liquid_physics: bool,
     /// The velocities and pressure of the liquids (see `liquid.rs`).
     liq: liquid::Liquids,
@@ -802,6 +805,7 @@ impl World {
             climate: thermal::Climate::default(),
             revision: 1,
             dried: 0,
+            gone: 0,
             wind: 0.0,
             wind_max: 1.0,
             wind_changes: 1.0,
@@ -865,6 +869,9 @@ impl World {
         w.structures_fall = false;
         w.climate_fixed = Some(15.0);
         w.reset_temps();
+        // (The cells' liquids, as these scenes were written and checked; a test of the
+        // physical liquids says so, as `liquid::tests::world` does.)
+        w.set_liquid_physics(false);
         w
     }
 
@@ -911,10 +918,11 @@ impl World {
             climate_fixed, climate, revision, wind, wind_max, wind_changes, windiness, wind_clock, biome, leaf_rgb, autumn, grass_rgb,
             structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, dp,
             dp_slow, dpd, pressure_forces, lod, parallel_cells, liquid_physics, liq, fill, pocket_of,
-            pockets, latent, vel: _, moisture, fuel, growth, jet, liq_p, cls: _, liq_w: _, zones, bursts, charge, mcharge, magnet, polar,
-            bolts, storm_rng, pressure_cache: _, prof: _, air_rows, air_sky, later: _, dried,
+            pockets, latent, vel, moisture, fuel, growth, jet, liq_p, cls: _, liq_w: _, zones, bursts, charge, mcharge, magnet, polar,
+            bolts, storm_rng, pressure_cache: _, prof: _, air_rows, air_sky, later: _, dried, gone,
         } = from;
         self.dried = *dried;
+        self.gone = *gone;
         self.cells.clone_from(cells);
         self.frame = *frame;
         self.rng = *rng;
@@ -963,6 +971,8 @@ impl World {
         self.liquid_physics = *liquid_physics;
         self.liq.copy_picture(liq);
         self.fill.clone_from(fill);
+        // The grains' falling speed, for the simulation view.
+        self.vel.clone_from(vel);
         self.pocket_of.clone_from(pocket_of);
         self.pockets.clone_from(pockets);
         self.latent.clone_from(latent);
@@ -1706,6 +1716,9 @@ impl World {
         if self.liquid_physics {
             timed!(self, prof::LIQUIDS, self.step_liquids());
             self.seep_through_thin();
+        }
+        if audit {
+            marks.push(("liquides", self.water_units_audit()));
         }
         if audit {
             marks.push(("liquides", self.water_units_audit()));
@@ -2846,6 +2859,11 @@ impl World {
             }
             self.fall_drop(x, y);
             return;
+        }
+        // A drop that has joined other water (or landed) no longer falls freely: its speed goes
+        // (moved by their physics, the liquids take it over, see `liquid.rs`).
+        if !self.liquid_physics {
+            self.vel[i] = 0;
         }
         self.step_liquid(x, y);
     }
