@@ -618,7 +618,7 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
         mech.sliders.push(sl);
     }
     for (uid, [a, b], len, strength, broken) in raw_rods {
-        let mut end = |e: RawEnd| match e {
+        let end = |e: RawEnd| match e {
             RawEnd::Pin(gear, pin) => End::Pin { gear, pin },
             RawEnd::Carriage(u) => End::Carriage(u),
             RawEnd::Node(raw) => End::Node(resolve(raw, Vec2::ZERO)),
