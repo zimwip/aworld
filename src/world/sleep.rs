@@ -7,8 +7,22 @@
 
 use super::*;
 
-/// Side of a sleeping zone, in cells.
-pub const CS: usize = 32;
+/// Side of a sleeping zone, in cells: 32, or 16 or 64 when the game is built with
+/// `AWORLD_ZONE=16` (or 64) to compare (smaller zones sleep more often but cost more to watch; see
+/// the metrics panel, Ctrl+D).
+pub const CS: usize = match option_env!("AWORLD_ZONE") {
+    Some(v) => zone_side(v.as_bytes()),
+    None => 32,
+};
+
+const fn zone_side(v: &[u8]) -> usize {
+    match v {
+        b"16" => 16,
+        b"32" => 32,
+        b"64" => 64,
+        _ => panic!("AWORLD_ZONE : 16, 32 ou 64"),
+    }
+}
 /// Zones across and down.
 pub const CW: usize = W.div_ceil(CS);
 pub const CH: usize = H.div_ceil(CS);

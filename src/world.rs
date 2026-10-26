@@ -1643,9 +1643,7 @@ impl World {
         }
         self.after_cells();
         self.prof.stop(prof::TOTAL, clock);
-        if self.prof.on {
-            self.prof.steps += 1;
-        }
+        self.prof.end_step();
     }
 
     /// The turn of the cell at (x, y), in zone `zone` (see `turn.rs` for the order).
