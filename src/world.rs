@@ -5395,7 +5395,8 @@ mod tests {
         for _ in 0..900 {
             w.step();
         }
-        let ice_top = (0..H() as i32).find(|&y| w.raw(190, y) == Mat::Ice).unwrap_or(-1);
+        // (Wherever it landed: it may have slid off the column it fell in.)
+        let ice_top = (0..W() * H()).find(|&i| w.cells[i].m == Mat::Ice).map_or(-1, |i| (i / W()) as i32);
         assert!(ice_top > 450, "the ice should have dropped through the gas and drops to the rock, top at {ice_top}");
     }
 
