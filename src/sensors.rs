@@ -30,13 +30,14 @@ pub struct Reading {
     pub hum: f32,
 }
 
+#[derive(Clone)]
 pub struct Sensor {
     pub x: i32,
     pub y: i32,
     pub history: VecDeque<Reading>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Sensors {
     pub list: Vec<Sensor>,
     steps: u32,

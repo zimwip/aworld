@@ -55,7 +55,7 @@ pub struct Spark {
     pub drag: f32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Fireworks {
     pub rockets: Vec<Rocket>,
     pub sparks: Vec<Spark>,

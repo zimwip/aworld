@@ -156,6 +156,16 @@ pub struct Drop {
 }
 
 impl Liquids {
+    /// What the picture of the world needs (see `World::copy_picture`): the velocities, the
+    /// pressure, the kind of each cell and the drops in flight, not the scratch nor the solver.
+    pub(super) fn copy_picture(&mut self, from: &Liquids) {
+        self.u.clone_from(&from.u);
+        self.v.clone_from(&from.v);
+        self.p.clone_from(&from.p);
+        self.class.clone_from(&from.class);
+        self.drops.clone_from(&from.drops);
+    }
+
     fn ready(&mut self) {
         if self.u.len() != (W + 1) * H {
             self.u = vec![0.0; (W + 1) * H];

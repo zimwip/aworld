@@ -30,7 +30,7 @@ pub struct Plane {
     pub turned: f32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Planes {
     pub plane: Option<Plane>,
     cooldown: f32,
