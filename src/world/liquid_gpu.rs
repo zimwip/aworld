@@ -73,7 +73,8 @@ mod native {
         groups: u32,
         stamp: u32,
         sent: u32,
-        pad: [u32; 2],
+        time: f32,
+        pad: u32,
     }
 
     /// A cell as it goes to the card and comes back (see `CellRecord` in the kernels).
@@ -164,6 +165,7 @@ mod native {
         fill: wgpu::Buffer,
         temp: wgpu::Buffer,
         gaspa: wgpu::Buffer,
+        tables: wgpu::Buffer,
         class: wgpu::Buffer,
         p: wgpu::Buffer,
         // The velocities (group 3).
@@ -282,7 +284,9 @@ mod native {
             let (nu_, nv) = ((W + 1) * H, W * (H + 1));
             let params = d.create_buffer(&wgpu::BufferDescriptor { label: Some("liquid params"), size: SLOT * 2, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
             let (code, fill, temp, gaspa, class, p, nu, rhs) = (grid("code", n), grid("fill", n), grid("temp", n), grid("gaspa", n), grid("class", n), grid("p", n), grid("nu", n), grid("rhs", n));
-            let tables = grid("tables", 256);
+            // The materials (256 words), then the wind over the liquids and the first hard row of
+            // each column (flow.rs: `skim`, `sky`).
+            let tables = grid("tables", 256 + flow::FW * flow::FH + W);
             let (want, scale, qnew, tnew, fu, fv, thrown, mnew) = (grid("want", n), grid("scale", n), grid("qnew", n), grid("tnew", n), grid("fu", nu_), grid("fv", nv), grid("thrown", n), grid("mnew", n));
             let groups = n.div_ceil(WG);
             let partials = grid("partials", groups);
@@ -338,6 +342,7 @@ mod native {
                 fill,
                 temp,
                 gaspa,
+                tables,
                 class,
                 p,
                 u,
@@ -730,9 +735,11 @@ mod native {
                 q.write_buffer(&card.patches, 0, bytes(&patches));
             }
             q.write_buffer(&card.throws_n, 0, bytes(&[0u32]));
+            q.write_buffer(&card.tables, 256 * 4, bytes(self.flow.skim_table()));
+            q.write_buffer(&card.tables, (256 + flow::FW * flow::FH) as u64 * 4, bytes(self.flow.sky_table()));
             let groups = (rows * W).div_ceil(WG);
             for colour in 0..2u32 {
-                let pr = Params { w: W as u32, h: H as u32, y0: y0 as u32, rows: rows as u32, dt, colour, patches: patches.len() as u32, groups: groups as u32, stamp, sent: sent.len() as u32, pad: [0; 2] };
+                let pr = Params { w: W as u32, h: H as u32, y0: y0 as u32, rows: rows as u32, dt, colour, patches: patches.len() as u32, groups: groups as u32, stamp, sent: sent.len() as u32, time: self.ticks as f32 * DT, pad: 0 };
                 q.write_buffer(&card.params, colour as u64 * SLOT, bytes(&[pr]));
             }
             // The game's cells are what the card holds now.

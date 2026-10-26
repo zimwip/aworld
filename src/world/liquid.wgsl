@@ -21,7 +21,8 @@ struct Params {
     // The step's stamp (a cell is reported changed once a step), and the cells sent this step.
     stamp: u32,
     sent: u32,
-    pad2: u32,
+    // The game's clock, s (the swells of the wind's pressure run with it).
+    time: f32,
     pad3: u32,
 }
 
@@ -115,6 +116,14 @@ const CRUMB: u32 = 8u;
 const THROW: f32 = 2.0;
 const THROW_SHARE: f32 = 0.5;
 const MAX_THROWS: u32 = 16384u;
+// The wind on the liquids (liquid.rs: RHO_AIR, SKIN, GUST, SWELLS, flow.rs: CELL, STIR).
+const RHO_AIR: f32 = 1.2;
+const SKIN: f32 = 0.25;
+const GUST: f32 = 10.0;
+const FLOW_CELL: u32 = 8u;
+const STIR: f32 = 1.5;
+// Where the wind over the surface of the liquids starts in `tables` (flow.rs: `skim`).
+const SKIM: u32 = 256u;
 
 const SOLID: u32 = 0u;
 const AIR: u32 = 1u;
@@ -187,6 +196,40 @@ fn runs_at(xi: i32, yi: i32) -> bool {
 }
 fn rho(c: u32) -> f32 {
     return density(mat_of(c)) * 1000.0;
+}
+
+/// The wind along x over the liquid at (xx, yy), m/s: none under a roof (flow.rs: `skim_at`).
+fn skim_at(xx: u32, yy: u32) -> f32 {
+    let fw = P.w / FLOW_CELL;
+    let fh = (P.h + FLOW_CELL - 1u) / FLOW_CELL;
+    // Under a roof, none.
+    if f32(yy) >= bitcast<f32>(tables[SKIM + fw * fh + xx]) { return 0.0; }
+    let fx = (f32(xx) + 0.5) / f32(FLOW_CELL) - 0.5;
+    let i0 = floor(fx);
+    let t = fx - i0;
+    let ia = u32((i32(i0) + i32(fw)) % i32(fw));
+    let ib = u32((i32(i0) + 1 + i32(fw)) % i32(fw));
+    let row = min(yy / FLOW_CELL, fh - 1u) * fw;
+    let a = bitcast<f32>(tables[SKIM + row + ia]);
+    let bb = bitcast<f32>(tables[SKIM + row + ib]);
+    return a + (bb - a) * t;
+}
+/// The drag of the wind on a rightward edge of the free surface, m/s² (liquid.rs: `wind_push`).
+fn wind_push(wind: f32, uu: f32, r: f32) -> f32 {
+    let rel = wind - uu;
+    if rel * wind <= 0.0 { return 0.0; }
+    return SKIN * RHO_AIR * rel * abs(rel) / (r * CELL_M);
+}
+/// The pressure of the wind on the liquid at column xx, Pa (liquid.rs: `wind_pa`).
+fn wind_pa(wind: f32, xx: f32) -> f32 {
+    if wind == 0.0 { return 0.0; }
+    let sum = 0.5 * swell(wind, xx, 2.0) + 0.3 * swell(wind, xx, 3.5) + 0.2 * swell(wind, xx, 6.0);
+    return GUST * RHO_AIR * wind * wind * sum;
+}
+/// One swell of the wind's pressure, `length` m long, running downwind at the waves' speed.
+fn swell(wind: f32, xx: f32, length: f32) -> f32 {
+    let kk = 6.2831855 / length;
+    return sin(kk * (xx * CELL_M - sign(wind) * sqrt(G / kk) * P.time) + length);
 }
 
 /// The cell of a thread of a kernel over the band, or the count if it is past it.
@@ -420,6 +463,14 @@ fn back_u(@builtin(global_invocation_id) id: vec3<u32>) {
     let a = kind_at(i32(xx) - 1, i32(yy));
     let bb = kind_at(i32(xx), i32(yy));
     if a != bb { to = to / (1.0 + CALM * P.dt); }
+    // The wind over a free surface drags it along.
+    let ua = kind_at(i32(xx) - 1, i32(yy) - 1);
+    let ub = kind_at(i32(xx), i32(yy) - 1);
+    if a == AIR || bb == AIR || ua == AIR || ua == WET || ub == AIR || ub == WET {
+        var c = yy * P.w + xx - 1u;
+        if bb >= WET { c = yy * P.w + xx; }
+        to += P.dt * wind_push(skim_at(min(xx, P.w - 1u), yy), to, rho(c));
+    }
     if a != FULLISH && bb != FULLISH {
         u3[e] = clamp(to, -SPRAY, SPRAY);
     } else {
@@ -585,6 +636,9 @@ fn viscous_v(@builtin(global_invocation_id) id: vec3<u32>) {
 /// The pressure of the gas that stands on the liquid at (xx, yy): the gas there, or over the
 /// film of liquid there.
 fn gas_pa_over(xi: i32, yi: i32) -> f32 {
+    return gas_over(xi, yi) + wind_pa(skim_at(u32(xi), u32(yi)), f32(xi));
+}
+fn gas_over(xi: i32, yi: i32) -> f32 {
     for (var k = 0; k < 4; k++) {
         let ky = yi - k;
         let kk = at_kind(xi, ky);
@@ -758,7 +812,9 @@ fn push_u(@builtin(global_invocation_id) id: vec3<u32>) {
     if (ca & 3u) >= WET && (cb & 3u) >= WET { r = 0.5 * (rho(a) + rho(bb)); } else if (ca & 3u) >= WET { r = rho(a); } else { r = rho(bb); }
     let s = P.dt / CELL_M;
     var val = u[e] - s / r * (pa_at(i32(xx), i32(yy)) - pa_at(i32(xx) - 1, i32(yy)));
-    if (ca & 3u) == FULLISH && (cb & 3u) == FULLISH && abs(val) < REST { val = 0.0; }
+    // (The surface the wind stirs is pushed a little at a time: it is let move.)
+    let stirred = yy > 0u && ((cls[a - P.w] & 3u) == AIR || (cls[bb - P.w] & 3u) == AIR) && abs(skim_at(xx, yy)) > STIR;
+    if (ca & 3u) == FULLISH && (cb & 3u) == FULLISH && abs(val) < REST && !stirred { val = 0.0; }
     u[e] = val;
 }
 @compute @workgroup_size(256)

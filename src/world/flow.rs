@@ -5,7 +5,7 @@
 //! Velocities are kept in coarse cells per step (a coarse cell is `CELL` world cells wide).
 
 use super::num::floor_f;
-use super::{Cell, World, H, W};
+use super::{Cell, Kind, World, H, W};
 use rayon::prelude::*;
 
 /// Width of a flow cell, in world cells.
@@ -23,6 +23,28 @@ pub const GAIN: f32 = 1.2;
 /// the tropopause, `CEILING_Y`).
 const JET: f32 = 0.8;
 const JET_ROW: f32 = super::CEILING_Y as f32 / CELL as f32 + 0.5;
+
+/// How many flow cells up the wind over a solid cell is looked for (`skim`).
+const SKIM_REACH: usize = 2;
+/// A wind over a pond faster than this (m/s) keeps it awake: it makes waves.
+pub(super) const STIR: f32 = 1.5;
+
+/// The wind along x over the liquid at world cell `(x, y)` from the tables `skim` (m/s) and
+/// `sky`: none under a roof, else interpolated across between the middles of the flow cells
+/// (the same on the graphics card).
+pub fn skim_at(skim: &[f32], sky: &[f32], x: usize, y: usize) -> f32 {
+    if y as f32 >= sky[x] {
+        return 0.0;
+    }
+    let fx = (x as f32 + 0.5) / CELL as f32 - 0.5;
+    let i0 = floor_f(fx);
+    let t = fx - i0;
+    let i0 = i0 as i32;
+    let row = (y / CELL).min(FH - 1) * FW;
+    let a = skim[row + i0.rem_euclid(FW as i32) as usize];
+    let b = skim[row + (i0 + 1).rem_euclid(FW as i32) as usize];
+    a + (b - a) * t
+}
 
 #[derive(Clone, Copy)]
 struct Vortex {
@@ -44,6 +66,15 @@ pub struct Flow {
     p: Vec<f32>,
     div: Vec<f32>,
     solid: Vec<bool>,
+    /// Flow cells that are mostly liquid lying on something (solid to the wind, see `refresh_solids`).
+    pond: Vec<bool>,
+    /// The wind along x over each flow cell, in m/s: its own, or for a solid cell the wind of
+    /// the first open cell over it (`SKIM_REACH` cells up at most). What pushes the surface of
+    /// the liquids (`skim`).
+    skim: Vec<f32>,
+    /// The first row from the top where each world column is hard: liquid under it is
+    /// sheltered from the wind (in a cave, a tank, under a bridge).
+    sky: Vec<f32>,
     /// How much warmer than the air each flow cell is (drives the rising of warm air).
     heat: Vec<f32>,
     /// Absolute temperature of each flow cell over the ambient one (T / T_ambient, kelvin).
@@ -86,6 +117,9 @@ impl Flow {
             p: vec![0.0; n],
             div: vec![0.0; n],
             solid: vec![false; n],
+            pond: vec![false; n],
+            skim: vec![0.0; n],
+            sky: vec![H as f32; W],
             heat: vec![0.0; n],
             theta: vec![1.0; n],
             rho: vec![1.0; n],
@@ -112,24 +146,41 @@ impl Flow {
         (self.rand() >> 8) as f32 / (1u32 << 24) as f32
     }
 
-    /// Which flow cells are mostly solid ground (cells that `solid` says are hard).
-    pub fn refresh_solids(&mut self, cells: &[Cell], solid: impl Fn(&Cell) -> bool) {
+    /// Which flow cells are mostly solid ground (cells that `solid` says are hard) or liquid
+    /// lying on something (`liquid`): the wind blows over a pond, not through it. Liquid that
+    /// falls through the air (rain, a jet) is no wall to it. The flow cells that are mostly
+    /// liquid are marked too (`pond`): the wind over them pushes their surface.
+    pub fn refresh_solids(&mut self, cells: &[Cell], solid: impl Fn(&Cell) -> bool, liquid: impl Fn(&Cell) -> bool) {
         let was = self.solid.clone();
-        for j in 0..FH {
-            for i in 0..FW {
-                let (mut n, mut hard) = (0, 0);
-                for dy in (0..CELL).step_by(2) {
-                    let y = j * CELL + dy;
-                    if y >= H {
-                        break;
-                    }
-                    for dx in (0..CELL).step_by(2) {
-                        n += 1;
-                        hard += solid(&cells[y * W + i * CELL + dx]) as u32;
-                    }
+        // Every other cell of every other row, the columns read from the bottom up so that a
+        // cell of liquid knows whether it lies on something.
+        let mut hard = vec![0u32; FW * FH];
+        let mut wet = vec![0u32; FW * FH];
+        let mut n = vec![0u32; FW * FH];
+        for (x, sky) in self.sky.iter_mut().enumerate() {
+            *sky = (0..H).find(|&y| solid(&cells[y * W + x])).unwrap_or(H) as f32;
+        }
+        for x in (0..W).step_by(2) {
+            let i = x / CELL;
+            let mut lies = true;
+            for y in (0..H).rev() {
+                let c = &cells[y * W + x];
+                let (h, l) = (solid(c), liquid(c));
+                // Liquid lies on what is under it, if that lies; the rest lies unless it is air.
+                if !l {
+                    lies = h || !matches!(c.m.kind(), Kind::Empty | Kind::Gas | Kind::Flame);
                 }
-                self.solid[j * FW + i] = hard * 5 >= n * 2;
+                if y % 2 == 0 {
+                    let k = (y / CELL) * FW + i;
+                    n[k] += 1;
+                    hard[k] += h as u32;
+                    wet[k] += (l && lies) as u32;
+                }
             }
+        }
+        for k in 0..FW * FH {
+            self.solid[k] = (hard[k] + wet[k]) * 5 >= n[k] * 2;
+            self.pond[k] = self.solid[k] && wet[k] > hard[k];
         }
         // A cell a solid has just left fills with the air around it, at its density: a body
         // falling through the air must not leave a trail of air at the ambient pressure (the
@@ -203,12 +254,31 @@ impl Flow {
                 self.wet[j * FW + i] = wet as f32 / n.max(1) as f32;
             }
         }
+        // A pond is solid to the wind: the air over it is fed with its moisture.
+        for k in (0..FW * (FH - 1)).rev() {
+            if !self.solid[k] && self.pond[k + FW] {
+                self.wet[k] = self.wet[k].max(self.wet[k + FW]);
+            }
+        }
     }
 
     /// Relative humidity of the air at a world position (0..1), as carried by the wind.
+    /// In a pond, it is the air's over it.
     pub fn moisture_at(&self, x: i32, y: i32) -> f32 {
         let (i, j) = ((x.max(0) as usize / CELL).min(FW - 1), (y.max(0) as usize / CELL).min(FH - 1));
-        self.moist[j * FW + i]
+        self.moist[self.over(j * FW + i)]
+    }
+
+    /// Flow cell `k`, or for a solid one the first open cell over it (`SKIM_REACH` up at most).
+    fn over(&self, k: usize) -> usize {
+        let mut q = k;
+        for _ in 0..SKIM_REACH {
+            if !self.solid[q] || q < FW {
+                break;
+            }
+            q -= FW;
+        }
+        q
     }
 
     /// Absolute air pressure relative to the ambient one at a world position, when the air is
@@ -571,6 +641,37 @@ impl Flow {
             }
         });
         self.gusts = gusts;
+        // The wind over the surface of the liquids, from the first open cell up.
+        for k in 0..FW * FH {
+            let q = self.over(k);
+            self.skim[k] = if self.solid[q] { 0.0 } else { self.vx[q] * CELL as f32 * super::liquid::CELL_M / super::liquid::DT };
+        }
+    }
+
+    /// The wind along x over the surface of a liquid at world cell `(x, y)`, in m/s: the wind of
+    /// the open air over it, between the middles of the flow cells across.
+    pub fn skim(&self, x: usize, y: usize) -> f32 {
+        skim_at(&self.skim, &self.sky, x, y)
+    }
+
+    /// The wind over the surface of the liquids, every flow cell (for the graphics card).
+    pub fn skim_table(&self) -> &[f32] {
+        &self.skim
+    }
+
+    /// The first hard row of every world column (for the graphics card).
+    pub fn sky_table(&self) -> &[f32] {
+        &self.sky
+    }
+
+    /// Wakes the zones whose liquid the wind over it is strong enough to stir.
+    pub(super) fn wake_ponds(&self, zones: &mut super::sleep::Zones) {
+        for k in 0..FW * FH {
+            let (x, y) = ((k % FW) * CELL + CELL / 2, ((k / FW) * CELL).min(H - 1));
+            if self.pond[k] && self.skim(x, y).abs() > STIR {
+                zones.wake(y * W + x);
+            }
+        }
     }
 
     /// The solver's pressure at a world position (arbitrary units: it is the push that keeps the air
@@ -673,7 +774,7 @@ impl World {
     pub(super) fn update_flow(&mut self) {
         let t = self.ticks;
         if t % 16 == 1 {
-            self.flow.refresh_solids(&self.cells, |c| c.m.is_hard() && !c.m.is_vegetation());
+            self.refresh_flow_solids();
         }
         if t % 4 == 1 {
             let ambient: Vec<f32> = (0..H as i32).map(|y| self.ambient_c(y)).collect();
@@ -684,6 +785,14 @@ impl World {
             let wind = self.wind;
             self.flow.step(wind, t);
         }
+        if self.liquid_physics {
+            self.flow.wake_ponds(&mut self.zones);
+        }
+    }
+
+    /// What the wind goes round: hard ground, and liquid lying on something.
+    fn refresh_flow_solids(&mut self) {
+        self.flow.refresh_solids(&self.cells, |c| c.m.is_hard() && !c.m.is_vegetation(), |c| c.m.kind() == Kind::Liquid);
     }
 
     /// Where the air carries a gas cell this step: along the local flow, a cell or two at most.
@@ -748,6 +857,33 @@ mod tests {
         let after = f.max_divergence();
         assert!(before > 0.01, "the test field must diverge: {before}");
         assert!(after < before * 0.25, "divergence {before} -> {after}");
+    }
+
+    #[test]
+    fn the_wind_blows_over_a_pond_and_through_the_rain() {
+        let mut w = World::new_static();
+        let set = |w: &mut World, x0: i32, y0: i32, x1: i32, y1: i32, m: super::super::Mat| {
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    w.set(x, y, m);
+                }
+            }
+        };
+        use super::super::Mat;
+        // Ground, a pond on it 4 flow cells deep, and a column of water falling through the air.
+        set(&mut w, 0, 480, W as i32 - 1, H as i32 - 1, Mat::Brick);
+        set(&mut w, 200, 448, 399, 479, Mat::Water);
+        set(&mut w, 600, 300, 615, 400, Mat::Water);
+        w.refresh_flow_solids();
+        let f = &w.flow;
+        for j in 56..60 {
+            assert!(f.is_solid(30, j) && f.pond[j * FW + 30], "pond row {j}");
+        }
+        assert!(f.is_solid(30, 62) && !f.pond[62 * FW + 30], "the ground is no pond");
+        assert!(!f.is_solid(30, 55), "the air over the pond");
+        for j in 38..50 {
+            assert!(!f.is_solid(75, j), "falling water, row {j}");
+        }
     }
 
     #[test]
