@@ -442,10 +442,11 @@ impl Kids {
         let in_liquid = world.at(col(k.x), k.y as i32).kind() == Kind::Liquid;
         let speed = SPEED * pace * if in_liquid { 0.5 } else { 1.0 };
         k.stride += speed * dt;
-        // Not at the edges of the world, except on the way in or out.
+        // He turns round before an edge of the world, except on the way home. Only when walking
+        // towards it: near an edge (or still outside, coming in) he always walks back in.
         let ahead_x = k.x + k.dir * 3.0;
-        let coming_in = k.age < 3.0 && (k.x < 0.0 || k.x > W as f32);
-        if !leaving && !coming_in && (ahead_x < 8.0 || ahead_x > W as f32 - 8.0) {
+        let outwards = (k.dir < 0.0 && ahead_x < 8.0) || (k.dir > 0.0 && ahead_x > W as f32 - 8.0);
+        if !leaving && outwards {
             k.dir = -k.dir;
             return false;
         }
@@ -1117,6 +1118,47 @@ mod tests {
         assert!(seen, "he came within a minute and a half");
         let (lo, hi) = xs.iter().fold((f32::MAX, f32::MIN), |a, &x| (a.0.min(x), a.1.max(x)));
         assert!(hi - lo > 150.0, "he walked about: {lo}..{hi}");
+    }
+
+    #[test]
+    fn he_walks_in_from_either_side_and_goes_across_the_world() {
+        // He used to stop at the edge he came in by, turning round on the spot every frame.
+        let world = flat(400);
+        for left in [true, false] {
+            let mut kids = Kids::new();
+            assert!(kids.summon(&world));
+            let k = kids.kid.as_mut().unwrap();
+            if (k.dir > 0.0) != left {
+                // Come in by the other side.
+                k.x = W as f32 - k.x;
+                k.dir = -k.dir;
+            }
+            k.stay = 1000.0;
+            let mut far: f32 = 0.0;
+            for _ in 0..60 * 40 {
+                kids.update(1.0 / 60.0, &world, &Sights::default());
+                let k = kids.kid.as_ref().expect("still here");
+                far = far.max(if left { k.x } else { W as f32 - k.x });
+            }
+            assert!(far > W as f32 / 2.0, "from the {} side, he got only {far} cells in", if left { "left" } else { "right" });
+        }
+    }
+
+    #[test]
+    fn at_an_edge_he_turns_round_once_and_walks_back() {
+        let world = flat(400);
+        let mut kids = Kids::new();
+        assert!(kids.summon(&world));
+        let k = kids.kid.as_mut().unwrap();
+        k.x = W as f32 - 6.0;
+        k.y = 400.0;
+        k.dir = 1.0;
+        k.age = 10.0;
+        k.stay = 1000.0;
+        k.trick_in = 1000.0;
+        run(&mut kids, &world, 5.0);
+        let k = kids.kid.as_ref().unwrap();
+        assert!(k.x < W as f32 - 50.0, "back into the world: {}", k.x);
     }
 
     #[test]
