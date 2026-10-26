@@ -1978,7 +1978,8 @@ mod latent_tests {
             }
         }
         let mut froze = false;
-        for t in 0..8000 {
+        // (About 8 600 steps: the wind blows over the pot's water, not through it.)
+        for _ in 0..10000 {
             c.step();
             if c.cells.iter().any(|m| m.m == Mat::Ice) {
                 froze = true;

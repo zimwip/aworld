@@ -127,6 +127,9 @@ le jeu tourne simplement en silence. `--no-default-features` compile une version
   du sol projeté derrière les roues, et une voiture lente qui patine peut s'enliser (elle se dégage dès qu'elle repart).
 - Le vent pousse aussi les blocs libres (surface × vent²), et les arbres se penchent et ondulent avec lui
   (effet visuel, plus fort en haut).
+- Le vent passe par-dessus l'eau posée (une mare est un obstacle pour lui, pas la pluie qui tombe). Avec la
+  physique des liquides, il entraîne la surface (l'eau monte sous le vent) et lève des vagues : des rafales de
+  pression qui courent à la vitesse des vagues. Une eau à l'abri (grotte, cuve, sous un pont) reste calme.
 - Câbles, ressorts et tiges : le point d'ancrage s'affiche (point vert) et la souris colle au point ; près d'un
   bord du monde, ce bord s'illumine.
 - Les liquides (eau, huile, lave) traversent les arbres au lieu d'être retenus.

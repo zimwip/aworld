@@ -79,6 +79,44 @@ pub(super) const CRUMB: u32 = 8;
 /// the model alone (no surface tension, no breaking) would keep them for ever.
 pub(super) const CALM: f32 = 3.0;
 
+/// The density of the air, kg/m³ (the wind's push on the liquids).
+pub(super) const RHO_AIR: f32 = 1.2;
+/// The drag of the wind on a free surface, as a share of ρ U² (the sea's is about 1.5e-3; it is
+/// made stronger here: a pond is a few tens of metres and its cells 17 cm, and the waves a real
+/// wind would raise on it in a minute are too small to see).
+pub(super) const SKIN: f32 = 0.25;
+/// The swell of the air's pressure over a liquid the wind blows on, as a share of ρ U²: eddies
+/// of the wind that run over the surface, pressing and lifting it, at the speed of the waves
+/// they raise (Phillips). Made strong for the same reason as `SKIN`.
+pub(super) const GUST: f32 = 10.0;
+/// The swells of the wind's pressure: wavelength (m) and share of `GUST`.
+pub(super) const SWELLS: [(f32, f32); 3] = [(2.0, 0.5), (3.5, 0.3), (6.0, 0.2)];
+
+/// What the wind (`wind`, m/s along x) does to the speed `u` of a rightward edge of the free
+/// surface of a liquid of density `rho`: it drags it along, in m/s², when it blows faster than
+/// it runs (still air would brake it too, but much less than `SKIN` makes the wind push). The
+/// same on the graphics card.
+pub(super) fn wind_push(wind: f32, u: f32, rho: f32) -> f32 {
+    let rel = wind - u;
+    if rel * wind <= 0.0 {
+        return 0.0;
+    }
+    SKIN * RHO_AIR * rel * rel.abs() / (rho * CELL_M)
+}
+
+/// The pressure of the wind (`wind`, m/s along x) on a liquid at column `x` at time `t` (s), Pa:
+/// swells of the deep-water waves' lengths running downwind at their speed. The same on the
+/// graphics card.
+pub(super) fn wind_pa(wind: f32, x: f32, t: f32) -> f32 {
+    let mut sum = 0.0;
+    for (length, share) in SWELLS {
+        let k = std::f32::consts::TAU / length;
+        let c = (G / k).sqrt();
+        sum += share * (k * (x * CELL_M - wind.signum() * c * t) + length).sin();
+    }
+    GUST * RHO_AIR * wind * wind * sum
+}
+
 /// Whether new worlds take their liquids by physics: `AWORLD_LIQUIDS=1`.
 pub(super) fn physics_by_default() -> bool {
     std::env::var_os("AWORLD_LIQUIDS").is_some_and(|v| v != "0")
@@ -855,6 +893,7 @@ impl World {
         let (uf, vf) = (&liq.u2, &liq.v2);
         // The free surface is calmed (implicit, before gravity: a surface at rest stays so).
         let calm = 1.0 / (1.0 + CALM * dt);
+        let (skim, sky) = (self.flow.skim_table(), self.flow.sky_table());
         liq.u3.par_chunks_mut(W + 1).enumerate().for_each(|(y, row)| {
             let Some((x0, x1)) = rows[y] else { return };
             row[x0..=(x1 + 1).min(W)].copy_from_slice(&uf[ui(x0, y)..=ui((x1 + 1).min(W), y)]);
@@ -868,6 +907,15 @@ impl World {
                 // most as fast as falling rain).
                 let (a, b) = (kind(x as i32 - 1, y as i32), kind(x as i32, y as i32));
                 let to = if a != b { to * calm } else { to };
+                // The wind over a free surface drags it along.
+                let open = |c: u8| c == AIR || c == WET;
+                let to = if a == AIR || b == AIR || open(kind(x as i32 - 1, y as i32 - 1)) || open(kind(x as i32, y as i32 - 1)) {
+                    let i = if wet(b) { y * W + x } else { y * W + x - 1 };
+                    let rho = density(self.cells[i].m) * 1000.0;
+                    to + dt * wind_push(flow::skim_at(skim, sky, x.min(W - 1), y), to, rho)
+                } else {
+                    to
+                };
                 row[x] = if a != FULLISH && b != FULLISH { to.clamp(-SPRAY, SPRAY) } else { to };
             }
         });
@@ -1048,6 +1096,10 @@ impl World {
     /// film. (A film at its own pressure, 0, beside air in a pocket at another one would draw the
     /// liquid under it up for ever.)
     fn gas_pa_over(&self, x: i32, y: i32) -> f32 {
+        self.gas_over(x, y) + wind_pa(flow::skim_at(self.flow.skim_table(), self.flow.sky_table(), x as usize, y as usize), x as f32, self.ticks as f32 * DT)
+    }
+
+    fn gas_over(&self, x: i32, y: i32) -> f32 {
         for k in 0..4 {
             let m = self.at(x, y - k);
             if m.kind() != Kind::Liquid {
@@ -1267,6 +1319,7 @@ impl World {
             if class[j] & 3 == FULLISH { p[j] } else { self.gas_pa_over(x, y) }
         };
         let s = dt / CELL_M;
+        let (skim, sky) = (self.flow.skim_table(), self.flow.sky_table());
         liq.u.par_chunks_mut(W + 1).enumerate().for_each(|(y, row)| {
             let Some((x0, x1)) = rows[y] else { return };
             for x in x0.max(1)..=(x1 + 1).min(W - 1) {
@@ -1277,7 +1330,9 @@ impl World {
                 }
                 let r = if ca & 3 >= WET && cb & 3 >= WET { 0.5 * (rho(a) + rho(b)) } else if ca & 3 >= WET { rho(a) } else { rho(b) };
                 row[x] -= s / r * (pa(x as i32, y as i32) - pa(x as i32 - 1, y as i32));
-                if ca & 3 == FULLISH && cb & 3 == FULLISH && row[x].abs() < REST {
+                // (The surface the wind stirs is pushed a little at a time: it is let move.)
+                let stirred = y > 0 && (class[a - W] & 3 == AIR || class[b - W] & 3 == AIR) && flow::skim_at(skim, sky, x, y).abs() > flow::STIR;
+                if ca & 3 == FULLISH && cb & 3 == FULLISH && row[x].abs() < REST && !stirred {
                     row[x] = 0.0;
                 }
             }
@@ -1935,6 +1990,72 @@ mod tests {
 
     /// How a splash dies down: every half second, the highest water (cell or drop), the drops in
     /// flight, the cells under half full, and the fastest edge.
+    /// A basin open to the sky, 240 x 15 of water, its walls 15 cells over the water.
+    fn basin(m: Mat) -> World {
+        let mut w = world();
+        rect(&mut w, 0, 450, W as i32 - 1, H as i32 - 1, Mat::Brick);
+        rect(&mut w, 99, 420, 99, 449, Mat::Brick);
+        rect(&mut w, 340, 420, 340, 449, Mat::Brick);
+        rect(&mut w, 100, 435, 339, 449, m);
+        w.temp.fill(15.0);
+        w
+    }
+
+    /// The height of the liquid in each column of the basin, in cells.
+    fn levels(w: &World) -> Vec<f32> {
+        (100..340).map(|x| (420..450).map(|y| if w.raw(x, y) == Mat::Water { w.liquid_fill(World::idx(x, y)) as f32 / field::FULL as f32 } else { 0.0 }).sum()).collect()
+    }
+
+    #[test]
+    fn the_wind_raises_waves_and_piles_the_water_downwind() {
+        let mut w = basin(Mat::Water);
+        // A wind of 43 km/h to the right over the basin.
+        w.flow.pin_uniform(12.0 / (CELL_M / DT), 0.0);
+        let before = w.liquid_units(Mat::Water);
+        let mut rough = 0.0f32;
+        for t in 0..600 {
+            w.step();
+            if t >= 120 && t % 30 == 0 {
+                let h = levels(&w);
+                let mean = h.iter().sum::<f32>() / h.len() as f32;
+                rough = rough.max(h.iter().fold(0.0f32, |a, v| a.max((v - mean).abs())));
+            }
+        }
+        // Waves a cell or two high (a pond a few tens of metres wide, a gale's waves made bigger).
+        assert!(rough > 1.0 && rough < 5.0, "{rough} cells");
+        // More water at the downwind end than at the upwind one.
+        let h = levels(&w);
+        let (up, down) = (h[..80].iter().sum::<f32>(), h[160..].iter().sum::<f32>());
+        assert!(down > up, "{up} {down}");
+        // None is lost but what dries into the air (the basin is open to the sky, and the wind
+        // dries it faster: about 11 cells in these 10 s, 5 without wind).
+        let after = w.liquid_units(Mat::Water);
+        assert!(after <= before && before - after < 16 * field::FULL as u64, "{before} -> {after}");
+    }
+
+    /// A steady wind over the basin (`WIND`, m/s, 12 by default): every second, the surface
+    /// every 20 columns, how rough it is, how fast it runs, and the water dried into the air.
+    #[test]
+    #[ignore]
+    fn probe_wind_waves() {
+        let mut w = basin(Mat::Water);
+        let wind: f32 = std::env::var("WIND").ok().and_then(|v| v.parse().ok()).unwrap_or(12.0);
+        w.flow.pin_uniform(wind / (CELL_M / DT), 0.0);
+        let before = w.liquid_units(Mat::Water);
+        for t in 0..=1200 {
+            if t % 60 == 0 {
+                let h = levels(&w);
+                let mean = h.iter().sum::<f32>() / h.len() as f32;
+                let rms = (h.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / h.len() as f32).sqrt();
+                let surface = if w.liq.u.len() == (W + 1) * H { (100..340).map(|x| w.liq.u[ui(x, (420..450).find(|&y| w.raw(x as i32, y) == Mat::Water).unwrap_or(449) as usize)]).sum::<f32>() / 240.0 } else { 0.0 };
+                let dried = (before - w.liquid_units(Mat::Water)) as f32 / field::FULL as f32;
+                let row: Vec<String> = h.iter().step_by(20).map(|v| format!("{v:4.1}")).collect();
+                println!("t {:4.1} s: rms {rms:.2} cells, surface {surface:.2} m/s, dried {dried:.1} cells | {}", t as f32 / 60.0, row.join(" "));
+            }
+            w.step();
+        }
+    }
+
     #[test]
     #[ignore]
     fn probe_splash() {
