@@ -1,5 +1,6 @@
-//! The frame counter in the bottom right corner (F3 shows or hides it): images a second, and how
-//! long one step of the simulation takes, both averaged over half a second so they can be read.
+//! The frame counter in the bottom right corner (F3 shows or hides it): images a second (the
+//! picture, at the pace of the screen), steps a second (the world, 60 a second at x1 whatever the
+//! screen), and how long one step takes, all averaged over half a second so they can be read.
 
 use macroquad::prelude::*;
 
@@ -14,16 +15,16 @@ pub struct Fps {
     frames: u32,
     step_time: f64,
     steps: u32,
-    /// The last figures: images a second, milliseconds a step (None while the world is paused),
-    /// and steps a frame.
+    /// The last figures: images a second, steps a second, and milliseconds a step (None while
+    /// the world is paused).
     fps: f32,
+    pps: f32,
     step_ms: Option<f32>,
-    per_frame: f32,
 }
 
 impl Fps {
     pub fn new() -> Self {
-        Fps { shown: true, since: get_time(), frames: 0, step_time: 0.0, steps: 0, fps: 0.0, step_ms: None, per_frame: 0.0 }
+        Fps { shown: true, since: get_time(), frames: 0, step_time: 0.0, steps: 0, fps: 0.0, pps: 0.0, step_ms: None }
     }
 
     /// The time spent on `steps` steps of the simulation this frame.
@@ -39,8 +40,8 @@ impl Fps {
         let span = now - self.since;
         if span >= EVERY {
             self.fps = (self.frames as f64 / span) as f32;
+            self.pps = (self.steps as f64 / span) as f32;
             self.step_ms = (self.steps > 0).then(|| (self.step_time * 1000.0 / self.steps as f64) as f32);
-            self.per_frame = self.steps as f32 / self.frames as f32;
             self.since = now;
             self.frames = 0;
             self.step_time = 0.0;
@@ -54,8 +55,8 @@ impl Fps {
         }
         let fps = format!("{:.0} FPS", self.fps);
         let step = match self.step_ms {
-            Some(ms) => format!("pas {ms:.1} ms ({:.1}/image)", self.per_frame),
-            None => "pas en pause".to_string(),
+            Some(ms) => format!("{:.0} PPS · {ms:.1} ms/pas", self.pps),
+            None => "monde en pause".to_string(),
         };
         let size = 15;
         let (wf, ws) = (ui.text_w(&fps, size), ui.text_w(&step, size));
