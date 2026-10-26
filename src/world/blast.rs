@@ -90,9 +90,25 @@ impl Charge {
 
     /// As much black powder as `grains` cells of it.
     pub fn powder(grains: f32) -> Charge {
+        Charge::of(Mat::Gunpowder, grains)
+    }
+
+    /// As much of the explosive `m` as `cells` cells of it.
+    pub fn of(m: Mat, cells: f32) -> Charge {
         let mut c = Charge::default();
-        c.add(Mat::Gunpowder);
-        Charge { work: c.work * grains, gas: c.gas * grains, cells: grains, ..c }
+        c.add(m);
+        Charge { work: c.work * cells, gas: c.gas * cells, cells: c.cells * cells, ..c }
+    }
+
+    /// Both charges going off as one.
+    fn join(self, o: Charge) -> Charge {
+        Charge {
+            work: self.work + o.work,
+            gas: self.gas + o.gas,
+            shock: self.shock.max(o.shock),
+            flame: self.flame.max(o.flame),
+            cells: self.cells + o.cells,
+        }
     }
 
     /// How many cells of black powder would do the same work.
@@ -110,6 +126,11 @@ const FALL: f32 = 0.12;
 const MAX_EJECTA: usize = 14_000;
 /// Longest ray, cells.
 const MAX_REACH: f32 = 220.0;
+const ATM_PER_MPA: f32 = 9.87;
+/// How many times its tensile strength a brittle solid holds in compression.
+const CRUSH: f32 = 10.0;
+/// Radial cracks round a blast.
+const CRACKS: usize = 11;
 
 /// Mechanical energy one grain of powder gives the ground, J.
 pub fn grain_energy() -> f32 {
@@ -221,9 +242,65 @@ impl World {
         if self.put_off(super::turn::Later::Powder(x, y)) {
             return;
         }
-        let mut charge = vec![(x, y)];
-        let mut front = vec![(x, y)];
-        let mut taken = std::collections::HashSet::from([(x, y)]);
+        let charge = self.charge_from(&[(x, y)]);
+        let n = charge.len() as f32;
+        let (sx, sy) = charge.iter().fold((0.0, 0.0), |a, &(x, y)| (a.0 + x as f32, a.1 + y as f32));
+        let mut sum = Charge::default();
+        for &(x, y) in &charge {
+            sum.add(self.raw(x, y));
+            self.set(x, y, Mat::Empty);
+        }
+        let (cx, cy) = ((sx / n).round() as i32, (sy / n).round() as i32);
+        self.boom(cx, cy, charge.len());
+        self.detonate(cx, cy, sum);
+    }
+
+    /// Sticks of dynamite go off together: `sticks` cells of dynamite centred on (cx, cy), lying
+    /// over the matter of `room` without having taken its place. The blast finds the matter there
+    /// and breaks it like the rest; only the gas of the charge opens a room the size of the sticks.
+    /// Powder or dynamite touching the sticks goes off with them, as part of the same charge.
+    pub fn set_off_sticks(&mut self, cx: f32, cy: f32, sticks: f32, room: &[(i32, i32)]) {
+        let seeds: Vec<(i32, i32)> = room
+            .iter()
+            .flat_map(|&(x, y)| [(x, y), (x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)])
+            .filter(|&(x, y)| Self::inb(x, y) && explosive(self.raw(x, y)).is_some() && self.mask_free(x, y))
+            .collect();
+        let near = if seeds.is_empty() { vec![] } else { self.charge_from(&seeds) };
+        let mut sum = Charge::of(Mat::Dynamite, sticks);
+        let (mut sx, mut sy) = (cx * sticks, cy * sticks);
+        for &(x, y) in &near {
+            let mut c = Charge::default();
+            c.add(self.raw(x, y));
+            sum = sum.join(c);
+            sx += x as f32;
+            sy += y as f32;
+            self.set(x, y, Mat::Empty);
+        }
+        let n = sticks + near.len() as f32;
+        let (cx, cy) = ((sx / n).round() as i32, (sy / n).round() as i32);
+        for &(x, y) in room {
+            if Self::inb(x, y) && self.mask_free(x, y) && !passable(self.raw(x, y)) && self.raw(x, y).kind() != Kind::Liquid {
+                self.set(x, y, Mat::Empty);
+            }
+        }
+        self.boom(cx, cy, n as usize);
+        self.detonate(cx, cy, sum);
+    }
+
+    /// One report per charge, a few more for a big one (more rockets at night).
+    fn boom(&mut self, cx: i32, cy: i32, cells: usize) {
+        for _ in 0..1 + (cells / 150).min(3) {
+            if self.powder_booms.len() < 16 {
+                self.powder_booms.push((cx, cy));
+            }
+        }
+    }
+
+    /// The cells of explosive that burn with those of `seeds`: a lump at once, a trail only so far.
+    fn charge_from(&self, seeds: &[(i32, i32)]) -> Vec<(i32, i32)> {
+        let mut taken = std::collections::HashSet::new();
+        let mut charge: Vec<(i32, i32)> = seeds.iter().copied().filter(|&c| taken.insert(c)).collect();
+        let mut front = charge.clone();
         let mut layer = 0;
         while !front.is_empty() && charge.len() < 40_000 {
             layer += 1;
@@ -245,26 +322,7 @@ impl World {
             charge.extend_from_slice(&next);
             front = next;
         }
-        let n = charge.len() as f32;
-        let (sx, sy) = charge.iter().fold((0.0, 0.0), |a, &(x, y)| (a.0 + x as f32, a.1 + y as f32));
-        let mut sum = Charge::default();
-        for &(x, y) in &charge {
-            sum.add(self.raw(x, y));
-            self.set(x, y, Mat::Empty);
-        }
-        let (cx, cy) = ((sx / n).round() as i32, (sy / n).round() as i32);
-        // One report per charge, a few more for a big one (more rockets at night).
-        for _ in 0..1 + (charge.len() / 150).min(3) {
-            if self.powder_booms.len() < 16 {
-                self.powder_booms.push((cx, cy));
-            }
-        }
-        self.detonate(cx, cy, sum);
-    }
-
-    /// A fuse burnt down to the explosive at (x, y): the charge it belongs to goes off now.
-    pub fn set_off(&mut self, x: i32, y: i32) {
-        self.set_off_powder(x, y);
+        charge
     }
 
     /// The charge goes off at (cx, cy): its matter becomes fields. Its gas raises the density of
@@ -340,7 +398,20 @@ impl World {
             .flat_map(|t| t.when.iter())
             .filter_map(|w| if let super::matter::Cond::ShockAbove(p) = w { Some(*p) } else { None })
             .fold(f32::MAX, f32::min);
+        // The weakest brittle solid (ice) breaks under a lower shock still.
+        let weakest = weakest.min(strength(Mat::Ice) * ATM_PER_MPA);
         let reach = (a * (c.shock / weakest).max(0.0).cbrt() * 1.2).min(80.0) as i32;
+        // The cracks that run out from the charge, each at its angle and as far as it gets (in
+        // shares of the distance at which the shock still breaks the matter), the same for the same
+        // blast.
+        let mut seed = (cx as u32).wrapping_mul(0x9e37_79b9) ^ (cy as u32).wrapping_mul(0x85eb_ca6b) ^ 0x2545_f491;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed % 10_000) as f32 / 10_000.0
+        };
+        let cracks: Vec<(f32, f32)> = (0..CRACKS).map(|k| ((k as f32 + next()) / CRACKS as f32 * std::f32::consts::TAU, 0.5 + 0.5 * next())).collect();
         for dy in -reach..=reach {
             for dx in -reach..=reach {
                 let (x, y) = (cx + dx, cy + dy);
@@ -354,7 +425,10 @@ impl World {
                     continue;
                 }
                 let k = a / d;
-                self.shock_cell(Self::idx(x, y), c.shock * k * k * k, c.flame * k);
+                let i = Self::idx(x, y);
+                let p = c.shock * k * k * k;
+                self.shock_cell(i, p, c.flame * k);
+                self.shock_break(i, p, d / a, (dy as f32).atan2(dx as f32), &cracks);
             }
         }
         // The clods started where they were torn off.
@@ -364,6 +438,39 @@ impl World {
             if let Some(t) = super::matter::shocked(p.m, c.shock * k * k * k, c.flame * k, true) {
                 p.m = t.to;
             }
+        }
+    }
+
+    /// A brittle solid hit by a shock of `p` atm, at `d` radii of the charge from its centre in the
+    /// direction `angle`. Rock holds about ten times more in compression than in tension: past its
+    /// crushing strength it is ground to rubble on the spot (the crushed zone round a blast hole),
+    /// past its tensile strength only where one of the radial `cracks` runs, and here and there
+    /// between them, less and less often towards the end of the fractured zone. That is how a
+    /// charge in a blast hole breaks the rock from the inside, without having to throw it anywhere.
+    fn shock_break(&mut self, i: usize, p: f32, d: f32, angle: f32, cracks: &[(f32, f32)]) {
+        let m = self.cells[i].m;
+        let sigma = strength(m) * ATM_PER_MPA;
+        let Some(into) = rubble(m) else { return };
+        if sigma <= 0.0 || p < sigma {
+            return;
+        }
+        // Wood splinters rather than shattering: only some of it breaks.
+        if m.is_wooden() && !self.chance(3) {
+            return;
+        }
+        let (x, y) = ((i % W) as i32, (i / W) as i32);
+        if p >= CRUSH * sigma {
+            self.set(x, y, into);
+            return;
+        }
+        // How far into the fractured zone, from 0 at the crushed zone to 1 at its outer edge.
+        let depth = (p / sigma).ln() / CRUSH.ln();
+        let on_crack = cracks.iter().any(|&(a, len)| {
+            let off = (angle - a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+            (off * d).abs() < 0.35 && depth > 1.0 - len
+        });
+        if on_crack || self.chance_f(0.3 * depth * depth) {
+            self.set(x, y, into);
         }
     }
 
@@ -608,6 +715,7 @@ impl World {
                     }
                 }
                 // Crushed matter that cannot get out stays: only the gas of the charge opens a room.
+                // (Its shock breaks the rock around it: see `shock_break`.)
                 Fate::Crush => {}
                 Fate::Throw(vx, vy) => {
                     let roll = self.rand();
@@ -937,6 +1045,34 @@ mod tests {
         assert!(clay > 20, "packed soil lines the hole: {clay}");
         // What flew out was loosened: no clod of packed clay in the air.
         assert!(w.ejecta.iter().all(|p| p.m != Mat::Clay));
+    }
+
+    #[test]
+    fn a_detonation_shatters_rock_but_not_iron() {
+        let shattered = |m: Mat| {
+            let mut w = World::new_static();
+            for x in 0..W as i32 {
+                for y in 300..H as i32 {
+                    w.set(x, y, m);
+                }
+            }
+            w.detonate(480, 400, Charge::of(Mat::Dynamite, 30.0));
+            (380..580).map(|x| (300..500).filter(|&y| w.raw(x, y) != m).count()).sum::<usize>()
+        };
+        let (stone, iron) = (shattered(Mat::Stone), shattered(Mat::Iron));
+        eprintln!("broken by a stick: stone {stone}, iron {iron}");
+        assert!(stone > 800, "{stone}");
+        assert!(iron < 100, "{iron}");
+        // Black powder only deflagrates: its shock barely cracks the rock.
+        let mut w = World::new_static();
+        for x in 0..W as i32 {
+            for y in 300..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        w.detonate(480, 400, Charge::powder(30.0));
+        let powder = (380..580).map(|x| (300..500).filter(|&y| w.raw(x, y) != Mat::Stone).count()).sum::<usize>();
+        assert!(powder * 4 < stone, "powder {powder} vs dynamite {stone}");
     }
 
     #[test]
