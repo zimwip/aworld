@@ -31,7 +31,7 @@ use crate::{ctrl_down, Game};
 macro_rules! shown {
     ($m:ident, $a:expr, $b:expr) => {
         $m!($a, $b; blocks, cables, members, springs, mech, cars, debris, dynamite, sensors, trucks, kids, planes, whales,
-            wolves, fireworks, fireworks_told, booms, bolts, thunder, shake, time, arrived, lost, census, speed, selected_car,
+            wolves, fireworks, fireworks_told, booms, bolts, thunder, shake, time, arrived, lost, census, volumes, speed, selected_car,
             running, shovel_age, mix, metrics)
     };
 }

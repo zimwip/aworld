@@ -11,6 +11,7 @@ pub mod liquid_class {
     #[allow(unused_imports)]
     pub use super::liquid::SOLID;
 }
+pub use liquid::CELL_M;
 pub mod flow;
 mod pockets;
 mod pressure;
@@ -1026,6 +1027,24 @@ impl World {
             n[c.m as usize] += 1;
         }
         n
+    }
+
+    /// The census, and how much of each material there is in cells of it: a cell of liquid counts
+    /// what it holds (the liquids by their physics may fill a cell only in part), a cell of steam or
+    /// cloud the vapour packed in it as well (as it would spread at the pressure of the open air).
+    pub fn volumes(&self) -> ([u32; NMAT], [f32; NMAT]) {
+        let mut n = [0u32; NMAT];
+        let mut v = [0f64; NMAT];
+        for (i, c) in self.cells.iter().enumerate() {
+            let m = c.m as usize;
+            n[m] += 1;
+            v[m] += match c.m.kind() {
+                Kind::Liquid => self.liquid_fill(i) as f64 / field::FULL as f64,
+                Kind::Gas if matches!(c.m, Mat::Steam | Mat::Cloud) => 1.0 + self.packed(i) as f64,
+                _ => 1.0,
+            };
+        }
+        (n, v.map(|x| x as f32))
     }
 
     /// Removes `count` cells of the given materials, nearest to `near` first.
@@ -4688,6 +4707,25 @@ mod tests {
         assert!(w.consume(&[Mat::Iron], 4, (100, 200)));
         assert_eq!(w.census()[Mat::Iron as usize], 6);
         assert!((100..104).all(|x| w.raw(x, 200) == Mat::Empty), "nearest cells go first");
+    }
+
+    #[test]
+    fn volumes_count_what_the_cells_hold() {
+        let mut w = World::new_static();
+        let before = w.volumes().1;
+        for x in 100..110 {
+            w.set(x, 200, Mat::Water);
+            w.set(x, 190, Mat::Steam);
+        }
+        let i = World::idx(100, 200);
+        w.fill[i] = field::FULL / 4;
+        w.set_packed(World::idx(100, 190), 3);
+        let (n, v) = w.volumes();
+        assert_eq!(n, w.census(), "the same census");
+        let water = v[Mat::Water as usize] - before[Mat::Water as usize];
+        assert!((water - 9.25).abs() < 1e-3, "a quarter-full cell counts a quarter: {water}");
+        let steam = v[Mat::Steam as usize] - before[Mat::Steam as usize];
+        assert!((steam - 13.0).abs() < 1e-3, "packed vapour counts its cells: {steam}");
     }
 
     #[test]

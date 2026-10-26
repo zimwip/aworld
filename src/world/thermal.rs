@@ -158,11 +158,13 @@ pub struct Climate {
     /// Heat held by the world (the cells and the sky), oldest first, one sample every
     /// quarter of an hour over the last day.
     pub history: std::collections::VecDeque<f32>,
+    /// How much of each material the world holds (see `World::volumes`), at the same samples.
+    pub volumes: std::collections::VecDeque<[f32; NMAT]>,
 }
 
 impl Default for Climate {
     fn default() -> Self {
-        Climate { sky_dev: 0.0, sun_gain: 1.0, space_gain: 1.0, greenhouse: 1.0, acc: [0.0; 3], acc_steps: 0.0, rates: [0.0; 3], history: Default::default() }
+        Climate { sky_dev: 0.0, sun_gain: 1.0, space_gain: 1.0, greenhouse: 1.0, acc: [0.0; 3], acc_steps: 0.0, rates: [0.0; 3], history: Default::default(), volumes: Default::default() }
     }
 }
 
@@ -170,7 +172,7 @@ impl Climate {
     /// A copy for a strip of the cells' turn (see `turn.rs`): the rules only read it, but for the
     /// heat they give the sky; the record of the past stays behind.
     pub(super) fn view(&self) -> Climate {
-        Climate { history: Default::default(), ..*self }
+        Climate { history: Default::default(), volumes: Default::default(), ..*self }
     }
 
     /// Heat the player puts in by hand (the flamethrower), counted with the flames.
@@ -1171,6 +1173,12 @@ impl World {
             c.history.pop_front();
         }
         c.history.push_back(total);
+        let held = self.volumes().1;
+        let c = &mut self.climate;
+        if c.volumes.len() >= SAMPLES {
+            c.volumes.pop_front();
+        }
+        c.volumes.push_back(held);
     }
 
     /// Heat held by the world: every cell (temperature times heat capacity, from 0 °C) and the
