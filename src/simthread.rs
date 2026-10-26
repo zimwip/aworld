@@ -301,6 +301,11 @@ impl Worker {
             let start = Instant::now();
             self.game.as_mut().expect("the world").sim_step();
             seconds += start.elapsed().as_secs_f64();
+            // A picture after every step, not after the update: a machine that cannot keep 60
+            // steps a second catches up two steps at a time, and the screen would show one
+            // picture for two steps, then one for one, a jerky motion at 120 images a second.
+            self.dirty = true;
+            self.publish();
         }
         self.game.as_mut().expect("the world").after_steps(dt, steps, seconds);
     }

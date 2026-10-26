@@ -6780,7 +6780,10 @@ mod science {
         }
         assert_eq!(w.raw(50, 400), Mat::Stone, "attached stone moved");
         assert_eq!(w.raw(215, 200), Mat::Empty, "slab still floating");
-        assert_eq!(w.raw(215, H as i32 - 2), Mat::Stone, "slab did not land");
+        // (A fall of 56 m crushes a corner or two of the slab into sand, which may lie under it:
+        // the stone is on the floor, not necessarily the cell that was under its middle.)
+        assert!((150..300).any(|x| w.raw(x, H as i32 - 2) == Mat::Stone), "slab did not land");
+        assert!((150..300).all(|x| (150..400).all(|y| w.raw(x, y) != Mat::Stone)), "the slab is still high in the air");
     }
 
     #[test]
