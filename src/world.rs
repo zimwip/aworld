@@ -887,7 +887,7 @@ impl World {
             stress_pos: _, stress_local: _, ticks, log, paint_log, temp, clock, day_cycle, thermal_flip, heat_carry, temp_old: _, heat_took: _,
             climate_fixed, climate, revision, wind, wind_max, wind_changes, windiness, wind_clock, biome, leaf_rgb, autumn, grass_rgb,
             structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, dp,
-            dp_slow, dpd, pressure_forces, lod, parallel_cells, water_field, liquid_physics, liq, fill, gifts: _, flux: _, pocket_of,
+            dp_slow, dpd, pressure_forces, lod, parallel_cells, liquid_physics, liq, fill, pocket_of,
             pockets, latent, vel: _, moisture, fuel, growth, jet, liq_p, cls: _, liq_w: _, zones, bursts, charge, mcharge, magnet, polar,
             bolts, storm_rng, pressure_cache: _, prof: _, air_rows, air_sky, later: _,
         } = from;
@@ -936,7 +936,6 @@ impl World {
         self.pressure_forces = *pressure_forces;
         self.lod = *lod;
         self.parallel_cells = *parallel_cells;
-        self.water_field = *water_field;
         self.liquid_physics = *liquid_physics;
         self.liq.copy_picture(liq);
         self.fill.clone_from(fill);
