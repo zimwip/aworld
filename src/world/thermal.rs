@@ -738,18 +738,45 @@ impl World {
 
     // ----- heat flow --------------------------------------------------------
 
-    /// How many times longer a thermal pass covers when the simulation is simplified.
-    pub(super) fn thermal_scale(&self) -> f32 {
+    /// How many times longer a thermal pass covers when the simulation is simplified (it then
+    /// runs half as often).
+    pub(super) fn thermal_lod_scale(&self) -> f32 {
         match self.lod {
             0 | 1 => 1.0,
             _ => 2.0,
         }
     }
 
-    /// `chance(n)` for a thermal rate: with a simplified (less frequent) pass the odds are scaled up.
+    /// How many times longer than its reference a thermal pass covers: longer when simplified,
+    /// and in proportion to the step (a part of the pass runs once a step, see `heat_turn`).
+    pub(super) fn thermal_scale(&self) -> f32 {
+        self.thermal_lod_scale() * self.dt / super::STEP
+    }
+
+    /// The covered time `ts` of a relaxation at rate `a` (a cell goes `a * ts` of the way to its
+    /// target in a pass): in a step of another length than the reference, the time that goes as
+    /// far as that many passes would, `(1 - (1 - a ts_ref)^k) / a`, never past the target.
+    fn relax_ts(&self, a: f32, ts: f32) -> f32 {
+        let k = self.dt / super::STEP;
+        if (k - 1.0).abs() < 1e-4 {
+            return ts;
+        }
+        let one = (a * TS * self.thermal_lod_scale()).min(1.0);
+        (1.0 - (1.0 - one).powf(k)) / a
+    }
+
+    /// `chance(n)` for a thermal rate, `n` the odds for the reference length of a pass: with a
+    /// simplified (less frequent) pass the odds are scaled up, and for a step of another length
+    /// they are those of as many passes (`1 - (1 - 1/n)^k`).
     pub(super) fn chance_t(&mut self, n: u32) -> bool {
-        let n = (n as f32 / self.thermal_scale()).round().max(1.0) as u32;
-        self.chance(n)
+        let n = (n as f32 / self.thermal_lod_scale()).round().max(1.0) as u32;
+        let k = self.dt / super::STEP;
+        if (k - 1.0).abs() < 1e-4 {
+            self.chance(n)
+        } else {
+            let p = 1.0 - (1.0 - 1.0 / n as f32).powf(k);
+            self.chance_f(p)
+        }
     }
 
     /// One thermal tick: conduction, air and sun forcing, fixed heat sources,
@@ -846,6 +873,7 @@ impl World {
     fn heat_air_and_reactions(&mut self) {
         let scale = self.thermal_scale();
         let ts = TS * scale;
+        let (t05, t12, t03) = (self.relax_ts(0.05, ts), self.relax_ts(0.12, ts), self.relax_ts(0.03, ts));
         let tb = tables();
         let clock = self.prof.start();
         let (sun, gx, gy, row_amb, _surf, fixed) = self.heat_frame();
@@ -873,16 +901,16 @@ impl World {
                         // gains or loses goes to the sky.
                         Mat::Empty if !fixed && !shut[pocket_of[i] as usize].is_nan() => {
                             let mean = shut[pocket_of[i] as usize];
-                            temp[x] = t + (mean - t) * 0.05 * ts;
+                            temp[x] = t + (mean - t) * 0.05 * t05;
                             0.0
                         }
                         Mat::Empty => {
-                            let d = (amb - t) * 0.12 * ts;
+                            let d = (amb - t) * 0.12 * t12;
                             temp[x] = t + d;
                             d * C_AIR
                         }
                         Mat::Steam | Mat::Cloud | Mat::Snow | Mat::Hail | Mat::Smoke => {
-                            let d = (amb - t) * 0.03 * ts;
+                            let d = (amb - t) * 0.03 * t03;
                             temp[x] = t + d;
                             d / tb.inv_c[m as usize]
                         }
@@ -951,6 +979,7 @@ impl World {
     fn heat_space_and_sun(&mut self) {
         let scale = self.thermal_scale();
         let ts = TS * scale;
+        let (t05, t04) = (self.relax_ts(0.05, ts), self.relax_ts(0.04, ts));
         let tb = tables();
         let (to_cells, flames) = std::mem::take(&mut self.heat_carry);
         let (sun, gx, _gy, row_amb, surf, fixed) = self.heat_frame();
@@ -1046,7 +1075,7 @@ impl World {
                             // Smoke is dark: it soaks up the sunlight that falls on it.
                             let target = surf + 15.0 * here;
                             if target > self.temp[i] {
-                                let d = (target - self.temp[i]) * 0.05 * ts;
+                                let d = (target - self.temp[i]) * 0.05 * t05;
                                 self.temp[i] += d;
                                 from_sun += d / tb.inv_c[m as usize];
                             }
@@ -1057,7 +1086,7 @@ impl World {
                             // to the warmth of the valley floor, or high clouds would climb on).
                             let target = row_amb[y] + 2.0 * here;
                             if target > self.temp[i] {
-                                let d = (target - self.temp[i]) * 0.04 * ts;
+                                let d = (target - self.temp[i]) * 0.04 * t04;
                                 self.temp[i] += d;
                                 from_sun += d / tb.inv_c[m as usize];
                             }
@@ -1066,7 +1095,7 @@ impl World {
                         _ => {
                             let target = surf + 15.0 * here * absorb(m);
                             if target > self.temp[i] {
-                                let d = (target - self.temp[i]) * 0.05 * ts;
+                                let d = (target - self.temp[i]) * 0.05 * t05;
                                 self.temp[i] += d;
                                 from_sun += d / tb.inv_c[m as usize];
                                 // Sunlight on ice or water goes into melting or boiling it first.
@@ -1209,6 +1238,11 @@ impl World {
         old.clear();
         old.extend_from_slice(&self.temp);
         let reach = 2.0 * THERMAL_EVERY as f32 * self.thermal_scale();
+        // How far the air takes the warmth it is carried (70 % in a pass of the reference length),
+        // and the convection's share, over the step's length (see `relax_ts`).
+        let k = self.dt / super::STEP;
+        let exact = (k - 1.0).abs() < 1e-4;
+        let blend = if exact { 0.7 } else { 1.0 - 0.3f32.powf(k) };
         let stride = if self.lod >= 1 { 2 } else { 1 };
         let tb = tables();
         let cell = super::flow::CELL;
@@ -1237,6 +1271,7 @@ impl World {
                 let spread = c.iter().map(|w| (w.0 - c[0].0).abs() + (w.1 - c[0].1).abs()).fold(0.0f32, f32::max);
                 let fine = spread * reach > 2.0 || (vx.abs().max(vy.abs()) * reach) > 10.0;
                 let gust = speed.min(1.5) * 0.02;
+                let gust = if exact { gust } else { 1.0 - (1.0 - gust).powf(k) };
                 let (ox, oy) = (-vx * reach, -vy * reach);
                 let (ix, iy) = (ox.floor(), oy.floor());
                 let (tx, ty) = (ox - ix, oy - iy);
@@ -1264,7 +1299,7 @@ impl World {
                             top * (1.0 - ty) + bot * ty
                         };
                         let k = i - bj * cell * W;
-                        band[k] = old_t[i] + (upwind - old_t[i]) * 0.7;
+                        band[k] = old_t[i] + (upwind - old_t[i]) * blend;
                         if stride == 2 {
                             // Simplified: the other three cells of the 2 x 2 block follow.
                             let t = band[k];

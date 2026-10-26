@@ -105,6 +105,10 @@ pub(super) fn scenes() -> Vec<(&'static str, fn() -> World, Option<fn(&mut World
 fn bench_scenes() {
     let steps: u32 = std::env::var("AWORLD_BENCH_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
     let only = std::env::var("AWORLD_BENCH_SCENE").ok();
+    // The length of a step, in ticks of 1/60 s (AWORLD_BENCH_DT=2: steps of 1/30 s).
+    let ticks: f32 = std::env::var("AWORLD_BENCH_DT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    let dt = ticks * super::STEP;
+    let steps = (steps as f32 / ticks).round() as u32;
     for (name, make, each) in scenes() {
         if only.as_deref().map_or(false, |o| o != name) {
             continue;
@@ -127,7 +131,7 @@ fn bench_scenes() {
                 f(&mut w, i);
             }
             let s = Instant::now();
-            w.step();
+            w.step_dt(dt);
             let ms = s.elapsed().as_secs_f64() * 1000.0;
             worst = worst.max(ms);
             if i < 96 {
@@ -135,6 +139,7 @@ fn bench_scenes() {
             }
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0 / steps as f64;
+        eprintln!("\n{name}: {:.0} ms de calcul par seconde du monde (pas de {:.1} ms)", ms * (1.0 / dt) as f64, dt * 1000.0);
         let awake = w.zones.awake.iter().filter(|&&a| a).count();
         eprintln!(
             "\n=== {name}: {ms:.2} ms/pas en moyenne, pire pas {worst:.1} ms, {awake}/{} zones éveillées à la fin",
@@ -194,4 +199,62 @@ fn the_cells_turn_on_every_core_is_the_same_on_one_core() {
         })
     };
     assert!(run(1) == run(4), "the turn depends on the number of cores");
+}
+
+/// What a scene looks like after a while, in a few numbers that do not depend on the lots drawn:
+/// the water (its amount, and the height of its centre), the mean temperature, what burns.
+fn summary(w: &World) -> (f64, f64, f64, usize) {
+    let (mut water, mut wy, mut temp, mut burning) = (0f64, 0f64, 0f64, 0usize);
+    for i in 0..W * H {
+        let m = w.cells[i].m;
+        if m == Mat::Water {
+            let f = w.liquid_fill(i) as f64;
+            water += f;
+            wy += f * (i / W) as f64;
+        }
+        if matches!(m, Mat::Fire | Mat::Ember) {
+            burning += 1;
+        }
+        temp += w.temp[i] as f64;
+    }
+    (water, wy / water.max(1.0), temp / (W * H) as f64, burning)
+}
+
+/// The same seconds of a scene at steps of 1/120, 1/60, 1/30 and 1/20 s:
+///
+/// ```text
+/// cargo test --release --bin aworld same_seconds_at_any_step -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn same_seconds_at_any_step() {
+    let seconds = 3.0;
+    for (name, make, _) in scenes() {
+        if !matches!(name, "liquides" | "incendie" | "démo") {
+            continue;
+        }
+        let w0 = make();
+        let (_, _, t0, _) = summary(&w0);
+        eprintln!("{name:>9} au départ : {t0:.2} °C en moyenne");
+        let seeds: u32 = std::env::var("AWORLD_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        for (ticks, seed) in [0.5f32, 1.0, 2.0, 3.0].into_iter().flat_map(|t| (0..seeds).map(move |s| (t, s))) {
+            let mut w = make();
+            // (Other lots for the same scene.)
+            for _ in 0..seed {
+                w.rand();
+            }
+            let dt = ticks * STEP;
+            let t = Instant::now();
+            for _ in 0..(seconds / dt).round() as u32 {
+                w.step_dt(dt);
+            }
+            let (water, wy, temp, burning) = summary(&w);
+            eprintln!(
+                "{name:>9} pas de 1/{:<3.0} s : eau {water:.0} (centre à y = {wy:.1}), {temp:.2} °C en moyenne, {burning} cases en feu, horloge {} ({:.1} s de calcul)",
+                1.0 / dt,
+                w.clock,
+                t.elapsed().as_secs_f64()
+            );
+        }
+    }
 }

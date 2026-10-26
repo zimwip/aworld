@@ -39,9 +39,12 @@ pub use statics::Slab;
 pub use storm::{Bolt, BREAKDOWN, GROUND_BREAKDOWN, QS, QW, QH};
 pub use thermal::{air_pressure_atm, Season, DAY_STEPS};
 
-/// The reference step of the world, in seconds: what every pass took before the world was driven
-/// by a time step (`World::step_dt`), and the longest step a pass not yet taught takes at once.
+/// The tick of the cells, in seconds: a grain falls, a flame spreads, a gas drifts one tick at a
+/// time (see `World::step_dt`). The passes that integrate over time take any step instead.
 pub const STEP: f32 = 1.0 / 60.0;
+/// The longest step the world takes at once, in seconds. A longer one (a slow computer, a fast
+/// speed) is several steps: past it the heat and the liquids would need sub-steps of their own.
+pub const MAX_DT: f32 = 3.0 * STEP;
 use thermal::adiabatic_cooling_c;
 
 /// How the brush treats what is already there.
@@ -642,6 +645,10 @@ pub struct World {
     pub clock: u32,
     /// The length of the step being taken, in seconds of the world (see `step_dt`).
     pub dt: f32,
+    /// The time the world has gone through that the cells have not ticked yet, in seconds.
+    tick_time: f32,
+    /// The heat passes since the world began: which part of its cycle comes next.
+    heat_stage: u32,
     /// When false the sun stands still.
     pub day_cycle: bool,
     thermal_flip: bool,
@@ -808,6 +815,8 @@ impl World {
             temp: vec![15.0; W * H],
             clock: DAY_STEPS / 5,
             dt: STEP,
+            tick_time: 0.0,
+            heat_stage: 0,
             day_cycle: true,
             thermal_flip: false,
             heat_carry: (0.0, 0.0),
@@ -926,7 +935,7 @@ impl World {
     pub fn copy_picture(&mut self, from: &World) {
         let World {
             cells, frame, rng, seen: _, stack: _, released: _, released_list: _, falling, slabs, level: _, strain, pushes, strain_key, stress_cache: _,
-            stress_pos: _, stress_local: _, ticks, log, paint_log, temp, clock, dt, day_cycle, thermal_flip, heat_carry, temp_old: _, heat_took: _,
+            stress_pos: _, stress_local: _, ticks, log, paint_log, temp, clock, dt, tick_time, heat_stage, day_cycle, thermal_flip, heat_carry, temp_old: _, heat_took: _,
             climate_fixed, climate, revision, wind, wind_max, wind_changes, windiness, wind_clock, biome, leaf_rgb, autumn, grass_rgb,
             structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, dp,
             dp_slow, dpd, pressure_forces, lod, parallel_cells, liquid_physics, liq, fill, pocket_of,
@@ -949,6 +958,8 @@ impl World {
         self.temp.clone_from(temp);
         self.clock = *clock;
         self.dt = *dt;
+        self.tick_time = *tick_time;
+        self.heat_stage = *heat_stage;
         self.day_cycle = *day_cycle;
         self.thermal_flip = *thermal_flip;
         self.heat_carry = *heat_carry;
@@ -1708,30 +1719,39 @@ impl World {
 
     // ----- simulation -------------------------------------------------------
 
-    /// One step of the reference length, 1/60 s.
+    /// One step of a tick, 1/60 s.
     pub fn step(&mut self) {
         self.step_dt(STEP);
     }
 
-    /// The world moves on by `dt` seconds. The passes are being taught to take any `dt` (each cut
-    /// into the sub-steps its stability needs, and no more); until all of them do, a `dt` longer
-    /// than `STEP` runs as that many steps of `STEP`.
+    /// The world moves on by `dt` seconds, at most `MAX_DT`. The cells tick every `STEP` of the
+    /// world's time (none, one or several times in the step); the liquids and the heat run once,
+    /// over `dt` (each cut into the sub-steps its stability needs). A world stepped by 1/120 s or
+    /// by 1/30 s goes through the same second, and a longer step costs less than as many ticks.
     pub fn step_dt(&mut self, dt: f32) {
-        let n = (dt / STEP).round().max(1.0) as usize;
-        for _ in 0..n {
-            self.dt = STEP;
-            self.step_once();
-        }
+        let dt = dt.clamp(0.0, MAX_DT);
+        self.dt = dt;
+        self.tick_time += dt;
+        // (A hair of slack: two steps of 1/120 s make a tick whatever the rounding.)
+        let ticks = ((self.tick_time + 1e-3 * STEP) / STEP).floor() as u32;
+        self.tick_time = (self.tick_time - ticks as f32 * STEP).max(0.0);
+        self.step_ticks(ticks);
     }
 
-    fn step_once(&mut self) {
+    /// A step with `ticks` ticks of the cells in it; the liquids come after the cells of the
+    /// last tick and the heat in its place among the passes of the last tick, as when every step
+    /// was a tick.
+    fn step_ticks(&mut self, ticks: u32) {
         self.revision += 1;
-        self.frame = self.frame.wrapping_add(1);
         let clock = self.prof.start();
         let audit = self.liquid_physics && std::env::var_os("AWORLD_DEBUG_MASS").is_some();
         let mut marks: Vec<(&str, u64)> = Vec::new();
         if audit {
             marks.push(("début", self.water_units_audit()));
+        }
+        // (The first tick's frame already, for what the card hands back.)
+        if ticks > 0 {
+            self.frame = self.frame.wrapping_add(1);
         }
         if self.liquid_physics {
             self.take_liquids_from_card();
@@ -1739,23 +1759,39 @@ impl World {
         if audit {
             marks.push(("reprise de la carte", self.water_units_audit()));
         }
-        timed!(self, 0, self.step_cells());
-        if audit {
-            marks.push(("tour des cellules", self.water_units_audit()));
+        for k in 0..ticks {
+            let last = k + 1 == ticks;
+            if k > 0 {
+                self.frame = self.frame.wrapping_add(1);
+            }
+            timed!(self, 0, self.step_cells());
+            if audit {
+                marks.push(("tour des cellules", self.water_units_audit()));
+            }
+            if self.liquid_physics {
+                if last {
+                    timed!(self, prof::LIQUIDS, self.step_liquids(self.dt));
+                }
+                self.seep_through_thin();
+            }
+            if audit {
+                marks.push(("liquides", self.water_units_audit()));
+            }
+            self.after_cells(last);
+            if audit {
+                marks.push(("après les cellules", self.water_units_audit()));
+            }
         }
-        if self.liquid_physics {
-            timed!(self, prof::LIQUIDS, self.step_liquids(self.dt));
-            self.seep_through_thin();
+        if ticks == 0 {
+            if self.liquid_physics {
+                timed!(self, prof::LIQUIDS, self.step_liquids(self.dt));
+            }
+            self.heat_turn();
+            if audit {
+                marks.push(("liquides et chaleur", self.water_units_audit()));
+            }
         }
         if audit {
-            marks.push(("liquides", self.water_units_audit()));
-        }
-        if audit {
-            marks.push(("liquides", self.water_units_audit()));
-        }
-        self.after_cells();
-        if audit {
-            marks.push(("après les cellules", self.water_units_audit()));
             for k in 1..marks.len() {
                 if marks[k].1 != marks[k - 1].1 {
                     eprintln!("pas {}: l'eau passe de {} à {} ({:+}) dans « {} »", self.frame, marks[k - 1].1, marks[k].1, marks[k].1 as i64 - marks[k - 1].1 as i64, marks[k].0);
@@ -1764,6 +1800,13 @@ impl World {
         }
         self.prof.stop(prof::TOTAL, clock);
         self.prof.end_step();
+    }
+
+    /// The next part of the heat pass, over the step's `dt` (see `thermal_stage`).
+    fn heat_turn(&mut self) {
+        self.heat_stage = self.heat_stage.wrapping_add(1);
+        let cycle = thermal::THERMAL_EVERY * self.thermal_lod_scale() as u32;
+        timed!(self, 12, self.thermal_stage(self.heat_stage % cycle));
     }
 
     /// The turn of the cell at (x, y), in zone `zone` (see `turn.rs` for the order).
@@ -1841,8 +1884,9 @@ impl World {
         }
     }
 
-    /// Everything after the cells: falling pieces, wind, pressure, heat, the clock.
-    fn after_cells(&mut self) {
+    /// Everything after the cells in a tick: falling pieces, wind, pressure, the clock, and on the
+    /// `last` tick of the step the heat.
+    fn after_cells(&mut self, last: bool) {
         self.ticks = self.ticks.wrapping_add(1);
         // The passes that come back every few steps are set on different steps, so that the
         // heavy ones never fall together, and the heat pass is spread over the three steps of its
@@ -1878,8 +1922,9 @@ impl World {
         if self.ticks % 64 == 0 {
             timed!(self, 11, self.update_season_cache());
         }
-        let cycle = thermal::THERMAL_EVERY * self.thermal_scale() as u32;
-        timed!(self, 12, self.thermal_stage(self.ticks % cycle));
+        if last {
+            self.heat_turn();
+        }
         timed!(self, 13, self.storm_step());
         if self.day_cycle {
             self.clock = self.clock.wrapping_add(1);

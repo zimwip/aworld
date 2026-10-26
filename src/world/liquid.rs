@@ -69,8 +69,16 @@ pub(super) const DROP_TERMINAL_MS: f32 = 9.0;
 /// the energy of a splash into a few cells, and drops thrown at the grid's speed would climb
 /// into the sky, which is logarithmic up there).
 pub(super) const LAUNCH: f32 = 4.43;
-/// At most this many sub-steps a step (fast flows take smaller ones).
+/// At most this many sub-steps in a step of `DT` (fast flows take smaller ones), and as many more
+/// in a longer step.
 pub(super) const MAX_SUB: usize = 4;
+/// At most this many sub-steps in any step (one of `MAX_DT`).
+pub(super) const MAX_SUB_ALL: usize = MAX_SUB * 3;
+
+/// The most sub-steps a step of `dt` seconds takes.
+pub(super) fn max_sub(dt: f32) -> usize {
+    ((MAX_SUB as f32 * dt / DT).ceil() as usize).clamp(1, MAX_SUB_ALL)
+}
 /// A cell left with this little liquid or less (units of fill, 1/8192 of a cell) is emptied: so
 /// little moves no more (what an edge passes rounds to nothing) and would hang in the air for
 /// ever, keeping its zone awake.
@@ -445,10 +453,9 @@ impl World {
         }
     }
 
-    /// The liquids' turn, for `dt` seconds (for now always `DT`: the solver is being taught to
-    /// take any step).
-    pub(super) fn step_liquids(&mut self, dt: f32) {
-        debug_assert!((dt - DT).abs() < 1e-6, "the liquids take steps of DT for now");
+    /// The liquids' turn, for `dt` seconds (at most `MAX_DT`), in as many sub-steps as the
+    /// fastest liquid needs to cross at most a cell in each.
+    pub(super) fn step_liquids(&mut self, step: f32) {
         let mut liq = std::mem::take(&mut self.liq);
         liq.ready();
         let audit = std::env::var_os("AWORLD_DEBUG_MASS").is_some();
@@ -459,7 +466,7 @@ impl World {
         if gpu::wanted() != gpu::Use::Off {
             let mut card = liq.card.take().unwrap_or_else(liquid_gpu::LiquidGpu::new);
             if let Some(c) = card.as_mut() {
-                self.step_liquids_on_card(&mut liq, c);
+                self.step_liquids_on_card(&mut liq, c, step);
             }
             liq.card = Some(card);
             if liq.card.as_ref().is_some_and(Option::is_some) {
@@ -473,7 +480,7 @@ impl World {
                 return;
             }
         }
-        self.fly_drops(&mut liq);
+        self.fly_drops(&mut liq, step);
         let clock = self.prof.start();
         self.classify(&mut liq, false);
         self.prof.stop(prof::LIQ_CLASSIFY, clock);
@@ -505,9 +512,9 @@ impl World {
                 u.chain(v).fold(0.0f32, |a, v| a.max(v.abs()))
             })
             .reduce(|| 0.0, f32::max)
-            + G * DT;
-        let sub = ((fastest * DT / CELL_M).ceil() as usize).clamp(1, MAX_SUB);
-        let dt = DT / sub as f32;
+            + G * step;
+        let sub = ((fastest * step / CELL_M).ceil() as usize).clamp(1, max_sub(step));
+        let dt = step / sub as f32;
         for k in 0..sub {
             if k > 0 {
                 let clock = self.prof.start();
@@ -691,15 +698,15 @@ impl World {
 
     /// Moves the drops in flight a step; those that land go back into the liquid (or make a cell
     /// of it on the ground) with their speed and their heat.
-    pub(super) fn fly_drops(&mut self, liq: &mut Liquids) {
+    pub(super) fn fly_drops(&mut self, liq: &mut Liquids, dt: f32) {
         if liq.drops.is_empty() {
             return;
         }
         let mut drops = std::mem::take(&mut liq.drops);
-        let s = DT / CELL_M;
-        let drag = G * DT / (DROP_TERMINAL_MS * DROP_TERMINAL_MS);
+        let s = dt / CELL_M;
+        let drag = G * dt / (DROP_TERMINAL_MS * DROP_TERMINAL_MS);
         drops.retain_mut(|d| {
-            d.vy += G * DT;
+            d.vy += G * dt;
             // Quadratic drag: g (v / v_t)², against the motion.
             let speed = (d.vx * d.vx + d.vy * d.vy).sqrt();
             let k = (1.0 - drag * speed).max(0.0);

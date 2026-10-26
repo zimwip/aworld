@@ -264,6 +264,8 @@ impl World {
                 temp: share(&self.temp),
                 clock: self.clock,
                 dt: self.dt,
+                tick_time: self.tick_time,
+                heat_stage: self.heat_stage,
                 day_cycle: self.day_cycle,
                 thermal_flip: self.thermal_flip,
                 climate_fixed: self.climate_fixed,

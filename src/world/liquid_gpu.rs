@@ -28,7 +28,7 @@ impl LiquidGpu {
 
 #[cfg(target_arch = "wasm32")]
 impl super::World {
-    pub(super) fn step_liquids_on_card(&mut self, _liq: &mut super::liquid::Liquids, _card: &mut LiquidGpu) {}
+    pub(super) fn step_liquids_on_card(&mut self, _liq: &mut super::liquid::Liquids, _card: &mut LiquidGpu, _step: f32) {}
     pub(super) fn collect_liquids(&mut self, _liq: &mut super::liquid::Liquids, _card: &mut LiquidGpu) {}
 }
 
@@ -426,7 +426,7 @@ mod native {
 
     /// The most time stamps a step writes (one before the first kernel, one after each phase of
     /// each sub-step, one after the copies back).
-    const MAX_STAMPS: usize = 2 + 5 * MAX_SUB + 2 + 2 + 4 * (MAX_ITER as usize + 1);
+    const MAX_STAMPS: usize = 2 + 5 * MAX_SUB_ALL + 2 + 2 + 4 * (MAX_ITER as usize + 1);
     /// The card's time in each phase, in ns, summed over the steps (`AWORLD_DEBUG_CARD`).
     static CARD: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
     const PHASES: [&str; 10] = ["envoi", "forces", "viscosité", "pression", "pression: préparation", "pression: gradients", "pression: lissage fin", "pression: niveaux grossiers", "transport", "retour"];
@@ -442,10 +442,10 @@ mod native {
     impl World {
         /// The liquids' turn on the card: the result of the step the card worked on comes in,
         /// the drops fly, and the card is given this step (the CPU goes on without waiting).
-        pub(in super::super) fn step_liquids_on_card(&mut self, liq: &mut Liquids, card: &mut LiquidGpu) {
+        pub(in super::super) fn step_liquids_on_card(&mut self, liq: &mut Liquids, card: &mut LiquidGpu, step: f32) {
             self.collect_liquids(liq, card);
-            self.fly_drops(liq);
-            self.submit_liquids(liq, card);
+            self.fly_drops(liq, step);
+            self.submit_liquids(liq, card, step);
         }
 
         /// What the card did with the step it was given: the cells it changed, the drops it
@@ -625,7 +625,7 @@ mod native {
 
         /// The step given to the card: the cells the game changed go to it, and the whole turn
         /// is encoded and submitted, its result to be read at the next step.
-        fn submit_liquids(&mut self, liq: &mut Liquids, card: &mut LiquidGpu) {
+        fn submit_liquids(&mut self, liq: &mut Liquids, card: &mut LiquidGpu, step: f32) {
             let clock = self.prof.start();
             let mut t = std::time::Instant::now();
             // The band: the rows that hold liquid in zones that run, a margin, what was sent.
@@ -636,7 +636,7 @@ mod native {
                 .collect();
             let first = liquid_rows.iter().position(|&r| r);
             let last = liquid_rows.iter().rposition(|&r| r);
-            let margin = MAX_SUB + 3;
+            let margin = max_sub(step) + 3;
             let now = first.map(|a| (a.saturating_sub(margin), (last.unwrap() + margin).min(H - 1)));
             let band = match (now, card.sent) {
                 (Some((a, b)), Some((c, d))) => (a.min(c), b.max(d)),
@@ -745,8 +745,8 @@ mod native {
                 fastest = fastest.max(pt.value.abs());
             }
             patches.truncate(MAX_PATCHES);
-            let sub = (((fastest + G * DT) * DT / CELL_M).ceil() as usize).clamp(1, MAX_SUB);
-            let dt = DT / sub as f32;
+            let sub = (((fastest + G * step) * step / CELL_M).ceil() as usize).clamp(1, max_sub(step));
+            let dt = step / sub as f32;
             // To the card.
             let q = &card.gpu.queue;
             let at = |c: usize| (c * 4) as u64;
