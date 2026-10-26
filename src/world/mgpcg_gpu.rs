@@ -71,6 +71,7 @@ mod native {
     /// The wiring of the kernels: see `mgpcg.wgsl` for what each does.
     struct Kernels {
         smooth: wgpu::ComputePipeline,
+        coarsest: wgpu::ComputePipeline,
         restrict: wgpu::ComputePipeline,
         prolong: wgpu::ComputePipeline,
         coarsen_kind: wgpu::ComputePipeline,
@@ -122,7 +123,6 @@ mod native {
     /// stride the card accepts for a dynamic offset.
     const SLOT: u64 = 256;
     const COARSEST: usize = 1024;
-    const COARSEST_SWEEPS: usize = 24;
     const SMOOTH: usize = 2;
     const WG: usize = 256;
 
@@ -185,6 +185,7 @@ mod native {
             };
             let kernels = Kernels {
                 smooth: pipeline("sweep"),
+                coarsest: pipeline("sweep_coarsest"),
                 restrict: pipeline("restrict_residual"),
                 prolong: pipeline("prolong"),
                 coarsen_kind: pipeline("coarsen_kind"),
@@ -313,12 +314,9 @@ mod native {
             let k = &self.kernels;
             let tiles = self.tiles_of(l);
             if l + 1 == self.used {
+                // All the coarsest level's sweeps in one launch (one workgroup).
                 let mut pass = enc.begin_compute_pass(&Default::default());
-                for _ in 0..COARSEST_SWEEPS {
-                    for colour in 0..2 {
-                        self.run(&mut pass, &k.smooth, l, colour, pre, tiles);
-                    }
-                }
+                self.run(&mut pass, &k.coarsest, l, 0, pre, (1, 1));
                 return;
             }
             let under = &self.levels[l + 1];

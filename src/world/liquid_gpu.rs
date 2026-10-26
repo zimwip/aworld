@@ -46,6 +46,7 @@ mod native {
     const SLOT: u64 = 256;
     const MAX_THROWS: usize = 16384;
     const MAX_PATCHES: usize = 1 << 16;
+    const MAX_CHANGES: usize = 1 << 18;
     const MASKED: u32 = 0x100;
     const OPEN: u32 = 0x200;
     const AWAKE: u32 = 0x400;
@@ -61,7 +62,20 @@ mod native {
         colour: u32,
         patches: u32,
         groups: u32,
-        pad: [u32; 4],
+        stamp: u32,
+        sent: u32,
+        pad: [u32; 2],
+    }
+
+    /// A cell as it goes to the card and comes back (see `CellRecord` in the kernels).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct CellRecord {
+        cell: u32,
+        code: u32,
+        fill: u32,
+        temp: f32,
+        gaspa: f32,
     }
 
     #[repr(C)]
@@ -83,6 +97,8 @@ mod native {
     }
 
     struct Kernels {
+        apply_cells: wgpu::ComputePipeline,
+        collect_changes: wgpu::ComputePipeline,
         patch: wgpu::ComputePipeline,
         classify: wgpu::ComputePipeline,
         forward_u: wgpu::ComputePipeline,
@@ -134,15 +150,26 @@ mod native {
         throws_n: wgpu::Buffer,
         throws: wgpu::Buffer,
         partials: wgpu::Buffer,
-        /// What comes back: the band's code, fill, temp, class and p, the throws, the partials.
+        sent_cells: wgpu::Buffer,
+        changes_n: wgpu::Buffer,
+        records: wgpu::Buffer,
+        /// What comes back: the band's class and p, the throws, the changed cells, the partials.
         read: wgpu::Buffer,
-        /// The band of rows sent last time.
+        /// The band of rows of the last step.
         sent: Option<(usize, usize)>,
-        /// The cells as sent (to see what the card changed).
+        /// The rows whose cells the card holds (every band so far).
+        held: Option<(usize, usize)>,
+        /// The step's stamp (the kernels report a cell changed once a step).
+        stamp: u32,
+        /// The cells as the card holds them, and the cells as the game has them now.
         code_up: Vec<u32>,
         fill_up: Vec<u32>,
         temp_up: Vec<f32>,
         gaspa_up: Vec<f32>,
+        code_new: Vec<u32>,
+        fill_new: Vec<u32>,
+        temp_new: Vec<f32>,
+        gaspa_new: Vec<f32>,
         /// The fastest edge at the end of the last step (for the sub-steps of the next).
         pub fastest: f32,
         /// The patches to apply at the start of the next step.
@@ -174,14 +201,16 @@ mod native {
             let layouts = [
                 d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("liquid solver"), entries: &g0 }),
                 d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("liquid cells"), entries: &(0..9).map(storage).collect::<Vec<_>>() }),
-                d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("liquid scratch"), entries: &(0..9).map(storage).collect::<Vec<_>>() }),
-                d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("liquid edges"), entries: &(0..9).map(storage).collect::<Vec<_>>() }),
+                d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("liquid scratch"), entries: &(0..10).map(storage).collect::<Vec<_>>() }),
+                d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("liquid edges"), entries: &(0..13).map(storage).collect::<Vec<_>>() }),
             ];
             let layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("liquid"), bind_group_layouts: &[&layouts[0], &layouts[1], &layouts[2], &layouts[3]], push_constant_ranges: &[] });
             let pipeline = |entry: &str| {
                 d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(entry), layout: Some(&layout), module: &shader, entry_point: Some(entry), compilation_options: Default::default(), cache: None })
             };
             let kernels = Kernels {
+                apply_cells: pipeline("apply_cells"),
+                collect_changes: pipeline("collect_changes"),
                 patch: pipeline("apply_patches"),
                 classify: pipeline("classify"),
                 forward_u: pipeline("forward_u"),
@@ -217,11 +246,16 @@ mod native {
             let (want, scale, qnew, tnew, fu, fv, thrown, mnew) = (grid("want", n), grid("scale", n), grid("qnew", n), grid("tnew", n), grid("fu", nu_), grid("fv", nv), grid("thrown", n), grid("mnew", n));
             let groups = n.div_ceil(WG);
             let partials = grid("partials", groups);
+            let mark = grid("mark", n);
             let (u, v, u2, v2, u3, v3) = (grid("u", nu_), grid("v", nv), grid("u2", nu_), grid("v2", nv), grid("u3", nu_), grid("v3", nv));
             let patches = grid("patches", MAX_PATCHES * 4);
             let throws_n = grid("throws n", 1);
             let throws = grid("throws", MAX_THROWS * 8);
-            let read_size = (5 * n + 1 + MAX_THROWS * 8 + groups) * 4;
+            let sent_cells = grid("sent cells", n * 5);
+            let changes_n = grid("changes n", 1);
+            let changes = grid("changes", MAX_CHANGES);
+            let records = grid("records", MAX_CHANGES * 5);
+            let read_size = (2 * n + 1 + MAX_THROWS * 8 + 1 + MAX_CHANGES * 5 + groups) * 4;
             let read = d.create_buffer(&wgpu::BufferDescriptor { label: Some("liquid read"), size: read_size as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
             // The materials, for the kernels.
             let mut table = vec![0u32; 256];
@@ -249,8 +283,8 @@ mod native {
             let binds = [
                 d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("liquid solver"), layout: &layouts[0], entries: &e0 }),
                 d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("liquid cells"), layout: &layouts[1], entries: &entries(&[&code, &fill, &temp, &gaspa, &class, &p, &nu, &rhs, &tables]) }),
-                d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("liquid scratch"), layout: &layouts[2], entries: &entries(&[&want, &scale, &qnew, &tnew, &fu, &fv, &thrown, &mnew, &partials]) }),
-                d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("liquid edges"), layout: &layouts[3], entries: &entries(&[&u, &v, &u2, &v2, &u3, &v3, &patches, &throws_n, &throws]) }),
+                d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("liquid scratch"), layout: &layouts[2], entries: &entries(&[&want, &scale, &qnew, &tnew, &fu, &fv, &thrown, &mnew, &partials, &mark]) }),
+                d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("liquid edges"), layout: &layouts[3], entries: &entries(&[&u, &v, &u2, &v2, &u3, &v3, &patches, &throws_n, &throws, &sent_cells, &changes_n, &changes, &records]) }),
             ];
             Some(LiquidGpu {
                 gpu,
@@ -274,12 +308,21 @@ mod native {
                 throws_n,
                 throws,
                 partials,
+                sent_cells,
+                changes_n,
+                records,
                 read,
                 sent: None,
+                held: None,
+                stamp: 0,
                 code_up: vec![0; n],
                 fill_up: vec![0; n],
                 temp_up: vec![0.0; n],
                 gaspa_up: vec![0.0; n],
+                code_new: vec![0; n],
+                fill_new: vec![0; n],
+                temp_new: vec![0.0; n],
+                gaspa_new: vec![0.0; n],
                 fastest: 0.0,
                 patches_up: Vec::new(),
             })
@@ -323,13 +366,18 @@ mod native {
                 }
             };
             card.sent = now;
+            card.stamp += 1;
+            let stamp = card.stamp;
             let (y0, y1) = band;
             let rows = y1 + 1 - y0;
             let cells = y0 * W..(y1 + 1) * W;
-            // The cells as the card reads them, and what the step needs to know of them.
-            let (mut code, mut fill, mut temp, mut gaspa) = (std::mem::take(&mut card.code_up), std::mem::take(&mut card.fill_up), std::mem::take(&mut card.temp_up), std::mem::take(&mut card.gaspa_up));
+            // The cells as the game has them now, and what the step needs to know of them: the
+            // full cells that run (the size of the pressure's system), whether any is thick, the
+            // cells that fell (their speed to the edges around).
+            let (mut code_v, mut fill_v, mut temp_v, mut gaspa_v) = (std::mem::take(&mut card.code_new), std::mem::take(&mut card.fill_new), std::mem::take(&mut card.temp_new), std::mem::take(&mut card.gaspa_new));
+            let (code, fill, temp, gaspa) = (&mut code_v, &mut fill_v, &mut temp_v, &mut gaspa_v);
             let world: &World = self;
-            let (fullish, thick): (usize, bool) = code[cells.clone()]
+            let (fullish, thick, fallen): (usize, bool, Vec<(usize, f32)>) = code[cells.clone()]
                 .par_chunks_mut(W)
                 .zip(fill[cells.clone()].par_chunks_mut(W))
                 .zip(temp[cells.clone()].par_chunks_mut(W))
@@ -337,7 +385,7 @@ mod native {
                 .enumerate()
                 .map(|(yy, (((code, fill), temp), gaspa))| {
                     let y = y0 + yy;
-                    let (mut fullish, mut thick) = (0, false);
+                    let (mut fullish, mut thick, mut fallen) = (0, false, Vec::new());
                     for x in 0..W {
                         let i = y * W + x;
                         let m = world.cells[i].m;
@@ -363,28 +411,49 @@ mod native {
                                 fullish += (f >= field::FULL / HOLDS) as usize;
                                 thick |= m == Mat::Lava;
                             }
+                            if world.vel[i] != 0 && !world.lone_liquid(x as i32, y as i32) {
+                                fallen.push((i, world.vel[i] as f32 / 8.0 * CELL_M / DT));
+                            }
                         } else {
                             fill[x] = 0;
                         }
                     }
-                    (fullish, thick)
+                    (fullish, thick, fallen)
                 })
-                .reduce(|| (0, false), |a, b| (a.0 + b.0, a.1 || b.1));
+                .reduce(|| (0, false, Vec::new()), |mut a, mut b| {
+                    a.2.append(&mut b.2);
+                    (a.0 + b.0, a.1 || b.1, a.2)
+                });
+            // What the card holds that is not what the game has: those cells go, and no other.
+            let (held_code, held_fill, held_temp, held_gaspa) = (&card.code_up, &card.fill_up, &card.temp_up, &card.gaspa_up);
+            let (code, fill, temp, gaspa) = (&code_v, &fill_v, &temp_v, &gaspa_v);
+            let held = card.held;
+            let sent: Vec<CellRecord> = (y0..=y1)
+                .into_par_iter()
+                .flat_map_iter(|y| {
+                    let fresh = held.is_none_or(|(a, b)| y < a || y > b);
+                    (y * W..(y + 1) * W).filter_map(move |i| {
+                        if fresh || code[i] != held_code[i] || fill[i] != held_fill[i] || temp[i].to_bits() != held_temp[i].to_bits() || gaspa[i].to_bits() != held_gaspa[i].to_bits() {
+                            Some(CellRecord { cell: i as u32, code: code[i], fill: fill[i], temp: temp[i], gaspa: gaspa[i] })
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+            card.held = Some(match held {
+                Some((a, b)) => (a.min(y0), b.max(y1)),
+                None => (y0, y1),
+            });
             // A drop that landed gives its speed to the edges under and over it.
             let mut patches = std::mem::take(&mut card.patches_up);
             let mut fastest = card.fastest;
-            for y in y0..=y1 {
-                for x in 0..W {
-                    let i = y * W + x;
-                    if self.cells[i].m.kind() == Kind::Liquid && self.vel[i] != 0 && !self.lone_liquid(x as i32, y as i32) {
-                        let speed = self.vel[i] as f32 / 8.0 * CELL_M / DT;
-                        for e in [vi(x, y + 1), vi(x, y)] {
-                            patches.push(Patch { edge: e as u32 | 0x8000_0000, mode: 0, value: speed, weight: 0.0 });
-                        }
-                        fastest = fastest.max(speed);
-                        self.vel[i] = 0;
-                    }
+            for (i, speed) in fallen {
+                let (x, y) = (i % W, i / W);
+                for e in [vi(x, y + 1), vi(x, y)] {
+                    patches.push(Patch { edge: e as u32 | 0x8000_0000, mode: 0, value: speed, weight: 0.0 });
                 }
+                self.vel[i] = 0;
             }
             for pt in &patches {
                 fastest = fastest.max(pt.value.abs());
@@ -395,19 +464,25 @@ mod native {
             // To the card.
             let q = &card.gpu.queue;
             let at = |c: usize| (c * 4) as u64;
-            q.write_buffer(&card.code, at(cells.start), bytes(&code[cells.clone()]));
-            q.write_buffer(&card.fill, at(cells.start), bytes(&fill[cells.clone()]));
-            q.write_buffer(&card.temp, at(cells.start), bytes(&temp[cells.clone()]));
-            q.write_buffer(&card.gaspa, at(cells.start), bytes(&gaspa[cells.clone()]));
+            if !sent.is_empty() {
+                q.write_buffer(&card.sent_cells, 0, bytes(&sent));
+            }
             if !patches.is_empty() {
                 q.write_buffer(&card.patches, 0, bytes(&patches));
             }
             q.write_buffer(&card.throws_n, 0, bytes(&[0u32]));
+            q.write_buffer(&card.changes_n, 0, bytes(&[0u32]));
             let groups = (rows * W).div_ceil(WG);
             for colour in 0..2u32 {
-                let pr = Params { w: W as u32, h: H as u32, y0: y0 as u32, rows: rows as u32, dt, colour, patches: patches.len() as u32, groups: groups as u32, pad: [0; 4] };
+                let pr = Params { w: W as u32, h: H as u32, y0: y0 as u32, rows: rows as u32, dt, colour, patches: patches.len() as u32, groups: groups as u32, stamp, sent: sent.len() as u32, pad: [0; 2] };
                 q.write_buffer(&card.params, colour as u64 * SLOT, bytes(&[pr]));
             }
+            // The game's cells are what the card holds now.
+            std::mem::swap(&mut card.code_up, &mut code_v);
+            std::mem::swap(&mut card.fill_up, &mut fill_v);
+            std::mem::swap(&mut card.temp_up, &mut temp_v);
+            std::mem::swap(&mut card.gaspa_up, &mut gaspa_v);
+            (card.code_new, card.fill_new, card.temp_new, card.gaspa_new) = (code_v, fill_v, temp_v, gaspa_v);
             self.prof.stop(prof::LIQ_UP, clock);
             let clock = self.prof.start();
             // The sub-steps.
@@ -416,9 +491,14 @@ mod native {
             let (nu_, nv) = (rows * (W + 1), rows * W);
             let (ubytes, vbytes) = (at(y0 * (W + 1))..at((y1 + 1) * (W + 1)), at(y0 * W)..at((y1 + 1) * W));
             let mut enc = card.encoder();
-            if !patches.is_empty() {
+            {
                 let mut pass = enc.begin_compute_pass(&Default::default());
-                card.run(&mut pass, &k.patch, 0, patches.len());
+                if !sent.is_empty() {
+                    card.run(&mut pass, &k.apply_cells, 0, sent.len());
+                }
+                if !patches.is_empty() {
+                    card.run(&mut pass, &k.patch, 0, patches.len());
+                }
             }
             let mut iterations = 0;
             for s in 0..sub {
@@ -482,19 +562,27 @@ mod native {
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 card.run(&mut pass, &k.fastest, 0, ncell);
+                card.run(&mut pass, &k.collect_changes, 0, MAX_CHANGES);
             }
-            // Back: the band's cells, class and pressure, the throws, the fastest edge.
+            // Back: the band's class and pressure, the throws, the changed cells, the fastest edge.
             let n = rows * W;
             let mut off = 0u64;
-            for buf in [&card.code, &card.fill, &card.temp, &card.class, &card.p] {
+            for buf in [&card.class, &card.p] {
                 enc.copy_buffer_to_buffer(buf, at(cells.start), &card.read, off, at(n));
                 off += at(n);
             }
             enc.copy_buffer_to_buffer(&card.throws_n, 0, &card.read, off, 4);
             off += 4;
-            let throws_at = off;
+            let throws_at = off as usize / 4;
             enc.copy_buffer_to_buffer(&card.throws, 0, &card.read, off, (MAX_THROWS * 32) as u64);
             off += (MAX_THROWS * 32) as u64;
+            let changes_at = off as usize / 4;
+            enc.copy_buffer_to_buffer(&card.changes_n, 0, &card.read, off, 4);
+            off += 4;
+            let records_at = off as usize / 4;
+            enc.copy_buffer_to_buffer(&card.records, 0, &card.read, off, (MAX_CHANGES * 20) as u64);
+            off += (MAX_CHANGES * 20) as u64;
+            let partials_at = off as usize / 4;
             enc.copy_buffer_to_buffer(&card.partials, 0, &card.read, off, at(groups));
             let total = off + at(groups);
             card.gpu.queue.submit([enc.finish()]);
@@ -504,28 +592,28 @@ mod native {
             self.prof.stop(prof::LIQ_CARD, clock);
             let clock = self.prof.start();
             let data = slice.get_mapped_range();
-            let word = |k: usize| u32::from_le_bytes([data[k * 4], data[k * 4 + 1], data[k * 4 + 2], data[k * 4 + 3]]);
-            let count = (word(5 * n) as usize).min(MAX_THROWS);
-            let throws_from = throws_at as usize / 4;
+            let data_ref: &[u8] = &data;
+            let word = |k: usize| u32::from_le_bytes([data_ref[k * 4], data_ref[k * 4 + 1], data_ref[k * 4 + 2], data_ref[k * 4 + 3]]);
+            let count = (word(throws_at - 1) as usize).min(MAX_THROWS);
             let mut throws: Vec<Throw> = (0..count)
                 .map(|t| {
-                    let k = throws_from + t * 8;
+                    let k = throws_at + t * 8;
                     Throw { cell: word(k), q: word(k + 1), x: f32::from_bits(word(k + 2)), y: f32::from_bits(word(k + 3)), vx: f32::from_bits(word(k + 4)), vy: f32::from_bits(word(k + 5)), mat: word(k + 6), temp: f32::from_bits(word(k + 7)) }
                 })
                 .collect();
-            let partials_from = total as usize / 4 - groups;
-            let fastest = (0..groups).map(|g| f32::from_bits(word(partials_from + g))).fold(0.0f32, f32::max);
-            card.fastest = fastest;
-            // What the card changed, into the cells; the classes and the pressure too.
-            let (code_r, fill_r, temp_r) = (&code[cells.clone()], &fill[cells.clone()], &temp[cells.clone()]);
-            let data_ref: &[u8] = &data;
-            let word_at = |k: usize| u32::from_le_bytes([data_ref[k * 4], data_ref[k * 4 + 1], data_ref[k * 4 + 2], data_ref[k * 4 + 3]]);
-            let changed: Vec<usize> = (0..n).into_par_iter().filter(|&j| word_at(j) & 0xff != code_r[j] & 0xff || word_at(n + j) != fill_r[j] || word_at(2 * n + j) != temp_r[j].to_bits()).collect();
-            liq.class[cells.clone()].par_iter_mut().enumerate().for_each(|(j, c)| *c = word_at(3 * n + j) as u8);
-            liq.p[cells.clone()].par_iter_mut().enumerate().for_each(|(j, c)| *c = f32::from_bits(word_at(4 * n + j)));
-            for &j in &changed {
-                let i = cells.start + j;
-                let m = Mat::from_u8((word_at(j) & 0xff) as u8);
+            let changed = (word(changes_at) as usize).min(MAX_CHANGES);
+            debug_assert!(changed < MAX_CHANGES, "the card changed more cells than it can report");
+            card.fastest = (0..groups).map(|g| f32::from_bits(word(partials_at + g))).fold(0.0f32, f32::max);
+            liq.class[cells.clone()].par_iter_mut().enumerate().for_each(|(j, c)| *c = word(j) as u8);
+            liq.p[cells.clone()].par_iter_mut().enumerate().for_each(|(j, c)| *c = f32::from_bits(word(n + j)));
+            // What the card changed, into the cells (and into what the card is known to hold).
+            for r in 0..changed {
+                let k = records_at + r * 5;
+                let (i, c, f, t) = (word(k) as usize, word(k + 1), word(k + 2), f32::from_bits(word(k + 3)));
+                card.code_up[i] = c;
+                card.fill_up[i] = f;
+                card.temp_up[i] = t;
+                let m = Mat::from_u8((c & 0xff) as u8);
                 if m != self.cells[i].m {
                     self.cells[i] = Cell { m, stamp: self.frame };
                     self.clear_states(i);
@@ -533,8 +621,7 @@ mod native {
                     self.vel[i] = 0;
                 }
                 if m.kind() == Kind::Liquid {
-                    self.temp[i] = f32::from_bits(word_at(2 * n + j));
-                    let f = word_at(n + j);
+                    self.temp[i] = t;
                     self.fill[i] = if f == field::FULL { 0 } else { f };
                 }
                 self.revision += 1;
@@ -550,7 +637,6 @@ mod native {
                 liq.drops.push(Drop { x: t.x, y: t.y, vx: t.vx + jx, vy: t.vy + jy, m: Mat::from_u8(t.mat as u8), q: t.q, t: t.temp });
             }
             liq.solve = (None, iterations);
-            (card.code_up, card.fill_up, card.temp_up, card.gaspa_up) = (code, fill, temp, gaspa);
             self.prof.stop(prof::LIQ_DOWN, clock);
         }
     }

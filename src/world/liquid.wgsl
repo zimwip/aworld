@@ -18,10 +18,20 @@ struct Params {
     colour: u32,
     patches: u32,
     groups: u32,
-    pad0: u32,
-    pad1: u32,
+    // The step's stamp (a cell is reported changed once a step), and the cells sent this step.
+    stamp: u32,
+    sent: u32,
     pad2: u32,
     pad3: u32,
+}
+
+// A cell as the CPU sends it (what the rest of the game changed), and as the card reports it.
+struct CellRecord {
+    cell: u32,
+    code: u32,
+    fill: u32,
+    temp: f32,
+    gaspa: f32,
 }
 
 struct Patch {
@@ -74,6 +84,8 @@ struct Throw {
 @group(2) @binding(6) var<storage, read_write> thrown: array<u32>;
 @group(2) @binding(7) var<storage, read_write> mnew: array<u32>;
 @group(2) @binding(8) var<storage, read_write> partials: array<f32>;
+// The stamp of the step a cell was last reported changed in.
+@group(2) @binding(9) var<storage, read_write> mark: array<atomic<u32>>;
 
 @group(3) @binding(0) var<storage, read_write> u: array<f32>;
 @group(3) @binding(1) var<storage, read_write> v: array<f32>;
@@ -85,6 +97,12 @@ struct Throw {
 // The drops thrown this step: the count, then the records.
 @group(3) @binding(7) var<storage, read_write> throws_n: atomic<u32>;
 @group(3) @binding(8) var<storage, read_write> throws: array<Throw>;
+// The cells the CPU sends, the cells the card changed (a count, then their indices), and
+// what they are now for the CPU.
+@group(3) @binding(9) var<storage, read_write> sent: array<CellRecord>;
+@group(3) @binding(10) var<storage, read_write> changes_n: atomic<u32>;
+@group(3) @binding(11) var<storage, read_write> changes: array<u32>;
+@group(3) @binding(12) var<storage, read_write> records: array<CellRecord>;
 
 const WG: u32 = 256u;
 const FULL: u32 = 65536u;
@@ -96,7 +114,8 @@ const REFILL: f32 = 0.1;
 const SPRAY: f32 = 9.0;
 const THROW: f32 = 2.0;
 const THROW_SHARE: f32 = 0.5;
-const MAX_THROWS: u32 = 65536u;
+const MAX_THROWS: u32 = 16384u;
+const MAX_CHANGES: u32 = 262144u;
 
 const SOLID: u32 = 0u;
 const AIR: u32 = 1u;
@@ -176,6 +195,36 @@ fn band_cell(id: u32) -> u32 {
     let c = id + P.y0 * P.w;
     if c >= (P.y0 + P.rows) * P.w { return 0xffffffffu; }
     return c;
+}
+
+/// Notes that cell c changed this step (once a step), for the CPU.
+fn note_change(c: u32) {
+    if atomicMax(&mark[c], P.stamp) != P.stamp {
+        let n = atomicAdd(&changes_n, 1u);
+        if n < MAX_CHANGES { changes[n] = c; }
+    }
+}
+
+// ---- What the CPU sends: the cells the rest of the game changed.
+
+@compute @workgroup_size(256)
+fn apply_cells(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= P.sent { return; }
+    let r = sent[id.x];
+    code[r.cell] = r.code;
+    fill[r.cell] = r.fill;
+    temp[r.cell] = r.temp;
+    gaspa[r.cell] = r.gaspa;
+}
+
+// ---- What goes back: the cells the card changed, as they are at the end of the step.
+
+@compute @workgroup_size(256)
+fn collect_changes(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = min(atomicLoad(&changes_n), MAX_CHANGES);
+    if id.x >= n { return; }
+    let c = changes[id.x];
+    records[id.x] = CellRecord(c, code[c], fill[c], temp[c], 0.0);
 }
 
 // ---- The patches a step starts with (drops that landed, cells that fell).
@@ -810,6 +859,7 @@ fn throw_apply(@builtin(global_invocation_id) id: vec3<u32>) {
     if c == 0xffffffffu { return; }
     let q = thrown[c];
     if q == 0u { return; }
+    note_change(c);
     let left = fill[c] - min(fill[c], q);
     let run = cls[c] & RUNS;
     if left == 0u {
@@ -977,11 +1027,13 @@ fn carry_commit(@builtin(global_invocation_id) id: vec3<u32>) {
     if q == -2147483647 - 1 { return; }
     if q <= 0 {
         if raw_kind(c) == K_LIQUID {
+            note_change(c);
             code[c] = (code[c] & ~0xffu) | MAT_EMPTY;
             fill[c] = 0u;
         }
         return;
     }
+    note_change(c);
     let nm = mnew[c];
     if nm != 0xffu {
         code[c] = (code[c] & ~0xffu) | nm;
@@ -1019,6 +1071,8 @@ fn overflow(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         fill[j] = up + extra;
         fill[c] = FULL;
+        note_change(j);
+        note_change(c);
     }
 }
 
