@@ -9,6 +9,7 @@ mod kid;
 mod debris;
 mod dynamite;
 mod mech;
+mod metrics;
 mod fluidgame;
 mod lens;
 mod mechgame;
@@ -285,6 +286,8 @@ struct Game {
     slow_frames: u32,
     /// The frame counter (F3).
     fps: fps::Fps,
+    /// The metrics panel (F4): where the time of a step goes.
+    metrics: metrics::Metrics,
     /// Simulation steps owed to the clock: the world runs 60 steps a second (times the speed)
     /// whatever the screen's refresh rate.
     sim_acc: f32,
@@ -395,6 +398,7 @@ impl Game {
             frame_ema: 0.016,
             slow_frames: 0,
             fps: fps::Fps::new(),
+            metrics: metrics::Metrics::new(),
             sim_acc: 0.0,
             beam_broke: false,
             broken_members: vec![],
@@ -1345,6 +1349,9 @@ impl Game {
         if is_key_pressed(KeyCode::F3) {
             self.fps.shown = !self.fps.shown;
         }
+        if is_key_pressed(KeyCode::F4) {
+            self.metrics.shown = !self.metrics.shown;
+        }
         if is_key_pressed(KeyCode::F5) {
             self.save();
         }
@@ -1556,6 +1563,7 @@ impl Game {
     // ----- simulation -------------------------------------------------------
 
     fn update(&mut self, dt: f32) {
+        let around = self.metrics.start();
         self.time += dt;
         self.shake *= 0.88f32.powf(dt * 60.0);
         if self.shake < 0.15 {
@@ -1659,18 +1667,17 @@ impl Game {
         let max = self.speed * 2;
         let steps = owed.min(max);
         self.sim_acc = if owed > max { 0.0 } else { self.sim_acc - steps as f32 };
+        self.metrics.around(around, true);
+        self.world.prof.on = self.metrics.on();
         let start = get_time();
         for _ in 0..steps {
             self.sim_step();
         }
         self.fps.steps(get_time() - start, steps);
-        // `AWORLD_PROFILE=1`: every 600 steps, where the time of a step went (see `world/prof.rs`).
-        if self.world.prof.on || std::env::var_os("AWORLD_PROFILE").is_some_and(|v| v != "0") {
-            self.world.prof.on = true;
-            if self.world.prof.steps >= 600 {
-                eprint!("--- profil sur {} pas (vitesse x{}, simplification {})\n{}", self.world.prof.steps, self.speed, self.world.lod, self.world.prof.report());
-                self.world.prof.reset();
-            }
+        let around = self.metrics.start();
+        // `AWORLD_PROFILE=1`: every 600 steps, where the time of a step went (see `metrics.rs`).
+        if let Some(report) = self.metrics.take_log() {
+            eprint!("--- profil sur 600 pas (vitesse x{}, simplification {})\n{report}", self.speed, self.world.lod);
         }
         if (self.time * 2.0) as u32 != ((self.time - dt) * 2.0) as u32 {
             let n = self.world.census();
@@ -1690,6 +1697,27 @@ impl Game {
             rpm,
         };
         self.sounds.update(dt, &mix);
+        self.metrics.around(around, false);
+    }
+
+    /// The metrics panel (F4), with what it reads from the game.
+    fn draw_metrics(&self, ui: &Ui, sw: f32, sh: f32, draw_ms: (f32, f32)) {
+        if !self.metrics.shown {
+            return;
+        }
+        let info = metrics::Info {
+            awake: self.world.zones.awake_count(),
+            zones: world::sleep::CW * world::sleep::CH,
+            lod: self.world.lod,
+            speed: self.speed,
+            blocks: self.blocks.len(),
+            members: self.members.len(),
+            cars: self.cars.len(),
+            pipes: self.mech.plumbing.pipes.len(),
+            scene_ms: draw_ms.0,
+            ui_ms: draw_ms.1,
+        };
+        self.metrics.draw(ui, sw, sh, &info);
     }
 
     /// New bolts of lightning go on the screen; their thunder comes a little later, the later the
@@ -1726,14 +1754,20 @@ impl Game {
     }
 
     fn sim_step(&mut self) {
+        // Each part's time goes to the metrics panel (F4; see `metrics.rs`).
+        let mut clock = self.metrics.start();
         self.world.step();
+        self.metrics.lap(metrics::WORLD, &mut clock);
         self.dynamite.step(&mut self.world);
+        self.metrics.lap(metrics::DYNAMITE, &mut clock);
         self.sensors.step(&self.world);
+        self.metrics.lap(metrics::SENSORS, &mut clock);
         let exit = self.exit;
         let was_driving: Vec<bool> = self.cars.iter().map(|c| c.fate == Fate::Driving).collect();
         for c in &mut self.cars {
             c.step(&self.world, exit);
         }
+        self.metrics.lap(metrics::CARS, &mut clock);
         let (clang, smoke) = self.debris.step(&self.world);
         if clang > 0.5 {
             self.sounds.emit(Ev::Thud(clang * 0.5));
@@ -1743,6 +1777,7 @@ impl Game {
                 self.world.set(x, y, Mat::Smoke);
             }
         }
+        self.metrics.lap(metrics::DEBRIS, &mut clock);
         // Cars that meet either bump gently or wreck each other on the spot.
         for i in 0..self.cars.len() {
             for j in i + 1..self.cars.len() {
@@ -1788,6 +1823,7 @@ impl Game {
             }
         }
 
+        self.metrics.lap(metrics::CARS, &mut clock);
         // Cars weigh on the blocks they drive over (bridges can give way).
         let mut impacts: Vec<u32> = vec![];
         if let Some(p) = &mut self.phys {
@@ -1839,9 +1875,13 @@ impl Game {
             }
             self.fix_dangling_anchors();
         }
+        self.metrics.lap(metrics::BLOCKS, &mut clock);
         self.mech_step();
+        self.metrics.lap(metrics::MECH, &mut clock);
         self.fluid_step();
+        self.metrics.lap(metrics::PIPES, &mut clock);
         stamp_all(&mut self.world, &self.blocks, &self.members);
+        self.metrics.lap(metrics::STAMPS, &mut clock);
 
         // Flames heat wooden blocks; water rusts metal ones.
         let touched = std::mem::take(&mut self.world.touched);
@@ -1918,7 +1958,10 @@ impl Game {
                 self.say("Feu d'artifice ! Ses couleurs viennent de métaux : cuivre bleu, strontium rouge, sodium jaune");
             }
         }
-        match self.trucks.step(&mut self.world) {
+        self.metrics.lap(metrics::AFTERMATH, &mut clock);
+        let news = self.trucks.step(&mut self.world);
+        self.metrics.lap(metrics::TRUCKS, &mut clock);
+        match news {
             Some(firetruck::News::Siren) => {
                 self.sounds.emit(Ev::Siren);
                 if self.trucks.truck.as_ref().map_or(false, |t| t.age == 0) {
@@ -1984,6 +2027,8 @@ impl Game {
                 self.selected_car = None;
             }
         }
+        self.metrics.lap(metrics::AFTERMATH, &mut clock);
+        self.metrics.end_step(&mut self.world.prof);
     }
 
     /// The fire engine goes up: a bigger bang than a car's, its pieces and ladder flying, and the
@@ -4266,6 +4311,7 @@ async fn main() {
     if shot.is_some() {
         // Screenshots stay as they were: no frame counter in them.
         game.fps.shown = args.iter().any(|a| a == "--fps");
+        game.metrics.shown = args.iter().any(|a| a == "--metrics");
         game.panel.pin = !std::env::args().any(|a| a == "--hide-panel");
         let biome = match arg("--biome").as_deref() {
             Some("mer") => Biome::Sea,
@@ -4411,6 +4457,8 @@ async fn main() {
     });
     let mut frame = 0u32;
     let mut frame_time = 0.0f32;
+    // The drawing of the world and of the interface, in milliseconds (smoothed): for the metrics panel.
+    let mut draw_ms = (0.0f32, 0.0f32);
 
     loop {
         let (sw, sh) = (screen_width(), screen_height());
@@ -4573,10 +4621,16 @@ async fn main() {
             shaken.ox += (t * 97.0).sin() * game.shake;
             shaken.oy += (t * 83.0).cos() * game.shake;
         }
+        let t0 = metrics::now();
         game.draw_scene(shaken, &mut renderer, &mut ui);
+        let t1 = metrics::now();
         ui.begin_windows(view.visible());
         game.draw_ui(&mut ui, sw, sh);
         ui.end_windows();
+        let t2 = metrics::now();
+        // The metrics panel (F4), over everything: what it reads is the frame just drawn.
+        draw_ms = (draw_ms.0 * 0.9 + (t1 - t0) as f32 * 100.0, draw_ms.1 * 0.9 + (t2 - t1) as f32 * 100.0);
+        game.draw_metrics(&ui, sw, sh, draw_ms);
 
         frame += 1;
         frame_time += get_frame_time();
