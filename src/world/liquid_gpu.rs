@@ -504,26 +504,28 @@ mod native {
             self.prof.stop(prof::LIQ_CARD, clock);
             let clock = self.prof.start();
             let data = slice.get_mapped_range();
-            let words = |from: usize, n: usize| -> Vec<u32> { data[from * 4..(from + n) * 4].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
-            let code_back = words(0, n);
-            let fill_back = words(n, n);
-            let temp_back = words(2 * n, n);
-            let class_back = words(3 * n, n);
-            let p_back = words(4 * n, n);
-            let count = (words(5 * n, 1)[0] as usize).min(MAX_THROWS);
-            let mut throws: Vec<Throw> = words(throws_at as usize / 4, count * 8)
-                .chunks_exact(8)
-                .map(|t| Throw { cell: t[0], q: t[1], x: f32::from_bits(t[2]), y: f32::from_bits(t[3]), vx: f32::from_bits(t[4]), vy: f32::from_bits(t[5]), mat: t[6], temp: f32::from_bits(t[7]) })
+            let word = |k: usize| u32::from_le_bytes([data[k * 4], data[k * 4 + 1], data[k * 4 + 2], data[k * 4 + 3]]);
+            let count = (word(5 * n) as usize).min(MAX_THROWS);
+            let throws_from = throws_at as usize / 4;
+            let mut throws: Vec<Throw> = (0..count)
+                .map(|t| {
+                    let k = throws_from + t * 8;
+                    Throw { cell: word(k), q: word(k + 1), x: f32::from_bits(word(k + 2)), y: f32::from_bits(word(k + 3)), vx: f32::from_bits(word(k + 4)), vy: f32::from_bits(word(k + 5)), mat: word(k + 6), temp: f32::from_bits(word(k + 7)) }
+                })
                 .collect();
-            let fastest = words(total as usize / 4 - groups, groups).iter().map(|&w| f32::from_bits(w)).fold(0.0f32, f32::max);
-            drop(data);
-            card.read.unmap();
+            let partials_from = total as usize / 4 - groups;
+            let fastest = (0..groups).map(|g| f32::from_bits(word(partials_from + g))).fold(0.0f32, f32::max);
             card.fastest = fastest;
-            // What the card changed, into the cells.
-            let changed: Vec<usize> = (0..n).into_par_iter().filter(|&j| code_back[j] & 0xff != code[cells.start + j] & 0xff || fill_back[j] != fill[cells.start + j] || temp_back[j] != temp[cells.start + j].to_bits()).collect();
-            for j in changed {
+            // What the card changed, into the cells; the classes and the pressure too.
+            let (code_r, fill_r, temp_r) = (&code[cells.clone()], &fill[cells.clone()], &temp[cells.clone()]);
+            let data_ref: &[u8] = &data;
+            let word_at = |k: usize| u32::from_le_bytes([data_ref[k * 4], data_ref[k * 4 + 1], data_ref[k * 4 + 2], data_ref[k * 4 + 3]]);
+            let changed: Vec<usize> = (0..n).into_par_iter().filter(|&j| word_at(j) & 0xff != code_r[j] & 0xff || word_at(n + j) != fill_r[j] || word_at(2 * n + j) != temp_r[j].to_bits()).collect();
+            liq.class[cells.clone()].par_iter_mut().enumerate().for_each(|(j, c)| *c = word_at(3 * n + j) as u8);
+            liq.p[cells.clone()].par_iter_mut().enumerate().for_each(|(j, c)| *c = f32::from_bits(word_at(4 * n + j)));
+            for &j in &changed {
                 let i = cells.start + j;
-                let m = Mat::from_u8((code_back[j] & 0xff) as u8);
+                let m = Mat::from_u8((word_at(j) & 0xff) as u8);
                 if m != self.cells[i].m {
                     self.cells[i] = Cell { m, stamp: self.frame };
                     self.clear_states(i);
@@ -531,14 +533,15 @@ mod native {
                     self.vel[i] = 0;
                 }
                 if m.kind() == Kind::Liquid {
-                    self.temp[i] = f32::from_bits(temp_back[j]);
-                    self.fill[i] = if fill_back[j] == field::FULL { 0 } else { fill_back[j] };
+                    self.temp[i] = f32::from_bits(word_at(2 * n + j));
+                    let f = word_at(n + j);
+                    self.fill[i] = if f == field::FULL { 0 } else { f };
                 }
                 self.revision += 1;
                 self.zones.wake(i);
             }
-            liq.class[cells.clone()].par_iter_mut().zip(&class_back).for_each(|(c, &b)| *c = b as u8);
-            liq.p[cells.clone()].par_iter_mut().zip(&p_back).for_each(|(c, &b)| *c = f32::from_bits(b));
+            drop(data);
+            card.read.unmap();
             // The drops thrown off (in a fixed order, so that a run is the same twice).
             throws.sort_by_key(|t| t.cell);
             for t in throws {
