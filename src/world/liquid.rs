@@ -226,7 +226,6 @@ impl World {
     /// cells under half full go and the others fill up, about as much as there was.
     pub fn set_liquid_physics(&mut self, on: bool) {
         if on {
-            self.set_water_field(false);
             // The liquids no longer take the cells' turn, so that turn can run on every core.
             if turn::parallel_with_liquids() {
                 self.parallel_cells = true;
