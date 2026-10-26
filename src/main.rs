@@ -3,6 +3,7 @@ mod blocks;
 mod camera;
 mod car;
 mod fireworks;
+mod fps;
 mod firetruck;
 mod kid;
 mod debris;
@@ -282,6 +283,8 @@ struct Game {
     shake: f32,
     frame_ema: f32,
     slow_frames: u32,
+    /// The frame counter (F3).
+    fps: fps::Fps,
     /// Simulation steps owed to the clock: the world runs 60 steps a second (times the speed)
     /// whatever the screen's refresh rate.
     sim_acc: f32,
@@ -391,6 +394,7 @@ impl Game {
             shake: 0.0,
             frame_ema: 0.016,
             slow_frames: 0,
+            fps: fps::Fps::new(),
             sim_acc: 0.0,
             beam_broke: false,
             broken_members: vec![],
@@ -1338,6 +1342,9 @@ impl Game {
         if is_key_pressed(KeyCode::F11) || is_key_pressed(KeyCode::F) {
             self.toggle_fullscreen();
         }
+        if is_key_pressed(KeyCode::F3) {
+            self.fps.shown = !self.fps.shown;
+        }
         if is_key_pressed(KeyCode::F5) {
             self.save();
         }
@@ -1652,9 +1659,11 @@ impl Game {
         let max = self.speed * 2;
         let steps = owed.min(max);
         self.sim_acc = if owed > max { 0.0 } else { self.sim_acc - steps as f32 };
+        let start = get_time();
         for _ in 0..steps {
             self.sim_step();
         }
+        self.fps.steps(get_time() - start, steps);
         // `AWORLD_PROFILE=1`: every 600 steps, where the time of a step went (see `world/prof.rs`).
         if self.world.prof.on || std::env::var_os("AWORLD_PROFILE").is_some_and(|v| v != "0") {
             self.world.prof.on = true;
@@ -2557,6 +2566,8 @@ impl Game {
         if self.show_science {
             self.draw_science(ui, sw, sh);
         }
+        self.fps.frame();
+        self.fps.draw(ui, sw, sh);
         if self.quit_modal {
             ui.muted = false;
             ui.layer("quit");
@@ -4253,6 +4264,8 @@ async fn main() {
         game.sounds = Sounds::load().await;
     }
     if shot.is_some() {
+        // Screenshots stay as they were: no frame counter in them.
+        game.fps.shown = args.iter().any(|a| a == "--fps");
         game.panel.pin = !std::env::args().any(|a| a == "--hide-panel");
         let biome = match arg("--biome").as_deref() {
             Some("mer") => Biome::Sea,
