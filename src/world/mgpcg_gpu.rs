@@ -61,6 +61,12 @@ mod native {
         diag: wgpu::Buffer,
         b: wgpu::Buffer,
         x: wgpu::Buffer,
+        /// Where the level's grids lie in the shared grids of the coarse levels (elements: the
+        /// cell grids, ax, ay), and its cells; the finest level has grids of its own, at 0.
+        oc: usize,
+        oax: usize,
+        oay: usize,
+        cells: usize,
         /// The level as group 1 (or 2): its grids.
         bind: wgpu::BindGroup,
         /// The finest level with the residual as its right side and the preconditioned residual
@@ -72,6 +78,7 @@ mod native {
     struct Kernels {
         smooth: wgpu::ComputePipeline,
         coarsest: wgpu::ComputePipeline,
+        fused: wgpu::ComputePipeline,
         restrict: wgpu::ComputePipeline,
         prolong: wgpu::ComputePipeline,
         coarsen_kind: wgpu::ComputePipeline,
@@ -112,6 +119,39 @@ mod native {
         crows: u32,
         pad0: u32,
         pad1: u32,
+    }
+
+    /// See `Lv` and `Fused` in the kernels: the coarse levels for `vcycle_small`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Lv {
+        w: u32,
+        h: u32,
+        y0: u32,
+        rows: u32,
+        oc: u32,
+        oax: u32,
+        oay: u32,
+        pad: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Fused {
+        first: u32,
+        used: u32,
+        pad0: u32,
+        pad1: u32,
+        lv: [Lv; MAX_LEVELS],
+    }
+
+    /// Levels at most (960 x 540 makes six).
+    const MAX_LEVELS: usize = 8;
+
+    /// The level from which the V-cycle runs in one launch (`vcycle_small`): the levels under
+    /// it are small enough that the launches cost more than the work. `AWORLD_GPU_FUSE` sets it.
+    fn fuse_from() -> usize {
+        std::env::var("AWORLD_GPU_FUSE").ok().and_then(|v| v.parse().ok()).unwrap_or(2).max(1)
     }
 
     fn bytes<T: Copy>(v: &[T]) -> &[u8] {
@@ -173,6 +213,11 @@ mod native {
         kernels: Kernels,
         params: wgpu::Buffer,
         params_bind: wgpu::BindGroup,
+        /// The parameters of `vcycle_small` (group 0, binding 1), the shared grids of the coarse
+        /// levels bound whole as its group 1, and the level it starts from.
+        fused: wgpu::Buffer,
+        coarse_bind: wgpu::BindGroup,
+        fuse: usize,
         /// The conjugate gradients' vectors on the finest level (r, z, s, q) and the partial sums
         /// of the kernels that reduce, as group 3.
         cg: wgpu::BindGroup,
@@ -211,12 +256,20 @@ mod native {
             };
             let params_layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("params"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<Params>() as u64) },
-                    count: None,
-                }],
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<Params>() as u64) },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<Fused>() as u64) },
+                        count: None,
+                    },
+                ],
             });
             let level_layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("level"), entries: &(0..6).map(storage).collect::<Vec<_>>() });
             let cg_layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("cg"), entries: &(0..6).map(storage).collect::<Vec<_>>() });
@@ -227,6 +280,7 @@ mod native {
             let kernels = Kernels {
                 smooth: pipeline("sweep"),
                 coarsest: pipeline("sweep_coarsest"),
+                fused: pipeline("vcycle_small"),
                 restrict: pipeline("restrict_residual"),
                 prolong: pipeline("prolong"),
                 coarsen_kind: pipeline("coarsen_kind"),
@@ -253,10 +307,14 @@ mod native {
                 dims.push((lw.div_ceil(2), lh.div_ceil(2)));
             }
             let params = d.create_buffer(&wgpu::BufferDescriptor { label: Some("params"), size: SLOT * 2 * dims.len() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            let fused = d.create_buffer(&wgpu::BufferDescriptor { label: Some("fused"), size: std::mem::size_of::<Fused>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
             let params_bind = d.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("params"),
                 layout: &params_layout,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &params, offset: 0, size: wgpu::BufferSize::new(std::mem::size_of::<Params>() as u64) }) }],
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &params, offset: 0, size: wgpu::BufferSize::new(std::mem::size_of::<Params>() as u64) }) },
+                    wgpu::BindGroupEntry { binding: 1, resource: fused.as_entire_binding() },
+                ],
             });
             let grid = |label: &str, n: usize| d.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: (n * 4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
             let n = w * h;
@@ -270,19 +328,45 @@ mod native {
                 bufs.iter().enumerate().map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() }).collect()
             }
             let cg = d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("cg"), layout: &cg_layout, entries: &entries(&[&r, &z, &s, &q, &partials, &sc]) });
+            // The coarse levels (every level but the finest) share one grid of each kind, each
+            // level's at an offset the card accepts for a binding, so that `vcycle_small` can
+            // reach them all in one launch; the finest level has grids of its own.
+            assert!(dims.len() <= MAX_LEVELS, "{} niveaux", dims.len());
+            let align = (d.limits().min_storage_buffer_offset_alignment as usize / 4).max(1);
+            let up = |n: usize| n.div_ceil(align) * align;
+            let (mut oc, mut oax, mut oay) = (0, 0, 0);
+            let mut offs = vec![(0, 0, 0)];
+            for &(lw, lh) in &dims[1..] {
+                offs.push((oc, oax, oay));
+                oc += up(lw * lh);
+                oax += up((lw + 1) * lh);
+                oay += up(lw * (lh + 1));
+            }
+            let shared = [grid("kind", oc.max(1)), grid("ax", oax.max(1)), grid("ay", oay.max(1)), grid("diag", oc.max(1)), grid("b", oc.max(1)), grid("x", oc.max(1))];
+            let coarse_bind = d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("coarse"), layout: &level_layout, entries: &entries(&shared.iter().collect::<Vec<_>>()) });
             let mut levels = Vec::new();
             for (l, &(lw, lh)) in dims.iter().enumerate() {
-                let kind = grid("kind", lw * lh);
-                let ax = grid("ax", (lw + 1) * lh);
-                let ay = grid("ay", lw * (lh + 1));
-                let diag = grid("diag", lw * lh);
-                let b = grid("b", lw * lh);
-                let x = grid("x", lw * lh);
-                let bind = d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("level"), layout: &level_layout, entries: &entries(&[&kind, &ax, &ay, &diag, &b, &x]) });
+                let (oc, oax, oay) = offs[l];
+                let (kind, ax, ay, diag, b, x) = if l == 0 {
+                    (grid("kind", lw * lh), grid("ax", (lw + 1) * lh), grid("ay", lw * (lh + 1)), grid("diag", lw * lh), grid("b", lw * lh), grid("x", lw * lh))
+                } else {
+                    (shared[0].clone(), shared[1].clone(), shared[2].clone(), shared[3].clone(), shared[4].clone(), shared[5].clone())
+                };
+                fn slices<'a>(bufs: [(&'a wgpu::Buffer, usize, usize); 6]) -> Vec<wgpu::BindGroupEntry<'a>> {
+                    bufs.iter()
+                        .enumerate()
+                        .map(|(i, &(buf, off, n))| wgpu::BindGroupEntry { binding: i as u32, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: buf, offset: (off * 4) as u64, size: wgpu::BufferSize::new((n * 4) as u64) }) })
+                        .collect()
+                }
+                let bind = d.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("level"),
+                    layout: &level_layout,
+                    entries: &slices([(&kind, oc, lw * lh), (&ax, oax, (lw + 1) * lh), (&ay, oay, lw * (lh + 1)), (&diag, oc, lw * lh), (&b, oc, lw * lh), (&x, oc, lw * lh)]),
+                });
                 let pre = (l == 0).then(|| d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("level pre"), layout: &level_layout, entries: &entries(&[&kind, &ax, &ay, &diag, &r, &z]) }));
-                levels.push(GpuLevel { w: lw, h: lh, kind, ax, ay, diag, b, x, bind, pre });
+                levels.push(GpuLevel { w: lw, h: lh, kind, ax, ay, diag, b, x, oc, oax, oay, cells: lw * lh, bind, pre });
             }
-            Some(PressureGpu { gpu, levels, kernels, params, params_bind, cg, z, sc, sc_read, x_read, sent: None, kind32: vec![0; n], used: 1, groups, bands: Vec::new(), line_groups: 1 })
+            Some(PressureGpu { gpu, levels, kernels, params, params_bind, fused, coarse_bind, fuse: fuse_from(), cg, z, sc, sc_read, x_read, sent: None, kind32: vec![0; n], used: 1, groups, bands: Vec::new(), line_groups: 1 })
         }
 
         /// The slot of level `l`'s parameters for `colour`, as a dynamic offset.
@@ -311,6 +395,12 @@ mod native {
                     self.gpu.queue.write_buffer(&self.params, Self::slot(l, colour) as u64, bytes(&[p]));
                 }
             }
+            let mut f = Fused { first: self.fuse.min(self.used) as u32, used: self.used as u32, pad0: 0, pad1: 0, lv: [Lv::default(); MAX_LEVELS] };
+            for (l, lev) in self.levels.iter().enumerate().take(self.used) {
+                let (y0, y1) = self.bands[l];
+                f.lv[l] = Lv { w: lev.w as u32, h: lev.h as u32, y0: y0 as u32, rows: (y1 + 1 - y0) as u32, oc: lev.oc as u32, oax: lev.oax as u32, oay: lev.oay as u32, pad: 0 };
+            }
+            self.gpu.queue.write_buffer(&self.fused, 0, bytes(&[f]));
         }
 
         /// The workgroups of a kernel over the band of level `l`, 16 x 16 cells a group.
@@ -352,6 +442,23 @@ mod native {
             pass.pass.dispatch_workgroups(groups.0, groups.1, 1);
         }
 
+        /// `vcycle_small` from level `l` down: the coarse levels' shared grids as group 1.
+        fn run_fused(&self, pass: &mut Pass, l: usize) {
+            pass.pass.set_pipeline(&self.kernels.fused);
+            if pass.params != Some((l, 0)) {
+                pass.pass.set_bind_group(0, &self.params_bind, &[Self::slot(l, 0)]);
+                pass.params = Some((l, 0));
+            }
+            pass.pass.set_bind_group(1, &self.coarse_bind, &[]);
+            pass.pass.set_bind_group(2, &self.coarse_bind, &[]);
+            (pass.level, pass.under) = (None, None);
+            if !pass.cg {
+                pass.pass.set_bind_group(3, &self.cg, &[]);
+                pass.cg = true;
+            }
+            pass.pass.dispatch_workgroups(1, 1, 1);
+        }
+
         /// The workgroups of a kernel over every cell of a `w` x `h` grid, 16 x 16 a group.
         fn tiles(w: usize, h: usize) -> (u32, u32) {
             (w.div_ceil(16) as u32, h.div_ceil(16) as u32)
@@ -367,6 +474,12 @@ mod native {
         fn vcycle(&self, enc: &mut wgpu::CommandEncoder, l: usize, pre: bool, stamps: &mut Stamper) {
             let k = &self.kernels;
             let tiles = self.tiles_of(l);
+            if l >= self.fuse && l >= 1 && l < self.used {
+                // This level and all under it in one launch.
+                let mut pass = Pass::new(enc);
+                self.run_fused(&mut pass, l);
+                return;
+            }
             if l + 1 == self.used {
                 // All the coarsest level's sweeps in one launch (one workgroup).
                 let mut pass = Pass::new(enc);
@@ -384,7 +497,7 @@ mod native {
                 }
                 self.run(&mut pass, &k.restrict, l, 0, pre, ctiles);
             }
-            enc.clear_buffer(&under.x, 0, None);
+            enc.clear_buffer(&under.x, (under.oc * 4) as u64, Some((under.cells * 4) as u64));
             if l == 0 {
                 stamps.at(enc, "pression: lissage fin");
             }

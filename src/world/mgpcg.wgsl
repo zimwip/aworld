@@ -25,6 +25,31 @@ struct Params {
 
 @group(0) @binding(0) var<uniform> P: Params;
 
+// The coarse levels as `vcycle_small` sees them: all their grids lie in the shared grids of the
+// coarse levels (bound whole as group 1), each level's at an offset, with its band of rows.
+struct Lv {
+    w: u32,
+    h: u32,
+    y0: u32,
+    rows: u32,
+    // Offsets (in elements) of the level's cell grids, of its ax, of its ay.
+    oc: u32,
+    oax: u32,
+    oay: u32,
+    pad: u32,
+}
+
+struct Fused {
+    // The level the launch starts on, and the levels the solve uses (its last is the coarsest).
+    first: u32,
+    used: u32,
+    pad0: u32,
+    pad1: u32,
+    lv: array<Lv, 8>,
+}
+
+@group(0) @binding(1) var<uniform> F: Fused;
+
 @group(1) @binding(0) var<storage, read_write> kind: array<u32>;
 @group(1) @binding(1) var<storage, read_write> ax: array<f32>;
 @group(1) @binding(2) var<storage, read_write> ay: array<f32>;
@@ -64,6 +89,8 @@ const SC_UNDO: u32 = 10u;
 const FLUID: u32 = 1u;
 const WG: u32 = 256u;
 const COARSEST_SWEEPS: u32 = 24u;
+// Sweeps before and after the visit below in a V-cycle (`SMOOTH` in mgpcg_gpu.rs).
+const SMOOTH_SWEEPS: u32 = 2u;
 
 var<workgroup> sh: array<f32, 256>;
 
@@ -521,6 +548,144 @@ fn direction(@builtin(global_invocation_id) id: vec3<u32>) {
             s[c] = z[c] + sc[SC_BETA] * s[c];
         } else {
             s[c] = 0.0;
+        }
+    }
+}
+
+// ---- The coarse levels in one launch.
+//
+// From level `F.first` down to the coarsest and back, the whole V-cycle under the fine levels in
+// one workgroup (one launch instead of ten a level): the levels are small enough that the
+// launches cost more than the work. Each thread takes every 256th cell of a band, and the threads
+// wait for each other between two passes. Group 1 is the shared grids of the coarse levels.
+
+fn f_apply_x(v: Lv, c: u32, xx: u32, y: u32) -> f32 {
+    var r = diag[v.oc + c] * x[v.oc + c];
+    if (xx > 0u && kind[v.oc + c - 1u] == FLUID) {
+        r -= ax[v.oax + y * (v.w + 1u) + xx] * x[v.oc + c - 1u];
+    }
+    if (xx + 1u < v.w && kind[v.oc + c + 1u] == FLUID) {
+        r -= ax[v.oax + y * (v.w + 1u) + xx + 1u] * x[v.oc + c + 1u];
+    }
+    if (y > 0u && kind[v.oc + c - v.w] == FLUID) {
+        r -= ay[v.oay + c] * x[v.oc + c - v.w];
+    }
+    if (y + 1u < v.h && kind[v.oc + c + v.w] == FLUID) {
+        r -= ay[v.oay + c + v.w] * x[v.oc + c + v.w];
+    }
+    return r;
+}
+
+fn f_sweep_cell(v: Lv, c: u32, xx: u32, y: u32) {
+    var r = b[v.oc + c];
+    if (xx > 0u && kind[v.oc + c - 1u] == FLUID) {
+        r += ax[v.oax + y * (v.w + 1u) + xx] * x[v.oc + c - 1u];
+    }
+    if (xx + 1u < v.w && kind[v.oc + c + 1u] == FLUID) {
+        r += ax[v.oax + y * (v.w + 1u) + xx + 1u] * x[v.oc + c + 1u];
+    }
+    if (y > 0u && kind[v.oc + c - v.w] == FLUID) {
+        r += ay[v.oay + c] * x[v.oc + c - v.w];
+    }
+    if (y + 1u < v.h && kind[v.oc + c + v.w] == FLUID) {
+        r += ay[v.oay + c + v.w] * x[v.oc + c + v.w];
+    }
+    x[v.oc + c] = r / diag[v.oc + c];
+}
+
+/// One sweep of one colour over the band of level v (every thread its share of the cells).
+fn f_sweep(v: Lv, colour: u32, lid: u32) {
+    let first = v.y0 * v.w;
+    let n = v.rows * v.w;
+    for (var i = lid; i < n; i += WG) {
+        let c = first + i;
+        let xx = c % v.w;
+        let y = c / v.w;
+        if (y < v.h && (xx + y) % 2u == colour && kind[v.oc + c] == FLUID) {
+            f_sweep_cell(v, c, xx, y);
+        }
+    }
+}
+
+@compute @workgroup_size(256)
+fn vcycle_small(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let done = sc[SC_DONE] != 0.0;
+    let t = lid.x;
+    let last = F.used - 1u;
+    // Down: sweeps, the residual on the level under (its solution cleared first).
+    for (var l = F.first; l < last; l += 1u) {
+        let v = F.lv[l];
+        let u = F.lv[l + 1u];
+        for (var k = 0u; k < 2u * SMOOTH_SWEEPS; k += 1u) {
+            if (!done) {
+                f_sweep(v, k % 2u, t);
+            }
+            workgroupBarrier();
+        }
+        if (!done) {
+            for (var i = t; i < u.w * u.h; i += WG) {
+                x[u.oc + i] = 0.0;
+            }
+        }
+        workgroupBarrier();
+        if (!done) {
+            let n = u.rows * u.w;
+            for (var k = t; k < n; k += WG) {
+                let cc = u.y0 * u.w + k;
+                let i = cc % u.w;
+                let j = cc / u.w;
+                if (j < u.h) {
+                    var sum = 0.0;
+                    for (var dy = 0u; dy < 2u; dy++) {
+                        for (var dx = 0u; dx < 2u; dx++) {
+                            let xx = 2u * i + dx;
+                            let y = 2u * j + dy;
+                            if (xx < v.w && y < v.h) {
+                                let c = y * v.w + xx;
+                                if (kind[v.oc + c] == FLUID) {
+                                    sum += b[v.oc + c] - f_apply_x(v, c, xx, y);
+                                }
+                            }
+                        }
+                    }
+                    b[u.oc + cc] = sum;
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+    // The coarsest level: all its sweeps.
+    let cst = F.lv[last];
+    for (var k = 0u; k < COARSEST_SWEEPS * 2u; k += 1u) {
+        if (!done) {
+            f_sweep(cst, k % 2u, t);
+        }
+        workgroupBarrier();
+    }
+    // Up: the correction from the level under, then sweeps.
+    var l = last;
+    while (l > F.first) {
+        l -= 1u;
+        let v = F.lv[l];
+        let u = F.lv[l + 1u];
+        if (!done) {
+            let first = v.y0 * v.w;
+            let n = v.rows * v.w;
+            for (var i = t; i < n; i += WG) {
+                let c = first + i;
+                let xx = c % v.w;
+                let y = c / v.w;
+                if (y < v.h && kind[v.oc + c] == FLUID) {
+                    x[v.oc + c] += x[u.oc + (y / 2u) * u.w + xx / 2u];
+                }
+            }
+        }
+        workgroupBarrier();
+        for (var k = 0u; k < 2u * SMOOTH_SWEEPS; k += 1u) {
+            if (!done) {
+                f_sweep(v, 1u - k % 2u, t);
+            }
+            workgroupBarrier();
         }
     }
 }
