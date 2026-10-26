@@ -146,7 +146,7 @@ le jeu tourne simplement en silence. `--no-default-features` compile une version
 
 ## Raccourcis
 
-Espace jouer/pause · B Béluga · W baleine · L loups · K petit garçon · R réessayer · C voiture · Z annuler · H/X/V vues · M son · F ou F11 plein écran · F3 compteur d'images (FPS et temps d'un pas) · Tab onglet. Poteau (brique haute) dans les blocs : plus besoin de tourner les blocs.
+Espace jouer/pause · B Béluga · W baleine · L loups · K petit garçon · R réessayer · C voiture · Z annuler · H/X/V vues · M son · F ou F11 plein écran · F3 compteur (FPS : images par seconde, PPS : pas de simulation par seconde, temps d'un pas) · Tab onglet. Poteau (brique haute) dans les blocs : plus besoin de tourner les blocs.
 **Ctrl + molette** zoome sur le pointeur (jusqu'à ×8), **Ctrl + glisser** déplace la vue.
 **Échap** recule d'un cran : page Science, tracé en cours, vue zoomée (retour à la vue standard), plein écran, puis une fenêtre « Quitter AWorld ? » qui met
 la simulation en pause ; Échap y reprend le jeu, **Entrée** quitte.
