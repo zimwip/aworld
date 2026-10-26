@@ -506,7 +506,7 @@ impl World {
             for x in x0..=x1 {
                 let i = y * W + x;
                 if liq.class[i] & 3 >= WET && self.vel[i] != 0 && !self.lone_liquid(x as i32, y as i32) {
-                    let speed = self.vel[i] as f32 / 8.0 * CELL_M / DT;
+                    let speed = self.vel[i] as f32 / super::FALL_UNIT as f32 * CELL_M / DT;
                     liq.v[vi(x, y + 1)] = liq.v[vi(x, y + 1)].max(speed);
                     liq.v[vi(x, y)] = liq.v[vi(x, y)].max(speed);
                     self.vel[i] = 0;

@@ -307,6 +307,7 @@ impl World {
                 pockets: share(&self.pockets),
                 latent: share(&self.latent),
                 vel: share(&self.vel),
+                fall_at: share(&self.fall_at),
                 moisture: share(&self.moisture),
                 fuel: share(&self.fuel),
                 growth: share(&self.growth),

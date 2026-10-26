@@ -535,12 +535,16 @@ pub fn vapour_pressure(t: f32) -> f32 {
     0.6108 * (17.27 * t / (t + 237.3)).exp()
 }
 
-/// A falling grain speeds up by this many eighths of a cell per step, every step.
-const GRAIN_ACCEL: u8 = 2;
-/// The fastest a grain falls through air (eighths of a cell per step).
-const GRAIN_TERMINAL: u8 = 32;
+/// The unit of a falling speed (`vel`): this many make a cell per tick (1/6 m in 1/60 s, 10 m/s),
+/// and as many of a falling cell's way through to the next (`fall_at`) make the whole cell.
+pub const FALL_UNIT: u32 = 64;
+/// A falling grain speeds up by this much every tick: gravity, 9.4 m/s² (9.81 would be 1.05).
+const GRAIN_ACCEL: u8 = 1;
+/// The fastest a grain falls through air: 9.1 m/s, where its drag balances gravity (that of a
+/// raindrop, see `liquid::DROP_TERMINAL_MS`).
+const GRAIN_TERMINAL: u8 = 58;
 
-/// Snowflakes fall gently: at most this many eighths of a cell per step.
+/// Snowflakes fall gently: at most 0.9 m/s.
 const SNOW_TERMINAL: u8 = 6;
 /// How far along a cell of snow can ooze before dropping a cell (a slope of 1 in this many).
 const SNOW_RUN: i32 = 5;
@@ -550,8 +554,8 @@ const SNOW_CREEP: u32 = 8;
 /// one drop again. Real water swells about 1700 times as it boils; the game keeps a small ratio so
 /// that a pot does not fill the sky, but a sky full of cloud only gives back a little water.
 pub const VAPOUR_PER_WATER: usize = 4;
-/// The fastest a raindrop falls (eighths of a cell per step): a little faster than a grain of dust.
-const DROP_TERMINAL: u8 = 40;
+/// The fastest a raindrop falls (see `FALL_UNIT`): 9.1 m/s, that of the liquids' drops.
+const DROP_TERMINAL: u8 = 58;
 /// A bubble of gas in a liquid climbs a cell one step in this many (a metre a second).
 const BUBBLE_RISE: u32 = 10;
 /// How much of the wind's speed a falling drop takes on sideways.
@@ -737,6 +741,8 @@ pub struct World {
     /// Falling speed of each grain, in eighths of a cell per step (gravity speeds a free-falling
     /// grain up; landing stops it).
     vel: Vec<u8>,
+    /// How far a falling cell is on its way to the next one down, in `FALL_UNIT`ths of a cell.
+    fall_at: Vec<u8>,
     /// The other states a cell of matter carries, one per `Aspect`.
     pub moisture: Vec<u16>,
     pub fuel: Vec<Fuel>,
@@ -862,6 +868,7 @@ impl World {
             liq_p: vec![1.0; W * H],
             latent: vec![0.0; W * H],
             vel: vec![0; W * H],
+            fall_at: vec![0; W * H],
             moisture: vec![0; W * H],
             fuel: vec![Fuel::default(); W * H],
             growth: vec![0; W * H],
@@ -939,7 +946,7 @@ impl World {
             climate_fixed, climate, revision, wind, wind_max, wind_changes, windiness, wind_clock, biome, leaf_rgb, autumn, grass_rgb,
             structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, dp,
             dp_slow, dpd, pressure_forces, lod, parallel_cells, liquid_physics, liq, fill, pocket_of,
-            pockets, latent, vel, moisture, fuel, growth, jet, liq_p, cls: _, liq_w: _, zones, bursts, charge, mcharge, magnet, polar,
+            pockets, latent, vel, fall_at, moisture, fuel, growth, jet, liq_p, cls: _, liq_w: _, zones, bursts, charge, mcharge, magnet, polar,
             bolts, storm_rng, pressure_cache: _, prof: _, air_rows, air_sky, later: _, dried, gone,
         } = from;
         self.dried = *dried;
@@ -997,6 +1004,7 @@ impl World {
         self.fill.clone_from(fill);
         // The grains' falling speed, for the simulation view.
         self.vel.clone_from(vel);
+        self.fall_at.clone_from(fall_at);
         self.pocket_of.clone_from(pocket_of);
         self.pockets.clone_from(pockets);
         self.latent.clone_from(latent);
@@ -1340,6 +1348,7 @@ impl World {
         self.temp.swap(i, j);
         self.latent.swap(i, j);
         self.vel.swap(i, j);
+        self.fall_at.swap(i, j);
         self.moisture.swap(i, j);
         self.fill.swap(i, j);
         self.fuel.swap(i, j);
@@ -1724,11 +1733,16 @@ impl World {
         self.step_dt(STEP);
     }
 
+    /// The shortest step worth taking, in seconds: the liquids and the heat run at every step,
+    /// and steps much shorter than a tick would cost them as many times more.
+    pub const MIN_DT: f32 = STEP / 2.0;
+
     /// The world moves on by `dt` seconds, at most `MAX_DT`. The cells tick every `STEP` of the
     /// world's time (none, one or several times in the step); the liquids and the heat run once,
     /// over `dt` (each cut into the sub-steps its stability needs). A world stepped by 1/120 s or
     /// by 1/30 s goes through the same second, and a longer step costs less than as many ticks.
-    pub fn step_dt(&mut self, dt: f32) {
+    /// Returns how many ticks the cells took in it.
+    pub fn step_dt(&mut self, dt: f32) -> u32 {
         let dt = dt.clamp(0.0, MAX_DT);
         self.dt = dt;
         self.tick_time += dt;
@@ -1736,6 +1750,7 @@ impl World {
         let ticks = ((self.tick_time + 1e-3 * STEP) / STEP).floor() as u32;
         self.tick_time = (self.tick_time - ticks as f32 * STEP).max(0.0);
         self.step_ticks(ticks);
+        ticks
     }
 
     /// A step with `ticks` ticks of the cells in it; the liquids come after the cells of the
@@ -1975,6 +1990,23 @@ impl World {
         None
     }
 
+    /// A tick of the fall of the cell at (x, y): its speed grows by gravity up to `terminal`, its
+    /// way through the cell by its speed, and once that makes a whole cell it goes down one if
+    /// `free` (else it waits there, still falling). Always true: the cell is on the move.
+    fn fall_on(&mut self, x: i32, y: i32, terminal: u8, free: bool) -> bool {
+        let i = Self::idx(x, y);
+        let v = self.vel[i].saturating_add(GRAIN_ACCEL).min(terminal);
+        let way = self.fall_at[i] as u32 + v as u32;
+        self.vel[i] = v;
+        if way < FALL_UNIT || !free {
+            self.fall_at[i] = way.min(FALL_UNIT - 1) as u8;
+            return true;
+        }
+        self.fall_at[i] = (way - FALL_UNIT) as u8;
+        self.swap((x, y), (x, y + 1));
+        true
+    }
+
     /// Returns true if the cell moved.
     fn step_powder(&mut self, x: i32, y: i32) -> bool {
         let i = Self::idx(x, y);
@@ -1993,21 +2025,21 @@ impl World {
             self.swap((x, y), (x, y - 1));
             return true;
         }
-        // Free fall: the grain gathers speed (gravity) up to a terminal speed (air drag), and
-        // covers several cells in a step once it is fast.
+        // Free fall: the grain gathers speed (gravity) up to a terminal speed (air drag), and goes
+        // down a cell each time its way through the cell adds up to a whole one (from rest: 6 cm
+        // in its first tenth of a second, as anything else that falls).
+        let terminal = if m == Mat::Snow { SNOW_TERMINAL } else { GRAIN_TERMINAL };
         if matches!(self.at(x, y + 1).kind(), Kind::Empty | Kind::Gas) && self.mask_free(x, y + 1) {
-            let terminal = if m == Mat::Snow { SNOW_TERMINAL } else { GRAIN_TERMINAL };
-            let v = self.vel[i].saturating_add(GRAIN_ACCEL).min(terminal);
-            let mut k = 1;
-            while k < 1 + v as i32 / 8 && matches!(self.at(x, y + k + 1).kind(), Kind::Empty | Kind::Gas) && self.mask_free(x, y + k + 1) {
-                k += 1;
-            }
-            // Stopped short by what is below: it lands.
-            self.vel[i] = if k < 1 + v as i32 / 8 { 0 } else { v };
-            self.swap((x, y), (x, y + k));
-            return true;
+            return self.fall_on(x, y, terminal, true);
+        }
+        // On a grain that is falling itself (the column it is part of hangs between two cells):
+        // it falls with it.
+        let j = Self::idx(x, y + 1);
+        if Self::inb(x, y + 1) && self.cells[j].m.kind() == Kind::Powder && self.vel[j] > 0 {
+            return self.fall_on(x, y, terminal, false);
         }
         self.vel[i] = 0;
+        self.fall_at[i] = 0;
         if sinks_in(self.at(x, y + 1)) {
             self.swap((x, y), (x, y + 1));
             return true;
@@ -3025,12 +3057,20 @@ impl World {
     }
 
 
-    /// Moves a drop with free air under it: one to `DROP_TERMINAL / 8` cells down this step, and
-    /// sideways as far as the local wind carries it.
+    /// Moves a drop with free air under it: it speeds up by gravity as a grain does (see
+    /// `fall_on`), goes down a cell when its way adds up to one, and sideways as far as the local
+    /// wind carries it.
     fn fall_drop(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
         let v = self.vel[i].saturating_add(GRAIN_ACCEL).min(DROP_TERMINAL);
-        let fall = 1 + v as i32 / 8;
+        let way = self.fall_at[i] as u32 + v as u32;
+        self.vel[i] = v;
+        if way < FALL_UNIT {
+            self.fall_at[i] = way as u8;
+            return;
+        }
+        self.fall_at[i] = (way - FALL_UNIT) as u8;
+        let fall = 1;
         let wind = (self.flow.wind_at(x, y).0 * DROP_DRIFT).clamp(-3.0, 3.0);
         let mut side = wind.trunc() as i32 + if (self.rand() % 1000) as f32 / 1000.0 < wind.fract().abs() { wind.signum() as i32 } else { 0 };
         let free = |w: &World, x: i32, y: i32| matches!(w.at(x, y).kind(), Kind::Empty | Kind::Gas) && w.mask_free(x, y);

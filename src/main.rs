@@ -292,8 +292,8 @@ struct Game {
     fps: fps::Fps,
     /// The metrics panel (Ctrl+D): where the time of a step goes.
     metrics: metrics::Metrics,
-    /// Simulation steps owed to the clock: the world runs 60 steps a second (times the speed)
-    /// whatever the screen's refresh rate.
+    /// The world's time owed to the clock, in seconds: the world goes through a second of its
+    /// time a second (times the speed) whatever the screen's refresh rate or the steps' length.
     sim_acc: f32,
     /// What the world sounds like, from its last update.
     mix: Mix,
@@ -1589,12 +1589,12 @@ impl Game {
     /// update, its steps, and the sound.
     fn update(&mut self, dt: f32) {
         self.tick_toast(dt);
-        if let Some(steps) = self.update_world(dt, dt) {
+        if let Some((steps, step)) = self.update_world(dt, dt) {
             // std's clock, macroquad's in the browser (std has none there; macroquad's needs a
             // window, which the tests have not).
             let start = metrics::now();
             for _ in 0..steps {
-                self.sim_step();
+                self.sim_step_dt(step);
             }
             self.after_steps(dt, steps, metrics::now() - start);
         }
@@ -1613,13 +1613,14 @@ impl Game {
     }
 
     /// Everything that lives in the world but its steps, for `dt` seconds: the visitors, the
-    /// simplifications that keep it smooth... The steps owed to the clock, or None while paused.
+    /// simplifications that keep it smooth... The steps owed to the clock and their length in
+    /// seconds, or None while paused.
     /// `pace` is how long an update takes: the frame on one thread, the work of the last update
     /// in the simulation thread (a slow screen does not slow that one down).
     /// On the desktop it runs in the simulation thread (see `simthread.rs`): it must not touch
     /// what only the screen owns (the camera, the menus); its messages and sounds go to the screen
     /// with the next picture.
-    fn update_world(&mut self, dt: f32, pace: f32) -> Option<usize> {
+    fn update_world(&mut self, dt: f32, pace: f32) -> Option<(usize, f32)> {
         let around = self.metrics.start();
         self.time += dt;
         self.shake *= 0.88f32.powf(dt * 60.0);
@@ -1711,17 +1712,24 @@ impl Game {
             self.metrics.around(around, true);
             return None;
         }
-        // A fixed time step: 60 steps a second at x1, the same on a 60 Hz or a 144 Hz screen. A
-        // machine that cannot keep up catches up a little, then lets the time go (and the frame
-        // watch above simplifies the physics or lowers the speed).
-        self.sim_acc += dt * STEPS_PER_SECOND * self.speed as f32;
-        let owed = self.sim_acc.floor() as usize;
-        let max = self.speed * 2;
-        let steps = owed.min(max);
-        self.sim_acc = if owed > max { 0.0 } else { self.sim_acc - steps as f32 };
+        // The world's time follows the clock (times the speed): the time owed since the last
+        // update is taken in as few steps as the world allows (at most `MAX_DT` each), so that a
+        // slow machine takes longer steps and the world goes on at the same pace. Past two of the
+        // longest steps an update lets the time go (and the frame watch above simplifies the
+        // physics or lowers the speed); under `MIN_DT` it waits for the next.
+        self.sim_acc += dt * self.speed.max(1) as f32;
+        let most = 2.0 * world::MAX_DT * self.speed.max(1) as f32;
+        let owed = self.sim_acc.min(most);
+        let (steps, step) = if owed < World::MIN_DT {
+            (0, 0.0)
+        } else {
+            let n = (owed / world::MAX_DT).ceil() as usize;
+            self.sim_acc = 0.0;
+            (n, owed / n as f32)
+        };
         self.metrics.around(around, true);
         self.world.prof.on = self.metrics.on();
-        Some(steps)
+        Some((steps, step))
     }
 
     /// After the `steps` steps of an update of `dt` seconds, that took `seconds`: the profile, the
@@ -1832,11 +1840,27 @@ impl Game {
         self.simview.after_steps(&self.world);
     }
 
+    /// One tick of the game, 1/60 s.
     fn sim_step(&mut self) {
+        self.sim_step_dt(world::STEP);
+    }
+
+    /// A step of the game, `dt` seconds of its time: the world's step, then for each tick of the
+    /// cells in it (one every 1/60 s of the world's time) the rest of the game's tick.
+    fn sim_step_dt(&mut self, dt: f32) {
         // Each part's time goes to the metrics panel (Ctrl+D; see `metrics.rs`).
         let mut clock = self.metrics.start();
-        self.world.step();
+        let ticks = self.world.step_dt(dt);
         self.metrics.lap(metrics::WORLD, &mut clock);
+        for _ in 0..ticks {
+            self.game_tick();
+        }
+    }
+
+    /// What ticks with the cells besides them: charges, sensors, cars, debris, blocks and
+    /// mechanisms (their physics takes steps of 1/60 s).
+    fn game_tick(&mut self) {
+        let mut clock = self.metrics.start();
         self.dynamite.step(&mut self.world);
         self.metrics.lap(metrics::DYNAMITE, &mut clock);
         self.sensors.step(&self.world);
