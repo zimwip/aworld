@@ -339,6 +339,119 @@ mod native {
             }
         }
 
+        /// Submits what is encoded and waits for the card to be through with it.
+        #[cfg(test)]
+        fn wait(&self, enc: wgpu::CommandEncoder) {
+            self.gpu.queue.submit([enc.finish()]);
+            self.gpu.device.poll(wgpu::Maintain::Wait);
+        }
+
+        /// What the card costs, for `bench_gpu`: a launch, a pass over the whole finest grid,
+        /// a V-cycle, the sending of the whole system, the reading of the whole solution.
+        /// Each is timed from the submission to the card being through, so a figure is the
+        /// wall time the game would wait, not the card's own time.
+        #[cfg(test)]
+        pub fn bench(&mut self) {
+            let (w, h) = (self.levels[0].w, self.levels[0].h);
+            let cells = w * h;
+            self.used = self.levels.len();
+            self.kind32.iter_mut().for_each(|k| *k = super::super::mgpcg::FLUID as u32);
+            self.write_params(0, h - 1);
+            let k = &self.kernels;
+            let q = &self.gpu.queue;
+            let l0 = &self.levels[0];
+            // Everything of the finest level once, so that the card has something to chew on.
+            let zeros = vec![0.0f32; (w + 1) * (h + 2)];
+            q.write_buffer(&l0.kind, 0, bytes(&self.kind32));
+            for buf in [&l0.diag, &l0.b, &l0.x, &l0.ax, &l0.ay] {
+                q.write_buffer(buf, 0, bytes(&zeros[..cells]));
+            }
+            q.write_buffer(&self.sc, 0, bytes(&[0.0f32; SC_N]));
+            self.wait(self.encoder());
+            let time = |name: &str, n: usize, unit: &str, f: &mut dyn FnMut()| {
+                f();
+                let t = std::time::Instant::now();
+                let reps = 5;
+                for _ in 0..reps {
+                    f();
+                }
+                let each = t.elapsed().as_secs_f64() / reps as f64;
+                eprintln!("{name}: {:.3} ms en tout, {:.2} µs par {unit}", each * 1e3, each * 1e6 / n as f64);
+            };
+            // 1. A launch: a thousand kernels of one thread, one after the other.
+            let n = 1000;
+            time("1000 lancements d'un noyau d'un fil", n, "lancement", &mut || {
+                let mut enc = self.encoder();
+                {
+                    let mut pass = enc.begin_compute_pass(&Default::default());
+                    for _ in 0..n {
+                        self.run(&mut pass, &k.rho, 0, 0, false, (1, 1));
+                    }
+                }
+                self.wait(enc);
+            });
+            // 2. A pass over the whole finest grid: a hundred sweeps (two colours each).
+            let n = 100;
+            let tiles = self.tiles_of(0);
+            time(&format!("100 balayages de la grille {w}x{h}"), n, "balayage", &mut || {
+                let mut enc = self.encoder();
+                {
+                    let mut pass = enc.begin_compute_pass(&Default::default());
+                    for _ in 0..n {
+                        for colour in 0..2 {
+                            self.run(&mut pass, &k.smooth, 0, colour, false, tiles);
+                        }
+                    }
+                }
+                self.wait(enc);
+            });
+            // 3. A reduction over the whole finest grid, a hundred times.
+            let line = self.line();
+            time(&format!("100 réductions sur la grille {w}x{h}"), n, "réduction", &mut || {
+                let mut enc = self.encoder();
+                {
+                    let mut pass = enc.begin_compute_pass(&Default::default());
+                    for _ in 0..n {
+                        self.run(&mut pass, &k.dot_rz, 0, 0, false, line);
+                        self.run(&mut pass, &k.rho, 0, 0, false, (1, 1));
+                    }
+                }
+                self.wait(enc);
+            });
+            // 4. The preconditioner: ten V-cycles over every level.
+            let n = 10;
+            time(&format!("10 cycles en V ({} niveaux)", self.used), n, "cycle", &mut || {
+                let mut enc = self.encoder();
+                for _ in 0..n {
+                    self.precondition(&mut enc);
+                }
+                self.wait(enc);
+            });
+            // 5. The whole system sent: six grids of the finest level.
+            let mb = (6 * cells * 4) as f64 / 1e6;
+            time(&format!("envoi du système entier ({mb:.1} Mo)"), 1, "envoi", &mut || {
+                let l0 = &self.levels[0];
+                q.write_buffer(&l0.kind, 0, bytes(&self.kind32));
+                for buf in [&l0.diag, &l0.b, &l0.x, &l0.ax, &l0.ay] {
+                    q.write_buffer(buf, 0, bytes(&zeros[..cells]));
+                }
+                self.wait(self.encoder());
+            });
+            // 6. The whole solution read back.
+            let mb = (cells * 4) as f64 / 1e6;
+            time(&format!("lecture de la solution entière ({mb:.1} Mo)"), 1, "lecture", &mut || {
+                let mut enc = self.encoder();
+                enc.copy_buffer_to_buffer(&self.levels[0].x, 0, &self.x_read, 0, (cells * 4) as u64);
+                self.read(enc, &self.x_read, cells);
+            });
+            // 7. The scalars read back (what one look at "is it done" costs).
+            time("lecture des 11 scalaires", 1, "lecture", &mut || {
+                let mut enc = self.encoder();
+                enc.copy_buffer_to_buffer(&self.sc, 0, &self.sc_read, 0, (SC_N * 4) as u64);
+                self.read(enc, &self.sc_read, SC_N);
+            });
+        }
+
         fn encoder(&self) -> wgpu::CommandEncoder {
             self.gpu.device.create_command_encoder(&Default::default())
         }
@@ -521,5 +634,45 @@ mod tests {
             assert!(worst < 10.0, "{w}x{h}: the card's pressure is {worst} Pa off the CPU's");
             assert!(it_gpu <= 8, "{w}x{h} took {it_gpu} iterations");
         }
+    }
+
+    /// The card's costs, to see what a resident solver could hope for on it:
+    /// `AWORLD_GPU=1 cargo test --release --bin aworld bench_gpu -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_gpu() {
+        let Some(g) = super::super::gpu::gpu() else {
+            eprintln!("no GPU here: skipped");
+            return;
+        };
+        eprintln!("carte : {}", g.name);
+        let (w, h) = (960, 540);
+        let mut gpu = PressureGpu::new(w, h).unwrap();
+        gpu.bench();
+        // And a whole solve of the big tank, as the game would ask for it.
+        let (w, h) = (960, 200);
+        let mut gpu = PressureGpu::new(w, h).unwrap();
+        let mut sys = tank(w, h);
+        gpu.solve(sys.fine(), 1.0, 0.0, 50);
+        let t = std::time::Instant::now();
+        let reps = 5;
+        let mut it = 0;
+        for _ in 0..reps {
+            let mut sys = tank(w, h);
+            it = gpu.solve(sys.fine(), 1.0, 0.0, 50);
+        }
+        let each = t.elapsed().as_secs_f64() / reps as f64;
+        eprintln!("résolution du bassin {w}x{h} : {:.3} ms ({it} itérations, {:.3} ms chacune)", each * 1e3, each * 1e3 / it as f64);
+        let mut cpu = tank(w, h);
+        cpu.coarsen();
+        cpu.solve(1.0, 0.0, 50);
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            let mut cpu = tank(w, h);
+            cpu.coarsen();
+            it = cpu.solve(1.0, 0.0, 50);
+        }
+        let each = t.elapsed().as_secs_f64() / reps as f64;
+        eprintln!("le même sur le CPU : {:.3} ms ({it} itérations, {:.3} ms chacune)", each * 1e3, each * 1e3 / it as f64);
     }
 }
