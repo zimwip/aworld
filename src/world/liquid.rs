@@ -39,11 +39,11 @@ const ATM: f32 = 101_325.0;
 /// The pressure solver stops once no pressure would move by more than this, Pa (a tenth of a
 /// millimetre of water).
 const SETTLED: f32 = 1.0;
-/// Iterations of the pressure solver a sub-step, at most (each is a multigrid V-cycle and a step
+/// Iterations of the pressure solver a step, at most (each is a multigrid V-cycle and a step
 /// of conjugate gradients; a body at rest takes one, a splash three or four).
 const MAX_ITER: u32 = 12;
 /// ... or until it is right to this part of where it started (a body in motion: its pressure
-/// moves by thousands of pascals a sub-step, and a part in a thousand of that is well under what
+/// moves by thousands of pascals a step, and a part in a thousand of that is well under what
 /// the cells carry; a body at rest starts close, and goes to `SETTLED`).
 const RELATIVE: f32 = 1e-3;
 /// Sweeps of the viscosity a sub-step.
@@ -134,6 +134,9 @@ pub struct Liquids {
     solve: (prof::Clock, u32),
     /// The pressure solver, with its grids.
     solver: mgpcg::Solver,
+    /// The same on the graphics card, for the big systems (`None` until asked for, and where
+    /// there is no card).
+    gpu: Option<Option<mgpcg_gpu::PressureGpu>>,
 }
 
 /// A drop of liquid thrown off a body (spray, a splash): it flies off the grid, under gravity
@@ -360,11 +363,17 @@ impl World {
             self.viscosity(&mut liq, dt);
             self.prof.stop(prof::LIQ_VISCOSITY, clock);
 
-            let clock = self.prof.start();
-            self.pressure(&mut liq, dt);
-            self.prof.stop(prof::LIQ_PRESSURE, clock);
-            let (solve_clock, iterations) = std::mem::take(&mut liq.solve);
-            self.prof.stop_n(prof::LIQ_ITERATIONS, solve_clock, iterations);
+            // The pressure once a step, on the last sub-step: the sub-steps are there for the
+            // transport (a cell at most each), and the pressure of the step before holds the
+            // liquid well enough through the first ones. A solve is nearly half of the step;
+            // one a sub-step was three and a half a step on the scene "liquides".
+            if k + 1 == sub {
+                let clock = self.prof.start();
+                self.pressure(&mut liq, dt);
+                self.prof.stop(prof::LIQ_PRESSURE, clock);
+                let (solve_clock, iterations) = std::mem::take(&mut liq.solve);
+                self.prof.stop_n(prof::LIQ_ITERATIONS, solve_clock, iterations);
+            }
             let clock = self.prof.start();
             self.throw_drops(&mut liq);
             self.prof.stop(prof::LIQ_DROPS, clock);
@@ -994,8 +1003,10 @@ impl World {
         // cell's kind is only read from across an edge.
         let kind = |c: usize| unsafe { kinds.get(c) };
         let (diag, b, x) = (&mut f.diag, &mut f.b, &mut f.x);
-        diag.par_chunks_mut(W).zip(b.par_chunks_mut(W)).zip(x.par_chunks_mut(W)).enumerate().for_each(|(y, ((diag, b), x))| {
-            let Some((x0, x1)) = rows[y] else { return };
+        // (How many unknowns there are decides whether the card takes the system.)
+        let unknowns: usize = diag.par_chunks_mut(W).zip(b.par_chunks_mut(W)).zip(x.par_chunks_mut(W)).enumerate().map(|(y, ((diag, b), x))| {
+            let Some((x0, x1)) = rows[y] else { return 0 };
+            let mut n = 0;
             for i in x0..=x1 {
                 let c = y * W + i;
                 if kind(c) != mgpcg::FLUID {
@@ -1031,10 +1042,17 @@ impl World {
                 diag[i] = d;
                 b[i] = rhs_i;
                 x[i] = p_old[c];
+                n += 1;
             }
-        });
-        solver.coarsen();
-        let iterations = solver.solve(SETTLED, RELATIVE, MAX_ITER);
+            n
+        }).sum();
+        let gpu = if unknowns >= mgpcg_gpu::threshold() { liq.gpu.get_or_insert_with(|| mgpcg_gpu::PressureGpu::new(W, H)).as_mut() } else { None };
+        let iterations = if let Some(gpu) = gpu {
+            gpu.solve(solver.fine(), SETTLED, RELATIVE, MAX_ITER)
+        } else {
+            solver.coarsen();
+            solver.solve(SETTLED, RELATIVE, MAX_ITER)
+        };
         // The solution back into the pressures, and the solver's grid left clean.
         {
             let f = solver.fine();

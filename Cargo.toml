@@ -23,6 +23,13 @@ rayon = "1.12.0"
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 macroquad = { version = "0.4", default-features = false, features = ["audio"] }
 
+# The pressure of the liquids on the GPU (src/world/mgpcg_gpu.rs): wgpu reaches Vulkan, Metal and
+# DirectX 12 on the desktop. (In the browser it will come with WebGPU, once the game draws with
+# wgpu as well; until then the web build solves on the CPU.)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wgpu = "24"
+pollster = "0.4"
+
 [features]
 default = ["sound"]
 # Without it the game is always silent. Nothing to install either way, on any system.

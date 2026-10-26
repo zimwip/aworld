@@ -547,7 +547,8 @@ impl Solver {
     /// Leaves every level clean over its rows, ready for the next solve: whatever that one does
     /// not write (beside a smaller body, say) must be nothing.
     pub fn clear(&mut self) {
-        for l in &mut self.levels[..self.used] {
+        // (The finest level is always to clear: it is filled in even when the card solves.)
+        for l in &mut self.levels[..self.used.max(1)] {
             l.clear();
         }
     }
