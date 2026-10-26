@@ -39,11 +39,11 @@ const ATM: f32 = 101_325.0;
 /// The pressure solver stops once no pressure would move by more than this, Pa (a tenth of a
 /// millimetre of water).
 const SETTLED: f32 = 1.0;
-/// Iterations of the pressure solver a sub-step, at most (each is a multigrid V-cycle and a step
+/// Iterations of the pressure solver a step, at most (each is a multigrid V-cycle and a step
 /// of conjugate gradients; a body at rest takes one, a splash three or four).
 const MAX_ITER: u32 = 12;
 /// ... or until it is right to this part of where it started (a body in motion: its pressure
-/// moves by thousands of pascals a sub-step, and a part in a thousand of that is well under what
+/// moves by thousands of pascals a step, and a part in a thousand of that is well under what
 /// the cells carry; a body at rest starts close, and goes to `SETTLED`).
 const RELATIVE: f32 = 1e-3;
 /// Sweeps of the viscosity a sub-step.
@@ -363,11 +363,17 @@ impl World {
             self.viscosity(&mut liq, dt);
             self.prof.stop(prof::LIQ_VISCOSITY, clock);
 
-            let clock = self.prof.start();
-            self.pressure(&mut liq, dt);
-            self.prof.stop(prof::LIQ_PRESSURE, clock);
-            let (solve_clock, iterations) = std::mem::take(&mut liq.solve);
-            self.prof.stop_n(prof::LIQ_ITERATIONS, solve_clock, iterations);
+            // The pressure once a step, on the last sub-step: the sub-steps are there for the
+            // transport (a cell at most each), and the pressure of the step before holds the
+            // liquid well enough through the first ones. A solve is nearly half of the step;
+            // one a sub-step was three and a half a step on the scene "liquides".
+            if k + 1 == sub {
+                let clock = self.prof.start();
+                self.pressure(&mut liq, dt);
+                self.prof.stop(prof::LIQ_PRESSURE, clock);
+                let (solve_clock, iterations) = std::mem::take(&mut liq.solve);
+                self.prof.stop_n(prof::LIQ_ITERATIONS, solve_clock, iterations);
+            }
             let clock = self.prof.start();
             self.throw_drops(&mut liq);
             self.prof.stop(prof::LIQ_DROPS, clock);

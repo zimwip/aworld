@@ -4,9 +4,13 @@
 //!
 //! The finest level is built on the CPU as before (`pressure` in `liquid.rs` fills in the kinds,
 //! the edges, the diagonal, the right side and the start) and sent to the card whole; the coarse
-//! levels are built there, the iterations run there, and the pressure comes back. A sea takes a
-//! few milliseconds instead of thirty; a handful of puddles is not worth the trip, and stays on
-//! the CPU (`GPU_MIN` unknowns, `AWORLD_GPU_MIN` to change it).
+//! levels are built there, the iterations run there, and the pressure comes back. A handful of
+//! puddles is not worth the trip, and stays on the CPU (`GPU_MIN` unknowns, `AWORLD_GPU_MIN` to
+//! change it); and the card is off unless asked for (`AWORLD_GPU=auto`, see `gpu.rs`): on an
+//! integrated card (an Intel Arc B390) a solve of the big tank takes 22 ms against the CPU's 31,
+//! and in the game, where a solve is a few iterations, the trip costs more than it saves. The
+//! cost is not the computing (a sweep over the whole world takes 64 µs there) but the hundred
+//! dependent kernel launches of a V-cycle, each ten to thirty microseconds (`bench_gpu`).
 //!
 //! The sums the conjugate gradients need (a dot product, the largest step) are added up per
 //! workgroup on the card and then in order on the CPU, so a solve is the same from one run to

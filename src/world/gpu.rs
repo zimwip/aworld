@@ -1,7 +1,8 @@
 //! The graphics card, for the computations that are the same on every cell (the pressure of the
 //! liquids, see `mgpcg_gpu.rs`): one wgpu device for the whole game, opened the first time it is
-//! asked for. `AWORLD_GPU=0` leaves the card alone (everything on the CPU, as before);
-//! `AWORLD_GPU=1` sends the card even the small systems the CPU would solve faster (for tests).
+//! asked for. Off unless asked: on an integrated card the trip costs as much as the CPU's own
+//! solve, so the card is for a dedicated one. `AWORLD_GPU=auto` sends it the big systems;
+//! `AWORLD_GPU=1` sends it even the small ones the CPU would solve faster (for tests).
 //!
 //! The web build has no card yet: it will, through WebGPU, once the game draws with wgpu too.
 
@@ -29,13 +30,13 @@ mod native {
 
     pub fn wanted() -> Use {
         match std::env::var("AWORLD_GPU").as_deref() {
-            Ok("0") => Use::Off,
             Ok("1") => Use::Always,
-            _ => Use::Auto,
+            Ok("auto") => Use::Auto,
+            _ => Use::Off,
         }
     }
 
-    /// The card, opened once; `None` where there is none (or `AWORLD_GPU=0`).
+    /// The card, opened once; `None` where there is none, or where it is not asked for.
     pub fn gpu() -> Option<&'static Gpu> {
         static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
         GPU.get_or_init(|| {
