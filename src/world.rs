@@ -23,6 +23,7 @@ mod liquid;
 mod mgpcg;
 mod gpu;
 mod mgpcg_gpu;
+mod liquid_gpu;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]

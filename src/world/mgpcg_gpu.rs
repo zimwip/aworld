@@ -456,7 +456,7 @@ mod native {
             });
         }
 
-        fn encoder(&self) -> wgpu::CommandEncoder {
+        pub fn encoder(&self) -> wgpu::CommandEncoder {
             self.gpu.device.create_command_encoder(&Default::default())
         }
 
@@ -480,12 +480,6 @@ mod native {
             let band = sy0 * w..(sy1 + 1) * w;
             self.kind32[band.clone()].par_iter_mut().zip(&fine.kind[band.clone()]).for_each(|(d, &s)| *d = s as u32);
             let fluid = fine.kind[band.clone()].par_iter().filter(|&&k| k == super::super::mgpcg::FLUID).count();
-            let mut nodes = fluid;
-            self.used = 1;
-            while nodes > COARSEST && self.used < self.levels.len() {
-                nodes /= 4;
-                self.used += 1;
-            }
             let q = &self.gpu.queue;
             let l0 = &self.levels[0];
             let at = |rows: usize| (rows * 4) as u64;
@@ -497,13 +491,52 @@ mod native {
             q.write_buffer(&l0.ax, at(xband.start), bytes(&fine.ax[xband]));
             let yband = sy0 * w..(sy1 + 2) * w;
             q.write_buffer(&l0.ay, at(yband.start), bytes(&fine.ay[yband]));
+            self.prepare(sy0, sy1, fluid, tol, rel);
+            let (done, mut enc) = self.iterate(self.encoder(), max_iter);
+            // The solution back (the rows of the system).
+            let n = (y1 + 1 - y0) * w;
+            enc.copy_buffer_to_buffer(&self.levels[0].x, at(y0 * w), &self.x_read, 0, at(n));
+            let x = self.read(enc, &self.x_read, n);
+            fine.x[y0 * w..(y1 + 1) * w].copy_from_slice(&x);
+            done
+        }
+
+        /// The finest level's grids on the card (kind, ax, ay, diag, b, x), for a shader that
+        /// builds the system there (`liquid.wgsl`).
+        pub fn fine_buffers(&self) -> [&wgpu::Buffer; 6] {
+            let l = &self.levels[0];
+            [&l.kind, &l.ax, &l.ay, &l.diag, &l.b, &l.x]
+        }
+
+        /// Solves the system that sits in the finest level's grids on the card already (rows
+        /// `y0..=y1`, about `fluid` unknowns): what `enc` holds runs first, and the encoder
+        /// returned takes what comes after. Returns the iterations.
+        pub fn solve_resident(&mut self, enc: wgpu::CommandEncoder, y0: usize, y1: usize, fluid: usize, tol: f32, rel: f32, max_iter: u32) -> (u32, wgpu::CommandEncoder) {
+            self.sent = None;
+            self.prepare(y0, y1, fluid, tol, rel);
+            self.iterate(enc, max_iter)
+        }
+
+        /// The levels a system of `fluid` unknowns uses, the band of each, and the scalars.
+        fn prepare(&mut self, y0: usize, y1: usize, fluid: usize, tol: f32, rel: f32) {
+            let mut nodes = fluid;
+            self.used = 1;
+            while nodes > COARSEST && self.used < self.levels.len() {
+                nodes /= 4;
+                self.used += 1;
+            }
             // rho, s·q, alpha, beta, step, best, tol, rel, done, iterations, undo.
-            q.write_buffer(&self.sc, 0, bytes(&[0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, tol, rel, 0.0, 0.0, 0.0]));
-            self.write_params(sy0, sy1);
+            self.gpu.queue.write_buffer(&self.sc, 0, bytes(&[0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, tol, rel, 0.0, 0.0, 0.0]));
+            self.write_params(y0, y1);
+        }
+
+        /// The iterations on the system in the finest level: the coarse levels built, then
+        /// `BATCH` iterations at a time until done or `max_iter`. Returns the iterations and
+        /// the encoder for what comes after.
+        fn iterate(&self, mut enc: wgpu::CommandEncoder, max_iter: u32) -> (u32, wgpu::CommandEncoder) {
             let k = &self.kernels;
             let line = self.line();
             // The coarse levels, the first residual, the tolerance, and the first direction.
-            let mut enc = self.encoder();
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 for l in 0..self.used - 1 {
@@ -540,12 +573,7 @@ mod native {
                     break;
                 }
             }
-            // The solution back (the rows of the system).
-            let n = (y1 + 1 - y0) * w;
-            enc.copy_buffer_to_buffer(&self.levels[0].x, at(y0 * w), &self.x_read, 0, at(n));
-            let x = self.read(enc, &self.x_read, n);
-            fine.x[y0 * w..(y1 + 1) * w].copy_from_slice(&x);
-            done
+            (done, enc)
         }
 
         /// Submits what is encoded, then reads `n` numbers back from a staging buffer.

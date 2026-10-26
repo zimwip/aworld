@@ -32,40 +32,40 @@ pub const CELL_M: f32 = 1.0 / 6.0;
 /// The weight of a cell of water, kN per metre of depth (ρ g h²).
 pub const CELL_OF_WATER_KN: f32 = 1000.0 * G * CELL_M * CELL_M / 1000.0;
 /// A step, in seconds.
-const DT: f32 = 1.0 / 60.0;
-const G: f32 = 9.81;
+pub(super) const DT: f32 = 1.0 / 60.0;
+pub(super) const G: f32 = 9.81;
 /// One atmosphere, in pascals.
-const ATM: f32 = 101_325.0;
+pub(super) const ATM: f32 = 101_325.0;
 /// The pressure solver stops once no pressure would move by more than this, Pa (a tenth of a
 /// millimetre of water).
-const SETTLED: f32 = 1.0;
+pub(super) const SETTLED: f32 = 1.0;
 /// Iterations of the pressure solver a step, at most (each is a multigrid V-cycle and a step
 /// of conjugate gradients; a body at rest takes one, a splash three or four).
-const MAX_ITER: u32 = 12;
+pub(super) const MAX_ITER: u32 = 12;
 /// ... or until it is right to this part of where it started (a body in motion: its pressure
 /// moves by thousands of pascals a step, and a part in a thousand of that is well under what
 /// the cells carry; a body at rest starts close, and goes to `SETTLED`).
-const RELATIVE: f32 = 1e-3;
+pub(super) const RELATIVE: f32 = 1e-3;
 /// Sweeps of the viscosity a sub-step.
-const VISCOUS_SWEEPS: usize = 12;
+pub(super) const VISCOUS_SWEEPS: usize = 12;
 /// Slower than this (m/s), an edge between two cells of liquid stands still: still water stops,
 /// so that its zones can sleep.
-const REST: f32 = 0.01;
+pub(super) const REST: f32 = 0.01;
 /// The part of its gap to full that a cell inside a body makes up a sub-step.
-const REFILL: f32 = 0.1;
+pub(super) const REFILL: f32 = 0.1;
 /// A cell holds a pressure from this part of full (1/HOLDS) up.
-const HOLDS: u32 = 2;
+pub(super) const HOLDS: u32 = 2;
 /// Liquid away from any full cell (drops, spray, a film) goes no faster than this, m/s: the air
 /// holds it back (rain falls at about this speed).
-const SPRAY: f32 = 9.0;
+pub(super) const SPRAY: f32 = 9.0;
 /// Liquid thrown at the air faster than this (m/s) comes off as drops.
-const THROW: f32 = 2.0;
+pub(super) const THROW: f32 = 2.0;
 /// The most of a cell that comes off as drops in a sub-step, thrown sideways or up.
-const THROW_SHARE: f32 = 0.5;
+pub(super) const THROW_SHARE: f32 = 0.5;
 /// What the drag of the air leaves of a drop's speed after a step.
-const DROP_DRAG: f32 = 0.998;
+pub(super) const DROP_DRAG: f32 = 0.998;
 /// At most this many sub-steps a step (fast flows take smaller ones).
-const MAX_SUB: usize = 4;
+pub(super) const MAX_SUB: usize = 4;
 
 /// Whether new worlds take their liquids by physics: `AWORLD_LIQUIDS=1`.
 pub(super) fn physics_by_default() -> bool {
@@ -73,12 +73,12 @@ pub(super) fn physics_by_default() -> bool {
 }
 
 /// What a cell is to the liquids.
-const SOLID: u8 = 0;
-const AIR: u8 = 1;
+pub(super) const SOLID: u8 = 0;
+pub(super) const AIR: u8 = 1;
 /// Liquid, less than half full: it moves with the edges around it, but holds no pressure.
-const WET: u8 = 2;
+pub(super) const WET: u8 = 2;
 /// Liquid, at least half full: it holds a pressure.
-const FULLISH: u8 = 3;
+pub(super) const FULLISH: u8 = 3;
 
 /// Density (kg/m³), kinematic viscosity (m²/s) and yield stress (Pa) of liquid `m` at `t` °C.
 pub(super) fn props(m: Mat, t: f32) -> (f32, f32, f32) {
@@ -101,42 +101,47 @@ pub(super) fn props(m: Mat, t: f32) -> (f32, f32, f32) {
 #[derive(Default)]
 pub struct Liquids {
     /// Rightward velocity on the left edge of each cell, (W + 1) a row, m/s.
-    u: Vec<f32>,
+    pub(super) u: Vec<f32>,
     /// Downward velocity on the top edge of each cell, W a row, H + 1 rows, m/s.
-    v: Vec<f32>,
+    pub(super) v: Vec<f32>,
     /// Pressure in each cell over the ambient one, Pa (kept from step to step).
-    p: Vec<f32>,
+    pub(super) p: Vec<f32>,
     /// What each cell is (`SOLID`, `AIR`, `WET`, `FULLISH`), and whether its zone runs (+ 4).
-    class: Vec<u8>,
+    pub(super) class: Vec<u8>,
     /// For each row, the span of cells (first, last) the liquids work on this sub-step: the
     /// liquid that runs and the cells around it. `None`: nothing to do in the row.
-    rows: Vec<Option<(usize, usize)>>,
+    pub(super) rows: Vec<Option<(usize, usize)>>,
     /// Scratch for the advection and the viscosity.
-    u2: Vec<f32>,
-    v2: Vec<f32>,
-    u3: Vec<f32>,
-    v3: Vec<f32>,
+    pub(super) u2: Vec<f32>,
+    pub(super) v2: Vec<f32>,
+    pub(super) u3: Vec<f32>,
+    pub(super) v3: Vec<f32>,
     /// Viscosity of each cell, m²/s (0: not thick), and whether any cell was thick.
-    nu: Vec<f32>,
-    thick: bool,
+    pub(super) nu: Vec<f32>,
+    pub(super) thick: bool,
     /// Scratch kept from step to step (allocated once, and cleared only where it was used): the
     /// divergence of each cell, what each edge passes, the liquid each empty cell takes and the
     /// cut of each cell's outflows.
-    rhs: Vec<f32>,
-    fu: Vec<i64>,
-    fv: Vec<i64>,
-    want: Vec<Mat>,
-    scale: Vec<f64>,
+    pub(super) rhs: Vec<f32>,
+    pub(super) fu: Vec<i64>,
+    pub(super) fv: Vec<i64>,
+    pub(super) want: Vec<Mat>,
+    pub(super) scale: Vec<f64>,
     /// The drops in flight.
-    drops: Vec<Drop>,
+    pub(super) drops: Vec<Drop>,
     /// The last pressure solve: when it began, and how many iterations it took (for the profile).
     /// The clock of the last pressure solve and its iterations (for the profile).
-    solve: (prof::Clock, u32),
+    pub(super) solve: (prof::Clock, u32),
     /// The pressure solver, with its grids.
-    solver: mgpcg::Solver,
+    pub(super) solver: mgpcg::Solver,
     /// The same on the graphics card, for the big systems (`None` until asked for, and where
     /// there is no card).
-    gpu: Option<Option<mgpcg_gpu::PressureGpu>>,
+    pub(super) gpu: Option<Option<mgpcg_gpu::PressureGpu>>,
+    /// The whole turn on the card (`None` until asked for, and where there is no card).
+    pub(super) card: Option<Option<liquid_gpu::LiquidGpu>>,
+    /// The fastest edge at the end of the last step, m/s (the card's turn keeps it to choose
+    /// its sub-steps without a look at its grids).
+    pub(super) fastest: f32,
 }
 
 /// A drop of liquid thrown off a body (spray, a splash): it flies off the grid, under gravity
@@ -147,12 +152,12 @@ pub struct Drop {
     pub x: f32,
     pub y: f32,
     /// Its velocity, m/s (down positive).
-    vx: f32,
-    vy: f32,
+    pub(super) vx: f32,
+    pub(super) vy: f32,
     pub m: Mat,
     /// Units of liquid (`field::FULL` a cell).
     pub q: u32,
-    t: f32,
+    pub(super) t: f32,
 }
 
 impl Liquids {
@@ -194,11 +199,11 @@ impl Liquids {
 }
 
 #[inline]
-fn ui(x: usize, y: usize) -> usize {
+pub(super) fn ui(x: usize, y: usize) -> usize {
     y * (W + 1) + x
 }
 #[inline]
-fn vi(x: usize, y: usize) -> usize {
+pub(super) fn vi(x: usize, y: usize) -> usize {
     y * W + x
 }
 
@@ -301,7 +306,7 @@ impl World {
 
     /// Units of liquid in cell `i` (`field::FULL` for a full cell).
     #[inline]
-    fn liquid_fill(&self, i: usize) -> u32 {
+    pub(super) fn liquid_fill(&self, i: usize) -> u32 {
         self.water_fill(i)
     }
 
@@ -316,6 +321,18 @@ impl World {
         let mut liq = std::mem::take(&mut self.liq);
         liq.ready();
         self.fly_drops(&mut liq);
+        // The whole turn on the card, where there is one (and it is wanted).
+        if gpu::wanted() != gpu::Use::Off {
+            let mut card = liq.card.take().unwrap_or_else(liquid_gpu::LiquidGpu::new);
+            if let Some(c) = card.as_mut() {
+                self.step_liquids_on_card(&mut liq, c);
+            }
+            liq.card = Some(card);
+            if liq.card.as_ref().is_some_and(Option::is_some) {
+                self.liq = liq;
+                return;
+            }
+        }
         let clock = self.prof.start();
         self.classify(&mut liq, false);
         self.prof.stop(prof::LIQ_CLASSIFY, clock);
@@ -530,9 +547,16 @@ impl World {
         let q = had + d.q;
         self.fill[j] = if q == field::FULL { 0 } else { q };
         // Its speed goes to the edges of the cell, in proportion to what it brings.
-        if liq.u.len() == (W + 1) * H {
-            let w = d.q as f32 / q as f32;
-            let (x, y) = (j % W, j / W);
+        let w = d.q as f32 / q as f32;
+        let (x, y) = (j % W, j / W);
+        if let Some(Some(card)) = liq.card.as_mut() {
+            for e in [ui(x, y), ui(x + 1, y)] {
+                card.patches_up.push(liquid_gpu::Patch { edge: e as u32, mode: 1, value: d.vx, weight: w });
+            }
+            for e in [vi(x, y), vi(x, y + 1)] {
+                card.patches_up.push(liquid_gpu::Patch { edge: e as u32 | 0x8000_0000, mode: 1, value: d.vy, weight: w });
+            }
+        } else if liq.u.len() == (W + 1) * H {
             for e in [ui(x, y), ui(x + 1, y)] {
                 liq.u[e] += w * (d.vx - liq.u[e]);
             }

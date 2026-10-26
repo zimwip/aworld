@@ -4,13 +4,14 @@
 
 /// The phases of a step, in the order they run.
 /// After `total`, the parts of the heat pass (already counted in `chaleur`), then the water field.
-pub const PHASES: [&str; 30] = [
+pub const PHASES: [&str; 33] = [
     "cellules", "structures", "chutes", "corps rigides", "poches", "éjectas", "tassement", "vent",
     "écoulement air", "pression", "poussée", "saisons", "chaleur", "orage", "niveaux liquides", "total",
     "  chaleur/conduction", "  chaleur/vent", "  chaleur/air+réactions", "  chaleur/vers l'espace", "  chaleur/soleil",
     "eau en champ", "liquides physiques",
     "  liquides/classement", "  liquides/forces", "  liquides/viscosité", "  liquides/pression", "  liquides/itérations",
     "  liquides/gouttes", "  liquides/transport",
+    "  liquides/carte: envoi", "  liquides/carte: noyaux", "  liquides/carte: retour",
 ];
 pub const TOTAL: usize = 15;
 pub const HEAT_CONDUCTION: usize = 16;
@@ -31,6 +32,10 @@ pub const LIQ_PRESSURE: usize = 26;
 pub const LIQ_ITERATIONS: usize = 27;
 pub const LIQ_DROPS: usize = 28;
 pub const LIQ_CARRY: usize = 29;
+/// The turn on the card: what goes to it, the kernels (the CPU waiting), what comes back.
+pub const LIQ_UP: usize = 30;
+pub const LIQ_CARD: usize = 31;
+pub const LIQ_DOWN: usize = 32;
 
 #[derive(Clone)]
 pub struct Profile {
