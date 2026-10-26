@@ -199,6 +199,7 @@ impl World {
     /// The rest of the view is shared with the world: it is not dropped.
     fn absorb(&mut self, v: &mut World, later: &mut Vec<Later>) {
         self.revision = self.revision.max(v.revision);
+        self.dried += v.dried;
         self.water_flow += v.water_flow;
         self.climate.sky_dev += v.climate.sky_dev - self.air_sky;
         self.touched.append(&mut v.touched);
@@ -254,6 +255,7 @@ impl World {
                 climate_fixed: self.climate_fixed,
                 climate: self.climate.view(),
                 revision: self.revision,
+                dried: 0,
                 wind: self.wind,
                 wind_max: self.wind_max,
                 wind_changes: self.wind_changes,

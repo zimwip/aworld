@@ -100,9 +100,6 @@ struct Throw {
 // The cells the CPU sends, the cells the card changed (a count, then their indices), and
 // what they are now for the CPU.
 @group(3) @binding(9) var<storage, read_write> sent: array<CellRecord>;
-@group(3) @binding(10) var<storage, read_write> changes_n: atomic<u32>;
-@group(3) @binding(11) var<storage, read_write> changes: array<u32>;
-@group(3) @binding(12) var<storage, read_write> records: array<CellRecord>;
 
 const WG: u32 = 256u;
 const FULL: u32 = 65536u;
@@ -113,11 +110,11 @@ const REST: f32 = 0.01;
 const REFILL: f32 = 0.1;
 const SPRAY: f32 = 9.0;
 const CALM: f32 = 3.0;
+const LAUNCH: f32 = 4.43;
 const CRUMB: u32 = 8u;
 const THROW: f32 = 2.0;
 const THROW_SHARE: f32 = 0.5;
 const MAX_THROWS: u32 = 16384u;
-const MAX_CHANGES: u32 = 262144u;
 
 const SOLID: u32 = 0u;
 const AIR: u32 = 1u;
@@ -199,12 +196,9 @@ fn band_cell(id: u32) -> u32 {
     return c;
 }
 
-/// Notes that cell c changed this step (once a step), for the CPU.
+/// Notes that cell c changed this step, for the CPU (which reads the marks of the band back).
 fn note_change(c: u32) {
-    if atomicMax(&mark[c], P.stamp) != P.stamp {
-        let n = atomicAdd(&changes_n, 1u);
-        if n < MAX_CHANGES { changes[n] = c; }
-    }
+    atomicMax(&mark[c], P.stamp);
 }
 
 // ---- What the CPU sends: the cells the rest of the game changed.
@@ -217,16 +211,6 @@ fn apply_cells(@builtin(global_invocation_id) id: vec3<u32>) {
     fill[r.cell] = r.fill;
     temp[r.cell] = r.temp;
     gaspa[r.cell] = r.gaspa;
-}
-
-// ---- What goes back: the cells the card changed, as they are at the end of the step.
-
-@compute @workgroup_size(256)
-fn collect_changes(@builtin(global_invocation_id) id: vec3<u32>) {
-    let n = min(atomicLoad(&changes_n), MAX_CHANGES);
-    if id.x >= n { return; }
-    let c = changes[id.x];
-    records[id.x] = CellRecord(c, code[c], fill[c], temp[c], 0.0);
 }
 
 // ---- The patches a step starts with (drops that landed, cells that fell).
@@ -467,7 +451,7 @@ fn back_v(@builtin(global_invocation_id) id: vec3<u32>) {
     if a != bb { was = was / (1.0 + CALM * P.dt); }
     let fall = was + G * P.dt;
     if a != FULLISH && bb != FULLISH {
-        let f = clamp(fall, -SPRAY, SPRAY);
+        let f = clamp(fall, -LAUNCH, SPRAY);
         let under = kind_at(xi, yi + 1);
         if a < WET && bb == WET && (under == SOLID || under == FULLISH) {
             v3[e] = min(f, max(v[vi(xx, yy + 1u)], 0.0));
@@ -851,6 +835,8 @@ fn throw_find(@builtin(global_invocation_id) id: vec3<u32>) {
     if lone && length(vec2<f32>(vx, vy)) > 0.5 { share = 1.0; }
     let q = u32(f32(f) * share);
     if q <= FULL / 50u { return; }
+    let sp = length(vec2<f32>(vx, vy));
+    if sp > LAUNCH { vx = vx * LAUNCH / sp; vy = vy * LAUNCH / sp; }
     let n = atomicAdd(&throws_n, 1u);
     if n >= MAX_THROWS { return; }
     thrown[c] = q;
@@ -1030,7 +1016,7 @@ fn carry_commit(@builtin(global_invocation_id) id: vec3<u32>) {
     if c == 0xffffffffu { return; }
     let q = qnew[c];
     if q == -2147483647 - 1 { return; }
-    if q <= i32(CRUMB) {
+    if q <= 0 {
         if raw_kind(c) == K_LIQUID {
             note_change(c);
             code[c] = (code[c] & ~0xffu) | MAT_EMPTY;
@@ -1057,7 +1043,7 @@ fn overflow(@builtin(global_invocation_id) id: vec3<u32>) {
     while yy > max(P.y0, 1u) {
         yy -= 1u;
         let c = yy * P.w + xx;
-        if raw_kind(c) != K_LIQUID || fill[c] <= FULL { continue; }
+        if raw_kind(c) != K_LIQUID || fill[c] <= FULL + CRUMB { continue; }
         let j = c - P.w;
         let m = mat_of(c);
         var up = 0u;
@@ -1079,30 +1065,48 @@ fn overflow(@builtin(global_invocation_id) id: vec3<u32>) {
         note_change(j);
         note_change(c);
     }
-    // Liquid over a short cell of the same liquid sinks into it, from the top down (see the CPU).
+    // Liquid over a short cell of the same liquid sinks into it, from the top down, and a
+    // crumb joins the liquid under or over it, or goes (see the CPU).
     yy = P.y0;
-    while yy + 1 < P.h && yy < P.y0 + P.rows {
+    while yy < P.y0 + P.rows {
         let c = yy * P.w + xx;
-        let j = c + P.w;
         yy += 1u;
         let m = mat_of(c);
-        if raw_kind(c) != K_LIQUID || mat_of(j) != m || (code[c] & MASKED) != 0u || (code[j] & MASKED) != 0u { continue; }
-        if (code[c] & AWAKE) == 0u && (code[j] & AWAKE) == 0u { continue; }
+        if raw_kind(c) != K_LIQUID || (code[c] & MASKED) != 0u { continue; }
         let have = fill[c];
-        let below = min(fill[j], FULL);
-        let gap = FULL - below;
-        if gap == 0u { continue; }
-        let moved = min(have, gap);
-        temp[j] = (temp[j] * f32(below) + temp[c] * f32(moved)) / f32(below + moved);
-        fill[j] = below + moved;
-        if have - moved <= CRUMB {
+        var to = 0xffffffffu;
+        let under = c + P.w;
+        let has_under = yy < P.h && mat_of(under) == m && (code[under] & MASKED) == 0u;
+        if have <= CRUMB {
+            if has_under {
+                to = under;
+            } else if c >= P.w && mat_of(c - P.w) == m && (code[c - P.w] & MASKED) == 0u {
+                to = c - P.w;
+            } else {
+                code[c] = (code[c] & ~0xffu) | MAT_EMPTY;
+                fill[c] = 0u;
+                note_change(c);
+                continue;
+            }
+        } else {
+            if !has_under { continue; }
+            to = under;
+        }
+        let there = fill[to];
+        let gap = FULL - min(there, FULL);
+        if (gap == 0u && have > CRUMB) || ((code[c] & AWAKE) == 0u && (code[to] & AWAKE) == 0u) { continue; }
+        var moved = gap;
+        if min(have, gap) + CRUMB >= have { moved = have; }
+        temp[to] = (temp[to] * f32(there) + temp[c] * f32(moved)) / f32(there + moved);
+        fill[to] = there + moved;
+        if moved == have {
             code[c] = (code[c] & ~0xffu) | MAT_EMPTY;
             fill[c] = 0u;
         } else {
             fill[c] = have - moved;
         }
         note_change(c);
-        note_change(j);
+        note_change(to);
     }
 }
 

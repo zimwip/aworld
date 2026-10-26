@@ -56,7 +56,6 @@ mod native {
     const SLOT: u64 = 256;
     const MAX_THROWS: usize = 16384;
     const MAX_PATCHES: usize = 1 << 16;
-    const MAX_CHANGES: usize = 1 << 18;
     const MASKED: u32 = 0x100;
     const OPEN: u32 = 0x200;
     const AWAKE: u32 = 0x400;
@@ -113,16 +112,17 @@ mod native {
         rows: usize,
         groups: usize,
         throws_at: usize,
-        changes_at: usize,
-        records_at: usize,
+        /// The band of `code`, `fill`, `temp` and `mark` as the card left them.
+        cells_at: usize,
         partials_at: usize,
+        /// The stamp of the step: the cells whose mark carries it changed.
+        stamp: u32,
         sc_at: usize,
         total: u64,
     }
 
     struct Kernels {
         apply_cells: wgpu::ComputePipeline,
-        collect_changes: wgpu::ComputePipeline,
         patch: wgpu::ComputePipeline,
         classify: wgpu::ComputePipeline,
         forward_u: wgpu::ComputePipeline,
@@ -175,9 +175,8 @@ mod native {
         throws: wgpu::Buffer,
         partials: wgpu::Buffer,
         sent_cells: wgpu::Buffer,
-        changes_n: wgpu::Buffer,
-        records: wgpu::Buffer,
         /// What comes back: the band's class and p, the throws, the changed cells, the partials.
+        mark: wgpu::Buffer,
         read: wgpu::Buffer,
         /// The band of rows of the last step.
         sent: Option<(usize, usize)>,
@@ -212,7 +211,14 @@ mod native {
             let pressure = PressureGpu::new(W, H)?;
             let d = &gpu.device;
             assert!(Mat::Water as u8 == 2 && Mat::Stone as u8 == 7 && Mat::Empty as u8 == 0, "liquid.wgsl names these materials by their number");
+            // A shader that does not compile would leave a card that does nothing, quietly: the
+            // liquids then stay on the CPU, and the error is said once.
+            d.push_error_scope(wgpu::ErrorFilter::Validation);
             let shader = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("liquid"), source: wgpu::ShaderSource::Wgsl(include_str!("liquid.wgsl").into()) });
+            if let Some(e) = pollster::block_on(d.pop_error_scope()) {
+                eprintln!("aworld: the liquids' shader does not compile, the liquids stay on the CPU: {e}");
+                return None;
+            }
             let storage = |binding: u32| wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -231,7 +237,7 @@ mod native {
                 d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("liquid solver"), entries: &g0 }),
                 d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("liquid cells"), entries: &(0..9).map(storage).collect::<Vec<_>>() }),
                 d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("liquid scratch"), entries: &(0..10).map(storage).collect::<Vec<_>>() }),
-                d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("liquid edges"), entries: &(0..13).map(storage).collect::<Vec<_>>() }),
+                d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("liquid edges"), entries: &(0..10).map(storage).collect::<Vec<_>>() }),
             ];
             let layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("liquid"), bind_group_layouts: &[&layouts[0], &layouts[1], &layouts[2], &layouts[3]], push_constant_ranges: &[] });
             let pipeline = |entry: &str| {
@@ -239,7 +245,6 @@ mod native {
             };
             let kernels = Kernels {
                 apply_cells: pipeline("apply_cells"),
-                collect_changes: pipeline("collect_changes"),
                 patch: pipeline("apply_patches"),
                 classify: pipeline("classify"),
                 forward_u: pipeline("forward_u"),
@@ -281,10 +286,7 @@ mod native {
             let throws_n = grid("throws n", 1);
             let throws = grid("throws", MAX_THROWS * 8);
             let sent_cells = grid("sent cells", n * 5);
-            let changes_n = grid("changes n", 1);
-            let changes = grid("changes", MAX_CHANGES);
-            let records = grid("records", MAX_CHANGES * 5);
-            let read_size = (2 * n + 1 + MAX_THROWS * 8 + 1 + MAX_CHANGES * 5 + groups + SC_N) * 4;
+            let read_size = (6 * n + 1 + MAX_THROWS * 8 + groups + SC_N) * 4;
             let read = d.create_buffer(&wgpu::BufferDescriptor { label: Some("liquid read"), size: read_size as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
             // The materials, for the kernels.
             let mut table = vec![0u32; 256];
@@ -313,7 +315,7 @@ mod native {
                 d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("liquid solver"), layout: &layouts[0], entries: &e0 }),
                 d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("liquid cells"), layout: &layouts[1], entries: &entries(&[&code, &fill, &temp, &gaspa, &class, &p, &nu, &rhs, &tables]) }),
                 d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("liquid scratch"), layout: &layouts[2], entries: &entries(&[&want, &scale, &qnew, &tnew, &fu, &fv, &thrown, &mnew, &partials, &mark]) }),
-                d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("liquid edges"), layout: &layouts[3], entries: &entries(&[&u, &v, &u2, &v2, &u3, &v3, &patches, &throws_n, &throws, &sent_cells, &changes_n, &changes, &records]) }),
+                d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("liquid edges"), layout: &layouts[3], entries: &entries(&[&u, &v, &u2, &v2, &u3, &v3, &patches, &throws_n, &throws, &sent_cells]) }),
             ];
             Some(LiquidGpu {
                 gpu,
@@ -338,8 +340,7 @@ mod native {
                 throws,
                 partials,
                 sent_cells,
-                changes_n,
-                records,
+                mark,
                 read,
                 sent: None,
                 held: None,
@@ -379,6 +380,17 @@ mod native {
         }
     }
 
+    /// A cell goes up to the card again when its heat (°C) or the pressure of its pocket (Pa)
+    /// moved by more than this since it was sent.
+    const TEMP_GAP: f32 = 0.5;
+    const GASPA_GAP: f32 = 20.0;
+
+    static DBG: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+    fn tick(k: usize, t: std::time::Instant) -> std::time::Instant {
+        DBG[k].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        std::time::Instant::now()
+    }
+
     impl World {
         /// The liquids' turn on the card: the result of the step the card worked on comes in,
         /// the drops fly, and the card is given this step (the CPU goes on without waiting).
@@ -392,9 +404,14 @@ mod native {
         /// threw, the classes and the pressure, into the world.
         pub(in super::super) fn collect_liquids(&mut self, liq: &mut Liquids, card: &mut LiquidGpu) {
             let Some(pend) = card.pending.take() else { return };
+            let audit = std::env::var_os("AWORLD_DEBUG_MASS").is_some();
+            let units = |w: &World| (0..W * H).filter(|&i| w.cells[i].m == Mat::Water).map(|i| w.liquid_fill(i) as u64).sum::<u64>();
+            let before = if audit { units(self) + liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>() } else { 0 };
             let clock = self.prof.start();
             let slice = card.read.slice(..pend.total);
+            let mut t = std::time::Instant::now();
             card.gpu.device.poll(wgpu::Maintain::Wait);
+            t = tick(5, t);
             self.prof.stop(prof::LIQ_CARD, clock);
             let clock = self.prof.start();
             let (y0, rows, groups) = (pend.y0, pend.rows, pend.groups);
@@ -410,8 +427,6 @@ mod native {
                     Throw { cell: word(k), q: word(k + 1), x: f32::from_bits(word(k + 2)), y: f32::from_bits(word(k + 3)), vx: f32::from_bits(word(k + 4)), vy: f32::from_bits(word(k + 5)), mat: word(k + 6), temp: f32::from_bits(word(k + 7)) }
                 })
                 .collect();
-            let changed = (word(pend.changes_at) as usize).min(MAX_CHANGES);
-            debug_assert!(changed < MAX_CHANGES, "the card changed more cells than it can report");
             card.fastest = (0..groups).map(|g| f32::from_bits(word(pend.partials_at + g))).fold(0.0f32, f32::max);
             let iterations = f32::from_bits(word(pend.sc_at + SC_ITER)) as u32;
             let done = f32::from_bits(word(pend.sc_at + SC_DONE)) != 0.0;
@@ -419,42 +434,90 @@ mod native {
             self.prof.stop_n(prof::LIQ_ITERATIONS, None, iterations);
             liq.class[cells.clone()].par_iter_mut().enumerate().for_each(|(j, c)| *c = word(j) as u8);
             liq.p[cells.clone()].par_iter_mut().enumerate().for_each(|(j, c)| *c = f32::from_bits(word(n + j)));
-            // What the card changed, into the cells (and into what the card is known to hold).
-            // A cell the rest of the game changed meanwhile keeps the game's version: the card
-            // will be told at the next step.
-            for r in 0..changed {
-                let k = pend.records_at + r * 5;
-                let (i, c, f, t) = (word(k) as usize, word(k + 1), word(k + 2), f32::from_bits(word(k + 3)));
-                let known = Mat::from_u8((card.code_up[i] & 0xff) as u8);
-                let (known_f, known_t) = (card.fill_up[i], card.temp_up[i]);
-                card.code_up[i] = c;
-                card.fill_up[i] = f;
-                card.temp_up[i] = t;
-                if self.cells[i].m != known {
-                    continue;
-                }
-                let m = Mat::from_u8((c & 0xff) as u8);
-                // What the card moved is added to what the game has now, not put in its place:
-                // the rest of the game went on meanwhile (the heat spread, the lava cooled, the
-                // sun dried the surface), and that would be lost at every step.
-                let (f, t) = if m == known && m.kind() == Kind::Liquid {
-                    ((self.liquid_fill(i) as i64 + f as i64 - known_f as i64).max(0) as u32, self.temp[i] + (t - known_t))
-                } else {
-                    (f, t)
-                };
-                let m = if m.kind() == Kind::Liquid && f <= CRUMB { Mat::Empty } else { m };
-                if m != self.cells[i].m {
-                    self.cells[i] = Cell { m, stamp: self.frame };
-                    self.clear_states(i);
-                    self.latent[i] = 0.0;
-                    self.vel[i] = 0;
-                }
-                if m.kind() == Kind::Liquid {
-                    self.temp[i] = t;
-                    self.fill[i] = if f == field::FULL { 0 } else { f };
-                }
-                self.revision += 1;
+            // What the card changed (the cells whose mark carries the step's stamp), into the
+            // cells and into what the card is known to hold; row by row in parallel, the zones
+            // woken and the states cleared after. A cell the rest of the game changed meanwhile
+            // keeps the game's version: the card will be told at the next step. What the card
+            // moved (fill, heat) is added to what the game has now, not put in its place: the
+            // rest of the game went on meanwhile (the heat spread, the lava cooled, the sun
+            // dried the surface), and that would be lost at every step.
+            let frame = self.frame;
+            let (cells_at, stamp) = (pend.cells_at, pend.stamp);
+            let (world_cells, world_fill, world_temp) = (&mut self.cells[cells.clone()], &mut self.fill[cells.clone()], &mut self.temp[cells.clone()]);
+            let (code_up, fill_up, temp_up) = (&mut card.code_up[cells.clone()], &mut card.fill_up[cells.clone()], &mut card.temp_up[cells.clone()]);
+            let (changed, woken, cleared): (usize, Vec<usize>, Vec<(usize, u32)>) = world_cells
+                .par_chunks_mut(W)
+                .zip(world_fill.par_chunks_mut(W))
+                .zip(world_temp.par_chunks_mut(W))
+                .zip(code_up.par_chunks_mut(W))
+                .zip(fill_up.par_chunks_mut(W))
+                .zip(temp_up.par_chunks_mut(W))
+                .enumerate()
+                .map(|(yy, (((((wc, wf), wt), cu), fu), tu))| {
+                    let (mut changed, mut woken, mut cleared) = (0, Vec::new(), Vec::new());
+                    let mut last_zone = usize::MAX;
+                    for x in 0..W {
+                        let j = yy * W + x;
+                        if word(cells_at + 3 * n + j) != stamp {
+                            continue;
+                        }
+                        changed += 1;
+                        let i = y0 * W + j;
+                        let (c, f, t) = (word(cells_at + j), word(cells_at + n + j), f32::from_bits(word(cells_at + 2 * n + j)));
+                        let known = Mat::from_u8((cu[x] & 0xff) as u8);
+                        let (known_f, known_t) = (fu[x], tu[x]);
+                        (cu[x], fu[x], tu[x]) = (c, f, t);
+                        if wc[x].m != known {
+                            continue;
+                        }
+                        let m = Mat::from_u8((c & 0xff) as u8);
+                        let (f, t) = if m == known && m.kind() == Kind::Liquid {
+                            let have = match wf[x] {
+                                0 => field::FULL,
+                                q => q,
+                            };
+                            ((have as i64 + f as i64 - known_f as i64).max(0) as u32, wt[x] + (t - known_t))
+                        } else {
+                            (f, t)
+                        };
+                        let m = if m.kind() == Kind::Liquid && f <= CRUMB { Mat::Empty } else { m };
+                        let fill = if f == field::FULL { 0 } else { f };
+                        if m != wc[x].m {
+                            wc[x] = Cell { m, stamp: frame };
+                            // (Its states are cleared after, which blanks the fill: it is set again.)
+                            cleared.push((i, if m.kind() == Kind::Liquid { fill } else { 0 }));
+                        }
+                        if m.kind() == Kind::Liquid {
+                            wt[x] = t;
+                            wf[x] = fill;
+                        }
+                        // One wake per zone a row crosses (and the cells on a zone's edge wake
+                        // the zone next door: those are woken one by one).
+                        let zone = x / sleep::CS;
+                        if zone != last_zone || x % sleep::CS == 0 || x % sleep::CS == sleep::CS - 1 || (y0 + yy) % sleep::CS == 0 || (y0 + yy) % sleep::CS == sleep::CS - 1 {
+                            woken.push(i);
+                            last_zone = zone;
+                        }
+                    }
+                    (changed, woken, cleared)
+                })
+                .reduce(|| (0, Vec::new(), Vec::new()), |mut a, mut b| {
+                    a.1.append(&mut b.1);
+                    a.2.append(&mut b.2);
+                    (a.0 + b.0, a.1, a.2)
+                });
+            DBG[7].store(changed as u64, std::sync::atomic::Ordering::Relaxed);
+            for (i, fill) in cleared {
+                self.clear_states(i);
+                self.fill[i] = fill;
+                self.latent[i] = 0.0;
+                self.vel[i] = 0;
+            }
+            for i in woken {
                 self.zones.wake(i);
+            }
+            if changed > 0 {
+                self.revision += 1;
             }
             drop(data);
             card.read.unmap();
@@ -465,6 +528,13 @@ mod native {
                 let (jx, jy) = (jitter(self.rand()), jitter(self.rand()));
                 liq.drops.push(Drop { x: t.x, y: t.y, vx: t.vx + jx, vy: t.vy + jy, m: Mat::from_u8(t.mat as u8), q: t.q, t: t.temp });
             }
+            tick(6, t);
+            if audit {
+                let after = units(self) + liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>();
+                if after != before {
+                    eprintln!("pas {}: l'eau passe de {before} à {after} ({:+}) en reprenant la carte ({} gouttes lancées, {} cellules changées)", pend.stamp, after as i64 - before as i64, count, changed);
+                }
+            }
             self.prof.stop(prof::LIQ_DOWN, clock);
         }
 
@@ -472,6 +542,7 @@ mod native {
         /// is encoded and submitted, its result to be read at the next step.
         fn submit_liquids(&mut self, liq: &mut Liquids, card: &mut LiquidGpu) {
             let clock = self.prof.start();
+            let mut t = std::time::Instant::now();
             // The band: the rows that hold liquid in zones that run, a margin, what was sent.
             let awake = &self.zones.awake;
             let liquid_rows: Vec<bool> = (0..H)
@@ -550,6 +621,7 @@ mod native {
                     (a.0 + b.0, a.1 || b.1, a.2)
                 });
             // What the card holds that is not what the game has: those cells go, and no other.
+            t = tick(0, t);
             let (held_code, held_fill, held_temp, held_gaspa) = (&card.code_up, &card.fill_up, &card.temp_up, &card.gaspa_up);
             let (code, fill, temp, gaspa) = (&code_v, &fill_v, &temp_v, &gaspa_v);
             let held = card.held;
@@ -558,7 +630,10 @@ mod native {
                 .flat_map_iter(|y| {
                     let fresh = held.is_none_or(|(a, b)| y < a || y > b);
                     (y * W..(y + 1) * W).filter_map(move |i| {
-                        if fresh || code[i] != held_code[i] || fill[i] != held_fill[i] || temp[i].to_bits() != held_temp[i].to_bits() || gaspa[i].to_bits() != held_gaspa[i].to_bits() {
+                        // (A little heat or pocket pressure makes no difference to the liquid: the
+                        // whole pool would go up every third step, when the heat spreads, for
+                        // hundredths of a degree. The card keeps what it has until the gap counts.)
+                        if fresh || code[i] != held_code[i] || fill[i] != held_fill[i] || (temp[i] - held_temp[i]).abs() > TEMP_GAP || (gaspa[i] - held_gaspa[i]).abs() > GASPA_GAP {
                             Some(CellRecord { cell: i as u32, code: code[i], fill: fill[i], temp: temp[i], gaspa: gaspa[i] })
                         } else {
                             None
@@ -571,6 +646,7 @@ mod native {
                 None => (y0, y1),
             });
             // A drop that landed gives its speed to the edges under and over it.
+            t = tick(1, t);
             let mut patches = std::mem::take(&mut card.patches_up);
             let mut fastest = card.fastest;
             for (i, speed) in fallen {
@@ -596,18 +672,20 @@ mod native {
                 q.write_buffer(&card.patches, 0, bytes(&patches));
             }
             q.write_buffer(&card.throws_n, 0, bytes(&[0u32]));
-            q.write_buffer(&card.changes_n, 0, bytes(&[0u32]));
             let groups = (rows * W).div_ceil(WG);
             for colour in 0..2u32 {
                 let pr = Params { w: W as u32, h: H as u32, y0: y0 as u32, rows: rows as u32, dt, colour, patches: patches.len() as u32, groups: groups as u32, stamp, sent: sent.len() as u32, pad: [0; 2] };
                 q.write_buffer(&card.params, colour as u64 * SLOT, bytes(&[pr]));
             }
             // The game's cells are what the card holds now.
-            std::mem::swap(&mut card.code_up, &mut code_v);
-            std::mem::swap(&mut card.fill_up, &mut fill_v);
-            std::mem::swap(&mut card.temp_up, &mut temp_v);
-            std::mem::swap(&mut card.gaspa_up, &mut gaspa_v);
+            // What the card holds now: what was sent, and for the rest what it held.
+            for r in &sent {
+                let i = r.cell as usize;
+                (card.code_up[i], card.fill_up[i], card.temp_up[i], card.gaspa_up[i]) = (r.code, r.fill, r.temp, r.gaspa);
+            }
+
             (card.code_new, card.fill_new, card.temp_new, card.gaspa_new) = (code_v, fill_v, temp_v, gaspa_v);
+            t = tick(2, t);
             self.prof.stop(prof::LIQ_UP, clock);
             let clock = self.prof.start();
             // The sub-steps.
@@ -682,7 +760,6 @@ mod native {
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 card.run(&mut pass, &k.fastest, 0, ncell);
-                card.run(&mut pass, &k.collect_changes, 0, MAX_CHANGES);
             }
             // Back: the band's class and pressure, the throws, the changed cells, the fastest
             // edge, the pressure's scalars. The card is not waited for: the result is read at
@@ -698,21 +775,27 @@ mod native {
             let throws_at = off as usize / 4;
             enc.copy_buffer_to_buffer(&card.throws, 0, &card.read, off, (MAX_THROWS * 32) as u64);
             off += (MAX_THROWS * 32) as u64;
-            let changes_at = off as usize / 4;
-            enc.copy_buffer_to_buffer(&card.changes_n, 0, &card.read, off, 4);
-            off += 4;
-            let records_at = off as usize / 4;
-            enc.copy_buffer_to_buffer(&card.records, 0, &card.read, off, (MAX_CHANGES * 20) as u64);
-            off += (MAX_CHANGES * 20) as u64;
+            let cells_at = off as usize / 4;
+            for buf in [&card.code, &card.fill, &card.temp, &card.mark] {
+                enc.copy_buffer_to_buffer(buf, at(cells.start), &card.read, off, at(n));
+                off += at(n);
+            }
             let partials_at = off as usize / 4;
             enc.copy_buffer_to_buffer(&card.partials, 0, &card.read, off, at(groups));
             off += at(groups);
             let sc_at = off as usize / 4;
             enc.copy_buffer_to_buffer(card.pressure.scalars(), 0, &card.read, off, (SC_N * 4) as u64);
             let total = off + (SC_N * 4) as u64;
+            t = tick(3, t);
             card.gpu.queue.submit([enc.finish()]);
             card.read.slice(..total).map_async(wgpu::MapMode::Read, |_| {});
-            card.pending = Some(Pending { y0, rows, groups, throws_at, changes_at, records_at, partials_at, sc_at, total });
+            t = tick(4, t);
+            card.pending = Some(Pending { y0, rows, groups, throws_at, cells_at, partials_at, stamp, sc_at, total });
+            if std::env::var_os("AWORLD_DEBUG_CARD").is_some() && stamp % 100 == 0 {
+                let ms = |k: usize| DBG[k].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / stamp as f64;
+                eprintln!("carte, ms/pas: bande {:.2}, différences {:.2} ({} cellules envoyées), écritures {:.2}, encodage {:.2}, soumission {:.2}, attente {:.2}, lecture {:.2} ({} cellules reçues)", ms(0), ms(1), sent.len(), ms(2), ms(3), ms(4), ms(5), ms(6), DBG[7].load(std::sync::atomic::Ordering::Relaxed));
+            }
+            let _ = t;
             liq.solve = (None, 0);
             self.prof.stop(prof::LIQ_UP, clock);
         }

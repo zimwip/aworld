@@ -630,6 +630,8 @@ pub struct World {
     pub climate: thermal::Climate,
     /// Bumped whenever the picture could have changed: lets the renderer skip work.
     pub revision: u64,
+    /// Water dried into the air since the start, in units of fill (the volume tests count it).
+    pub dried: u64,
     /// Wind, -1 (left) to 1 (right).
     pub wind: f32,
     /// The player's wind controls: strongest wind (0..1), how fast the direction keeps changing
@@ -790,6 +792,7 @@ impl World {
             climate_fixed: None,
             climate: thermal::Climate::default(),
             revision: 1,
+            dried: 0,
             wind: 0.0,
             wind_max: 1.0,
             wind_changes: 1.0,
@@ -1570,17 +1573,39 @@ impl World {
         self.revision += 1;
         self.frame = self.frame.wrapping_add(1);
         let clock = self.prof.start();
+        let audit = self.liquid_physics && std::env::var_os("AWORLD_DEBUG_MASS").is_some();
+        let mut marks: Vec<(&str, u64)> = Vec::new();
+        if audit {
+            marks.push(("début", self.water_units_audit()));
+        }
         if self.liquid_physics {
             self.take_liquids_from_card();
         }
+        if audit {
+            marks.push(("reprise de la carte", self.water_units_audit()));
+        }
         timed!(self, 0, self.step_cells());
+        if audit {
+            marks.push(("tour des cellules", self.water_units_audit()));
+        }
         if self.water_field {
             timed!(self, prof::FIELD, self.step_water_field());
         }
         if self.liquid_physics {
             timed!(self, prof::LIQUIDS, self.step_liquids());
         }
+        if audit {
+            marks.push(("liquides", self.water_units_audit()));
+        }
         self.after_cells();
+        if audit {
+            marks.push(("après les cellules", self.water_units_audit()));
+            for k in 1..marks.len() {
+                if marks[k].1 != marks[k - 1].1 {
+                    eprintln!("pas {}: l'eau passe de {} à {} ({:+}) dans « {} »", self.frame, marks[k - 1].1, marks[k].1, marks[k].1 as i64 - marks[k - 1].1 as i64, marks[k].0);
+                }
+            }
+        }
         self.prof.stop(prof::TOTAL, clock);
         if self.prof.on {
             self.prof.steps += 1;
@@ -2874,6 +2899,7 @@ impl World {
         // A cell of the field that is not full makes less vapour (none at all from a thin film:
         // it just dries).
         let share = if self.partial_liquids() { self.water_fill(i) as f32 / field::FULL as f32 } else { 1.0 };
+        self.dried += (share * field::FULL as f32) as u64;
         // (A part of a cell of steam is a whole one or none, by chance: on average the water is
         // all there.)
         let v = share * VAPOUR_PER_WATER as f32;
@@ -2933,6 +2959,7 @@ impl World {
         let part = field::FULL / VAPOUR_PER_WATER as u32;
         let fill = self.water_fill(i);
         let taken = fill.min(part);
+        self.dried += taken as u64;
         // Less than a quarter makes a whole cell of steam or none, by chance: on average the
         // water is all there.
         let steam = taken == part || (self.rand() % part) < taken;

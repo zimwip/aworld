@@ -64,6 +64,10 @@ pub(super) const THROW: f32 = 2.0;
 pub(super) const THROW_SHARE: f32 = 0.5;
 /// What the drag of the air leaves of a drop's speed after a step.
 pub(super) const DROP_DRAG: f32 = 0.998;
+/// A drop leaves the liquid at most this fast, m/s: the speed that rises 1 m (the grid packs
+/// the energy of a splash into a few cells, and drops thrown at the grid's speed would climb
+/// into the sky, which is logarithmic up there).
+pub(super) const LAUNCH: f32 = 4.43;
 /// At most this many sub-steps a step (fast flows take smaller ones).
 pub(super) const MAX_SUB: usize = 4;
 /// A cell left with this little liquid or less (units of fill, 1/8192 of a cell) is emptied: so
@@ -350,6 +354,11 @@ impl World {
         self.liq.card.as_ref().and_then(|c| c.as_ref()).and_then(|c| c.rows())
     }
 
+    /// Units of water in the cells and the drops (the mass audit, `AWORLD_DEBUG_MASS`).
+    pub(super) fn water_units_audit(&self) -> u64 {
+        (0..W * H).filter(|&i| self.cells[i].m == Mat::Water).map(|i| self.liquid_fill(i) as u64).sum::<u64>() + self.liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>()
+    }
+
     /// What the card did with the last step, into the world: before the cells' turn, so that
     /// the rain of the cells and the card never move the same liquid at once (the card works
     /// from the cells as they were after the cells' turn, and what it did is in before the next).
@@ -367,6 +376,9 @@ impl World {
     pub(super) fn step_liquids(&mut self) {
         let mut liq = std::mem::take(&mut self.liq);
         liq.ready();
+        let audit = std::env::var_os("AWORLD_DEBUG_MASS").is_some();
+        let units = |w: &World, liq: &Liquids| (0..W * H).filter(|&i| w.cells[i].m == Mat::Water).map(|i| w.liquid_fill(i) as u64).sum::<u64>() + liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>();
+        let before = if audit { units(self, &liq) } else { 0 };
         // The whole turn on the card, where there is one (and it is wanted): the card works on
         // the step while the CPU does the rest of it, and the CPU takes its result at the next.
         if gpu::wanted() != gpu::Use::Off {
@@ -376,6 +388,12 @@ impl World {
             }
             liq.card = Some(card);
             if liq.card.as_ref().is_some_and(Option::is_some) {
+                if audit {
+                    let after = units(self, &liq);
+                    if after != before {
+                        eprintln!("pas {}: l'eau passe de {before} à {after} ({:+}) entre les gouttes et l'envoi", self.frame, after as i64 - before as i64);
+                    }
+                }
                 self.liq = liq;
                 return;
             }
@@ -504,6 +522,8 @@ impl World {
                         share = 1.0;
                     }
                     let q = (fill as f32 * share) as u32;
+                    let speed = vx.hypot(vy);
+                    let (vx, vy) = if speed > LAUNCH { (vx * LAUNCH / speed, vy * LAUNCH / speed) } else { (vx, vy) };
                     (q > field::FULL / 50).then_some((i, q, x as f32 + 0.5 + ox, y as f32 + 0.5 + oy, vx, vy))
                 })
             })
@@ -796,8 +816,8 @@ impl World {
                 let fall = if a != b { was * calm } else { was } + G * dt;
                 row[x] = if a != FULLISH && b != FULLISH {
                     // A film lying on liquid or on the ground goes no faster than what is under it
-                    // (it has nowhere to fall).
-                    let fall = fall.clamp(-SPRAY, SPRAY);
+                    // (it has nowhere to fall); spray climbs no faster than a thrown drop.
+                    let fall = fall.clamp(-LAUNCH, SPRAY);
                     if a < WET && b == WET && matches!(kind(xi, yi + 1), SOLID | FULLISH) { fall.min(v[vi(x, y + 1)].max(0.0)) } else { fall }
                 } else {
                     fall
@@ -1367,7 +1387,7 @@ impl World {
         });
         (liq.fu, liq.fv, liq.want, liq.scale) = (fu, fv, want, scale);
         for (i, q, t, new) in changes {
-            if q <= CRUMB as i64 {
+            if q <= 0 {
                 if self.cells[i].m.kind() == Kind::Liquid {
                     self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
                     self.clear_states(i);
@@ -1396,7 +1416,7 @@ impl World {
             let Some((x0, x1)) = liq.span(y) else { continue };
             for x in x0..=x1 {
                 let i = y * W + x;
-                if self.cells[i].m.kind() != Kind::Liquid || self.fill[i] <= full {
+                if self.cells[i].m.kind() != Kind::Liquid || self.fill[i] <= full + CRUMB {
                     continue;
                 }
                 let j = i - W;
@@ -1422,25 +1442,48 @@ impl World {
         // Liquid lying on a cell of the same liquid that is short of full sinks into it (from
         // the top down, so that a film on the surface sinks through to the first gap): the
         // pressure alone never fills a cell under a film, since the film holds no pressure and
-        // the surface edge under it comes to rest, and the film would lie there for ever.
-        for y in 0..H - 1 {
+        // the surface edge under it comes to rest, and the film would lie there for ever. What
+        // would leave a crumb behind goes whole (a cell may hold a crumb over full). A crumb
+        // (`CRUMB` units or less: so little moves no more, what an edge passes rounding to
+        // nothing) joins the liquid under or over it, or goes if there is none.
+        for y in 0..H {
             let Some((x0, x1)) = liq.span(y) else { continue };
             for x in x0..=x1 {
-                let (i, j) = (y * W + x, (y + 1) * W + x);
+                let i = y * W + x;
                 let m = self.cells[i].m;
-                if m.kind() != Kind::Liquid || self.cells[j].m != m || self.mask[i] != 0 || self.mask[j] != 0 {
+                if m.kind() != Kind::Liquid || self.mask[i] != 0 {
                     continue;
                 }
-                let (have, gap) = (self.liquid_fill(i), full - self.liquid_fill(j).min(full));
-                if gap == 0 || !(self.zones.awake[y / sleep::CS * sleep::CW + x / sleep::CS] || self.zones.awake[(y + 1) / sleep::CS * sleep::CW + x / sleep::CS]) {
+                let runs = |yy: usize| self.zones.awake[yy / sleep::CS * sleep::CW + x / sleep::CS];
+                let have = self.liquid_fill(i);
+                let same = |j: usize| self.cells[j].m == m && self.mask[j] == 0;
+                let below = (y + 1 < H && same(i + W)).then_some(i + W);
+                let to = if have <= CRUMB {
+                    match below.or((y > 0 && same(i - W)).then_some(i - W)) {
+                        Some(j) => j,
+                        None => {
+                            self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
+                            self.clear_states(i);
+                            self.vel[i] = 0;
+                            self.revision += 1;
+                            self.zones.wake(i);
+                            continue;
+                        }
+                    }
+                } else {
+                    let Some(j) = below else { continue };
+                    j
+                };
+                let there = self.liquid_fill(to);
+                let gap = full.saturating_sub(there);
+                if gap == 0 && have > CRUMB || !(runs(y) || runs(to / W)) {
                     continue;
                 }
-                let moved = have.min(gap);
-                let below = self.liquid_fill(j);
-                self.temp[j] = ((self.temp[j] as f64 * below as f64 + self.temp[i] as f64 * moved as f64) / (below + moved) as f64) as f32;
-                let q = below + moved;
-                self.fill[j] = if q == full { 0 } else { q };
-                if have - moved <= CRUMB {
+                let moved = if have.min(gap) + CRUMB >= have { have } else { gap };
+                self.temp[to] = ((self.temp[to] as f64 * there as f64 + self.temp[i] as f64 * moved as f64) / (there + moved) as f64) as f32;
+                let q = there + moved;
+                self.fill[to] = if q == full { 0 } else { q };
+                if moved == have {
                     self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
                     self.clear_states(i);
                     self.vel[i] = 0;
@@ -1449,7 +1492,7 @@ impl World {
                 }
                 self.revision += 1;
                 self.zones.wake(i);
-                self.zones.wake(j);
+                self.zones.wake(to);
             }
         }
     }
@@ -1496,7 +1539,9 @@ mod tests {
         let mut w = world();
         tank(&mut w, 100, 400, 339, 449);
         rect(&mut w, 100, 420, 139, 449, m);
-        w.temp.fill(if m == Mat::Lava { 1150.0 } else { 15.0 });
+        // (Water at 0 °C exactly: it neither freezes nor evaporates, so that the tests of
+        // volume count the water alone.)
+        w.temp.fill(if m == Mat::Lava { 1150.0 } else { 0.0 });
         w
     }
 
@@ -1506,7 +1551,7 @@ mod tests {
         tank(&mut w, 100, 400, 339, 449);
         rect(&mut w, 100, 435, 339, 449, Mat::Water);
         rect(&mut w, 212, 404, 227, 419, Mat::Water);
-        w.temp.fill(15.0);
+        w.temp.fill(0.0);
         w
     }
 
@@ -1532,6 +1577,40 @@ mod tests {
                 let fastest = if w.liq.u.len() == (W + 1) * H { w.liq.u.iter().chain(w.liq.v.iter()).fold(0.0f32, |a, v| a.max(v.abs())) } else { 0.0 };
                 let awake = (12..15).flat_map(|zy| (3..=10).map(move |zx| (zx, zy))).filter(|&(zx, zy)| w.zones.awake[zy * sleep::CW + zx]).count();
                 println!("t {:4.1} s: {} cells, {short} short, mean fill {mean:.3}, top y {top}, fastest {fastest:.2} m/s, {awake} zones run", t as f32 / 60.0, cells.len());
+            }
+            w.step();
+        }
+    }
+
+    /// Lava painted in the air over a stone floor (the demo scene's lava): every second, the
+    /// most pressure and the fullest cell, which should stay within a few atmospheres and full.
+    #[test]
+    #[ignore]
+    fn probe_lava() {
+        let mut w = world();
+        tank(&mut w, 100, 400, 339, 449);
+        rect(&mut w, 100, 430, 339, 449, Mat::Stone);
+        rect(&mut w, 200, 390, 219, 409, Mat::Lava);
+        w.temp.fill(15.0);
+        rect_temp(&mut w, 200, 390, 219, 409, 1150.0);
+        for t in 0..=900 {
+            if t % 60 == 0 {
+                let (mut pmax, mut pcell, mut fmax, mut fcell, mut over) = (0.0f32, (0, 0), 0u32, (0, 0), 0);
+                for y in 380..450 {
+                    for x in 100..340 {
+                        let i = World::idx(x, y);
+                        if w.raw(x, y) != Mat::Lava {
+                            continue;
+                        }
+                        let f = w.liquid_fill(i);
+                        if f > fmax { fmax = f; fcell = (x, y); }
+                        if let Some(pa) = w.liquid_pa(x as usize, y as usize) {
+                            if pa.abs() > pmax { pmax = pa.abs(); pcell = (x, y); }
+                            if pa.abs() > 1e5 { over += 1; }
+                        }
+                    }
+                }
+                println!("t {:4.1} s: |p| max {pmax:.3e} Pa at {pcell:?}, {over} cells over 1e5 Pa, fill max {fmax} at {fcell:?}, units {:.1} cells", t as f32 / 60.0, w.liquid_units(Mat::Lava) as f32 / field::FULL as f32);
             }
             w.step();
         }
@@ -1646,8 +1725,8 @@ mod tests {
             // out (the cells' water was at 36).
             let f = front(&w, m, 100, 400, 339, 449) as f32 * CELL_M;
             assert!((9.0..15.0).contains(&f), "{m:?}: {f} m");
-            // (Water also dries a little into the air.)
-            let after = w.liquid_units(m);
+            // (Water also dries a little into the air: that is water too.)
+            let after = w.liquid_units(m) + if m == Mat::Water { w.dried } else { 0 };
             assert!(after <= before && before - after < before / 10_000, "{m:?}: {before} -> {after}");
         }
     }
@@ -1726,7 +1805,8 @@ mod tests {
             }
         }
         assert!(highest < 430.0, "the spray rose to {highest}");
-        let after = w.liquid_units(Mat::Water);
+        // (What dried into the air is water too.)
+        let after = w.liquid_units(Mat::Water) + w.dried;
         assert!(after <= before && before - after < before / 10_000, "{before} -> {after}");
     }
 
