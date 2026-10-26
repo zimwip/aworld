@@ -214,11 +214,6 @@ impl Slab {
         self.drawn.iter().map(|d| &d.0)
     }
 
-    /// Whether it is still turning on its edge.
-    pub fn pivoting(&self) -> bool {
-        self.hinge.is_some()
-    }
-
     /// The pose it has after `dt` of a step: turned about its edge, or moved and turned about
     /// its centre of mass.
     fn pose_after(&self, dt: f32) -> ((f32, f32), f32) {

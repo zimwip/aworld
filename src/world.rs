@@ -224,6 +224,7 @@ impl Mat {
     }
 
     /// Metal that has melted (iron or steel).
+    #[cfg(test)]
     pub fn is_molten(self) -> bool {
         matches!(self, Mat::Molten | Mat::MoltenSteel)
     }
@@ -431,7 +432,9 @@ const EMPTY: Cell = Cell { m: Mat::Empty, stamp: 0 };
 /// others; painting a cell (`World::set`) starts it afresh.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Aspect {
-    /// `temp` (°C) and `latent`: every matter has a temperature.
+    /// `temp` (°C) and `latent`: every matter has a temperature. (Nothing asks for it yet: it
+    /// completes the list.)
+    #[allow(dead_code)]
     Heat,
     /// `moisture`: water held in the cell on top of the matter's own, in `WATER_UNITS` per cell of
     /// liquid water. Soil holds what it drank; packed vapour the extra cells of vapour in it.
@@ -1604,6 +1607,7 @@ impl World {
     }
 
     /// Countryside by default; see [`World::generate_biome`].
+    #[cfg(test)]
     pub fn generate(&mut self, seed: u32) -> ((i32, i32), (i32, i32)) {
         self.generate_biome(seed, Biome::Countryside)
     }
@@ -6899,13 +6903,6 @@ fn crucible_world(wall: Mat) -> World {
     for y in base - 10..base + 3 {
         for x in (192..202).chain(220..230) {
             w.set(x, y, Mat::Wood);
-        }
-    }
-    for y in base - 10..base + 3 {
-        for x in 192..230 {
-            if (192..202).contains(&x) || (220..230).contains(&x) {
-                continue;
-            }
         }
     }
     // A little iron (three rows) with charcoal on top, inside the 12-wide bowl.

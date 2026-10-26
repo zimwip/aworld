@@ -89,7 +89,6 @@ pub const LAVA_C: f32 = 1100.0;
 pub const BOIL_C: f32 = 100.0;
 /// Water freezes and ice melts at 0 °C. What keeps it from flickering between the two is the
 /// latent heat: a cell has to give up (or take in) `LATENT_FUSION` before it changes.
-pub const FREEZE_C: f32 = 0.0;
 pub const MELT_C: f32 = 0.0;
 /// Heat (°C times heat capacity, the units of the heat flow) a cell of ice takes in to melt,
 /// and a cell of water gives up to freeze. Real water: 80 °C worth of heating.
@@ -755,6 +754,7 @@ impl World {
 
     /// One thermal tick: conduction, air and sun forcing, fixed heat sources,
     /// and every material reaction that depends on temperature.
+    #[cfg(test)]
     pub(super) fn thermal_pass(&mut self) {
         self.heat_conduction();
         self.heat_air_and_reactions();

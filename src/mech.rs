@@ -106,6 +106,7 @@ impl Motor {
         Motor { torque: 20.0, free_speed: 0.12, dir: 1.0, on: true, auto_reverse: false, reverse_at: 0.8, cooldown: 0, overload: 0, steam: false, power: 1.0, pressure: 1.0, draw: 0.0 }
     }
 
+    #[cfg(test)]
     pub fn reversing() -> Self {
         Motor { auto_reverse: true, ..Motor::new() }
     }
@@ -275,6 +276,7 @@ pub struct Rod {
 
 impl Rod {
     /// A rod from a gear pin to a carriage.
+    #[cfg(test)]
     pub fn new(uid: u32, gear: u32, pin: Vec2, slider: u32, len: f32) -> Self {
         Self::between(uid, End::Pin { gear, pin }, End::Carriage(slider), len)
     }
@@ -286,10 +288,6 @@ impl Rod {
     /// Does this rod touch the carriage `uid`?
     pub fn on_carriage(&self, uid: u32) -> bool {
         matches!(self.a, End::Carriage(u) if u == uid) || matches!(self.b, End::Carriage(u) if u == uid)
-    }
-
-    pub fn on_gear(&self, uid: u32) -> bool {
-        matches!(self.a, End::Pin { gear, .. } if gear == uid) || matches!(self.b, End::Pin { gear, .. } if gear == uid)
     }
 }
 

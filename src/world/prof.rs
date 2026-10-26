@@ -86,11 +86,6 @@ impl Profile {
         self.steps += other.steps;
     }
 
-    /// The dearest single step of a phase, in milliseconds.
-    pub fn worst_ms(&self, phase: usize) -> f64 {
-        self.worst_ns[phase] as f64 / 1e6
-    }
-
     /// Average milliseconds a phase costs per step (spread over every step, also those where
     /// it does not run).
     pub fn ms_per_step(&self, phase: usize) -> f64 {
