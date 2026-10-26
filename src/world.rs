@@ -648,6 +648,8 @@ pub struct World {
     pub revision: u64,
     /// Water dried into the air since the start, in units of fill (the volume tests count it).
     pub dried: u64,
+    /// Liquid that left the world by its sides since the start, in units of fill.
+    pub gone: u64,
     /// Wind, -1 (left) to 1 (right).
     pub wind: f32,
     /// The player's wind controls: strongest wind (0..1), how fast the direction keeps changing
@@ -802,6 +804,7 @@ impl World {
             climate: thermal::Climate::default(),
             revision: 1,
             dried: 0,
+            gone: 0,
             wind: 0.0,
             wind_max: 1.0,
             wind_changes: 1.0,
@@ -912,9 +915,10 @@ impl World {
             structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, dp,
             dp_slow, dpd, pressure_forces, lod, parallel_cells, liquid_physics, liq, fill, pocket_of,
             pockets, latent, vel: _, moisture, fuel, growth, jet, liq_p, cls: _, liq_w: _, zones, bursts, charge, mcharge, magnet, polar,
-            bolts, storm_rng, pressure_cache: _, prof: _, air_rows, air_sky, later: _, dried,
+            bolts, storm_rng, pressure_cache: _, prof: _, air_rows, air_sky, later: _, dried, gone,
         } = from;
         self.dried = *dried;
+        self.gone = *gone;
         self.cells.clone_from(cells);
         self.frame = *frame;
         self.rng = *rng;

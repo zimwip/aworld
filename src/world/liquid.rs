@@ -376,9 +376,30 @@ impl World {
         let mut card = liq.card.take();
         if let Some(Some(c)) = card.as_mut() {
             self.collect_liquids(&mut liq, c);
+            if let Some((y0, y1)) = c.rows() {
+                self.drain_sides(y0..=y1);
+            }
         }
         liq.card = card;
         self.liq = liq;
+    }
+
+    /// The world is open on its sides: a liquid that reaches the first or the last column leaves
+    /// it, as a drop thrown off the side does. The cells of those columns are emptied in `rows`
+    /// (after a sub-step, or after the card's step), and what left is counted in `gone`.
+    pub(super) fn drain_sides(&mut self, rows: impl Iterator<Item = usize>) {
+        for y in rows {
+            for i in [y * W, y * W + W - 1] {
+                if self.cells[i].m.kind() == Kind::Liquid && self.mask[i] == 0 {
+                    self.gone += self.liquid_fill(i) as u64;
+                    self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
+                    self.clear_states(i);
+                    self.latent[i] = 0.0;
+                    self.vel[i] = 0;
+                    self.revision += 1;
+                }
+            }
+        }
     }
 
     /// The liquids' turn.
@@ -472,6 +493,7 @@ impl World {
             let clock = self.prof.start();
             self.carry_liquids(&mut liq, dt);
             self.prof.stop(prof::LIQ_CARRY, clock);
+            self.drain_sides((0..H).filter(|&y| liq.rows[y].is_some()));
         }
         self.liq = liq;
     }
@@ -640,7 +662,8 @@ impl World {
                 let (nx, ny) = (d.x + dx / n as f32, d.y + dy / n as f32);
                 let (ix, iy) = (nx.floor() as i32, ny.floor() as i32);
                 if ix < 0 || ix >= W as i32 || iy >= H as i32 {
-                    // Off the side or the bottom of the world: gone.
+                    // Off the side or the bottom of the world: gone (and counted).
+                    self.gone += d.q as u64;
                     return false;
                 }
                 if iy >= 0 {
@@ -1614,6 +1637,29 @@ mod tests {
         w
     }
 
+    /// The world is open on its sides: a pool on a floor that runs to the left edge of the
+    /// world empties through that edge, and what left is counted.
+    #[test]
+    fn water_runs_off_the_side_of_the_world() {
+        let mut w = world();
+        rect(&mut w, 0, 450, 120, 450, Mat::Brick);
+        rect(&mut w, 121, 420, 121, 450, Mat::Brick);
+        rect(&mut w, 60, 430, 120, 449, Mat::Water);
+        w.temp.fill(0.0);
+        let before = w.liquid_units(Mat::Water);
+        // (A layer two cells deep drains at the speed of a real one, a couple of metres a second
+        // at the edge, which thins as the layer does: half a minute for the last tenth.)
+        for _ in 0..1800 {
+            w.step();
+        }
+        let left = w.liquid_units(Mat::Water);
+        assert!(left < before / 8, "the water stayed: {before} -> {left}");
+        assert!(w.gone > before * 4 / 5, "little left by the side: {} of {before} (dried {}, left {left})", w.gone, w.dried);
+        // (Half a minute of a cascade off the edge: the crumbs its drops leave, a thousandth.)
+        let after = left + w.dried + w.gone;
+        assert!(after <= before && before - after < before / 1_000, "{before} -> {after}");
+    }
+
     /// A block of water 16 x 16 let go 2.5 m over a pool 15 cells deep, in the same tank.
     fn chute() -> World {
         let mut w = world();
@@ -1795,7 +1841,7 @@ mod tests {
             let f = front(&w, m, 100, 400, 339, 449) as f32 * CELL_M;
             assert!((9.0..15.0).contains(&f), "{m:?}: {f} m");
             // (Water also dries a little into the air: that is water too.)
-            let after = w.liquid_units(m) + if m == Mat::Water { w.dried } else { 0 };
+            let after = w.liquid_units(m) + w.gone + if m == Mat::Water { w.dried } else { 0 };
             assert!(after <= before && before - after < before / 10_000, "{m:?}: {before} -> {after}");
         }
     }
@@ -1875,7 +1921,7 @@ mod tests {
         }
         assert!(highest < 430.0, "the spray rose to {highest}");
         // (What dried into the air is water too.)
-        let after = w.liquid_units(Mat::Water) + w.dried;
+        let after = w.liquid_units(Mat::Water) + w.dried + w.gone;
         assert!(after <= before && before - after < before / 10_000, "{before} -> {after}");
     }
 

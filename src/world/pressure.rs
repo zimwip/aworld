@@ -180,6 +180,12 @@ impl World {
                         if !matches!(m.kind(), Kind::Liquid | Kind::Powder) {
                             continue;
                         }
+                        // (The physical liquids are pushed by the gas pressure in their own step,
+                        // which may be running on the graphics card right now: a cell moved here
+                        // behind its back would be counted twice or lost.)
+                        if m.kind() == Kind::Liquid && self.liquid_physics {
+                            continue;
+                        }
                         let quiet = if m.kind() == Kind::Liquid { QUIET } else { QUIET_LOOSE };
                         let p = ((g - quiet) * PUSH / density(m).max(0.2)).min(1.0);
                         if p <= 0.0 {

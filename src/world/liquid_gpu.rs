@@ -403,6 +403,8 @@ mod native {
     /// The card's time in each phase, in ns, summed over the steps (`AWORLD_DEBUG_CARD`).
     static CARD: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
     const PHASES: [&str; 6] = ["envoi", "forces", "viscosité", "pression", "transport", "retour"];
+    /// The audit of the water at the collect (`AWORLD_DEBUG_MASS`).
+    static AUDIT: [std::sync::atomic::AtomicI64; 5] = [const { std::sync::atomic::AtomicI64::new(0) }; 5];
     static DBG: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
     fn tick(k: usize, t: std::time::Instant) -> std::time::Instant {
         DBG[k].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -498,6 +500,26 @@ mod native {
                         let known = Mat::from_u8((cu[x] & 0xff) as u8);
                         let (known_f, known_t) = (fu[x], tu[x]);
                         (cu[x], fu[x], tu[x]) = (c, f, t);
+                        if audit {
+                            let water = |m: Mat, q: u32| if m == Mat::Water { q as i64 } else { 0 };
+                            AUDIT[0].fetch_add(water(Mat::from_u8((c & 0xff) as u8), f) - water(known, known_f), std::sync::atomic::Ordering::Relaxed);
+                            if wc[x].m == known && known == Mat::Water {
+                                let have = match wf[x] {
+                                    0 => field::FULL,
+                                    q => q,
+                                };
+                                if have != known_f {
+                                    AUDIT[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    AUDIT[2].fetch_add(have as i64 - known_f as i64, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            } else if wc[x].m != known {
+                                if AUDIT[3].load(std::sync::atomic::Ordering::Relaxed) < 3 {
+                                    eprintln!("    ({x}, {}) : la carte connaissait {known:?} {known_f}, le CPU a {:?} {} (posée au pas {}, image {frame}), la carte dit {:?} {f}", y0 + yy, wc[x].m, wf[x], wc[x].stamp, Mat::from_u8((c & 0xff) as u8));
+                                }
+                                AUDIT[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                AUDIT[4].fetch_add(water(known, known_f) - water(Mat::from_u8((c & 0xff) as u8), f), std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
                         if wc[x].m != known {
                             continue;
                         }
@@ -562,8 +584,11 @@ mod native {
             tick(6, t);
             if audit {
                 let after = units(self) + liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>();
-                if after != before {
-                    eprintln!("pas {}: l'eau passe de {before} à {after} ({:+}) en reprenant la carte ({} gouttes lancées, {} cellules changées)", pend.stamp, after as i64 - before as i64, count, changed);
+                let a = |k: usize| AUDIT[k].swap(0, std::sync::atomic::Ordering::Relaxed);
+                let (card_delta, stale_n, stale_q, other_n, other_q) = (a(0), a(1), a(2), a(3), a(4));
+                let thrown: i64 = liq.drops.iter().rev().take(count).filter(|d| d.m == Mat::Water).map(|d| d.q as i64).sum();
+                if after != before || card_delta + thrown != 0 {
+                    eprintln!("pas {}: l'eau passe de {before} à {after} ({:+}) en reprenant la carte ({} gouttes lancées, {} cellules changées ; la carte a déplacé {:+} et jeté {thrown}, {stale_n} cellules changées entre-temps sur le CPU de {stale_q:+}, {other_n} cellules dont la matière a changé, ignorant {other_q:+})", pend.stamp, after as i64 - before as i64, count, changed, card_delta);
                 }
             }
             self.prof.stop(prof::LIQ_DOWN, clock);
