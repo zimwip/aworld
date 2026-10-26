@@ -210,6 +210,13 @@ pub struct Drop {
     pub(super) t: f32,
 }
 
+impl Drop {
+    /// Its velocity, m/s (down positive): for the picture, which stretches it along its flight.
+    pub fn velocity(&self) -> (f32, f32) {
+        (self.vx, self.vy)
+    }
+}
+
 impl Liquids {
     /// What the picture of the world needs (see `World::copy_picture`): the velocities, the
     /// pressure, the kind of each cell and the drops in flight, not the scratch nor the solver.

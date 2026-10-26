@@ -199,8 +199,10 @@ void main() {
     gl_FragColor = vec4(vec3(0.02, 0.05, 0.2) * a + warm, a);
 }";
 
-// Clouds and steam are drawn from a density layer: blurred, then thresholded so
-// the cells merge into soft, billowy blobs, lit from above.
+// Clouds and steam are drawn from a density layer, blurred once per change into a smooth field
+// (`GAS_BLUR`, across then down, every cell read: a blur that skips cells cannot rub out a
+// pattern that alternates from one cell to the next, and leaves a fine checkerboard), then
+// thresholded here so the cells merge into soft, billowy blobs, lit from above.
 // `dusk` is (twilight strength, x of the low sun from 0 to 1): at sunrise and sunset the sun shines
 // from below the clouds, so their undersides and the edges facing it glow gold and rose while
 // their tops fall into a lavender shade.
@@ -211,17 +213,7 @@ uniform sampler2D Texture;
 uniform vec2 texel;
 uniform vec2 dusk;
 float dens(vec2 p) {
-    float d = 0.0;
-    float ws = 0.0;
-    for (int i = -3; i <= 3; i++) {
-        for (int j = -3; j <= 3; j++) {
-            vec4 s = texture2D(Texture, p + vec2(float(i), float(j)) * texel * 2.0);
-            float w = exp(-float(i * i + j * j) / 7.0);
-            d += s.a * w;
-            ws += w;
-        }
-    }
-    return d / ws;
+    return texture2D(Texture, p).a;
 }
 void main() {
     float d = dens(uv);
@@ -246,6 +238,79 @@ void main() {
     }
     float alpha = a * 0.86;
     gl_FragColor = vec4(col * alpha, alpha);
+}";
+
+// One pass of the gas blur: a Gaussian along `dir` (one texel across, or one down), σ ≈ 3.7
+// cells, the two passes together the same bell as the blur the clouds always had. The density
+// is the alpha; the result is written as is (no blending) into the field.
+const GAS_BLUR: &str = "#version 100
+precision highp float;
+varying vec2 uv;
+uniform sampler2D Texture;
+uniform vec2 dir;
+void main() {
+    float d = 0.0;
+    float ws = 0.0;
+    for (int i = -9; i <= 9; i++) {
+        float w = exp(-float(i * i) / 28.0);
+        d += texture2D(Texture, uv + dir * float(i)).a * w;
+        ws += w;
+    }
+    gl_FragColor = vec4(d / ws);
+}";
+
+// Drops of water: each is a quad along its flight, texcoord in units of the drop's radius: x from
+// the middle of the round head back along the tail, y across. The vertex colour's red is the
+// tail's length (in radii, over 16), its green the size of a pixel (in radii), its alpha the
+// drop's opacity.
+const RAIN_VERT: &str = "#version 100
+attribute vec3 position;
+attribute vec2 texcoord;
+attribute vec4 color0;
+varying highp vec2 uv;
+varying mediump vec4 col;
+uniform mat4 Model;
+uniform mat4 Projection;
+void main() {
+    gl_Position = Projection * Model * vec4(position, 1.0);
+    uv = texcoord;
+    col = color0 / 255.0;
+}";
+
+// A cartoon drop: a round head, a tail tapering to a point behind it, a darker rim, a glint.
+const RAIN_FRAG: &str = "#version 100
+precision highp float;
+varying highp vec2 uv;
+varying mediump vec4 col;
+void main() {
+    float px = col.g;
+    float len = col.r * 16.0;
+    float a = uv.x;
+    float b = abs(uv.y);
+    // Signed distance to the outline, in radii (negative inside).
+    float dist;
+    if (a <= 0.0) {
+        dist = length(uv) - 1.0;
+    } else {
+        float t = clamp(a / len, 0.0, 1.0);
+        float hw = pow(1.0 - t, 1.4);
+        dist = (b - hw) * 0.85;
+    }
+    float r = 1.0 / px;
+    float cover = clamp(0.5 - dist * r, 0.0, 1.0);
+    if (cover <= 0.0) {
+        discard;
+    }
+    vec3 body = vec3(0.42, 0.66, 0.98);
+    vec3 rim = vec3(0.16, 0.36, 0.78);
+    vec3 c = mix(body, rim, smoothstep(-0.38, -0.12, dist));
+    // The glint, on the head, a little to one side.
+    float g = 1.0 - smoothstep(0.12, 0.32, length(uv - vec2(-0.25, -0.35)));
+    c = mix(c, vec3(0.95, 0.98, 1.0), g * 0.9);
+    // The tail fades out toward its tip.
+    float fade = a > 0.0 ? 1.0 - 0.55 * clamp(a / len, 0.0, 1.0) : 1.0;
+    float alpha = cover * fade * col.a;
+    gl_FragColor = vec4(c * alpha, alpha);
 }";
 
 /// What the world picture shows.
@@ -339,6 +404,16 @@ pub struct Renderer {
     gas_image: Image,
     gas_texture: Texture2D,
     gas_material: Material,
+    /// The blur of the gas layer: across into the first target, then down into the second, the
+    /// smooth density field `GAS_FRAG` reads.
+    gas_blur: Material,
+    gas_field: [RenderTarget; 2],
+    /// The falling drops of rain, drawn as drops rather than cells: (x, y) the middle of the
+    /// cell, (dx, dy) the way it falls, the length of its tail in cells, the size of its head
+    /// (1 a cell's drop). Gathered once per change of the world.
+    drops: Vec<[f32; 6]>,
+    rev_rain: u64,
+    rain_material: Material,
     /// What the textures currently show, so unchanged frames cost nothing.
     /// Trees are a layer of their own so they can sway: (x, y, height above ground, colour).
     veg_image: Image,
@@ -518,6 +593,24 @@ impl Renderer {
             },
         )
         .expect("gas shader");
+        let gas_blur = load_material(
+            ShaderSource::Glsl { vertex: VERT, fragment: GAS_BLUR },
+            MaterialParams { uniforms: vec![UniformDesc::new("dir", UniformType::Float2)], ..Default::default() },
+        )
+        .expect("gas blur shader");
+        let gas_field = [(); 2].map(|_| {
+            let t = render_target(W as u32, H as u32);
+            t.texture.set_filter(FilterMode::Linear);
+            t
+        });
+        let rain_material = load_material(
+            ShaderSource::Glsl { vertex: RAIN_VERT, fragment: RAIN_FRAG },
+            MaterialParams {
+                pipeline_params: PipelineParams { color_blend: Some(blend), alpha_blend: Some(blend), ..Default::default() },
+                ..Default::default()
+            },
+        )
+        .expect("rain shader");
         let night_material = load_material(
             ShaderSource::Glsl { vertex: VERT, fragment: NIGHT_FRAG },
             MaterialParams {
@@ -556,6 +649,11 @@ impl Renderer {
             gas_image,
             gas_texture,
             gas_material,
+            gas_blur,
+            gas_field,
+            drops: vec![],
+            rev_rain: u64::MAX,
+            rain_material,
             rev_world: u64::MAX,
             rev_gas: u64::MAX,
             last_mode: 0,
@@ -680,7 +778,7 @@ impl Renderer {
                     // changes (temperature tints) that do not wake a zone.
                     // A fresh world (a new game, a loaded one) counts its steps from the start again.
                     if self.full || self.last_mode != id || world.zones.stamp() < self.drawn_stamp {
-                        Self::fill(&mut self.image, |x, y| world.color_without_trees(x, y));
+                        Self::fill(&mut self.image, |x, y| landscape_color(world, x, y));
                         for k in 0..CW * CH {
                             self.veg_zones[k] = Self::veg_of_zone(world, k);
                         }
@@ -690,7 +788,7 @@ impl Renderer {
                         self.band = (self.band + 1) % CH;
                         zones.extend((0..CW).map(|i| self.band * CW + i));
                         for k in zones {
-                            Self::fill_zone(&mut self.image, k, |x, y| world.color_without_trees(x, y));
+                            Self::fill_zone(&mut self.image, k, |x, y| landscape_color(world, x, y));
                             self.veg_zones[k] = Self::veg_of_zone(world, k);
                         }
                     }
@@ -733,6 +831,69 @@ impl Renderer {
         gl_use_material(&self.material);
         draw_texture_ex(&self.texture, v.ox, v.oy, WHITE, size.clone());
         draw_texture_ex(&self.veg_texture, v.ox, v.oy, WHITE, size);
+        gl_use_default_material();
+        self.draw_rain(world, v);
+    }
+
+    /// The falling raindrops and the drops of water in flight (spray, splashes), stretched along
+    /// their flight like drops in a cartoon: a round head and a tail that tapers behind it,
+    /// longer the faster it goes (`landscape_color` leaves the raindrops' cells out of the
+    /// landscape).
+    fn draw_rain(&mut self, world: &World, v: View) {
+        if self.rev_rain != world.revision {
+            self.drops.clear();
+            for y in 1..H - 1 {
+                for x in 0..W {
+                    if let Some(n) = rain_drop(world, x, y) {
+                        // Its fall (eighths of a cell a step), and the wind that slants it.
+                        let fall = world.cell_fall(x, y) as f32 / 8.0;
+                        let (wx, _) = world.flow.wind_at(x as i32, y as i32);
+                        let (dx, dy) = ((wx * 0.6).clamp(-0.7, 0.7), 1.0);
+                        let norm = (dx * dx + dy * dy).sqrt();
+                        let len = (1.6 + 1.2 * fall).min(4.5) + (n - 1) as f32;
+                        self.drops.push([x as f32 + 0.5, y as f32 + 0.5, dx / norm, dy / norm, len, 1.0]);
+                    }
+                }
+            }
+            self.rev_rain = world.revision;
+        }
+        // The drops in flight move every frame: the more water, the bigger.
+        let flying = world.liquid_drops().iter().filter(|d| d.m == Mat::Water).map(|d| {
+            let (vx, vy) = d.velocity();
+            let speed = (vx * vx + vy * vy).sqrt();
+            let (dx, dy) = if speed > 1e-3 { (vx / speed, vy / speed) } else { (0.0, 1.0) };
+            let size = 0.35 + 0.65 * (d.q as f32 / 65536.0).min(1.0).sqrt();
+            [d.x, d.y, dx, dy, (0.8 + 0.3 * speed).min(4.5) * size, size]
+        });
+        let drops: Vec<[f32; 6]> = self.drops.iter().copied().chain(flying).collect();
+        if drops.is_empty() {
+            return;
+        }
+        gl_use_material(&self.rain_material);
+        let mut verts: Vec<Vertex> = vec![];
+        let mut idx: Vec<u16> = vec![];
+        for [x, y, dx, dy, len, size] in drops {
+            if idx.len() + 6 > BOLT_MESH_INDICES {
+                draw_mesh(&Mesh { vertices: std::mem::take(&mut verts), indices: std::mem::take(&mut idx), texture: None });
+            }
+            // The head's radius on screen: a little more than half a cell for a cell's worth of
+            // water, never under a pixel.
+            let r = (0.62 * v.s * size).max(1.0);
+            let head = vec2(v.ox + x * v.s, v.oy + y * v.s);
+            let back = -vec2(dx, dy);
+            let side = vec2(-back.y, back.x);
+            // In radii: the tail's length, and a margin of a pixel round the drop for its soft edge.
+            let tail = (len * v.s / r).max(1.5);
+            let m = 1.0 / r;
+            let col = Color::new((tail / 16.0).min(1.0), m, 0.0, 0.92);
+            let k = verts.len() as u16;
+            for (a, b) in [(-1.0 - m, -1.0 - m), (tail + m, -1.0 - m), (tail + m, 1.0 + m), (-1.0 - m, 1.0 + m)] {
+                let p = head + (back * a + side * b) * r;
+                verts.push(Vertex::new(p.x, p.y, 0.0, a, b, col));
+            }
+            idx.extend_from_slice(&[k, k + 1, k + 2, k, k + 2, k + 3]);
+        }
+        draw_mesh(&Mesh { vertices: verts, indices: idx, texture: None });
         gl_use_default_material();
     }
 
@@ -886,6 +1047,7 @@ impl Renderer {
             self.has_gas = self.gas_zones.iter().any(|&n| n > 0);
             if self.has_gas || was {
                 self.gas_texture.update(&self.gas_image);
+                self.blur_gas();
             }
             self.rev_gas = world.revision;
             self.gas_stamp = world.zones.stamp();
@@ -899,13 +1061,64 @@ impl Renderer {
         self.gas_material.set_uniform("dusk", vec2(dusk, sun_x));
         gl_use_material(&self.gas_material);
         draw_texture_ex(
-            &self.gas_texture,
+            &self.gas_field[1].texture,
             v.ox,
             v.oy,
             WHITE,
             DrawTextureParams { dest_size: Some(vec2(W as f32 * v.s, H as f32 * v.s)), ..Default::default() },
         );
         gl_use_default_material();
+    }
+}
+
+impl Renderer {
+    /// Blurs the gas layer into the smooth density field: across, then down, off screen.
+    fn blur_gas(&self) {
+        let (w, h) = (W as f32, H as f32);
+        let pass = |src: &Texture2D, dst: &RenderTarget, dir: Vec2| {
+            let mut camera = Camera2D::from_display_rect(Rect::new(0.0, 0.0, w, h));
+            // Upside down, so that the target reads the right way up when drawn (as `ui.rs` does).
+            camera.zoom.y = -camera.zoom.y;
+            camera.render_target = Some(dst.clone());
+            set_camera(&camera);
+            clear_background(Color::new(0.0, 0.0, 0.0, 0.0));
+            self.gas_blur.set_uniform("dir", dir);
+            gl_use_material(&self.gas_blur);
+            draw_texture_ex(src, 0.0, 0.0, WHITE, DrawTextureParams { dest_size: Some(vec2(w, h)), ..Default::default() });
+            gl_use_default_material();
+        };
+        pass(&self.gas_texture, &self.gas_field[0], vec2(1.0 / w, 0.0));
+        pass(&self.gas_field[0].texture, &self.gas_field[1], vec2(0.0, 1.0 / h));
+        set_default_camera();
+    }
+}
+
+/// The most cells of water one above the other that still fall as one drop.
+const DROP_CELLS: usize = 3;
+
+/// A drop of water falling through the air, whose lowest cell is (x, y): a short column of water
+/// (`DROP_CELLS` at most) with air (or gas) under it, and no block, and no liquid above it. Its number of
+/// cells; drawn as a drop (`Renderer::draw_rain`) rather than as cells.
+fn rain_drop(world: &World, x: usize, y: usize) -> Option<usize> {
+    let i = y * W + x;
+    if world.cells[i].m != Mat::Water || y + 1 >= H || !matches!(world.cells[i + W].m.kind(), Kind::Empty | Kind::Gas) || !world.mask_free(x as i32, y as i32 + 1) {
+        return None;
+    }
+    let n = (0..=DROP_CELLS).take_while(|&k| k <= y && world.cells[i - k * W].m == Mat::Water).count();
+    (n <= DROP_CELLS && y >= n && world.cells[i - n * W].m.kind() != Kind::Liquid).then_some(n)
+}
+
+/// Whether cell (x, y) is part of a falling drop.
+fn in_drop(world: &World, x: usize, y: usize) -> bool {
+    (y..(y + DROP_CELLS).min(H)).take_while(|&yy| world.cells[yy * W + x].m == Mat::Water).any(|yy| rain_drop(world, x, yy).is_some())
+}
+
+/// The landscape's colour of cell (x, y): the world's, but none for a falling raindrop.
+fn landscape_color(world: &World, x: usize, y: usize) -> [u8; 4] {
+    if in_drop(world, x, y) {
+        [0, 0, 0, 0]
+    } else {
+        world.color_without_trees(x, y)
     }
 }
 

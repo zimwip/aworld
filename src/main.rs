@@ -2255,6 +2255,10 @@ impl Game {
         }
         // Drops of liquid in flight (spray, splashes): the more liquid, the bigger.
         for d in self.world.liquid_drops() {
+            // The drops of water are drawn with the landscape, as cartoon drops (`Renderer::draw_rain`).
+            if d.m == Mat::Water && render_mode == RenderMode::Normal && self.mode != ViewMode::Simulation {
+                continue;
+            }
             let s = view.to_screen(vec2(d.x, d.y));
             let r = size * (0.35 + 0.65 * (d.q as f32 / 65536.0).min(1.0).sqrt());
             draw_rectangle(s.x - r * 0.5, s.y - r * 0.5, r, r, mat_color(d.m));
@@ -4241,6 +4245,25 @@ fn demo_quarry(g: &mut Game) {
     g.set_running(true);
 }
 
+/// A bank of cloud raining over the meadow, and a plume of steam: `--rain`, for the pictures of
+/// the clouds and the drops.
+fn demo_rain(g: &mut Game) {
+    for (k, x) in (150..820).step_by(13).enumerate() {
+        g.world.paint(x, 120 + (k as i32 * 7) % 15, 15 + (k as i32 * 5) % 6, Mat::Cloud);
+    }
+    for k in 0..6 {
+        g.world.paint(560 + k * 4, 330 - k * 22, 8 + k * 2, Mat::Steam);
+    }
+    for i in 0..2400u32 {
+        let h = i.wrapping_mul(2654435761);
+        let (x, y) = (160 + (h % 640) as i32, 160 + ((h >> 12) % 200) as i32);
+        if g.world.raw(x, y) == Mat::Empty {
+            g.world.set(x, y, Mat::Water);
+        }
+    }
+    g.set_running(true);
+}
+
 /// A meadow over rock with a big charge of powder buried in it: `--crater` lights it. With
 /// `dynamite`, the charge is a stick of dynamite packed in charcoal (it leaves diamonds).
 fn demo_crater(g: &mut Game, dynamite: bool) {
@@ -4615,6 +4638,9 @@ async fn main() {
         }
         if args.iter().any(|a| a == "--crater") {
             demo_crater(&mut game, args.iter().any(|a| a == "--dynamite"));
+        }
+        if args.iter().any(|a| a == "--rain") {
+            demo_rain(&mut game);
         }
         if args.iter().any(|a| a == "--sticks") {
             demo_sticks(&mut game);

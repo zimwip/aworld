@@ -1611,7 +1611,8 @@ impl World {
         }
     }
 
-    fn mask_free(&self, x: i32, y: i32) -> bool {
+    /// Whether no block or car stands in cell (x, y) (outside the world counts as free).
+    pub fn mask_free(&self, x: i32, y: i32) -> bool {
         !Self::inb(x, y) || self.mask[Self::idx(x, y)] == 0
     }
 
