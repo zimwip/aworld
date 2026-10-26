@@ -19,8 +19,19 @@
 //!   falls outside the cells they rest on, they tip over the last one.
 //!
 //! A tipping body turns about its edge, α = m·g·lever / (I + m·r²), until the edge no longer has to
-//! pull to keep it turning (the edge can push, not pull); it then flies on, spinning. When it hits
-//! something it breaks according to the energy it brings: a small share of it opens cracks, and
+//! pull to keep it turning (the edge can push, not pull); it then flies on, spinning. A free body
+//! with room under it falls the same way, as a rigid body (a large one drops straight down).
+//!
+//! In flight a body keeps its momentum m·v and its angular momentum I·ω. When it runs into
+//! something firm, each point of contact pushes back along the normal of the surface there with
+//! an impulse J (J/m changes its velocity, r×J/I its spin), just enough that no point goes on into
+//! the surface, plus a bounce of its matter's restitution; friction, at most μ·J, brakes the
+//! points along the surface. So a body landing on a corner off its centre of mass is turned over
+//! onto a face, one dropped across the edge of a ledge turns off it, a block thrown along the
+//! ground slides and stops, a round stone rolls down a slope. It comes to rest when it hardly moves
+//! any more, and the statics take it from there.
+//!
+//! When it hits something it breaks according to the energy it brings: a small share of it opens cracks, and
 //! opening a crack across a section costs the fracture energy of the matter (J/m²). The faster
 //! a part hits, the smaller the pieces: ice and glass shatter from a few metres, rock only after a
 //! long fall, wood and metal not at all. What is crushed finer than a cell becomes grains: hail,
@@ -30,6 +41,7 @@ use super::blast::strength;
 use super::*;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::f32::consts::FRAC_PI_2;
 
 /// Side of a cell, m.
 const CELL_M: f32 = 0.05;
@@ -45,6 +57,19 @@ const CRACK_SHARE: f32 = 0.0005;
 const MAX_SLAB: usize = 40_000;
 /// At most this many bodies start to tip in one pass.
 const MAX_TIPS: usize = 4;
+/// A falling body of this many cells falls as a rigid body that can turn (see `tip_pass`);
+/// a crumb or a large one, or one when this many bodies already fly, drops straight down.
+const MIN_TUMBLER: usize = 6;
+const MAX_TUMBLER: usize = 6_000;
+const MAX_FLYING: usize = 24;
+/// Coefficient of friction of a body against what it hits (rock on rock is about 0.6).
+const FRICTION: f32 = 0.55;
+/// A body in contact whose fastest point moves slower than this (cells per step) for
+/// `REST_STEPS` steps in a row comes to rest.
+const SETTLE: f32 = 0.05;
+const REST_STEPS: u8 = 6;
+/// A body still bumping along after this many steps of contact comes to rest all the same.
+const MAX_CONTACT: u16 = 900;
 
 /// The sections of one anchored body, as `stress_pass` last worked them out: the load on each of
 /// its cells (in `World::strain`'s units) and the sections that cannot carry theirs.
@@ -106,6 +131,18 @@ pub fn rubble(m: Mat) -> Option<Mat> {
     }
 }
 
+/// Coefficient of restitution of matter `m`: the share of the speed along the normal a body of
+/// it bounces back with.
+fn restitution(m: Mat) -> f32 {
+    match m {
+        Mat::Wood | Mat::Trunk | Mat::Branch => 0.45,
+        Mat::Iron | Mat::Steel | Mat::Glass | Mat::Diamond => 0.4,
+        Mat::Ice => 0.35,
+        Mat::Clay | Mat::Leaf | Mat::Sapling => 0.05,
+        _ => 0.3,
+    }
+}
+
 /// Typical size of the pieces, in cells, when matter `m` hits at `v` m/s.
 fn piece_size(m: Mat, v: f32) -> f32 {
     if v < 0.3 || rubble(m).is_none() {
@@ -152,7 +189,25 @@ pub struct Slab {
     drawn: Vec<(usize, u32)>,
     /// Parts crushed against the edge it turns on (where they would be now, cells).
     crushed: Vec<(u32, (f32, f32))>,
+    /// Steps in a row it has lain nearly still against something, and steps it has been in
+    /// contact at all.
+    rest: u8,
+    contact: u16,
 }
+
+/// What a body in flight ran into.
+struct Hit {
+    /// Whether all of it was liquid.
+    soft: bool,
+    /// Where it touched (cells), and the normal of the surface there, out of it (towards the
+    /// body), of length 1.
+    points: Vec<((f32, f32), (f32, f32))>,
+    /// The firmest matter it ran into.
+    m: Mat,
+}
+
+/// At most this many points of contact are worked out in a hit.
+const MAX_POINTS: usize = 16;
 
 impl Slab {
     pub fn cells(&self) -> impl Iterator<Item = &usize> {
@@ -164,8 +219,22 @@ impl Slab {
         self.hinge.is_some()
     }
 
+    /// The pose it has after `dt` of a step: turned about its edge, or moved and turned about
+    /// its centre of mass.
+    fn pose_after(&self, dt: f32) -> ((f32, f32), f32) {
+        let angle = self.angle + self.spin * dt;
+        match self.hinge {
+            Some(h) => {
+                let (sn, cs) = (self.spin * dt).sin_cos();
+                let r = (self.c.0 - h.0, self.c.1 - h.1);
+                ((h.0 + r.0 * cs - r.1 * sn, h.1 + r.0 * sn + r.1 * cs), angle)
+            }
+            None => ((self.c.0 + self.v.0 * dt, self.c.1 + self.v.1 * dt), angle),
+        }
+    }
+
     /// Velocity of the point `p` of the body, cells per step.
-    fn velocity_at(&self, p: (f32, f32)) -> (f32, f32) {
+    pub(super) fn velocity_at(&self, p: (f32, f32)) -> (f32, f32) {
         match self.hinge {
             Some(h) => (-self.spin * (p.1 - h.1), self.spin * (p.0 - h.0)),
             None => (self.v.0 - self.spin * (p.1 - self.c.1), self.v.1 + self.spin * (p.0 - self.c.0)),
@@ -598,7 +667,12 @@ impl World {
         for mut p in free {
             p.cells.sort_unstable_by(|a, b| b.cmp(a));
             if self.piece_can_move(&p, 1) {
-                self.falling.push(p);
+                if self.tumbles(&p) {
+                    // Through the air it falls as a rigid body: it lands on a corner, turns, rolls.
+                    self.loosen(p.cells, None, (0.0, p.vy / 2.0), 0.0);
+                } else {
+                    self.falling.push(p);
+                }
                 continue;
             }
             let in_piece = |i: usize| p.cells.binary_search_by(|q| i.cmp(q)).is_ok();
@@ -671,6 +745,19 @@ impl World {
         }
     }
 
+    /// Whether the falling body `p` falls as a slab that can turn and roll (see `step_slab`)
+    /// rather than straight down: through open air, and not too large.
+    fn tumbles(&self, p: &Piece) -> bool {
+        if !(MIN_TUMBLER..=MAX_TUMBLER).contains(&p.cells.len()) || self.slabs.len() >= MAX_FLYING {
+            return false;
+        }
+        let in_piece = |i: usize| p.cells.binary_search_by(|q| i.cmp(q)).is_ok();
+        p.cells.iter().all(|&i| {
+            let t = i + W;
+            t < W * H && (in_piece(t) || (self.mask[t] == 0 && free_for_slab(self.cells[t].m)))
+        })
+    }
+
     /// Turns the cells of a body into a slab turning about `hinge`, or flying at `v` (cells per
     /// step) and turning at `spin`.
     fn loosen(&mut self, cells: Vec<usize>, hinge: Option<(f32, f32)>, v: (f32, f32), spin: f32) {
@@ -696,7 +783,7 @@ impl World {
             inertia += density(p.cell.m) * (r2 + 1.0 / 6.0);
             reach = reach.max(r2.sqrt());
         }
-        self.slabs.push(Slab { parts, home, c0, c: c0, v, angle: 0.0, spin, mass, inertia, reach: reach + 1.0, hinge, drawn, crushed: vec![] });
+        self.slabs.push(Slab { parts, home, c0, c: c0, v, angle: 0.0, spin, mass, inertia, reach: reach + 1.0, hinge, drawn, crushed: vec![], rest: 0, contact: 0 });
     }
 
     /// Moves the bodies in flight; those that hit something come to rest there, broken or not.
@@ -733,39 +820,172 @@ impl World {
         };
         let fastest = (s.v.0 * s.v.0 + s.v.1 * s.v.1).sqrt() * s.hinge.is_none() as u8 as f32 + s.spin.abs() * lever;
         let n = fastest.ceil().clamp(1.0, 8.0) as i32;
+        let mut touched = false;
+        let mut slipping = false;
         for _ in 0..n {
-            let (c, angle) = match s.hinge {
-                Some(h) => {
-                    let (sn, cs) = (s.spin / n as f32).sin_cos();
-                    let r = (s.c.0 - h.0, s.c.1 - h.1);
-                    ((h.0 + r.0 * cs - r.1 * sn, h.1 + r.0 * sn + r.1 * cs), s.angle + s.spin / n as f32)
+            let (c, angle) = s.pose_after(1.0 / n as f32);
+            let hit = match self.place(s, c, angle) {
+                Ok(()) => {
+                    s.c = c;
+                    s.angle = angle;
+                    continue;
                 }
-                None => ((s.c.0 + s.v.0 / n as f32, s.c.1 + s.v.1 / n as f32), s.angle + s.spin / n as f32),
+                Err(hit) => hit,
             };
+            if hit.soft {
+                // Into a liquid: it floats or sinks as a plain falling piece.
+                self.land(s, true);
+                return false;
+            }
+            // It hit something firm: from now on it is a free body, and the hit pushes it back
+            // at the point of contact, which turns it about its centre of mass.
+            if s.hinge.is_some() {
+                s.v = s.velocity_at(s.c);
+                s.hinge = None;
+            }
+            touched = true;
+            match self.collide(s, &hit) {
+                None => return false,
+                Some(slip) => slipping |= slip,
+            }
+            // What is left of the step, with the new velocity: it slides or rolls on along the
+            // surface. Should that run into something too, it waits for the next step.
+            let (c, angle) = s.pose_after(1.0 / n as f32);
             match self.place(s, c, angle) {
                 Ok(()) => {
                     s.c = c;
                     s.angle = angle;
                 }
-                Err(soft) => {
-                    self.land(s, soft);
-                    return false;
-                }
+                Err(_) => break,
             }
         }
-        !s.drawn.is_empty()
+        if s.drawn.is_empty() {
+            return false;
+        }
+        if touched {
+            s.contact = s.contact.saturating_add(1);
+            let fastest = (s.v.0 * s.v.0 + s.v.1 * s.v.1).sqrt() + s.spin.abs() * s.reach;
+            s.rest = if fastest < SETTLE && !slipping { s.rest + 1 } else { 0 };
+            if s.rest >= REST_STEPS || s.contact >= MAX_CONTACT {
+                // At rest: its cells stay where they are, and the statics take it from there (if
+                // its centre of mass is not over what it rests on, it tips over again). Nearly
+                // square to the grid, it settles square (a turned body loses its straight edges).
+                let square = (s.angle / FRAC_PI_2).round() * FRAC_PI_2;
+                if (s.angle - square).abs() < 0.06 && self.place(s, s.c, square).is_ok() {
+                    s.angle = square;
+                }
+                self.land(s, false);
+                return false;
+            }
+        } else {
+            s.rest = 0;
+        }
+        true
     }
 
-    /// Draws the body at a new pose, unless that runs into something: then Err, with true if all
-    /// it ran into is liquid.
-    fn place(&mut self, s: &mut Slab, c: (f32, f32), angle: f32) -> Result<(), bool> {
+    /// A body hit something firm (`hit`). If the blow is hard enough it breaks (see
+    /// `fracture`; None); otherwise the impulses of the contacts change its velocity and its
+    /// spin, as for any rigid body: along the normal they push it back, so that no point of
+    /// contact goes on into the surface, and bounce it as much as its matter bounces; friction,
+    /// at most μ times that, brakes the points of contact along the surface. A body touching on
+    /// a corner off its centre of mass is turned by it. Returns whether it slips (friction could
+    /// not hold it).
+    fn collide(&mut self, s: &mut Slab, hit: &Hit) -> Option<bool> {
+        let ms = ms_per_cell_step();
+        let cross = |a: (f32, f32), b: (f32, f32)| a.0 * b.1 - a.1 * b.0;
+        let dot = |a: (f32, f32), b: (f32, f32)| a.0 * b.0 + a.1 * b.1;
+        // The hardest blow, and where.
+        let (mut worst, mut at, mut n) = (0.0f32, hit.points[0].0, hit.points[0].1);
+        for &(p, pn) in &hit.points {
+            let vn = -dot(s.velocity_at(p), pn);
+            if vn > worst {
+                (worst, at, n) = (vn, p, pn);
+            }
+        }
+        if worst * ms > 2.0 && self.thuds.len() < 8 {
+            self.thuds.push((at.0 as i32, at.1 as i32, (worst * ms / 3.0).min(4.0)));
+        }
+        // How hard each part hits: the speed it brings into the surface.
+        if worst * ms > 0.3 && s.parts.iter().any(|p| rubble(p.cell.m).is_some()) {
+            let cells: Vec<usize> = s.drawn.iter().map(|d| d.0).collect();
+            let vel: Vec<(f32, f32)> = cells.iter().map(|&i| {
+                let v = s.velocity_at(((i % W) as f32 + 0.5, (i / W) as f32 + 0.5));
+                let into = dot(v, n).min(0.0) * ms;
+                (into * n.0, into * n.1)
+            }).collect();
+            if let Some(pieces) = self.fracture(&cells, &vel) {
+                let drawn: HashSet<u32> = s.drawn.iter().map(|d| d.1).collect();
+                self.fill_in(s, &drawn);
+                self.fly_apart(s, pieces, n);
+                return None;
+            }
+        }
+        // A slow touch does not bounce (else a body at rest would hop under its own weight).
+        let e = if worst > 3.0 * FALL { (restitution(s.parts[0].cell.m) + restitution(hit.m)) / 2.0 } else { 0.0 };
+        struct Contact {
+            r: (f32, f32),
+            n: (f32, f32),
+            t: (f32, f32),
+            /// Speed along the normal it must leave with, and the impulses so far.
+            goal: f32,
+            jn: f32,
+            jt: f32,
+        }
+        let mut contacts: Vec<Contact> = hit.points.iter().map(|&(p, n)| {
+            let vn = dot(s.velocity_at(p), n);
+            Contact { r: (p.0 - s.c.0, p.1 - s.c.1), n, t: (-n.1, n.0), goal: (-e * vn).max(0.0), jn: 0.0, jt: 0.0 }
+        }).collect();
+        let push = |s: &mut Slab, r: (f32, f32), j: (f32, f32)| {
+            s.v.0 += j.0 / s.mass;
+            s.v.1 += j.1 / s.mass;
+            s.spin += cross(r, j) / s.inertia;
+        };
+        let at = |s: &Slab, r: (f32, f32)| (s.v.0 - s.spin * r.1, s.v.1 + s.spin * r.0);
+        // Impulses one contact after the other, again and again: each one only ever pushes (its
+        // total stays ≥ 0), and its friction stays within the cone.
+        for _ in 0..8 {
+            for k in &mut contacts {
+                let rn = cross(k.r, k.n);
+                let dj = (k.goal - dot(at(s, k.r), k.n)) / (1.0 / s.mass + rn * rn / s.inertia);
+                let jn = (k.jn + dj).max(0.0);
+                let dj = jn - k.jn;
+                k.jn = jn;
+                push(s, k.r, (dj * k.n.0, dj * k.n.1));
+                let rt = cross(k.r, k.t);
+                let dj = -dot(at(s, k.r), k.t) / (1.0 / s.mass + rt * rt / s.inertia);
+                let limit = FRICTION * k.jn;
+                let jt = (k.jt + dj).clamp(-limit, limit);
+                let dj = jt - k.jt;
+                k.jt = jt;
+                push(s, k.r, (dj * k.t.0, dj * k.t.1));
+            }
+        }
+        let slipping = contacts.iter().any(|k| {
+            let vt = dot(at(s, k.r), k.t);
+            k.jn > 0.0 && vt.abs() > 0.01
+        });
+        Some(slipping)
+    }
+
+    /// Draws the body at a new pose, unless that runs into something: then Err, with what it ran
+    /// into.
+    fn place(&mut self, s: &mut Slab, c: (f32, f32), angle: f32) -> Result<(), Hit> {
         let (sn, cs) = angle.sin_cos();
         // (Sorted, not hashed: the cells are then always looked at in the same order, and the
         // same throw lands the same way every time.)
         let mut around: Vec<usize> = Vec::with_capacity(s.parts.len() * 3);
+        let mut walls = vec![];
         for p in &s.parts {
             let d = (p.x as f32 + 0.5 - s.c0.0, p.y as f32 + 0.5 - s.c0.1);
             let (x, y) = ((c.0 + d.0 * cs - d.1 * sn).floor() as i32, (c.1 + d.0 * sn + d.1 * cs).floor() as i32);
+            // The base of the world is ground and its sides are walls (the sky is open).
+            if y >= H as i32 {
+                walls.push(((x as f32 + 0.5, H as f32), (0.0, -1.0)));
+            } else if x < 0 && y >= 0 {
+                walls.push(((0.0, y as f32 + 0.5), (1.0, 0.0)));
+            } else if x >= W as i32 && y >= 0 {
+                walls.push(((W as f32, y as f32 + 0.5), (-1.0, 0.0)));
+            }
             for (tx, ty) in [(x, y), (x + 1, y), (x, y + 1)] {
                 if Self::inb(tx, ty) {
                     around.push(Self::idx(tx, ty));
@@ -778,7 +998,7 @@ impl World {
         let mut drawn = Vec::with_capacity(s.parts.len());
         let mut crushed = vec![];
         let mut soft = true;
-        let mut blocked = false;
+        let mut hits: Vec<usize> = vec![];
         for &t in &around {
             // Which part of the body covers the centre of this cell, if any.
             let q = ((t % W) as f32 + 0.5 - c.0, (t / W) as f32 + 0.5 - c.1);
@@ -800,13 +1020,17 @@ impl World {
                     continue;
                 }
             }
-            blocked = true;
+            hits.push(t);
             if self.mask[t] != 0 || self.cells[t].m.kind() != Kind::Liquid {
                 soft = false;
             }
         }
-        if blocked {
-            return Err(soft);
+        if !hits.is_empty() || !walls.is_empty() {
+            let mut hit = if hits.is_empty() { Hit { soft: false, points: vec![], m: Mat::Stone } } else { self.hit(&hits, &own, soft, s.v) };
+            hit.soft &= walls.is_empty();
+            let every = walls.len().div_ceil(MAX_POINTS).max(1);
+            hit.points.extend(walls.into_iter().step_by(every));
+            return Err(hit);
         }
         // What the body leaves is filled with the air (or smoke, or flames) it pushes aside.
         let now: HashSet<usize> = drawn.iter().map(|d| d.0).collect();
@@ -856,8 +1080,8 @@ impl World {
         Ok(())
     }
 
-    /// The body hit something. In a liquid it goes on as a plain falling piece (it floats or
-    /// sinks); on anything firmer it breaks, or not, by how hard each part hits.
+    /// The body's flight is over: at rest, its cells stay where they are; in a liquid
+    /// (`soft`) it goes on as a plain falling piece (it floats or sinks).
     fn land(&mut self, s: &Slab, soft: bool) {
         // What was crushed at its foot crumbles there.
         let drawn: HashSet<u32> = s.drawn.iter().map(|d| d.1).collect();
@@ -867,36 +1091,87 @@ impl World {
                 self.ejecta.push(Ejecta { x: p.0, y: p.1 - 1.5, vx: 0.0, vy: -0.2, m: rubble(m).unwrap_or(m) });
             }
         }
+        if s.drawn.is_empty() {
+            return;
+        }
+        if !soft {
+            self.fill_in(s, &drawn);
+            return;
+        }
         let cells: Vec<usize> = s.drawn.iter().map(|d| d.0).collect();
-        if cells.is_empty() {
-            return;
+        let density = cells.iter().map(|&i| density(self.cells[i].m)).sum::<f32>() / cells.len() as f32;
+        let vy = (s.velocity_at(s.c).1 * 2.0).clamp(0.0, 3.0);
+        self.falling.push(Piece { cells, vy, fallen: 0.0, density });
+    }
+
+    /// A turned body covers the grid with a cell or two fewer than it has (two parts fall on the
+    /// same cell): at rest, those parts take the free cell nearest where they would be.
+    fn fill_in(&mut self, s: &Slab, drawn: &HashSet<u32>) {
+        let crushed: HashSet<u32> = s.crushed.iter().map(|c| c.0).collect();
+        let (sn, cs) = s.angle.sin_cos();
+        let frame = self.frame;
+        for (k, p) in s.parts.iter().enumerate() {
+            let k = k as u32;
+            if drawn.contains(&k) || crushed.contains(&k) {
+                continue;
+            }
+            let d = (p.x as f32 + 0.5 - s.c0.0, p.y as f32 + 0.5 - s.c0.1);
+            let (x, y) = ((s.c.0 + d.0 * cs - d.1 * sn).floor() as i32, (s.c.1 + d.0 * sn + d.1 * cs).floor() as i32);
+            let free = |w: &World, (x, y): (i32, i32)| Self::inb(x, y) && w.mask[Self::idx(x, y)] == 0 && free_for_slab(w.cells[Self::idx(x, y)].m);
+            let Some(t) = (0..=3).flat_map(|r| (-r..=r).flat_map(move |dy| (-r..=r).map(move |dx| (x + dx, y + dy)))).find(|&c| free(self, c)) else { continue };
+            let i = Self::idx(t.0, t.1);
+            self.cells[i] = Cell { stamp: frame, ..p.cell };
+            self.temp[i] = p.temp;
+            self.put_states(i, p.states);
+            self.zones.wake(i);
         }
-        if soft {
-            let density = cells.iter().map(|&i| density(self.cells[i].m)).sum::<f32>() / cells.len() as f32;
-            let vy = (s.velocity_at(s.c).1 * 2.0).clamp(0.0, 3.0);
-            self.falling.push(Piece { cells, vy, fallen: 0.0, density });
-            return;
-        }
-        let ms = ms_per_cell_step();
-        let vel: Vec<(f32, f32)> = cells.iter().map(|&i| {
-            let v = s.velocity_at(((i % W) as f32 + 0.5, (i / W) as f32 + 0.5));
-            (v.0 * ms, v.1 * ms)
+    }
+
+    /// Where the body touches the cells `hits` it ran into (`own`: the cells it covers now),
+    /// and which way the surface faces there: away from the firm cells around each of them.
+    fn hit(&self, hits: &[usize], own: &HashSet<usize>, soft: bool, v: (f32, f32)) -> Hit {
+        let firm = |u: usize| !own.contains(&u) && (self.mask[u] != 0 || !free_for_slab(self.cells[u].m));
+        let m = hits.iter().map(|&t| self.cells[t].m).find(|m| m.kind() == Kind::Static).unwrap_or(self.cells[hits[0]].m);
+        let every = hits.len().div_ceil(MAX_POINTS);
+        let points = hits.iter().step_by(every).map(|&t| {
+            let (x, y) = ((t % W) as i32, (t / W) as i32);
+            let (mut nx, mut ny) = (0.0f32, 0.0f32);
+            for dy in -2..=2 {
+                for dx in -2..=2 {
+                    let (ux, uy) = (x + dx, y + dy);
+                    // The edges of the world are walls, its floor is the ground.
+                    if !Self::inb(ux, uy) || firm(Self::idx(ux, uy)) {
+                        nx -= dx as f32;
+                        ny -= dy as f32;
+                    }
+                }
+            }
+            let l = (nx * nx + ny * ny).sqrt();
+            let n = if l > 1e-3 {
+                (nx / l, ny / l)
+            } else {
+                // Nothing to tell which way it faces (in a crack): straight against the motion.
+                let l = (v.0 * v.0 + v.1 * v.1).sqrt().max(1e-6);
+                (-v.0 / l, -v.1 / l)
+            };
+            ((x as f32 + 0.5, y as f32 + 0.5), n)
         }).collect();
-        let hardest = vel.iter().map(|v| (v.0 * v.0 + v.1 * v.1).sqrt()).fold(0.0f32, f32::max);
-        if self.thuds.len() < 8 && hardest > 2.0 {
-            let c = (s.c.0 as i32, s.c.1 as i32);
-            self.thuds.push((c.0, c.1, (hardest / 3.0).min(4.0)));
-        }
-        // The pieces fly on with what is left of their speed; those that were the ones to hit
-        // hit again at once, softer, and settle or break further.
-        let Some(pieces) = self.fracture(&cells, &vel) else { return };
-        let at: HashMap<usize, usize> = cells.iter().enumerate().map(|(k, &i)| (i, k)).collect();
+        Hit { soft, points, m }
+    }
+
+    /// The body broke into `pieces` when it hit a surface facing `n`: they fly on with what is
+    /// left of their speed, bounced off it, and those that hit again break further or settle.
+    fn fly_apart(&mut self, s: &Slab, pieces: Vec<Vec<usize>>, n: (f32, f32)) {
         for piece in pieces {
             if piece.len() < 3 {
                 continue;
             }
-            let v = piece.iter().fold((0.0, 0.0), |a, i| (a.0 + vel[at[i]].0, a.1 + vel[at[i]].1));
-            let v = (v.0 / piece.len() as f32 / ms * 0.6, v.1 / piece.len() as f32 / ms * 0.6);
+            let k = piece.len() as f32;
+            let c = piece.iter().fold((0.0, 0.0), |a, &i| (a.0 + (i % W) as f32 + 0.5, a.1 + (i / W) as f32 + 0.5));
+            let v = s.velocity_at((c.0 / k, c.1 / k));
+            let vn = (v.0 * n.0 + v.1 * n.1).min(0.0);
+            // The part along the surface is braked, the part into it bounces back a little.
+            let v = ((v.0 - vn * n.0) * 0.6 - 0.3 * vn * n.0, (v.1 - vn * n.1) * 0.6 - 0.3 * vn * n.1);
             self.loosen(piece, None, v, s.spin * 0.6);
         }
     }
@@ -1167,5 +1442,225 @@ mod tests {
         // A 10 x 4 plate: I = m (a² + b²) / 12.
         let plate = s.mass * (100.0 + 16.0) / 12.0;
         assert!((s.inertia - plate).abs() / plate < 1e-3, "{} vs {plate}", s.inertia);
+    }
+
+    /// Kinetic energy of a body, Σ ½mv² + ½Iω².
+    fn energy(s: &Slab) -> f32 {
+        0.5 * s.mass * (s.v.0 * s.v.0 + s.v.1 * s.v.1) + 0.5 * s.inertia * s.spin * s.spin
+    }
+
+    /// Cells of matter `m` in the world.
+    fn cells_of(w: &World, m: Mat) -> Vec<(i32, i32)> {
+        (0..W * H).filter(|&i| w.cells[i].m == m).map(|i| ((i % W) as i32, (i / W) as i32)).collect()
+    }
+
+    #[test]
+    fn a_hit_off_the_centre_of_mass_turns_a_body_and_makes_no_energy() {
+        let mut w = world(450);
+        for x in 100..120 {
+            for y in 300..306 {
+                w.set(x, y, Mat::Wood);
+            }
+        }
+        let cells: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Wood).collect();
+        w.loosen(cells, None, (0.0, 2.0), 0.0);
+        let mut s = w.slabs.pop().unwrap();
+        let before = energy(&s);
+        // It comes down on its right-hand corner, onto flat ground.
+        let hit = Hit { soft: false, points: vec![((119.5, 306.0), (0.0, -1.0))], m: Mat::Stone };
+        assert!(w.collide(&mut s, &hit).is_some(), "wood does not break");
+        assert!(s.v.1 < 2.0, "the ground pushed it back: {:?}", s.v);
+        assert!(s.spin < -0.01, "pushed up at its right end, it turns anticlockwise: {}", s.spin);
+        assert!(energy(&s) <= before, "a hit loses energy, it never makes any: {} > {before}", energy(&s));
+        // Straight under its centre, the same blow does not turn it.
+        let mut s2 = { let mut w = world(450); for x in 100..120 { for y in 300..306 { w.set(x, y, Mat::Wood); } } let cells: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Wood).collect(); w.loosen(cells, None, (0.0, 2.0), 0.0); w.slabs.pop().unwrap() };
+        let mid = Hit { soft: false, points: vec![((s2.c.0, 306.0), (0.0, -1.0))], m: Mat::Stone };
+        w.collide(&mut s2, &mid);
+        assert!(s2.spin.abs() < 1e-4, "{}", s2.spin);
+        // The momentum it gave the ground is what it lost: Δp = J, along the normal.
+        assert!(s2.v.0.abs() < 1e-4 && s2.v.1 <= 0.0, "it bounces straight back: {:?}", s2.v);
+    }
+
+    #[test]
+    fn a_plank_dropped_onto_the_edge_of_a_ledge_turns_off_it() {
+        let mut w = world(450);
+        // A pedestal of stone (one body with the ground), and a plank of wood in the air above
+        // its right-hand edge, three quarters of it beyond the edge.
+        for x in 200..260 {
+            for y in 400..450 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for x in 250..290 {
+            for y in 340..344 {
+                w.set(x, y, Mat::Wood);
+            }
+        }
+        let mut turned = 0.0f32;
+        for _ in 0..900 {
+            w.step();
+            for s in &w.slabs {
+                turned = turned.max(s.angle.abs());
+            }
+        }
+        assert!(turned > 0.5, "it turned about the edge as it fell: {turned} rad");
+        let wood = cells_of(&w, Mat::Wood);
+        assert_eq!(wood.len(), 160, "nothing is lost");
+        assert!(wood.iter().all(|c| c.0 >= 255 && c.1 > 400), "it fell off beside the ledge: {:?}", &wood[..4]);
+        assert!(w.slabs.is_empty(), "and came to rest");
+    }
+
+    #[test]
+    fn a_block_thrown_sideways_slides_and_stops() {
+        let mut w = world(450);
+        // A crate of wood on the ground, pushed along it.
+        for x in 100..112 {
+            for y in 440..450 {
+                w.set(x, y, Mat::Wood);
+            }
+        }
+        let cells: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Wood).collect();
+        w.loosen(cells, None, (1.5, 0.0), 0.0);
+        run(&mut w, 600);
+        assert!(w.slabs.is_empty(), "it came to rest");
+        let wood = cells_of(&w, Mat::Wood);
+        assert_eq!(wood.len(), 120);
+        // Friction brakes it at μg: it slides v² / 2μg, some 17 cells.
+        let x = wood.iter().map(|c| c.0).sum::<i32>() as f32 / 120.0 + 0.5;
+        assert!(x > 116.0, "it carried on along the ground: centre at {x}");
+        assert!(x < 140.0, "but friction stopped it: centre at {x}");
+        assert!(wood.iter().any(|c| c.1 == 449), "it lies on the ground");
+    }
+
+    #[test]
+    fn a_block_falling_on_its_corner_comes_to_rest_on_a_face() {
+        let mut w = world(450);
+        for x in 300..316 {
+            for y in 300..310 {
+                w.set(x, y, Mat::Wood);
+            }
+        }
+        let cells: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Wood).collect();
+        // Spinning as it falls: it lands on a corner.
+        w.loosen(cells, None, (0.0, 0.0), 0.02);
+        let mut spun = false;
+        for _ in 0..900 {
+            w.step();
+            spun |= w.slabs.iter().any(|s| s.angle.abs() > 0.3);
+        }
+        assert!(spun);
+        assert!(w.slabs.is_empty(), "it came to rest");
+        // Flat on the ground: the bottom row is nearly full, and it stands no higher than its
+        // long side.
+        let wood = cells_of(&w, Mat::Wood);
+        let bottom = wood.iter().filter(|c| c.1 == 449).count();
+        let top = wood.iter().map(|c| c.1).min().unwrap();
+        assert!(bottom >= 8, "it lies on a face: {bottom} cells on the ground");
+        assert!(top >= 449 - 17, "it does not stand on a corner: top at {top}");
+    }
+
+    #[test]
+    fn a_round_stone_rolls_down_a_slope() {
+        let mut w = world(450);
+        // A slope going down to the right, one cell in three.
+        for x in 0..600 {
+            for y in (250 + x / 3)..450 {
+                w.set(x, y, Mat::Glass);
+            }
+        }
+        // A round boulder of rock resting on it.
+        let (cx, cy, r) = (100i32, 274i32, 7i32);
+        for x in cx - r..=cx + r {
+            for y in cy - r..=cy + r {
+                if (x - cx).pow(2) + (y - cy).pow(2) <= r * r && w.raw(x, y) == Mat::Empty {
+                    w.set(x, y, Mat::Stone);
+                }
+            }
+        }
+        let mut spin = 0.0f32;
+        for _ in 0..400 {
+            w.step();
+            for s in &w.slabs {
+                spin = spin.max(s.spin);
+            }
+        }
+        let stone: Vec<(i32, i32)> = cells_of(&w, Mat::Stone).into_iter().filter(|c| c.1 < 449).collect();
+        let x = stone.iter().map(|c| c.0).sum::<i32>() as f32 / stone.len().max(1) as f32;
+        assert!(spin > 0.02, "it turned clockwise, rolling to the right: {spin}");
+        assert!(x > 130.0, "it went down the slope: centre at {x}");
+    }
+}
+
+#[cfg(test)]
+mod snapshots {
+    use super::*;
+
+    /// Writes frames of three scenes as text (AWORLD_SNAP=dir), for pictures.
+    #[test]
+    #[ignore]
+    fn snapshot_tumbling() {
+        let Ok(dir) = std::env::var("AWORLD_SNAP") else { return };
+        let mut w = World::new();
+        w.day_cycle = false;
+        w.climate_fixed = Some(-5.0);
+        w.reset_temps();
+        for x in 0..W as i32 {
+            for y in 450..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        // A ledge and a plank above its edge.
+        for x in 60..120 {
+            for y in 400..450 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for x in 110..150 {
+            for y in 340..344 {
+                w.set(x, y, Mat::Wood);
+            }
+        }
+        // A crate falling on its corner.
+        for x in 300..316 {
+            for y in 330..340 {
+                w.set(x, y, Mat::Wood);
+            }
+        }
+        let cells: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Wood && i % W >= 300 && i % W < 316).collect();
+        w.loosen(cells, None, (0.4, 0.0), 0.03);
+        // A slope and a round boulder.
+        for x in 420..700 {
+            for y in (330 + (x - 420) / 3)..450 {
+                w.set(x, y, Mat::Glass);
+            }
+        }
+        let (cx, cy, r) = (440i32, 318i32, 7i32);
+        for x in cx - r..=cx + r {
+            for y in cy - r..=cy + r {
+                if (x - cx).pow(2) + (y - cy).pow(2) <= r * r && w.raw(x, y) == Mat::Empty {
+                    w.set(x, y, Mat::Stone);
+                }
+            }
+        }
+        // Ground stone and boulder stone are told apart by height in the picture.
+        for k in 0..=300 {
+            if k % 10 == 0 {
+                let mut out = String::new();
+                for y in 280..460 {
+                    for x in 40..720 {
+                        out.push(match w.raw(x, y) {
+                            Mat::Empty => '.',
+                            Mat::Wood => 'w',
+                            Mat::Glass => 'g',
+                            Mat::Stone => 's',
+                            _ => 'o',
+                        });
+                    }
+                    out.push('\n');
+                }
+                std::fs::write(format!("{dir}/f{k:04}.txt"), out).unwrap();
+            }
+            w.step();
+        }
     }
 }

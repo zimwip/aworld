@@ -257,7 +257,6 @@ pub enum RenderMode {
     Humidity = 3,
     Electric = 4,
     Stress = 5,
-    Simulation = 6,
 }
 
 // Lightning: each segment of a bolt is a quad whose texcoord y runs from -1 to 1 across it. A thin
@@ -676,9 +675,6 @@ impl Renderer {
                 RenderMode::Stress => {
                     Self::fill(&mut self.image, |x, y| stress_color(world, x, y));
                 }
-                RenderMode::Simulation => {
-                    Self::fill(&mut self.image, |x, y| simulation_color(world, x, y));
-                }
                 RenderMode::Normal => {
                     // Only the zones that changed, plus one row of zones in turn for the slow
                     // changes (temperature tints) that do not wake a zone.
@@ -1051,32 +1047,6 @@ fn stress_color(world: &World, x: usize, y: usize) -> [u8; 4] {
     let a = c[3] as f32 / 255.0;
     let mix = |k: f32, base: u8| ((k * 255.0 * 0.75 + base as f32 * 0.25) * a) as u8;
     [mix(r, c[0]), mix(g, c[1]), mix(b, c[2]), c[3]]
-}
-
-/// The simulation view of a cell: what the liquids' physics makes of it. Full liquid in blue,
-/// a film or spray in light blue, a lone drop left to the cells in yellow, a wall (a solid, or
-/// a gas in the open) in grey, the rest dim; a cell whose zone sleeps is darker still.
-fn simulation_color(world: &World, x: usize, y: usize) -> [u8; 4] {
-    use crate::world::liquid_class::{AIR, FULLISH, WET};
-    let c = world.color(x, y);
-    let Some(class) = world.liquid_class(x, y) else {
-        return [c[0] / 3, c[1] / 3, c[2] / 3, c[3]];
-    };
-    let runs = class & 4 != 0;
-    let m = world.cell_mat(x, y);
-    let col: [u8; 4] = match class & 3 {
-        FULLISH => [40, 96, 230, 255],
-        WET => [130, 200, 245, 220],
-        AIR if m.kind() == Kind::Liquid => [245, 220, 70, 255],
-        AIR => [0, 0, 0, 0],
-        _ if m == Mat::Empty || m.kind() == Kind::Gas => [96, 84, 60, 160],
-        _ => [c[0] / 3 + 40, c[1] / 3 + 40, c[2] / 3 + 44, 255],
-    };
-    if runs || class & 3 < WET {
-        col
-    } else {
-        [col[0] / 2, col[1] / 2, col[2] / 2, col[3]]
-    }
 }
 
 /// Green (relaxed) through yellow to red (about to break).

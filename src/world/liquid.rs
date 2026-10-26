@@ -154,6 +154,8 @@ pub struct Liquids {
     /// The fastest edge at the end of the last step, m/s (the card's turn keeps it to choose
     /// its sub-steps without a look at its grids).
     pub(super) fastest: f32,
+    /// In a picture of the world (see `World::copy_picture`), the rows the card worked on.
+    pub(super) card_rows: Option<(usize, usize)>,
 }
 
 /// A drop of liquid thrown off a body (spray, a splash): it flies off the grid, under gravity
@@ -181,6 +183,7 @@ impl Liquids {
         self.p.clone_from(&from.p);
         self.class.clone_from(&from.class);
         self.drops.clone_from(&from.drops);
+        self.card_rows = from.card.as_ref().and_then(|c| c.as_ref()).and_then(|c| c.rows()).or(from.card_rows);
     }
 
     fn ready(&mut self) {
@@ -364,7 +367,7 @@ impl World {
     /// The rows the card works on (the band of the last step given to it), when the liquids
     /// run on a card.
     pub fn liquid_card_rows(&self) -> Option<(usize, usize)> {
-        self.liq.card.as_ref().and_then(|c| c.as_ref()).and_then(|c| c.rows())
+        self.liq.card.as_ref().and_then(|c| c.as_ref()).and_then(|c| c.rows()).or(self.liq.card_rows)
     }
 
     /// Units of water in the cells and the drops (the mass audit, `AWORLD_DEBUG_MASS`).
