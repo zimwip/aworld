@@ -2706,7 +2706,8 @@ impl Game {
             self.draw_science(ui, sw, sh);
         }
         self.fps.frame();
-        self.fps.draw(ui, sw, sh);
+        let target = self.running.then(|| STEPS_PER_SECOND * self.speed as f32);
+        self.fps.draw(ui, sw, sh, target);
         if self.quit_modal {
             ui.muted = false;
             ui.layer("quit");
@@ -2799,7 +2800,18 @@ impl Game {
             self.speed -= 1;
         }
         let r = place(4, &mut x);
-        ui.text_center(&format!("x{}", self.speed), r.x + r.w / 2.0, r.y + h / 2.0 + 6.0, 17, TEXT);
+        // Each step is 1/60 s of the world's time: a machine that cannot take 60 steps a second
+        // (times the speed) runs the world in slow motion, and says so here.
+        let target = STEPS_PER_SECOND * self.speed as f32;
+        let slow = if self.running { self.fps.slow_motion(target) } else { None };
+        let colour = if slow.is_some() { Color::new(1.0, 0.78, 0.25, 1.0) } else { TEXT };
+        ui.text_center(&format!("x{}", self.speed), r.x + r.w / 2.0, r.y + h / 2.0 + 6.0, 17, colour);
+        if let (Some(k), true) = (slow, ui.hover(r)) {
+            self.hover_info = Some((
+                format!("Ralenti : temps ×{}", fps::decimal(k)),
+                format!("La machine ne fait que {:.0} pas par seconde sur les {target:.0} demandés : chaque pas vaut 1/60 s du monde, qui avance donc à ×{} du temps réel. La physique reste la même, seulement plus lente. Baisse la vitesse, ou laisse le jeu simplifier le calcul.", k * STEPS_PER_SECOND, fps::decimal(k)),
+            ));
+        }
         let r = place(5, &mut x);
         if ui.button(r, "", Icon::Plus, false, self.speed < 6, ACCENT) {
             self.speed += 1;

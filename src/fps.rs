@@ -63,15 +63,27 @@ impl Fps {
         }
     }
 
-    pub fn draw(&self, ui: &Ui, sw: f32, sh: f32) {
+    /// How fast the world really goes against the real time when the machine cannot keep up with
+    /// `target` steps a second (each step is 1/60 s of the world's time, whatever the machine):
+    /// 0.53 is a world in slow motion at 53 %. None while it keeps up, or is paused.
+    pub fn slow_motion(&self, target: f32) -> Option<f32> {
+        self.step_ms?;
+        (self.pps < target * 0.9).then(|| self.pps / crate::STEPS_PER_SECOND)
+    }
+
+    /// `target`: the steps a second the world should take (60 times the speed), None in pause.
+    pub fn draw(&self, ui: &Ui, sw: f32, sh: f32, target: Option<f32>) {
         if !self.shown {
             return;
         }
         let fps = format!("{:.0} FPS", self.fps);
-        let step = match self.step_ms {
+        let mut step = match self.step_ms {
             Some(ms) => format!("{:.0} PPS · {ms:.1} ms/pas", self.pps),
             None => "monde en pause".to_string(),
         };
+        if let Some(k) = target.and_then(|t| self.slow_motion(t)) {
+            step += &format!(" · temps ×{}", decimal(k));
+        }
         let size = 15;
         let (wf, ws) = (ui.text_w(&fps, size), ui.text_w(&step, size));
         let w = wf + ws + 36.0;
@@ -87,4 +99,9 @@ impl Fps {
         ui.text(&fps, r.x + 10.0, r.y + 16.0, size, colour);
         ui.text(&step, r.x + wf + 26.0, r.y + 16.0, size, DIM);
     }
+}
+
+/// A number with one decimal, the French way (0,5).
+pub fn decimal(x: f32) -> String {
+    format!("{x:.1}").replace('.', ",")
 }
