@@ -1413,6 +1413,9 @@ impl World {
         }
         self.cells[ia].stamp = self.frame;
         self.cells[ib].stamp = self.frame;
+        if self.later.is_some() && self.cells[ib].m.kind() == Kind::Powder && matches!(self.cells[ia].m.kind(), Kind::Empty | Kind::Gas) {
+            self.left_hole(a.0, a.1);
+        }
     }
 
     /// Swaps the matter of cells `i` and `j` with every state it carries (see `Aspect`).
@@ -3890,8 +3893,10 @@ impl World {
                             if piece.density >= density(self.cells[target].m) {
                                 true
                             } else {
+                                // (A drop caught in a notch of the piece rests on the piece
+                                // itself: it comes down with it.)
                                 let under = target + W();
-                                let settled = under >= W() * H() || matches!(self.cells[under].m.kind(), Kind::Liquid | Kind::Static | Kind::Powder);
+                                let settled = under >= W() * H() || (!in_piece(under) && matches!(self.cells[under].m.kind(), Kind::Liquid | Kind::Static | Kind::Powder));
                                 !settled
                             }
                         }
