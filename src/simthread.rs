@@ -5,7 +5,8 @@
 //! into a spare `Game`, the picture, and hands it over; the screen swaps the picture into its own
 //! `Game` and gives the old one back to be filled again. So the screen always has a whole,
 //! steady world to draw, 60 or 144 times a second, however long a step takes: only the steps a
-//! second (PPS) drop when the world is heavy, not the images a second (FPS).
+//! second (PPS) drop when the world is heavy, not the images a second (FPS). The two clocks are
+//! apart: the world steps on its own time, the screen takes the latest picture when it draws.
 //!
 //! The screen's own part (the camera, the menus, the tool, the sound, the message at the bottom)
 //! never leaves the main thread. When a click, a key or the wheel may change the world, the screen
@@ -104,8 +105,6 @@ impl News {
 }
 
 enum ToSim {
-    /// The screen shows a new image: time for an update of the world.
-    Tick,
     /// The screen needs the real world for this frame.
     Lend,
     /// The world, back from the screen; and an old picture to fill again.
@@ -142,7 +141,14 @@ impl SimThread {
         let spare = Box::new(blank());
         std::thread::Builder::new()
             .name("simulation".into())
-            .spawn(move || Worker { game: Some(sim), spare: Some(spare), rx, tx, lends: 0, dirty: true, ticked: false, last: Instant::now(), busy: 0.016, lent_for: 0.0 }.run())
+            .spawn(move || {
+                // The world's passes run on a pool of their own, one core short of the machine:
+                // in rayon's shared pool the screen's parallel work (the light map) would wait
+                // behind the steps, and the images a second would drop with the steps.
+                let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(cores.saturating_sub(1).max(1)).thread_name(|i| format!("simulation-{i}")).build().expect("simulation pool");
+                pool.install(move || Worker { game: Some(sim), spare: Some(spare), rx, tx, lends: 0, dirty: true, last: Instant::now(), busy: 0.016, lent_for: 0.0 }.run())
+            })
             .expect("simulation thread");
         SimThread { to, from, lends: 0, shown: 0 }
     }
@@ -164,7 +170,6 @@ impl SimThread {
                 }
             }
         }
-        let _ = self.to.send(ToSim::Tick);
         loop {
             let next = if self.shown < self.lends { self.from.recv().ok() } else { self.from.try_recv().ok() };
             match next {
@@ -181,7 +186,6 @@ impl SimThread {
         copy_settings(game, &mut sim);
         self.lends += 1;
         let _ = self.to.send(ToSim::Back(sim));
-        let _ = self.to.send(ToSim::Tick);
     }
 
     fn show(&mut self, game: &mut Game, mut pic: Box<Game>, news: News, n: u64) {
@@ -218,9 +222,8 @@ struct Worker {
     rx: Receiver<ToSim>,
     tx: Sender<ToScreen>,
     lends: u64,
-    /// The world changed since the last picture; an image was asked for since the last update.
+    /// The world changed since the last picture.
     dirty: bool,
-    ticked: bool,
     /// When the last update began, and how long its work took.
     last: Instant,
     busy: f32,
@@ -229,39 +232,53 @@ struct Worker {
 }
 
 impl Worker {
+    /// The world keeps its own time: an update as soon as a step is due (back to back when the
+    /// steps are slower than the clock), whatever the screen is doing, and a picture for the
+    /// screen whenever it has given the last one back.
     fn run(mut self) {
         loop {
-            // Nothing to do until the screen asks for something.
-            if !self.ticked {
-                match self.rx.recv() {
-                    Ok(m) => self.handle(m),
-                    Err(_) => return,
-                }
-            }
-            if !self.poll() || self.game.is_none() {
+            if self.game.is_none() {
                 return;
             }
-            if self.ticked {
-                self.ticked = false;
+            self.publish();
+            // A step that is due goes first: a screen that borrows the world at every frame (a
+            // brush held down) gets it back after one step at least, never before.
+            let wait = (self.last + self.interval()).saturating_duration_since(Instant::now());
+            if wait.is_zero() {
                 self.update();
                 self.dirty = true;
+                continue;
             }
-            if self.dirty {
-                if let Some(mut pic) = self.spare.take() {
-                    let game = self.game.as_mut().expect("the world");
-                    copy_picture(game, &mut pic);
-                    let news = News::take(game);
-                    self.dirty = false;
-                    if self.tx.send(ToScreen::Picture(pic, news, self.lends)).is_err() {
-                        return;
-                    }
-                }
+            match self.rx.recv_timeout(wait) {
+                Ok(m) => self.handle(m),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }
     }
 
-    /// One update of the world, as long as the time since the last one (as the screen's frame
-    /// did on one thread), its steps stopping for a lend when the screen asks. The world is
+    /// How often the world updates: once a step while it runs (60 a second times the speed),
+    /// 60 times a second while paused (the visitors still move).
+    fn interval(&self) -> std::time::Duration {
+        let game = self.game.as_ref().expect("the world");
+        let steps = if game.running { crate::STEPS_PER_SECOND * game.speed.max(1) as f32 } else { crate::STEPS_PER_SECOND };
+        std::time::Duration::from_secs_f32(1.0 / steps)
+    }
+
+    /// A picture of the world as it is now, if it changed and the screen gave a spare back.
+    fn publish(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        let (Some(game), Some(mut pic)) = (self.game.as_mut(), self.spare.take()) else { return };
+        copy_picture(game, &mut pic);
+        let news = News::take(game);
+        self.dirty = false;
+        let _ = self.tx.send(ToScreen::Picture(pic, news, self.lends));
+    }
+
+    /// One update of the world, as long as the time since the last one, its steps stopping for a
+    /// lend when the screen asks. The world is
     /// simplified when the updates themselves are slow, not the screen.
     fn update(&mut self) {
         let dt = self.last.elapsed().as_secs_f32().min(0.05);
@@ -289,9 +306,14 @@ impl Worker {
     }
 
     /// Reads what the screen sent; false once it is gone (the game is closing).
+    /// One lend at most: the world takes its next step before it is lent again.
     fn poll(&mut self) -> bool {
         loop {
             match self.rx.try_recv() {
+                Ok(m @ ToSim::Lend) => {
+                    self.handle(m);
+                    return true;
+                }
                 Ok(m) => self.handle(m),
                 Err(std::sync::mpsc::TryRecvError::Empty) => return true,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
@@ -301,7 +323,6 @@ impl Worker {
 
     fn handle(&mut self, m: ToSim) {
         match m {
-            ToSim::Tick => self.ticked = true,
             ToSim::Recycle(pic) => self.spare = Some(pic),
             ToSim::Back(_) => unreachable!("given back without being lent"),
             ToSim::Lend => {
@@ -311,7 +332,7 @@ impl Worker {
                 if self.tx.send(ToScreen::Lent(game, news)).is_err() {
                     return;
                 }
-                // Wait for it (the screen may tick and recycle meanwhile).
+                // Wait for it (the screen may recycle a picture meanwhile).
                 while self.game.is_none() {
                     match self.rx.recv() {
                         Ok(ToSim::Back(game)) => self.game = Some(game),
@@ -322,6 +343,8 @@ impl Worker {
                 self.lends += 1;
                 self.dirty = true;
                 self.lent_for += since.elapsed().as_secs_f32();
+                // The screen waits for a picture with its edits: it goes before the next step.
+                self.publish();
             }
         }
     }
@@ -388,5 +411,41 @@ mod bench {
         }
         let step = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
         println!("picture {copy:.2} ms, step {step:.2} ms");
+    }
+}
+
+#[cfg(test)]
+mod frame_bench {
+    use super::*;
+
+    /// `cargo test --release frame_cost -- --ignored --nocapture`: the screen's parallel work while
+    /// the world runs in its thread; with `PAINT=1`, every frame borrows the world (a brush held
+    /// down) and the world must still step.
+    #[test]
+    #[ignore]
+    fn frame_cost() {
+        let mut g = Game::new();
+        g.set_running(true);
+        g.speed = 2;
+        let mut sim = SimThread::start(&mut g);
+        let mut buf = vec![[0u8; 4]; crate::render::LW * crate::render::LH];
+        let t = Instant::now();
+        let n = 300;
+        let mut worst = 0.0f64;
+        let paint = std::env::var_os("PAINT").is_some();
+        for _ in 0..n {
+            let f = Instant::now();
+            // Painting: every frame borrows the world.
+            if let Some(lent) = sim.frame(&mut g, paint) {
+                g.world.paint(480, 100, 4, crate::Mat::Water);
+                crate::render::light_map(&g.world, &mut buf);
+                sim.give_back(&mut g, lent);
+            } else {
+                crate::render::light_map(&g.world, &mut buf);
+            }
+            worst = worst.max(f.elapsed().as_secs_f64());
+        }
+        let (secs, steps) = g.fps.take_steps();
+        println!("frame {:.2} ms (worst {:.1}), {steps} steps in {:.1} s ({secs:.1} s of steps)", t.elapsed().as_secs_f64() * 1000.0 / n as f64, worst * 1000.0, t.elapsed().as_secs_f64());
     }
 }
