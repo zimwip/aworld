@@ -4,7 +4,8 @@
 //! Nothing here changes the world. Each reading says where it comes from, because the kinds of
 //! matter do not share one model:
 //! - a liquid moving by its physics has a velocity on the edges of its cells (`liquid.rs`), in m/s;
-//!   otherwise, like a grain, it only keeps a falling speed (`vel`, eighths of a cell a step);
+//!   otherwise (particles), like a grain, it only keeps a falling speed (`vel`, eighths of a cell
+//!   a step), or the sideways speed of a jet (`jet`, cells a step) while it flies out of one;
 //! - a grain slides down a heap from cell to cell without any speed: only its fall has one;
 //! - a gas (and a flame) has no velocity of its own: it rides the air's flow (`flow.rs`), 8 × 8
 //!   cells to a flow cell;
@@ -18,6 +19,9 @@ use std::collections::HashMap;
 
 /// Units of liquid in a full cell.
 pub const FULL: u32 = super::field::FULL;
+
+/// A cell, in metres.
+pub const CELL_METRES: f32 = CELL_M;
 
 /// A cell a step, in m/s.
 pub const CELL_STEP_MS: f32 = CELL_M / DT;
@@ -35,6 +39,9 @@ pub enum Source {
     Piece,
     /// A slab tipping over or tumbling.
     Slab,
+    /// A drop of the cells' liquids shot out of a jet (`jet`): it keeps its sideways speed as it
+    /// falls a cell a step.
+    Jet,
 }
 
 impl Source {
@@ -45,6 +52,7 @@ impl Source {
             Source::Wind => "flux de l'air (flow.rs)",
             Source::Piece => "morceau qui tombe",
             Source::Slab => "dalle, corps rigide (statics.rs)",
+            Source::Jet => "jet sous pression (jet, pockets.rs)",
         }
     }
 }
@@ -124,6 +132,12 @@ impl World {
         let i = y * W + x;
         let m = self.cells[i].m;
         let fall = |v: u8| (v != 0).then(|| Motion { vx: 0.0, vy: v as f32 / 8.0 * CELL_STEP_MS, source: Source::Fall });
+        // A drop shot out of a jet flies a cell down and `v` cells sideways a step (see `fly`).
+        let jet = self.jet[i];
+        if m.kind() == Kind::Liquid && jet >= 2 {
+            let v = (jet >> 1) as f32 * if jet & 1 == 1 { 1.0 } else { -1.0 };
+            return Some(Motion { vx: v * CELL_STEP_MS, vy: CELL_STEP_MS, source: Source::Jet });
+        }
         match m.kind() {
             Kind::Liquid if self.liquid_physics => {
                 let class = self.liq.class.get(i)?;
@@ -214,6 +228,17 @@ mod tests {
         assert!((air.vx - 0.5 * CELL_STEP_MS).abs() < 0.01 && air.vy.abs() < 0.01, "{air:?}");
         // The ground stands still.
         assert!(w.cell_motion(50, 300, &solids).is_none());
+    }
+
+    #[test]
+    fn a_drop_out_of_a_jet_keeps_its_sideways_speed() {
+        let mut w = World::new_static();
+        w.set(300, 100, Mat::Water);
+        // Three cells a step to the left.
+        w.jet[100 * W + 300] = 3 << 1;
+        let m = w.cell_motion(300, 100, &HashMap::new()).expect("a flying drop");
+        assert_eq!(m.source, Source::Jet);
+        assert!((m.vx + 3.0 * CELL_STEP_MS).abs() < 1e-3 && (m.vy - CELL_STEP_MS).abs() < 1e-3, "{m:?}");
     }
 
     #[test]

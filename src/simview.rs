@@ -67,6 +67,20 @@ pub enum Back {
     Diff(DiffOf),
 }
 
+/// A particle the game moves besides the world's cells (a piece of a wrecked car, a spark of a
+/// firework): where it is (cells) and its velocity (m/s, down positive).
+pub struct Particle {
+    pub x: f32,
+    pub y: f32,
+    pub vx: f32,
+    pub vy: f32,
+    /// Its place in `PARTICLES`.
+    pub kind: usize,
+}
+
+/// The kinds of `Particle`.
+pub const PARTICLES: [(&str, Color); 2] = [("débris", Color::new(0.95, 0.75, 0.6, 0.9)), ("feux d'artifice", Color::new(1.0, 0.6, 0.9, 0.9))];
+
 /// The kinds of matter, as the velocities are grouped.
 const KINDS: [(&str, Color); 5] = [
     ("liquides", Color::new(0.75, 0.9, 1.0, 1.0)),
@@ -168,6 +182,8 @@ pub struct SimView {
     pub zones: bool,
     pub card: bool,
     pub flying: bool,
+    /// The particles of the game in flight last drawn, by kind (`PARTICLES`).
+    particles: [usize; 2],
     pub velocity: [bool; 5],
     /// Where the panel is (None: its place by default), and the drag that moves it.
     pub pos: Option<Vec2>,
@@ -200,6 +216,7 @@ impl SimView {
             zones: true,
             card: true,
             flying: true,
+            particles: [0; 2],
             velocity: [true, true, false, false, true],
             pos: None,
             drag: None,
@@ -346,7 +363,7 @@ impl SimView {
     }
 
     /// The layers over the background, and the cell under the pointer.
-    pub fn draw_layers(&mut self, w: &World, view: View, ui: &Ui) {
+    pub fn draw_layers(&mut self, w: &World, view: View, ui: &Ui, particles: &[Particle]) {
         let area = view.visible();
         let (a, b) = (view.to_world(vec2(area.x, area.y)), view.to_world(vec2(area.x + area.w, area.y + area.h)));
         let vis = Rect::new(a.x, a.y, b.x - a.x, b.y - a.y);
@@ -392,7 +409,17 @@ impl SimView {
                 arrow(a, vec2(vx, vy) * view.s, col);
                 draw_rectangle(a.x - 2.0, a.y - 2.0, 4.0, 4.0, col);
             }
+            for p in particles {
+                let col = PARTICLES[p.kind].1;
+                let a = view.to_screen(vec2(p.x, p.y));
+                arrow(a, vec2(p.vx, p.vy) * view.s, col);
+                draw_circle_lines(a.x, a.y, 2.5, 1.2, col);
+            }
         }
+        self.particles = particles.iter().fold([0; 2], |mut n, p| {
+            n[p.kind] += 1;
+            n
+        });
         if let Some((x, y)) = self.hover {
             let a = view.to_screen(vec2(x as f32, y as f32));
             draw_rectangle_lines(a.x - 1.0, a.y - 1.0, view.s + 2.0, view.s + 2.0, 1.5, WHITE);
@@ -458,7 +485,7 @@ impl SimView {
         const PW: f32 = 300.0;
         let mut ask = Ask::None;
         let lines = self.readout(w);
-        let h = 30.0 + 84.0 + 20.0 + 8.0 * 22.0 + 30.0 + 20.0 + 3.0 * 22.0 + 50.0 + 58.0 + 14.0 + lines.len() as f32 * 15.0 + 10.0;
+        let h = 30.0 + 98.0 + 20.0 + 8.0 * 22.0 + 30.0 + 20.0 + 3.0 * 22.0 + 50.0 + 58.0 + 14.0 + lines.len() as f32 * 15.0 + 10.0;
         let pos = self.pos.unwrap_or(vec2(sw - 22.0 - PW - 10.0, 52.0));
         let pos = vec2(pos.x.clamp(0.0, (sw - PW).max(0.0)), pos.y.clamp(0.0, (sh - 30.0).max(0.0)));
         let r = Rect::new(pos.x, pos.y, PW, h);
@@ -497,8 +524,10 @@ impl SimView {
         }
         y += 32.0;
         let card = if w.liquid_card_rows().is_some() { " · liquides sur la carte" } else { "" };
-        ui.text(&format!("{} zones tournent · {} gouttes en vol{card}", w.zones.awake_count(), w.liquid_drops().len()), x, y + 10.0, 11, TEXT);
-        y += 14.0;
+        let flying = format!("{} gouttes, {} éclats, {} débris, {} étincelles", w.liquid_drops().len(), w.ejecta_motion().count(), self.particles[0], self.particles[1]);
+        ui.text(&format!("{} zones tournent{card}", w.zones.awake_count()), x, y + 10.0, 11, TEXT);
+        ui.text(&format!("En vol : {flying}"), x, y + 24.0, 11, TEXT);
+        y += 28.0;
         let note = match &self.stats {
             Some(s) => format!("Diff du pas {} au pas {}. Touche point : un pas.", s.from, s.to),
             None => "Un pas met le monde en pause, puis le fond montre ce qu'il a changé. Touche point : un pas.".to_string(),
@@ -544,7 +573,7 @@ impl SimView {
         // The layers.
         ui.text("Couches", x, y + 12.0, 13, ACCENT);
         y += 20.0;
-        for (label, on) in [("Zones éveillées (sleep.rs)", &mut self.zones), ("Gouttes et éclats en vol", &mut self.flying), ("Lignes traitées par la carte", &mut self.card)] {
+        for (label, on) in [("Zones éveillées (sleep.rs)", &mut self.zones), ("Particules en vol (gouttes, éclats, débris…)", &mut self.flying), ("Lignes traitées par la carte", &mut self.card)] {
             if ui.checkbox(Rect::new(x, y, cw, 20.0), label, *on, true) {
                 *on = !*on;
             }
@@ -818,6 +847,7 @@ fn draw_motion(view: View, x: f32, y: f32, m: Motion, col: Color) {
         Source::LiquidGrid => draw_circle(c.x, c.y, 1.2, col),
         Source::Fall => draw_rectangle(c.x - 1.2, c.y - 1.2, 2.4, 2.4, col),
         Source::Wind => draw_circle_lines(c.x, c.y, 2.0, 1.0, col),
+        Source::Jet => draw_triangle(c + vec2(0.0, -2.2), c + vec2(-2.0, 1.6), c + vec2(2.0, 1.6), col),
         Source::Piece | Source::Slab => {
             draw_line(c.x - 2.0, c.y - 2.0, c.x + 2.0, c.y + 2.0, 1.0, col);
             draw_line(c.x - 2.0, c.y + 2.0, c.x + 2.0, c.y - 2.0, 1.0, col);
