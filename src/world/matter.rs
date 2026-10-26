@@ -231,7 +231,7 @@ impl World {
     pub(super) fn change_state(&mut self, i: usize, to: Mat, latent: f32) {
         let (from, t, kept) = (self.cells[i].m, self.temp[i], self.states(i));
         let heat = heat_of(from, t) - latent;
-        let (x, y) = ((i % W) as i32, (i / W) as i32);
+        let (x, y) = ((i % W()) as i32, (i / W()) as i32);
         self.set(x, y, to);
         self.temp[i] = (heat - latent0(to)) / cap(to);
         self.keep_states(i, kept, from);
@@ -239,11 +239,11 @@ impl World {
 
     /// Lithostatic pressure (atm) at every cell: the air plus the weight of the column above it.
     pub fn load(&self) -> Vec<f32> {
-        let mut p = vec![0.0; W * H];
-        for x in 0..W {
+        let mut p = vec![0.0; W() * H()];
+        for x in 0..W() {
             let mut acc = 1.0;
-            for y in 0..H {
-                let i = y * W + x;
+            for y in 0..H() {
+                let i = y * W() + x;
                 p[i] = acc;
                 acc += weight(self.cells[i].m);
             }
@@ -254,12 +254,12 @@ impl World {
     /// The slow changes: every cell whose conditions hold may change, with its chance.
     pub(super) fn settle_matter(&mut self) {
         let load = self.load();
-        for i in 0..W * H {
+        for i in 0..W() * H() {
             let m = self.cells[i].m;
             if !settles(m) || self.mask[i] != 0 {
                 continue;
             }
-            let here = Here { temp: self.temp[i], pressure: load[i], shock: 0.0, above: (i >= W).then(|| self.cells[i - W].m.kind()), air: false };
+            let here = Here { temp: self.temp[i], pressure: load[i], shock: 0.0, above: (i >= W()).then(|| self.cells[i - W()].m.kind()), air: false };
             for tr in TRANSITIONS.iter().filter(|t| t.from == m && !t.by_shock() && !t.by_heat()) {
                 if tr.holds(&here) && (tr.every <= SETTLE_EVERY || self.rand() % tr.every < SETTLE_EVERY) {
                     self.change_state(i, tr.to, tr.latent);
@@ -302,14 +302,14 @@ mod tests {
     #[test]
     fn the_load_grows_with_the_weight_above() {
         let mut w = World::new_static();
-        for y in 100..H as i32 {
+        for y in 100..H() as i32 {
             for x in 0..10 {
                 w.set(x, y, if y < 300 { Mat::Water } else { Mat::Stone });
             }
         }
         let p = w.load();
         // 200 cells of water are 10 m: one more atmosphere.
-        let at = |y: usize| p[y * W + 5];
+        let at = |y: usize| p[y * W() + 5];
         assert!((at(300) - at(100) - 0.97).abs() < 0.05, "{} atm under 10 m of water", at(300) - at(100));
         assert!(at(500) - at(300) > 2.5 * (at(300) - at(100)), "rock weighs more than water");
         assert!((at(50) - 1.0).abs() < 0.01, "open air");
@@ -319,7 +319,7 @@ mod tests {
     fn mud_buried_deep_sets_into_clay_but_not_near_the_surface() {
         let mut w = World::new_static();
         for x in 0..40 {
-            for y in 200..H as i32 {
+            for y in 200..H() as i32 {
                 w.set(x, y, if y < 420 { Mat::Dirt } else { Mat::Mud });
             }
             w.set(x, 230, Mat::Mud);
@@ -328,7 +328,7 @@ mod tests {
             w.settle_matter();
         }
         let clay = |y0: i32, y1: i32| (0..40).flat_map(|x| (y0..y1).map(move |y| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Clay).count();
-        assert!(clay(420, H as i32) > 400, "deep mud became clay: {}", clay(420, H as i32));
+        assert!(clay(420, H() as i32) > 400, "deep mud became clay: {}", clay(420, H() as i32));
         assert_eq!(w.raw(5, 230), Mat::Mud, "shallow mud stays mud");
     }
 
@@ -355,10 +355,10 @@ mod tests {
         for x in 0..3 {
             w.set(x, 10, Mat::Charcoal);
         }
-        w.temp[10 * W] = 20.0;
-        assert!(!w.shock_cell(10 * W, 3_000.0, 2_000.0), "black powder: too weak");
-        assert!(!w.shock_cell(10 * W + 1, 100_000.0, 600.0), "squeezed but cold");
-        assert!(w.shock_cell(10 * W + 2, 100_000.0, 3_000.0));
+        w.temp[10 * W()] = 20.0;
+        assert!(!w.shock_cell(10 * W(), 3_000.0, 2_000.0), "black powder: too weak");
+        assert!(!w.shock_cell(10 * W() + 1, 100_000.0, 600.0), "squeezed but cold");
+        assert!(w.shock_cell(10 * W() + 2, 100_000.0, 3_000.0));
         assert_eq!(w.raw(2, 10), Mat::Diamond);
     }
 
@@ -366,7 +366,7 @@ mod tests {
     fn soil_soaking_into_mud_keeps_its_water_and_rock_loses_it() {
         let mut w = World::new_static();
         w.set(5, 5, Mat::Dirt);
-        let i = 5 * W + 5;
+        let i = 5 * W() + 5;
         w.moisture[i] = 150;
         w.change_state(i, Mat::Mud, 0.0);
         assert_eq!(w.moisture[i], 150, "mud carries water: the soil's stays in it");
@@ -378,7 +378,7 @@ mod tests {
     fn states_move_with_the_matter_and_painting_starts_afresh() {
         let mut w = World::new_static();
         w.set(5, 5, Mat::Mud);
-        let (i, j) = (5 * W + 5, 6 * W + 5);
+        let (i, j) = (5 * W() + 5, 6 * W() + 5);
         w.moisture[i] = 99;
         w.swap((5, 5), (5, 6));
         assert_eq!((w.moisture[i], w.moisture[j]), (0, 99), "the water went down with the mud");
@@ -400,7 +400,7 @@ mod tests {
     fn hot_sand_turns_to_glass_in_the_heat_pass_keeping_its_heat() {
         let mut w = World::new_static();
         w.set(5, 5, Mat::Sand);
-        let i = 5 * W + 5;
+        let i = 5 * W() + 5;
         w.temp[i] = 700.0;
         let before = heat_of(Mat::Sand, 700.0);
         while !w.heat_change(i, 5, 5, Mat::Sand) {}
@@ -412,7 +412,7 @@ mod tests {
     fn a_change_of_matter_keeps_the_heat() {
         let mut w = World::new_static();
         w.set(5, 5, Mat::Mud);
-        let i = 5 * W + 5;
+        let i = 5 * W() + 5;
         w.temp[i] = 40.0;
         let before = heat_of(Mat::Mud, 40.0);
         w.change_state(i, Mat::Clay, 0.0);

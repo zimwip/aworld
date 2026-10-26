@@ -66,8 +66,8 @@ pub fn encode_cells(biome: Biome, clock: u32, raw: impl Fn(i32, i32) -> Mat, ent
     let mut out = Vec::new();
     out.extend(MAGIC);
     out.push(VERSION);
-    out.extend((W as u16).to_le_bytes());
-    out.extend((H as u16).to_le_bytes());
+    out.extend((W() as u16).to_le_bytes());
+    out.extend((H() as u16).to_le_bytes());
     out.push(biome.id());
     out.extend(clock.to_le_bytes());
     put_point(&mut out, entry);
@@ -75,8 +75,8 @@ pub fn encode_cells(biome: Biome, clock: u32, raw: impl Fn(i32, i32) -> Mat, ent
 
     let mut run_mat = raw(0, 0);
     let mut run = 0u32;
-    for y in 0..H as i32 {
-        for x in 0..W as i32 {
+    for y in 0..H() as i32 {
+        for x in 0..W() as i32 {
             let m = raw(x, y);
             if m == run_mat {
                 run += 1;
@@ -344,7 +344,7 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
     if !(1..=VERSION).contains(&version) {
         return Err(bad("version de fichier inconnue"));
     }
-    if r.u16()? as usize != W || r.u16()? as usize != H {
+    if r.u16()? as usize != W() || r.u16()? as usize != H() {
         return Err(bad("taille de monde différente"));
     }
     let (biome, clock) = if version >= 2 {
@@ -355,11 +355,11 @@ pub fn decode(data: &[u8]) -> io::Result<Loaded> {
     };
     let entry = r.point()?;
     let exit = r.point()?;
-    let mut mats = Vec::with_capacity(W * H);
-    while mats.len() < W * H {
+    let mut mats = Vec::with_capacity(W() * H());
+    while mats.len() < W() * H() {
         let m = Mat::from_u8(r.u8()?);
         let n = r.u32()? as usize;
-        if mats.len() + n > W * H {
+        if mats.len() + n > W() * H() {
             return Err(bad("grille corrompue"));
         }
         mats.extend(std::iter::repeat(m).take(n));
@@ -697,7 +697,7 @@ mod tests {
         let members = vec![m1, m2];
         let sp = Spring::new(SpringKind::Elastic, Anchor::Ground(vec2(3.0, 4.0)), Anchor::End { uid: members[1].uid, end: 0 }, 40.0, 1.5, vec2(3.0, 4.0), vec2(9.0, 9.0));
         let bytes = encode(&w, Some(e), Some(x), &blocks, &cables, &members, &[sp], &Mechanism::default());
-        assert!(bytes.len() < W * H / 4, "RLE should compress: {}", bytes.len());
+        assert!(bytes.len() < W() * H() / 4, "RLE should compress: {}", bytes.len());
         let l = decode(&bytes).unwrap();
         assert_eq!(l.entry, Some(e));
         assert_eq!(l.exit, Some(x));
@@ -728,8 +728,8 @@ mod tests {
         assert!((l.blocks[1].angle - 1.5).abs() < 1e-6);
         let mut w2 = World::new();
         w2.load_mats(&l.mats);
-        for i in (0..W * H).step_by(997) {
-            assert_eq!(w.raw((i % W) as i32, (i / W) as i32), w2.raw((i % W) as i32, (i / W) as i32));
+        for i in (0..W() * H()).step_by(997) {
+            assert_eq!(w.raw((i % W()) as i32, (i / W()) as i32), w2.raw((i % W()) as i32, (i / W()) as i32));
         }
     }
 

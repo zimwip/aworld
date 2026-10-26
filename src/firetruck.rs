@@ -97,13 +97,13 @@ pub struct FireTrucks {
 }
 
 fn solid(world: &World, x: i32, y: i32) -> bool {
-    world.hard_for_car(x.clamp(0, W as i32 - 1), y)
+    world.hard_for_car(x.clamp(0, W() as i32 - 1), y)
 }
 
 /// The ground under column `x` near row `y`: the first solid cell with room above it, looking a
 /// few cells up (a gentle climb) and down (a gentle drop). None on water, at a wall or a cliff.
 fn ground_near(world: &World, x: i32, y: i32) -> Option<i32> {
-    let x = x.clamp(0, W as i32 - 1);
+    let x = x.clamp(0, W() as i32 - 1);
     for gy in (y - 6)..=(y + 12) {
         if world.at(x, gy).kind() == Kind::Liquid && !solid(world, x, gy - 1) {
             return None;
@@ -118,7 +118,7 @@ fn ground_near(world: &World, x: i32, y: i32) -> Option<i32> {
 
 /// The ground seen from the sky over column `x`: where an engine coming in from that side starts.
 fn ground_from_top(world: &World, x: i32) -> Option<i32> {
-    (0..H as i32).find_map(|y| match world.at(x, y).kind() {
+    (0..H() as i32).find_map(|y| match world.at(x, y).kind() {
         Kind::Liquid => Some(None),
         _ if solid(world, x, y) => Some(Some(y)),
         _ => None,
@@ -127,11 +127,11 @@ fn ground_from_top(world: &World, x: i32) -> Option<i32> {
 
 /// The biggest fire in the world: where it is and how many burning cells it has.
 pub fn biggest_fire(world: &World) -> Option<(Vec2, u32)> {
-    let (zw, zh) = ((W as i32 + ZONE - 1) / ZONE, (H as i32 + ZONE - 1) / ZONE);
+    let (zw, zh) = ((W() as i32 + ZONE - 1) / ZONE, (H() as i32 + ZONE - 1) / ZONE);
     let mut count = vec![0u32; (zw * zh) as usize];
     let mut sum = vec![Vec2::ZERO; (zw * zh) as usize];
-    for y in (0..H as i32).step_by(2) {
-        for x in (0..W as i32).step_by(2) {
+    for y in (0..H() as i32).step_by(2) {
+        for x in (0..W() as i32).step_by(2) {
             if matches!(world.raw(x, y), Mat::Fire | Mat::Ember) {
                 let k = ((y / ZONE) * zw + x / ZONE) as usize;
                 // One cell in four is looked at: count it four times.
@@ -180,12 +180,12 @@ impl FireTrucks {
         if self.truck.is_some() {
             return false;
         }
-        let left_first = fire.x < W as f32 / 2.0;
+        let left_first = fire.x < W() as f32 / 2.0;
         for left in [left_first, !left_first] {
-            let edge = if left { 0 } else { W as i32 - 1 };
+            let edge = if left { 0 } else { W() as i32 - 1 };
             if let Some(y) = ground_from_top(world, edge) {
                 let dir = if left { 1.0 } else { -1.0 };
-                let x = if left { -LENGTH } else { W as f32 + LENGTH };
+                let x = if left { -LENGTH } else { W() as f32 + LENGTH };
                 self.truck = Some(Truck { x, y: y as f32, dir, state: State::Coming, tank: TANK, fire, aim: fire, age: 0, tilt: 0.0, heat: 0 });
                 return true;
             }
@@ -263,7 +263,7 @@ impl FireTrucks {
                 }
             }
             State::Leaving => {
-                let gone = t.x < -LENGTH * 1.5 || t.x > W as f32 + LENGTH * 1.5;
+                let gone = t.x < -LENGTH * 1.5 || t.x > W() as f32 + LENGTH * 1.5;
                 if gone || !Self::drive(&mut t, world) {
                     self.rest = REST;
                     return news;
@@ -321,8 +321,8 @@ impl FireTrucks {
         let mut n = 0;
         let (x0, x1) = ((at.x - r) as i32, (at.x + r) as i32);
         let (y0, y1) = ((at.y - r) as i32, (at.y + r) as i32);
-        for y in y0.max(0)..y1.min(H as i32) {
-            for x in x0.max(0)..x1.min(W as i32) {
+        for y in y0.max(0)..y1.min(H() as i32) {
+            for x in x0.max(0)..x1.min(W() as i32) {
                 if matches!(world.raw(x, y), Mat::Fire | Mat::Ember) {
                     n += 1;
                 }
@@ -352,7 +352,7 @@ impl FireTrucks {
             for k in 1..=n {
                 let p = d.pos + d.vel * (k as f32 / n as f32);
                 let (x, y) = (p.x as i32, p.y as i32);
-                if y >= H as i32 || x < -2 || x > W as i32 + 2 {
+                if y >= H() as i32 || x < -2 || x > W() as i32 + 2 {
                     landed = true;
                     break;
                 }
@@ -482,8 +482,8 @@ mod tests {
 
     /// Flat stone ground at row 450 across the world, with a woodpile set alight at x = 600.
     fn burning(world: &mut World) {
-        for x in 0..W as i32 {
-            for y in 450..H as i32 {
+        for x in 0..W() as i32 {
+            for y in 450..H() as i32 {
                 world.set(x, y, Mat::Stone);
             }
         }
@@ -505,8 +505,8 @@ mod tests {
     #[test]
     fn a_small_fire_does_not_call_the_firemen_but_a_big_one_does() {
         let mut world = World::new_static();
-        for x in 0..W as i32 {
-            for y in 450..H as i32 {
+        for x in 0..W() as i32 {
+            for y in 450..H() as i32 {
                 world.set(x, y, Mat::Stone);
             }
         }

@@ -15,8 +15,14 @@ use super::*;
 
 /// Cells per side of a square of the charge grid.
 pub const QS: usize = 6;
-pub const QW: usize = W / QS;
-pub const QH: usize = H / QS;
+#[allow(non_snake_case)]
+pub fn QW() -> usize {
+    W() / QS
+}
+#[allow(non_snake_case)]
+pub fn QH() -> usize {
+    H() / QS
+}
 /// Charge separation per step in a square full of cold cloud with an updraft.
 const SEPARATION: f32 = 0.0006;
 /// Charge (arbitrary units) at which the air breaks down.
@@ -104,8 +110,8 @@ impl World {
     /// Charge of the square holding cell (x, y).
     #[cfg(test)]
     pub fn charge_at(&self, x: i32, y: i32) -> f32 {
-        let (qx, qy) = ((x.clamp(0, W as i32 - 1) as usize) / QS, (y.clamp(0, H as i32 - 1) as usize) / QS);
-        self.charge[qy * QW + qx]
+        let (qx, qy) = ((x.clamp(0, W() as i32 - 1) as usize) / QS, (y.clamp(0, H() as i32 - 1) as usize) / QS);
+        self.charge[qy * QW() + qx]
     }
 
     pub(super) fn storm_step(&mut self) {
@@ -115,20 +121,20 @@ impl World {
         // Cloud in each square, and how cold it is.
         // Also, for the charge in the ground: whether a square holds matter, how well the best of
         // it conducts, and whether it has air in it.
-        let mut cloud = vec![0.0f32; QW * QH];
-        let mut cold = vec![0.0f32; QW * QH];
-        let mut cond = vec![-1.0f32; QW * QH];
-        let mut open = vec![false; QW * QH];
+        let mut cloud = vec![0.0f32; QW() * QH()];
+        let mut cold = vec![0.0f32; QW() * QH()];
+        let mut cond = vec![-1.0f32; QW() * QH()];
+        let mut open = vec![false; QW() * QH()];
         // And whether it holds loose grains (which a field can pull), and iron filings (rust).
-        let mut grains = vec![false; QW * QH];
-        let mut rusty = vec![false; QW * QH];
-        for qy in 0..QH {
-            for qx in 0..QW {
+        let mut grains = vec![false; QW() * QH()];
+        let mut rusty = vec![false; QW() * QH()];
+        for qy in 0..QH() {
+            for qx in 0..QW() {
                 let (mut n, mut t) = (0u32, 0.0f32);
-                let k = qy * QW + qx;
+                let k = qy * QW() + qx;
                 for y in qy * QS..(qy + 1) * QS {
                     for x in qx * QS..(qx + 1) * QS {
-                        let i = y * W + x;
+                        let i = y * W() + x;
                         let m = self.cells[i].m;
                         if m == Mat::Cloud {
                             n += 1;
@@ -157,13 +163,13 @@ impl World {
         //    updraft, the positive charge goes up to the top and the negative stays low.
         let dt = STORM_EVERY as f32;
         let mut q = std::mem::take(&mut self.charge);
-        for qy in 3..QH - 1 {
-            for qx in 0..QW {
-                let k = qy * QW + qx;
+        for qy in 3..QH() - 1 {
+            for qx in 0..QW() {
+                let k = qy * QW() + qx;
                 if cloud[k] < 0.5 || cold[k] == 0.0 {
                     continue;
                 }
-                let deep = (1..=4).filter(|d| qy + d < QH && cloud[(qy + d) * QW + qx] > 0.4).count() as f32 / 4.0;
+                let deep = (1..=4).filter(|d| qy + d < QH() && cloud[(qy + d) * QW() + qx] > 0.4).count() as f32 / 4.0;
                 if deep < 0.5 {
                     continue;
                 }
@@ -172,29 +178,29 @@ impl World {
                 let dq = SEPARATION * dt * cloud[k] * deep * updraft;
                 // The crystals are lifted a few squares, as far as the cloud goes.
                 let mut top = qy;
-                while top > qy.saturating_sub(4) && top > 0 && cloud[(top - 1) * QW + qx] > 0.3 {
+                while top > qy.saturating_sub(4) && top > 0 && cloud[(top - 1) * QW() + qx] > 0.3 {
                     top -= 1;
                 }
-                q[top * QW + qx] += dq;
-                q[(qy + 1).min(QH - 1) * QW + qx] -= dq;
+                q[top * QW() + qx] += dq;
+                q[(qy + 1).min(QH() - 1) * QW() + qx] -= dq;
             }
         }
         // 2. The wind carries the charge along (semi-Lagrangian: each square takes what was upwind
         //    of it, interpolated), and it leaks away, quickly out of the cloud.
-        let mut moved = vec![0.0f32; QW * QH];
-        for qy in 0..QH {
-            for qx in 0..QW {
+        let mut moved = vec![0.0f32; QW() * QH()];
+        for qy in 0..QH() {
+            for qx in 0..QW() {
                 let (cx, cy) = ((qx * QS + QS / 2) as i32, (qy * QS + QS / 2) as i32);
                 // Only sideways: up and down, the charge sits where the sorting of the ice put it
                 // (the crystals ride the updraft to the top, the graupel falls against it).
                 let (vx, _) = self.flow.sample(cx, cy);
-                let sx = (qx as f32 - vx * dt / QS as f32).clamp(0.0, QW as f32 - 1.001);
+                let sx = (qx as f32 - vx * dt / QS as f32).clamp(0.0, QW() as f32 - 1.001);
                 let sy = qy as f32;
                 let (i, j) = (sx as usize, sy as usize);
                 let (tx, ty) = (sx - i as f32, sy - j as f32);
-                let at = |a: usize, b: usize| q[b.min(QH - 1) * QW + a.min(QW - 1)];
+                let at = |a: usize, b: usize| q[b.min(QH() - 1) * QW() + a.min(QW() - 1)];
                 let v = (at(i, j) * (1.0 - tx) + at(i + 1, j) * tx) * (1.0 - ty) + (at(i, j + 1) * (1.0 - tx) + at(i + 1, j + 1) * tx) * ty;
-                let k = qy * QW + qx;
+                let k = qy * QW() + qx;
                 let keep = if cloud[k] > 0.2 { 0.9985 } else { 0.97 };
                 moved[k] = v * keep;
             }
@@ -223,14 +229,14 @@ impl World {
         if best < BREAKDOWN {
             return;
         }
-        let (qx, qy) = (at % QW, at / QW);
+        let (qx, qy) = (at % QW(), at / QW());
         let (x0, y0) = ((qx * QS + QS / 2) as i32, (qy * QS + QS / 2) as i32);
         let negative = self.charge[at] < 0.0;
         let to_ground = negative && self.storm_rng.next() % 10 < 6;
         if to_ground {
             // From the base of the cloud, down to the best spot under it.
             let mut base = y0;
-            while base < H as i32 - 1 && matches!(self.raw(x0, base + 1), Mat::Cloud | Mat::Snow | Mat::Hail) {
+            while base < H() as i32 - 1 && matches!(self.raw(x0, base + 1), Mat::Cloud | Mat::Snow | Mat::Hail) {
                 base += 1;
             }
             let target = self.lightning_target(x0, base, 90);
@@ -242,10 +248,10 @@ impl World {
             for dy in -12i32..=12 {
                 for dx in -16i32..=16 {
                     let (ox, oy) = (qx as i32 + dx, qy as i32 + dy);
-                    if ox < 0 || oy < 0 || ox >= QW as i32 || oy >= QH as i32 {
+                    if ox < 0 || oy < 0 || ox >= QW() as i32 || oy >= QH() as i32 {
                         continue;
                     }
-                    let k = oy as usize * QW + ox as usize;
+                    let k = oy as usize * QW() + ox as usize;
                     let v = -self.charge[k] * self.charge[at].signum();
                     if v > ok {
                         ok = v;
@@ -253,9 +259,9 @@ impl World {
                     }
                 }
             }
-            let (ox, oy) = ((other % QW * QS + QS / 2) as f32, (other / QW * QS + QS / 2) as f32);
+            let (ox, oy) = ((other % QW() * QS + QS / 2) as f32, (other / QW() * QS + QS / 2) as f32);
             self.discharge_around(qx, qy, 4);
-            self.discharge_around(other % QW, other / QW, 4);
+            self.discharge_around(other % QW(), other / QW(), 4);
             let (a, b) = if oy < y0 as f32 { ((ox, oy), (x0 as f32, y0 as f32)) } else { ((x0 as f32, y0 as f32), (ox, oy)) };
             self.lightning_bolt(a, None, (b.0 as i32, b.1 as i32), best.min(3.0) / 3.0 * 0.6, false);
         }
@@ -266,8 +272,8 @@ impl World {
         for dy in -r..=r {
             for dx in -r..=r {
                 let (x, y) = (qx as i32 + dx, qy as i32 + dy);
-                if x >= 0 && y >= 0 && x < QW as i32 && y < QH as i32 {
-                    self.charge[y as usize * QW + x as usize] *= 0.15;
+                if x >= 0 && y >= 0 && x < QW() as i32 && y < QH() as i32 {
+                    self.charge[y as usize * QW() + x as usize] *= 0.15;
                 }
             }
         }
@@ -276,10 +282,10 @@ impl World {
     /// Where a bolt coming down from (x0, y0) strikes: the point within `reach` columns that
     /// stands highest, conducts best and is nearest. Returns the first solid or liquid cell.
     pub fn lightning_target(&mut self, x0: i32, y0: i32, reach: i32) -> (i32, i32) {
-        let mut best = (x0.clamp(0, W as i32 - 1), H as i32 - 1);
+        let mut best = (x0.clamp(0, W() as i32 - 1), H() as i32 - 1);
         let mut score = f32::MIN;
         let mut x = (x0 - reach).max(0);
-        while x <= (x0 + reach).min(W as i32 - 1) {
+        while x <= (x0 + reach).min(W() as i32 - 1) {
             if let Some(y) = self.first_hit(x, y0) {
                 let m = self.raw(x, y);
                 let s = -(y as f32) + 40.0 * conductivity(m) + 40.0 * self.mcharge_at(x, y).abs() - (x - x0).abs() as f32 * 0.35 + self.storm_rng.f() * 6.0;
@@ -295,11 +301,11 @@ impl World {
 
     /// The first cell under (x, y) that lightning can strike (not air, cloud or smoke).
     fn first_hit(&self, x: i32, y: i32) -> Option<i32> {
-        (y.max(0)..H as i32).find(|&yy| {
+        (y.max(0)..H() as i32).find(|&yy| {
             let m = self.raw(x, yy);
             match m.kind() {
                 Kind::Empty | Kind::Gas | Kind::Flame => false,
-                _ => !(matches!(m, Mat::Snow | Mat::Hail) && yy < GROUND_ROW),
+                _ => !(matches!(m, Mat::Snow | Mat::Hail) && yy < GROUND_ROW()),
             }
         })
     }
@@ -309,9 +315,9 @@ impl World {
     /// surface above. Released in the open air, it does not stop there: it jumps on, like a bolt,
     /// to the nearest place where it can reach the ground.
     pub fn strike(&mut self, x: i32, y: i32) {
-        let x = x.clamp(0, W as i32 - 1);
-        let y = y.clamp(0, H as i32 - 1);
-        let surface = self.first_hit(x, 0).unwrap_or(H as i32 - 1);
+        let x = x.clamp(0, W() as i32 - 1);
+        let y = y.clamp(0, H() as i32 - 1);
+        let surface = self.first_hit(x, 0).unwrap_or(H() as i32 - 1);
         let aim = y.min(surface);
         // From the base of the cloud above (the first cloud from the top, down through it), or
         // else from the top of the picture. A wisp of cloud just above the pointer does not count.
@@ -322,7 +328,7 @@ impl World {
         if aim - top < 60 {
             top = 0;
         }
-        let start = ((x as f32 + self.storm_rng.f() * 30.0).clamp(0.0, W as f32 - 1.0), top as f32);
+        let start = ((x as f32 + self.storm_rng.f() * 30.0).clamp(0.0, W() as f32 - 1.0), top as f32);
         if y < surface {
             let target = self.nearest_ground(x, y, 60);
             self.lightning_bolt(start, Some((x as f32, y as f32)), target, 1.0, true);
@@ -334,9 +340,9 @@ impl World {
     /// Where a bolt left hanging in the air at (x, y) goes on to: the nearest thing under it
     /// within `reach` columns, conductors first.
     fn nearest_ground(&mut self, x0: i32, y0: i32, reach: i32) -> (i32, i32) {
-        let mut best = (x0, self.first_hit(x0, y0).unwrap_or(H as i32 - 1));
+        let mut best = (x0, self.first_hit(x0, y0).unwrap_or(H() as i32 - 1));
         let mut score = f32::MIN;
-        for x in ((x0 - reach).max(0)..=(x0 + reach).min(W as i32 - 1)).step_by(2) {
+        for x in ((x0 - reach).max(0)..=(x0 + reach).min(W() as i32 - 1)).step_by(2) {
             if let Some(y) = self.first_hit(x, y0) {
                 let d = (((x - x0) * (x - x0) + (y - y0) * (y - y0)) as f32).sqrt();
                 let s = -d - 0.5 * (x - x0).abs() as f32 + 30.0 * conductivity(self.raw(x, y)) + self.storm_rng.f() * 2.0;
@@ -554,7 +560,7 @@ impl World {
             trail.push((cx as f32, cy as f32));
         }
         // The bolt leaves its charge (negative, from the base of the cloud) where its current went.
-        let mut squares: Vec<usize> = trail.iter().map(|p| (p.1 as usize / QS).min(QH - 1) * QW + (p.0 as usize / QS).min(QW - 1)).collect();
+        let mut squares: Vec<usize> = trail.iter().map(|p| (p.1 as usize / QS).min(QH() - 1) * QW() + (p.0 as usize / QS).min(QW() - 1)).collect();
         squares.dedup();
         for k in squares {
             self.mcharge[k] = (self.mcharge[k] - 0.6 * power.max(0.5)).max(-1.5);
@@ -569,7 +575,7 @@ impl World {
             let i = Self::idx(mx, my);
             self.temp[i] += 250.0 * power.max(0.5);
             // The current through iron magnetises it (lightning makes magnets).
-            let q = (my as usize / QS) * QW + mx as usize / QS;
+            let q = (my as usize / QS) * QW() + mx as usize / QS;
             self.magnet[q] = self.magnet[q].max(power.max(0.5));
             self.zones.wake(i);
             if done.len() > 1500 {
@@ -588,19 +594,19 @@ impl World {
 impl World {
     /// Charge held in the ground at the square of cell (x, y).
     pub fn mcharge_at(&self, x: i32, y: i32) -> f32 {
-        let (qx, qy) = ((x.clamp(0, W as i32 - 1) as usize) / QS, (y.clamp(0, H as i32 - 1) as usize) / QS);
-        self.mcharge[qy * QW + qx]
+        let (qx, qy) = ((x.clamp(0, W() as i32 - 1) as usize) / QS, (y.clamp(0, H() as i32 - 1) as usize) / QS);
+        self.mcharge[qy * QW() + qx]
     }
 
     /// One step of the charge in the ground. `cond`: how well the best matter of each square
     /// conducts (-1: no matter); `open`: the square has air in it. Returns which squares are
     /// exposed: matter with air in or just above it (only those feel the cloud).
     fn ground_charge_step(&mut self, cond: &[f32], open: &[bool]) -> Vec<bool> {
-        let mut exposed = vec![false; QW * QH];
-        for qy in 0..QH {
-            for qx in 0..QW {
-                let k = qy * QW + qx;
-                exposed[k] = cond[k] >= 0.0 && (open[k] || (qy > 0 && open[k - QW]));
+        let mut exposed = vec![false; QW() * QH()];
+        for qy in 0..QH() {
+            for qx in 0..QW() {
+                let k = qy * QW() + qx;
+                exposed[k] = cond[k] >= 0.0 && (open[k] || (qy > 0 && open[k - QW()]));
             }
         }
         let clouds: Vec<(i32, i32, f32)> = self
@@ -608,7 +614,7 @@ impl World {
             .iter()
             .enumerate()
             .filter(|(_, q)| q.abs() > 0.02)
-            .map(|(k, q)| ((k % QW) as i32, (k / QW) as i32, *q))
+            .map(|(k, q)| ((k % QW()) as i32, (k / QW()) as i32, *q))
             .collect();
         if clouds.is_empty() && self.mcharge.iter().all(|q| q.abs() < 1e-4) {
             self.polar.fill(0.0);
@@ -617,18 +623,18 @@ impl World {
         // Conductors share their charge with their neighbours, quickly (several passes).
         for _ in 0..4 {
             let m = self.mcharge.clone();
-            for qy in 0..QH {
-                for qx in 0..QW {
-                    let k = qy * QW + qx;
+            for qy in 0..QH() {
+                for qx in 0..QW() {
+                    let k = qy * QW() + qx;
                     if cond[k] <= 0.0 {
                         continue;
                     }
                     let mut flow = 0.0;
                     for (nx, ny) in [(qx as i32 - 1, qy as i32), (qx as i32 + 1, qy as i32), (qx as i32, qy as i32 - 1), (qx as i32, qy as i32 + 1)] {
-                        if nx < 0 || ny < 0 || nx >= QW as i32 || ny >= QH as i32 {
+                        if nx < 0 || ny < 0 || nx >= QW() as i32 || ny >= QH() as i32 {
                             continue;
                         }
-                        let n = ny as usize * QW + nx as usize;
+                        let n = ny as usize * QW() + nx as usize;
                         if cond[n] > 0.0 {
                             flow += 0.22 * cond[k].min(cond[n]) * (m[n] - m[k]);
                         }
@@ -642,20 +648,20 @@ impl World {
         // gathers at most a share `INFLUENCE` of its own charge, the most close by). It shows in
         // what conducts poorly (along a conductor the charge simply spreads out), at once, and is
         // gone as soon as the charge that draws it is.
-        let mut influence = vec![0.0f32; QW * QH];
+        let mut influence = vec![0.0f32; QW() * QH()];
         let sources: Vec<(i32, i32, f32)> = self
             .mcharge
             .iter()
             .enumerate()
             .filter(|(_, q)| q.abs() > 0.03)
-            .map(|(k, q)| ((k % QW) as i32, (k / QW) as i32, *q))
+            .map(|(k, q)| ((k % QW()) as i32, (k / QW()) as i32, *q))
             .collect();
         for &(sx, sy, q) in &sources {
             let mut total = 0.0;
             for dy in -INFLUENCE_R..=INFLUENCE_R {
                 for dx in -INFLUENCE_R..=INFLUENCE_R {
                     let (x, y) = (sx + dx, sy + dy);
-                    if (dx, dy) != (0, 0) && x >= 0 && y >= 0 && x < QW as i32 && y < QH as i32 && cond[y as usize * QW + x as usize] >= 0.0 {
+                    if (dx, dy) != (0, 0) && x >= 0 && y >= 0 && x < QW() as i32 && y < QH() as i32 && cond[y as usize * QW() + x as usize] >= 0.0 {
                         total += 1.0 / (1.0 + (dx * dx + dy * dy) as f32);
                     }
                 }
@@ -666,8 +672,8 @@ impl World {
             for dy in -INFLUENCE_R..=INFLUENCE_R {
                 for dx in -INFLUENCE_R..=INFLUENCE_R {
                     let (x, y) = (sx + dx, sy + dy);
-                    if (dx, dy) != (0, 0) && x >= 0 && y >= 0 && x < QW as i32 && y < QH as i32 {
-                        let k = y as usize * QW + x as usize;
+                    if (dx, dy) != (0, 0) && x >= 0 && y >= 0 && x < QW() as i32 && y < QH() as i32 {
+                        let k = y as usize * QW() + x as usize;
                         // Only matter that holds no charge of its own takes it.
                         if cond[k] >= 0.0 && self.mcharge[k].abs() < 0.1 {
                             influence[k] -= INFLUENCE * q / (1.0 + (dx * dx + dy * dy) as f32) / total * (1.0 - cond[k]);
@@ -679,9 +685,9 @@ impl World {
         self.polar = influence;
         let m = &self.mcharge;
         let mut next = m.clone();
-        for qy in 0..QH {
-            for qx in 0..QW {
-                let k = qy * QW + qx;
+        for qy in 0..QH() {
+            for qx in 0..QW() {
+                let k = qy * QW() + qx;
                 if cond[k] < 0.0 {
                     next[k] = 0.0;
                     continue;
@@ -712,12 +718,12 @@ impl World {
     /// Lets the ground take the charge the clouds draw up for `steps` storm steps, without any
     /// bolt (for a demo picture).
     pub fn settle_ground_charge(&mut self, steps: u32) {
-        let mut cond = vec![-1.0f32; QW * QH];
-        let mut open = vec![false; QW * QH];
-        for y in 0..H {
-            for x in 0..W {
-                let k = (y / QS) * QW + x / QS;
-                let m = self.cells[y * W + x].m;
+        let mut cond = vec![-1.0f32; QW() * QH()];
+        let mut open = vec![false; QW() * QH()];
+        for y in 0..H() {
+            for x in 0..W() {
+                let k = (y / QS) * QW() + x / QS;
+                let m = self.cells[y * W() + x].m;
                 if matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) {
                     open[k] = true;
                 } else {
@@ -746,13 +752,13 @@ impl World {
         if best < GROUND_BREAKDOWN {
             return false;
         }
-        let (gx, gy) = (at % QW, at / QW);
+        let (gx, gy) = (at % QW(), at / QW());
         let sign = self.mcharge[at].signum();
         // The cloud square above with the most charge of the other sign.
         let (mut from, mut fq) = (None, 0.3f32);
         for qy in 0..gy {
-            for qx in gx.saturating_sub(6)..(gx + 7).min(QW) {
-                let v = -self.charge[qy * QW + qx] * sign;
+            for qx in gx.saturating_sub(6)..(gx + 7).min(QW()) {
+                let v = -self.charge[qy * QW() + qx] * sign;
                 if v > fq {
                     fq = v;
                     from = Some((qx, qy));
@@ -762,7 +768,7 @@ impl World {
         let Some((cx, cy)) = from else { return false };
         let x0 = (cx * QS + QS / 2) as i32;
         let mut base = (cy * QS + QS / 2) as i32;
-        while base < H as i32 - 1 && matches!(self.raw(x0, base + 1), Mat::Cloud | Mat::Snow | Mat::Hail) {
+        while base < H() as i32 - 1 && matches!(self.raw(x0, base + 1), Mat::Cloud | Mat::Snow | Mat::Hail) {
             base += 1;
         }
         let tx = (gx * QS + QS / 2) as i32;
@@ -771,8 +777,8 @@ impl World {
         for dy in -2i32..=2 {
             for dx in -2i32..=2 {
                 let (x, y) = (gx as i32 + dx, gy as i32 + dy);
-                if x >= 0 && y >= 0 && x < QW as i32 && y < QH as i32 {
-                    self.mcharge[y as usize * QW + x as usize] *= 0.1;
+                if x >= 0 && y >= 0 && x < QW() as i32 && y < QH() as i32 {
+                    self.mcharge[y as usize * QW() + x as usize] *= 0.1;
                 }
             }
         }
@@ -813,22 +819,22 @@ impl World {
             .iter()
             .enumerate()
             .filter(|(_, q)| q.abs() > 0.05)
-            .map(|(k, q)| ((k % QW) as i32, (k / QW) as i32, *q))
+            .map(|(k, q)| ((k % QW()) as i32, (k / QW()) as i32, *q))
             .collect();
-        let ground: Vec<(i32, i32, f32)> = (0..QW * QH)
+        let ground: Vec<(i32, i32, f32)> = (0..QW() * QH())
             .map(|k| (k, self.mcharge[k]))
             .filter(|(_, q)| q.abs() > 0.05)
-            .map(|(k, q)| ((k % QW) as i32, (k / QW) as i32, q))
+            .map(|(k, q)| ((k % QW()) as i32, (k / QW()) as i32, q))
             .collect();
         if clouds.is_empty() && ground.is_empty() {
             return;
         }
-        for k in 0..QW * QH {
+        for k in 0..QW() * QH() {
             let q = self.mcharge[k] + self.polar[k];
             if !grains[k] || q.abs() < 0.05 {
                 continue;
             }
-            let (qx, qy) = (k % QW, k / QW);
+            let (qx, qy) = (k % QW(), k / QW());
             let (cx, cy) = self.field_at(qx, qy, &clouds, 0);
             let (gx, gy) = self.field_at(qx, qy, &ground, 8);
             let (fx, fy) = (q * (cx + gx), q * (cy + gy));
@@ -872,7 +878,7 @@ impl World {
             .iter()
             .enumerate()
             .filter(|(_, m)| **m > 0.05)
-            .map(|(k, m)| ((k % QW) as i32, (k / QW) as i32, *m))
+            .map(|(k, m)| ((k % QW()) as i32, (k / QW()) as i32, *m))
             .collect();
         if magnets.is_empty() {
             return;
@@ -880,11 +886,11 @@ impl World {
         for v in &mut self.magnet {
             *v *= 0.9998;
         }
-        for k in 0..QW * QH {
+        for k in 0..QW() * QH() {
             if !rusty[k] {
                 continue;
             }
-            let (qx, qy) = (k % QW, k / QW);
+            let (qx, qy) = (k % QW(), k / QW());
             let (mut fx, mut fy) = (0.0f32, 0.0f32);
             for &(mx, my, s) in &magnets {
                 let (dx, dy) = ((mx - qx as i32) as f32, (my - qy as i32) as f32);
@@ -908,9 +914,9 @@ impl World {
     pub(super) fn magnet_holds(&self, x: i32, y: i32) -> bool {
         let (qx, qy) = (x as usize / QS, y as usize / QS);
         let mut strong = 0.0f32;
-        for j in qy.saturating_sub(1)..(qy + 2).min(QH) {
-            for i in qx.saturating_sub(1)..(qx + 2).min(QW) {
-                strong = strong.max(self.magnet[j * QW + i]);
+        for j in qy.saturating_sub(1)..(qy + 2).min(QH()) {
+            for i in qx.saturating_sub(1)..(qx + 2).min(QW()) {
+                strong = strong.max(self.magnet[j * QW() + i]);
             }
         }
         if strong <= 0.1 {
@@ -926,7 +932,10 @@ impl World {
 const MAGNET_R: f32 = 8.0;
 
 /// Lightning goes into snow lying on the ground (low down), not into falling flakes.
-const GROUND_ROW: i32 = (H as i32) / 2;
+#[allow(non_snake_case)]
+fn GROUND_ROW() -> i32 {
+    (H() as i32) / 2
+}
 
 impl World {
     /// Charge in the ground at a cell, smoothly interpolated between the squares of the grid.
@@ -942,11 +951,11 @@ impl World {
 
 /// A value of a `QS` grid at cell (x, y), smoothly interpolated between the squares.
 fn smooth(grid: &[f32], x: usize, y: usize) -> f32 {
-    let fx = ((x as f32 + 0.5) / QS as f32 - 0.5).clamp(0.0, QW as f32 - 1.001);
-    let fy = ((y as f32 + 0.5) / QS as f32 - 0.5).clamp(0.0, QH as f32 - 1.001);
+    let fx = ((x as f32 + 0.5) / QS as f32 - 0.5).clamp(0.0, QW() as f32 - 1.001);
+    let fy = ((y as f32 + 0.5) / QS as f32 - 0.5).clamp(0.0, QH() as f32 - 1.001);
     let (i, j) = (fx as usize, fy as usize);
     let (tx, ty) = (fx - i as f32, fy - j as f32);
-    let q = |a: usize, b: usize| grid[b * QW + a];
+    let q = |a: usize, b: usize| grid[b * QW() + a];
     (q(i, j) * (1.0 - tx) + q(i + 1, j) * tx) * (1.0 - ty) + (q(i, j + 1) * (1.0 - tx) + q(i + 1, j + 1) * tx) * ty
 }
 
@@ -956,7 +965,7 @@ impl World {
     /// brightest close to breaking down: in the clouds, and in the ground and what stands on it
     /// (drawn up under a charged cloud, or left by a bolt).
     pub fn electric_color(&self, x: usize, y: usize) -> [u8; 4] {
-        let m = self.cells[y * W + x].m;
+        let m = self.cells[y * W() + x].m;
         let base = self.color(x, y);
         let grey = (base[0] as f32 * 0.3 + base[1] as f32 * 0.59 + base[2] as f32 * 0.11) * 0.4 * base[3] as f32 / 255.0;
         let mut c = [grey + 10.0, grey + 10.0, grey + 16.0];
@@ -972,7 +981,7 @@ impl World {
         }
         // Magnetised iron (and the filings it holds) shows violet.
         if matches!(m, Mat::Iron | Mat::Steel | Mat::Rust) {
-            let g = self.magnet[(y / QS) * QW + x / QS].min(1.0);
+            let g = self.magnet[(y / QS) * QW() + x / QS].min(1.0);
             if g > 0.05 {
                 for (v, t) in c.iter_mut().zip([190.0, 90.0, 255.0]) {
                     *v += (t - *v) * g * 0.8;
@@ -1002,8 +1011,8 @@ mod tests {
     use super::*;
 
     fn ground(w: &mut World, top: i32) {
-        for x in 0..W as i32 {
-            for y in top..H as i32 {
+        for x in 0..W() as i32 {
+            for y in top..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -1174,11 +1183,11 @@ mod tests {
             }
         }
         // A charged cloud: positive at the top, negative at the base.
-        for qy in 0..QH {
-            for qx in 0..QW {
+        for qy in 0..QH() {
+            for qx in 0..QW() {
                 let (x, y) = (qx * QS, qy * QS);
                 if (300..600).contains(&x) {
-                    w.charge[qy * QW + qx] = if (120..170).contains(&y) { 0.5 } else if (200..260).contains(&y) { -0.6 } else { 0.0 };
+                    w.charge[qy * QW() + qx] = if (120..170).contains(&y) { 0.5 } else if (200..260).contains(&y) { -0.6 } else { 0.0 };
                 }
             }
         }
@@ -1243,18 +1252,18 @@ mod tests {
     #[test]
     fn a_charged_spot_draws_the_opposite_charge_round_it() {
         let mut w = World::new_static();
-        for x in 0..W as i32 {
-            for y in 400..H as i32 {
+        for x in 0..W() as i32 {
+            for y in 400..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
-        let k = (420 / QS) * QW + 480 / QS;
+        let k = (420 / QS) * QW() + 480 / QS;
         for _ in 0..200 {
             w.mcharge[k] = -1.2;
             w.ticks = 0;
             w.storm_step();
         }
-        let at = |x: usize, y: usize| w.polar[(y / QS) * QW + x / QS] + w.mcharge[(y / QS) * QW + x / QS];
+        let at = |x: usize, y: usize| w.polar[(y / QS) * QW() + x / QS] + w.mcharge[(y / QS) * QW() + x / QS];
         let near = at(480 + QS * 2, 420);
         let far = at(100, 420);
         assert!(near > 0.02, "round a negative spot the rock turns positive: {near}");
@@ -1273,9 +1282,9 @@ mod tests {
         let before: Vec<Cell> = w.cells.clone();
         for _ in 0..40 {
             for qx in 450 / QS..510 / QS {
-                w.charge[(300 / QS) * QW + qx] = -1.0;
-                w.mcharge[(408 / QS) * QW + qx] = 0.8;
-                w.mcharge[(414 / QS) * QW + qx] = 0.8;
+                w.charge[(300 / QS) * QW() + qx] = -1.0;
+                w.mcharge[(408 / QS) * QW() + qx] = 0.8;
+                w.mcharge[(414 / QS) * QW() + qx] = 0.8;
             }
             w.ticks = 0;
             w.storm_step();
@@ -1287,9 +1296,9 @@ mod tests {
         v.cells.copy_from_slice(&before);
         for _ in 0..40 {
             for qx in 450 / QS..510 / QS {
-                v.charge[(300 / QS) * QW + qx] = 1.0;
-                v.mcharge[(408 / QS) * QW + qx] = 0.8;
-                v.mcharge[(414 / QS) * QW + qx] = 0.8;
+                v.charge[(300 / QS) * QW() + qx] = 1.0;
+                v.mcharge[(408 / QS) * QW() + qx] = 0.8;
+                v.mcharge[(414 / QS) * QW() + qx] = 0.8;
             }
             v.ticks = 0;
             v.storm_step();
@@ -1312,7 +1321,7 @@ mod tests {
             }
         }
         w.strike(480, 340);
-        assert!(w.magnet[(400 / QS) * QW + 480 / QS] > 0.4, "the current magnetised the post");
+        assert!(w.magnet[(400 / QS) * QW() + 480 / QS] > 0.4, "the current magnetised the post");
         let dist = |w: &World| {
             let (mut n, mut d) = (0, 0i32);
             for y in 300..420 {
@@ -1351,16 +1360,16 @@ mod anvil_lab {
     use super::*;
 
     fn dump(w: &World, path: &str) {
-        let mut out = format!("P6\n{} {}\n255\n", W, H).into_bytes();
-        for y in 0..H {
-            for x in 0..W {
-                let i = y * W + x;
+        let mut out = format!("P6\n{} {}\n255\n", W(), H()).into_bytes();
+        for y in 0..H() {
+            for x in 0..W() {
+                let i = y * W() + x;
                 let c = match w.cells[i].m {
                     Mat::Cloud => [240, 240, 250],
                     Mat::Steam => [150, 160, 190],
                     Mat::Water => [40, 90, 220],
                     Mat::Snow | Mat::Hail | Mat::Ice => [200, 230, 255],
-                    Mat::Empty => if y as i32 == CEILING_Y { [90, 40, 40] } else { [20, 24, 40] },
+                    Mat::Empty => if y as i32 == CEILING_Y() { [90, 40, 40] } else { [20, 24, 40] },
                     _ => [90, 80, 60],
                 };
                 out.extend_from_slice(&c);
@@ -1385,8 +1394,8 @@ mod anvil_lab {
             w.generate_biome(2, Biome::Countryside);
             w.set_phase(std::env::var("PHASE").map(|v| v.parse().unwrap()).unwrap_or(0.2));
         }
-        for x in 0..W as i32 {
-            for y in 420..H as i32 {
+        for x in 0..W() as i32 {
+            for y in 420..H() as i32 {
                 if real {
                     break;
                 }
@@ -1412,7 +1421,7 @@ mod anvil_lab {
             if step % 8 == 0 {
                 for x in 300..660 {
                     for y in 405..420 {
-                        let i = y * W + x;
+                        let i = y * W() + x;
                         if w.cells[i].m == Mat::Water {
                             w.temp[i] = w.temp[i].max(45.0);
                         }
@@ -1424,11 +1433,11 @@ mod anvil_lab {
                 let rate: u32 = rate.parse().unwrap();
                 for k in 0..rate {
                     let x = 600 + ((step as u32 * 7919 + k * 104729) % 120) as i32;
-                    let ground = (0..H as i32).find(|&y| !matches!(w.at(x, y).kind(), Kind::Empty | Kind::Gas)).unwrap_or(H as i32);
+                    let ground = (0..H() as i32).find(|&y| !matches!(w.at(x, y).kind(), Kind::Empty | Kind::Gas)).unwrap_or(H() as i32);
                     let y = ground - 2 - ((step as u32 + k * 13) % 6) as i32;
                     if w.raw(x, y) == Mat::Empty {
                         w.set(x, y, Mat::Steam);
-                        w.temp[y as usize * W + x as usize] = 32.0;
+                        w.temp[y as usize * W() + x as usize] = 32.0;
                     }
                 }
             }
@@ -1436,11 +1445,11 @@ mod anvil_lab {
             if step % 250 == 0 {
                 dump(&w, &format!("{dir}/anvil_{step:05}.ppm"));
                 let n = w.cells.iter().filter(|c| c.m == Mat::Cloud).count();
-                let top = (0..W * H).find(|&i| w.cells[i].m == Mat::Cloud).map(|i| i / W);
+                let top = (0..W() * H()).find(|&i| w.cells[i].m == Mat::Cloud).map(|i| i / W());
                 let c = |m: Mat| w.cells.iter().filter(|c| c.m == m).count();
                 let v: Vec<String> = [40, 60, 72, 100, 200, 390].iter().map(|&y| format!("{y}:{:.2}", w.flow.sample(480, y).0)).collect();
                 eprintln!("  flow vx {}", v.join(" "));
-                let anv: Vec<usize> = (0..80 * W).filter(|&i| w.cells[i].m == Mat::Cloud).map(|i| i % W).collect();
+                let anv: Vec<usize> = (0..80 * W()).filter(|&i| w.cells[i].m == Mat::Cloud).map(|i| i % W()).collect();
                 if !anv.is_empty() {
                     let mean = anv.iter().sum::<usize>() as f32 / anv.len() as f32;
                     eprintln!("  anvil n {} mean x {mean:.0} from {} to {}", anv.len(), anv.iter().min().unwrap(), anv.iter().max().unwrap());
