@@ -38,6 +38,10 @@ mod edges;
 pub use statics::Slab;
 pub use storm::{Bolt, BREAKDOWN, GROUND_BREAKDOWN, QS, QW, QH};
 pub use thermal::{air_pressure_atm, Season, DAY_STEPS};
+
+/// The reference step of the world, in seconds: what every pass took before the world was driven
+/// by a time step (`World::step_dt`), and the longest step a pass not yet taught takes at once.
+pub const STEP: f32 = 1.0 / 60.0;
 use thermal::adiabatic_cooling_c;
 
 /// How the brush treats what is already there.
@@ -636,6 +640,8 @@ pub struct World {
     pub temp: Vec<f32>,
     /// Steps since the world began; drives the day and night cycle.
     pub clock: u32,
+    /// The length of the step being taken, in seconds of the world (see `step_dt`).
+    pub dt: f32,
     /// When false the sun stands still.
     pub day_cycle: bool,
     thermal_flip: bool,
@@ -801,6 +807,7 @@ impl World {
             paint_log: 0,
             temp: vec![15.0; W * H],
             clock: DAY_STEPS / 5,
+            dt: STEP,
             day_cycle: true,
             thermal_flip: false,
             heat_carry: (0.0, 0.0),
@@ -919,7 +926,7 @@ impl World {
     pub fn copy_picture(&mut self, from: &World) {
         let World {
             cells, frame, rng, seen: _, stack: _, released: _, released_list: _, falling, slabs, level: _, strain, pushes, strain_key, stress_cache: _,
-            stress_pos: _, stress_local: _, ticks, log, paint_log, temp, clock, day_cycle, thermal_flip, heat_carry, temp_old: _, heat_took: _,
+            stress_pos: _, stress_local: _, ticks, log, paint_log, temp, clock, dt, day_cycle, thermal_flip, heat_carry, temp_old: _, heat_took: _,
             climate_fixed, climate, revision, wind, wind_max, wind_changes, windiness, wind_clock, biome, leaf_rgb, autumn, grass_rgb,
             structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, dp,
             dp_slow, dpd, pressure_forces, lod, parallel_cells, liquid_physics, liq, fill, pocket_of,
@@ -941,6 +948,7 @@ impl World {
         self.paint_log = *paint_log;
         self.temp.clone_from(temp);
         self.clock = *clock;
+        self.dt = *dt;
         self.day_cycle = *day_cycle;
         self.thermal_flip = *thermal_flip;
         self.heat_carry = *heat_carry;
@@ -1700,7 +1708,23 @@ impl World {
 
     // ----- simulation -------------------------------------------------------
 
+    /// One step of the reference length, 1/60 s.
     pub fn step(&mut self) {
+        self.step_dt(STEP);
+    }
+
+    /// The world moves on by `dt` seconds. The passes are being taught to take any `dt` (each cut
+    /// into the sub-steps its stability needs, and no more); until all of them do, a `dt` longer
+    /// than `STEP` runs as that many steps of `STEP`.
+    pub fn step_dt(&mut self, dt: f32) {
+        let n = (dt / STEP).round().max(1.0) as usize;
+        for _ in 0..n {
+            self.dt = STEP;
+            self.step_once();
+        }
+    }
+
+    fn step_once(&mut self) {
         self.revision += 1;
         self.frame = self.frame.wrapping_add(1);
         let clock = self.prof.start();
@@ -1720,7 +1744,7 @@ impl World {
             marks.push(("tour des cellules", self.water_units_audit()));
         }
         if self.liquid_physics {
-            timed!(self, prof::LIQUIDS, self.step_liquids());
+            timed!(self, prof::LIQUIDS, self.step_liquids(self.dt));
             self.seep_through_thin();
         }
         if audit {

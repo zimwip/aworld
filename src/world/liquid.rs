@@ -445,8 +445,10 @@ impl World {
         }
     }
 
-    /// The liquids' turn.
-    pub(super) fn step_liquids(&mut self) {
+    /// The liquids' turn, for `dt` seconds (for now always `DT`: the solver is being taught to
+    /// take any step).
+    pub(super) fn step_liquids(&mut self, dt: f32) {
+        debug_assert!((dt - DT).abs() < 1e-6, "the liquids take steps of DT for now");
         let mut liq = std::mem::take(&mut self.liq);
         liq.ready();
         let audit = std::env::var_os("AWORLD_DEBUG_MASS").is_some();

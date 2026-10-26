@@ -263,6 +263,7 @@ impl World {
                 paint_log: self.paint_log,
                 temp: share(&self.temp),
                 clock: self.clock,
+                dt: self.dt,
                 day_cycle: self.day_cycle,
                 thermal_flip: self.thermal_flip,
                 climate_fixed: self.climate_fixed,
