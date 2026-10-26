@@ -260,7 +260,7 @@ impl World {
             self.set(d.x, d.y, Mat::Empty);
             self.set(r.x, r.y, m);
             self.temp[j] = t;
-            // (Water in the field takes what the cell held with it.)
+            // (A cell of liquid takes what it held with it.)
             self.fill[j] = fill;
         }
     }
