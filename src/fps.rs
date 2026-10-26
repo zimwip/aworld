@@ -24,7 +24,7 @@ pub struct Fps {
 
 impl Fps {
     pub fn new() -> Self {
-        Fps { shown: true, since: get_time(), frames: 0, step_time: 0.0, steps: 0, fps: 0.0, pps: 0.0, step_ms: None }
+        Fps { shown: true, since: 0.0, frames: 0, step_time: 0.0, steps: 0, fps: 0.0, pps: 0.0, step_ms: None }
     }
 
     /// The time spent on `steps` steps of the simulation this frame.
@@ -33,10 +33,24 @@ impl Fps {
         self.steps += steps as u32;
     }
 
+    /// The steps counted since the last call, and their time (the simulation thread hands its
+    /// count to the screen's counter this way).
+    pub fn take_steps(&mut self) -> (f64, usize) {
+        let taken = (self.step_time, self.steps as usize);
+        self.step_time = 0.0;
+        self.steps = 0;
+        taken
+    }
+
     /// Once a frame.
     pub fn frame(&mut self) {
         self.frames += 1;
         let now = get_time();
+        // The clock starts with the first frame (a game made before the window, as in the tests,
+        // has no clock to read yet).
+        if self.since == 0.0 {
+            self.since = now;
+        }
         let span = now - self.since;
         if span >= EVERY {
             self.fps = (self.frames as f64 / span) as f32;

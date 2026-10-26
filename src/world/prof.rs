@@ -18,9 +18,8 @@ pub const HEAT_WIND: usize = 17;
 pub const HEAT_AIR: usize = 18;
 pub const HEAT_SPACE: usize = 19;
 pub const HEAT_SUN: usize = 20;
-/// Not in the order of the step: the water field runs right after the cells.
-pub const FIELD: usize = 21;
-/// Not in the order of the step either: the liquids' physics runs after the cells too.
+/// Not in the order of the step: the liquids' physics runs right after the cells. (Index 21, the
+/// water field that is gone, is never timed, so the overlay leaves it out.)
 pub const LIQUIDS: usize = 22;
 /// The parts of the liquids' physics (already counted in `liquides physiques`), one run per
 /// sub-step; `LIQ_ITERATIONS` counts one run per iteration of the pressure solver.
@@ -41,11 +40,16 @@ pub struct Profile {
     pub runs: [u32; PHASES.len()],
     /// Steps since the last `reset`.
     pub steps: u32,
+    /// The dearest single step of each phase since the last `reset`, in nanoseconds: an average
+    /// hides the step that stutters.
+    pub worst_ns: [u64; PHASES.len()],
+    /// What each phase has cost in the step under way (folded into `worst_ns` by `end_step`).
+    this_step: [u64; PHASES.len()],
 }
 
 impl Default for Profile {
     fn default() -> Self {
-        Profile { on: false, ns: [0; PHASES.len()], runs: [0; PHASES.len()], steps: 0 }
+        Profile { on: false, ns: [0; PHASES.len()], runs: [0; PHASES.len()], steps: 0, worst_ns: [0; PHASES.len()], this_step: [0; PHASES.len()] }
     }
 }
 
@@ -53,6 +57,33 @@ impl Profile {
     pub fn reset(&mut self) {
         let on = self.on;
         *self = Profile { on, ..Default::default() };
+    }
+
+    /// One step is over: count it, and keep what each phase cost in it if it is the dearest yet.
+    pub fn end_step(&mut self) {
+        if !self.on {
+            return;
+        }
+        self.steps += 1;
+        for (w, t) in self.worst_ns.iter_mut().zip(self.this_step.iter_mut()) {
+            *w = (*w).max(*t);
+            *t = 0;
+        }
+    }
+
+    /// Adds the figures of `other` to these (the panel gathers the steps of several frames).
+    pub fn add(&mut self, other: &Profile) {
+        for i in 0..PHASES.len() {
+            self.ns[i] += other.ns[i];
+            self.runs[i] += other.runs[i];
+            self.worst_ns[i] = self.worst_ns[i].max(other.worst_ns[i]);
+        }
+        self.steps += other.steps;
+    }
+
+    /// The dearest single step of a phase, in milliseconds.
+    pub fn worst_ms(&self, phase: usize) -> f64 {
+        self.worst_ns[phase] as f64 / 1e6
     }
 
     /// Average milliseconds a phase costs per step (spread over every step, also those where
@@ -113,7 +144,9 @@ impl Profile {
     pub fn stop_n(&mut self, phase: usize, clock: Clock, n: u32) {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(t) = clock {
-            self.ns[phase] += t.elapsed().as_nanos() as u64;
+            let ns = t.elapsed().as_nanos() as u64;
+            self.ns[phase] += ns;
+            self.this_step[phase] += ns;
             self.runs[phase] += n;
         }
         #[cfg(target_arch = "wasm32")]

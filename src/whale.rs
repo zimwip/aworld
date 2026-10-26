@@ -67,7 +67,7 @@ pub struct Drop {
     pub life: f32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Whales {
     pub whale: Option<Whale>,
     pub mist: Vec<Drop>,

@@ -141,6 +141,7 @@ const SAMPLE_STEPS: f32 = DAY_STEPS as f32 / 96.0;
 const SAMPLES: usize = 96;
 
 /// The energy budget of the world (see the top of this file).
+#[derive(Clone)]
 pub struct Climate {
     /// How far (°C) the whole sky stands above (or below) its usual day and night cycle.
     pub sky_dev: f32,

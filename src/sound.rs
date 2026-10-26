@@ -470,6 +470,17 @@ impl Sounds {
         }
     }
 
+    /// No audio either, but it keeps what it is told to play, for `take_events` (the simulation
+    /// thread hands its sounds to the screen's this way).
+    pub fn recorder() -> Self {
+        Sounds { muted: false, ..Self::silent() }
+    }
+
+    /// The sounds asked for since the last call.
+    pub fn take_events(&mut self) -> Vec<Ev> {
+        std::mem::take(&mut self.queue)
+    }
+
     #[cfg(feature = "sound")]
     pub async fn load() -> Self {
         let Some(out) = Out::open() else { return Sounds::silent() };

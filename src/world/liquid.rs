@@ -156,6 +156,16 @@ pub struct Drop {
 }
 
 impl Liquids {
+    /// What the picture of the world needs (see `World::copy_picture`): the velocities, the
+    /// pressure, the kind of each cell and the drops in flight, not the scratch nor the solver.
+    pub(super) fn copy_picture(&mut self, from: &Liquids) {
+        self.u.clone_from(&from.u);
+        self.v.clone_from(&from.v);
+        self.p.clone_from(&from.p);
+        self.class.clone_from(&from.class);
+        self.drops.clone_from(&from.drops);
+    }
+
     fn ready(&mut self) {
         if self.u.len() != (W + 1) * H {
             self.u = vec![0.0; (W + 1) * H];
@@ -226,7 +236,6 @@ impl World {
     /// cells under half full go and the others fill up, about as much as there was.
     pub fn set_liquid_physics(&mut self, on: bool) {
         if on {
-            self.set_water_field(false);
             // The liquids no longer take the cells' turn, so that turn can run on every core.
             if turn::parallel_with_liquids() {
                 self.parallel_cells = true;
