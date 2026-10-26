@@ -104,7 +104,7 @@ impl World {
     pub fn cell_motion(&self, x: usize, y: usize, solids: &HashMap<usize, Motion>) -> Option<Motion> {
         let i = y * W() + x;
         let m = self.cells[i].m;
-        let fall = |v: u8| (v != 0).then(|| Motion { vx: 0.0, vy: v as f32 / 8.0 * CELL_STEP_MS, source: Source::Fall });
+        let fall = |v: u8| (v != 0).then(|| Motion { vx: 0.0, vy: v as f32 / super::FALL_UNIT as f32 * CELL_STEP_MS, source: Source::Fall });
         // A drop shot out of a jet flies a cell down and `v` cells sideways a step (see `fly`).
         let jet = self.jet[i];
         if m.kind() == Kind::Liquid && jet >= 2 {
@@ -156,7 +156,7 @@ impl World {
         (self.cells[i].m.kind() == Kind::Liquid).then(|| self.water_fill(i))
     }
 
-    /// The falling speed a grain or a drop keeps (`vel`, eighths of a cell a step).
+    /// The falling speed a grain or a drop keeps (`vel`, in `FALL_UNIT`ths of a cell a tick).
     pub fn cell_fall(&self, x: usize, y: usize) -> u8 {
         self.vel[y * W() + x]
     }

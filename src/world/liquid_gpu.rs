@@ -693,7 +693,7 @@ mod native {
                                 thick |= m == Mat::Lava;
                             }
                             if world.vel[i] != 0 && !world.lone_liquid(x as i32, y as i32) {
-                                fallen.push((i, world.vel[i] as f32 / 8.0 * CELL_M / DT));
+                                fallen.push((i, world.vel[i] as f32 / FALL_UNIT as f32 * CELL_M / DT));
                             }
                         } else {
                             fill[x] = 0;

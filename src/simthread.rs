@@ -259,12 +259,10 @@ impl Worker {
         }
     }
 
-    /// How often the world updates: once a step while it runs (60 a second times the speed),
-    /// 60 times a second while paused (the visitors still move).
+    /// How often the world updates: 60 times a second, running or paused (the visitors still
+    /// move). Each update covers the time since the last, times the speed (see `update_world`).
     fn interval(&self) -> std::time::Duration {
-        let game = self.game.as_ref().expect("the world");
-        let steps = if game.running { crate::STEPS_PER_SECOND * game.speed.max(1) as f32 } else { crate::STEPS_PER_SECOND };
-        std::time::Duration::from_secs_f32(1.0 / steps)
+        std::time::Duration::from_secs_f32(1.0 / crate::STEPS_PER_SECOND)
     }
 
     /// A picture of the world as it is now, if it changed and the screen gave a spare back.
@@ -283,7 +281,7 @@ impl Worker {
     /// lend when the screen asks. The world is
     /// simplified when the updates themselves are slow, not the screen.
     fn update(&mut self) {
-        let dt = self.last.elapsed().as_secs_f32().min(0.05);
+        let dt = self.last.elapsed().as_secs_f32().min(0.25);
         self.last = Instant::now();
         let pace = self.busy.min(0.05);
         let start = Instant::now();
@@ -294,14 +292,14 @@ impl Worker {
     }
 
     fn update_steps(&mut self, dt: f32, pace: f32) {
-        let Some(steps) = self.game.as_mut().expect("the world").update_world(dt, pace) else { return };
+        let Some((steps, step)) = self.game.as_mut().expect("the world").update_world(dt, pace) else { return };
         let mut seconds = 0.0;
         for _ in 0..steps {
             if !self.poll() || self.game.is_none() {
                 return;
             }
             let start = Instant::now();
-            self.game.as_mut().expect("the world").sim_step();
+            self.game.as_mut().expect("the world").sim_step_dt(step);
             seconds += start.elapsed().as_secs_f64();
             // A picture after every step, not after the update: a machine that cannot keep 60
             // steps a second catches up two steps at a time, and the screen would show one
