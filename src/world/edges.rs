@@ -8,7 +8,7 @@ use super::*;
 
 /// Cells along the four borders, `d` cells deep, corners included.
 fn border(d: i32) -> Vec<(i32, i32)> {
-    let (w, h) = (W as i32, H as i32);
+    let (w, h) = (W() as i32, H() as i32);
     let mut v = vec![];
     for y in 0..h {
         for x in 0..w {
@@ -21,14 +21,14 @@ fn border(d: i32) -> Vec<(i32, i32)> {
 }
 
 fn corners() -> [(i32, i32); 4] {
-    let (w, h) = (W as i32 - 1, H as i32 - 1);
+    let (w, h) = (W() as i32 - 1, H() as i32 - 1);
     [(0, 0), (w, 0), (0, h), (w, h)]
 }
 
 /// Edge and corner spots for blasts and bolts: the corners, the middles of each side, and just
 /// outside the grid (a pointer dragged past the window).
 fn spots() -> Vec<(i32, i32)> {
-    let (w, h) = (W as i32, H as i32);
+    let (w, h) = (W() as i32, H() as i32);
     let mut v: Vec<(i32, i32)> = corners().to_vec();
     v.extend([(w / 2, 0), (w / 2, h - 1), (0, h / 2), (w - 1, h / 2)]);
     v.extend([(-3, h + 2), (w + 2, h + 2), (-5, -5), (w + 4, h / 2), (w / 3, h + 6)]);
@@ -57,7 +57,7 @@ fn scene(m: Mat, hot: bool) -> World {
         }
     }
     // Clouds under the top edge to draw charge and throw bolts at the corners.
-    for x in 0..W as i32 {
+    for x in 0..W() as i32 {
         for y in 4..8 {
             if w.raw(x, y) == Mat::Empty {
                 w.set(x, y, Mat::Cloud);
@@ -76,7 +76,7 @@ fn scene(m: Mat, hot: bool) -> World {
 /// Rigid blocks over the corners and along the bottom row, shifted one cell each call.
 fn blocks(w: &mut World, t: i32) {
     w.begin_blocks(vec![Mat::Wood, Mat::Iron, Mat::Stone], vec![false, true, false]);
-    let (wd, h) = (W as i32, H as i32);
+    let (wd, h) = (W() as i32, H() as i32);
     for (k, (cx, cy)) in corners().iter().enumerate() {
         for dy in -4..4 {
             for dx in -4..4 {
@@ -149,8 +149,8 @@ fn a_mixed_world_full_to_the_edges_runs_long() {
     // Every matter at once, in stripes that touch all four borders, hot in places.
     let mut w = World::new();
     let all = Mat::ALL;
-    for y in 0..H as i32 {
-        for x in 0..W as i32 {
+    for y in 0..H() as i32 {
+        for x in 0..W() as i32 {
             let m = all[((x / 5 + y / 7) as usize) % all.len()];
             w.set(x, y, m);
             if (x + y) % 11 == 0 {

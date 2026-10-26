@@ -22,8 +22,8 @@ impl View {
     /// The world fills the whole area: a little is cropped (sides centred, the sky rather than the ground)
     /// when the window is not the same shape as the world.
     pub fn fit(area: Rect) -> View {
-        let s = (area.w / W as f32).max(area.h / H as f32);
-        View { ox: area.x + (area.w - W as f32 * s) / 2.0, oy: area.y + area.h - H as f32 * s, s, area }
+        let s = (area.w / W() as f32).max(area.h / H() as f32);
+        View { ox: area.x + (area.w - W() as f32 * s) / 2.0, oy: area.y + area.h - H() as f32 * s, s, area }
     }
 
     /// What can be seen of the world, in screen pixels.
@@ -40,7 +40,7 @@ impl View {
     }
 
     pub fn rect(&self) -> Rect {
-        Rect::new(self.ox, self.oy, W as f32 * self.s, H as f32 * self.s)
+        Rect::new(self.ox, self.oy, W() as f32 * self.s, H() as f32 * self.s)
     }
 }
 
@@ -199,8 +199,10 @@ void main() {
     gl_FragColor = vec4(vec3(0.02, 0.05, 0.2) * a + warm, a);
 }";
 
-// Clouds and steam are drawn from a density layer: blurred, then thresholded so
-// the cells merge into soft, billowy blobs, lit from above.
+// Clouds and steam are drawn from a density layer, blurred once per change into a smooth field
+// (`GAS_BLUR`, across then down, every cell read: a blur that skips cells cannot rub out a
+// pattern that alternates from one cell to the next, and leaves a fine checkerboard), then
+// thresholded here so the cells merge into soft, billowy blobs, lit from above.
 // `dusk` is (twilight strength, x of the low sun from 0 to 1): at sunrise and sunset the sun shines
 // from below the clouds, so their undersides and the edges facing it glow gold and rose while
 // their tops fall into a lavender shade.
@@ -211,17 +213,7 @@ uniform sampler2D Texture;
 uniform vec2 texel;
 uniform vec2 dusk;
 float dens(vec2 p) {
-    float d = 0.0;
-    float ws = 0.0;
-    for (int i = -3; i <= 3; i++) {
-        for (int j = -3; j <= 3; j++) {
-            vec4 s = texture2D(Texture, p + vec2(float(i), float(j)) * texel * 2.0);
-            float w = exp(-float(i * i + j * j) / 7.0);
-            d += s.a * w;
-            ws += w;
-        }
-    }
-    return d / ws;
+    return texture2D(Texture, p).a;
 }
 void main() {
     float d = dens(uv);
@@ -246,6 +238,79 @@ void main() {
     }
     float alpha = a * 0.86;
     gl_FragColor = vec4(col * alpha, alpha);
+}";
+
+// One pass of the gas blur: a Gaussian along `dir` (one texel across, or one down), σ ≈ 3.7
+// cells, the two passes together the same bell as the blur the clouds always had. The density
+// is the alpha; the result is written as is (no blending) into the field.
+const GAS_BLUR: &str = "#version 100
+precision highp float;
+varying vec2 uv;
+uniform sampler2D Texture;
+uniform vec2 dir;
+void main() {
+    float d = 0.0;
+    float ws = 0.0;
+    for (int i = -9; i <= 9; i++) {
+        float w = exp(-float(i * i) / 28.0);
+        d += texture2D(Texture, uv + dir * float(i)).a * w;
+        ws += w;
+    }
+    gl_FragColor = vec4(d / ws);
+}";
+
+// Drops of water: each is a quad along its flight, texcoord in units of the drop's radius: x from
+// the middle of the round head back along the tail, y across. The vertex colour's red is the
+// tail's length (in radii, over 16), its green the size of a pixel (in radii), its alpha the
+// drop's opacity.
+const RAIN_VERT: &str = "#version 100
+attribute vec3 position;
+attribute vec2 texcoord;
+attribute vec4 color0;
+varying highp vec2 uv;
+varying mediump vec4 col;
+uniform mat4 Model;
+uniform mat4 Projection;
+void main() {
+    gl_Position = Projection * Model * vec4(position, 1.0);
+    uv = texcoord;
+    col = color0 / 255.0;
+}";
+
+// A cartoon drop: a round head, a tail tapering to a point behind it, a darker rim, a glint.
+const RAIN_FRAG: &str = "#version 100
+precision highp float;
+varying highp vec2 uv;
+varying mediump vec4 col;
+void main() {
+    float px = col.g;
+    float len = col.r * 16.0;
+    float a = uv.x;
+    float b = abs(uv.y);
+    // Signed distance to the outline, in radii (negative inside).
+    float dist;
+    if (a <= 0.0) {
+        dist = length(uv) - 1.0;
+    } else {
+        float t = clamp(a / len, 0.0, 1.0);
+        float hw = pow(1.0 - t, 1.4);
+        dist = (b - hw) * 0.85;
+    }
+    float r = 1.0 / px;
+    float cover = clamp(0.5 - dist * r, 0.0, 1.0);
+    if (cover <= 0.0) {
+        discard;
+    }
+    vec3 body = vec3(0.42, 0.66, 0.98);
+    vec3 rim = vec3(0.16, 0.36, 0.78);
+    vec3 c = mix(body, rim, smoothstep(-0.38, -0.12, dist));
+    // The glint, on the head, a little to one side.
+    float g = 1.0 - smoothstep(0.12, 0.32, length(uv - vec2(-0.25, -0.35)));
+    c = mix(c, vec3(0.95, 0.98, 1.0), g * 0.9);
+    // The tail fades out toward its tip.
+    float fade = a > 0.0 ? 1.0 - 0.55 * clamp(a / len, 0.0, 1.0) : 1.0;
+    float alpha = cover * fade * col.a;
+    gl_FragColor = vec4(c * alpha, alpha);
 }";
 
 /// What the world picture shows.
@@ -339,6 +404,16 @@ pub struct Renderer {
     gas_image: Image,
     gas_texture: Texture2D,
     gas_material: Material,
+    /// The blur of the gas layer: across into the first target, then down into the second, the
+    /// smooth density field `GAS_FRAG` reads.
+    gas_blur: Material,
+    gas_field: [RenderTarget; 2],
+    /// The falling drops of rain, drawn as drops rather than cells: (x, y) the middle of the
+    /// cell, (dx, dy) the way it falls, the length of its tail in cells, the size of its head
+    /// (1 a cell's drop). Gathered once per change of the world.
+    drops: Vec<[f32; 6]>,
+    rev_rain: u64,
+    rain_material: Material,
     /// What the textures currently show, so unchanged frames cost nothing.
     /// Trees are a layer of their own so they can sway: (x, y, height above ground, colour).
     veg_image: Image,
@@ -373,8 +448,14 @@ pub struct Renderer {
 
 /// Cells per texel of the light map.
 pub const LS: usize = 6;
-pub const LW: usize = W / LS;
-pub const LH: usize = H / LS;
+#[allow(non_snake_case)]
+pub fn LW() -> usize {
+    W() / LS
+}
+#[allow(non_snake_case)]
+pub fn LH() -> usize {
+    H() / LS
+}
 
 /// Fully cloudy, one square of the light map lets this fraction of the sunlight through, as the
 /// simulation does (it takes 20 % per cell of cloud).
@@ -388,14 +469,14 @@ const CLOUD_PASS: f32 = 0.26;
 /// single ember still shows.
 pub fn light_map(world: &World, out: &mut [[u8; 4]]) {
     let shadow = cloud_shadow(world);
-    let mut glows = vec![0u8; LW * LH];
+    let mut glows = vec![0u8; LW() * LH()];
     // (A row of squares per task, side by side.)
-    out[..LW * LH].par_chunks_mut(LW).zip(glows.par_chunks_mut(LW)).enumerate().for_each(|(ty, (out, glows))| {
-        for tx in 0..LW {
+    out[..LW() * LH()].par_chunks_mut(LW()).zip(glows.par_chunks_mut(LW())).enumerate().for_each(|(ty, (out, glows))| {
+        for tx in 0..LW() {
             let (mut glow, mut heat, mut fire) = (0.0f32, 0.0f32, 0.0f32);
             for y in ty * LS..(ty + 1) * LS {
                 for x in tx * LS..(tx + 1) * LS {
-                    let i = y * W + x;
+                    let i = y * W() + x;
                     match world.cells[i].m {
                         Mat::Fire => {
                             glow += 1.0;
@@ -410,7 +491,7 @@ pub fn light_map(world: &World, out: &mut [[u8; 4]]) {
             }
             let soft = |v: f32, k: f32| (255.0 * (1.0 - (-v / k).exp())) as u8;
             // Above a flame the air is hot too, even before the simulation has warmed it.
-            out[tx] = [soft(fire, 4.0), soft(heat + glow * 0.5, 10.0), (shadow[ty * LW + tx] * 255.0) as u8, 255];
+            out[tx] = [soft(fire, 4.0), soft(heat + glow * 0.5, 10.0), (shadow[ty * LW() + tx] * 255.0) as u8, 255];
             glows[tx] = soft(glow, 5.0);
         }
     });
@@ -424,25 +505,25 @@ fn night_pool(glows: &[u8], out: &mut [[u8; 4]]) {
     const R: i32 = 9;
     let weights: Vec<f32> = (-R..=R).map(|d| (-(d * d) as f32 / 29.0).exp()).collect();
     let total: f32 = weights.iter().sum::<f32>().powi(2);
-    let mut rows = vec![0.0f32; LW * LH];
-    for y in 0..LH {
-        for x in 0..LW {
+    let mut rows = vec![0.0f32; LW() * LH()];
+    for y in 0..LH() {
+        for x in 0..LW() {
             let mut v = 0.0;
             for (k, w) in weights.iter().enumerate() {
-                let sx = (x as i32 + k as i32 - R).clamp(0, LW as i32 - 1) as usize;
-                v += glows[y * LW + sx] as f32 * w;
+                let sx = (x as i32 + k as i32 - R).clamp(0, LW() as i32 - 1) as usize;
+                v += glows[y * LW() + sx] as f32 * w;
             }
-            rows[y * LW + x] = v;
+            rows[y * LW() + x] = v;
         }
     }
-    for y in 0..LH {
-        for x in 0..LW {
+    for y in 0..LH() {
+        for x in 0..LW() {
             let mut v = 0.0;
             for (k, w) in weights.iter().enumerate() {
-                let sy = (y as i32 + k as i32 - R).clamp(0, LH as i32 - 1) as usize;
-                v += rows[sy * LW + x] * w;
+                let sy = (y as i32 + k as i32 - R).clamp(0, LH() as i32 - 1) as usize;
+                v += rows[sy * LW() + x] * w;
             }
-            out[y * LW + x][3] = (v / total * 4.5).min(255.0) as u8;
+            out[y * LW() + x][3] = (v / total * 4.5).min(255.0) as u8;
         }
     }
 }
@@ -453,38 +534,38 @@ fn night_pool(glows: &[u8], out: &mut [[u8; 4]]) {
 /// from the top, each square takes the shade of the square the ray came from, plus that square's
 /// own cloud.
 pub fn cloud_shadow(world: &World) -> Vec<f32> {
-    let mut depth = vec![0.0f32; LW * LH];
+    let mut depth = vec![0.0f32; LW() * LH()];
     if world.sun() <= 0.0 {
         return depth;
     }
     // How much of each square is cloud (smoke is darker).
-    let mut cloud = vec![0.0f32; LW * LH];
-    for y in 0..H {
-        for x in 0..W {
-            let k = match world.cells[y * W + x].m {
+    let mut cloud = vec![0.0f32; LW() * LH()];
+    for y in 0..H() {
+        for x in 0..W() {
+            let k = match world.cells[y * W() + x].m {
                 Mat::Cloud | Mat::Steam => 1.0,
                 Mat::Smoke => 2.0,
                 _ => continue,
             };
-            cloud[(y / LS) * LW + x / LS] += k / (LS * LS) as f32;
+            cloud[(y / LS) * LW() + x / LS] += k / (LS * LS) as f32;
         }
     }
     let (dx, dy) = world.sun_ray_dir();
     // Squares the ray moves sideways per row (a very low sun is taken as a slanted one).
     let slope = (dx / dy.max(0.05)).clamp(-3.0, 3.0);
     let k = -CLOUD_PASS.ln();
-    for ty in 1..LH {
-        for tx in 0..LW {
+    for ty in 1..LH() {
+        for tx in 0..LW() {
             let from = tx as f32 - slope;
             let (i0, f) = (from.floor(), from - from.floor());
             let at = |i: f32| {
                 let i = i as i32;
-                if i < 0 || i >= LW as i32 { 0.0 } else {
-                    let j = (ty - 1) * LW + i as usize;
+                if i < 0 || i >= LW() as i32 { 0.0 } else {
+                    let j = (ty - 1) * LW() + i as usize;
                     depth[j] + cloud[j] * k
                 }
             };
-            depth[ty * LW + tx] = at(i0) * (1.0 - f) + at(i0 + 1.0) * f;
+            depth[ty * LW() + tx] = at(i0) * (1.0 - f) + at(i0 + 1.0) * f;
         }
     }
     depth.iter().map(|d| 1.0 - (-d).exp()).collect()
@@ -492,7 +573,7 @@ pub fn cloud_shadow(world: &World) -> Vec<f32> {
 
 impl Renderer {
     pub fn new() -> Self {
-        let image = Image::gen_image_color(W as u16, H as u16, Color::new(0.0, 0.0, 0.0, 0.0));
+        let image = Image::gen_image_color(W() as u16, H() as u16, Color::new(0.0, 0.0, 0.0, 0.0));
         let texture = Texture2D::from_image(&image);
         texture.set_filter(FilterMode::Linear);
         let blend = BlendState::new(Equation::Add, BlendFactor::One, BlendFactor::OneMinusValue(BlendValue::SourceAlpha));
@@ -506,7 +587,7 @@ impl Renderer {
             },
         )
         .expect("shader");
-        let gas_image = Image::gen_image_color(W as u16, H as u16, Color::new(0.0, 0.0, 0.0, 0.0));
+        let gas_image = Image::gen_image_color(W() as u16, H() as u16, Color::new(0.0, 0.0, 0.0, 0.0));
         let gas_texture = Texture2D::from_image(&gas_image);
         gas_texture.set_filter(FilterMode::Linear);
         let gas_material = load_material(
@@ -518,6 +599,24 @@ impl Renderer {
             },
         )
         .expect("gas shader");
+        let gas_blur = load_material(
+            ShaderSource::Glsl { vertex: VERT, fragment: GAS_BLUR },
+            MaterialParams { uniforms: vec![UniformDesc::new("dir", UniformType::Float2)], ..Default::default() },
+        )
+        .expect("gas blur shader");
+        let gas_field = [(); 2].map(|_| {
+            let t = render_target(W() as u32, H() as u32);
+            t.texture.set_filter(FilterMode::Linear);
+            t
+        });
+        let rain_material = load_material(
+            ShaderSource::Glsl { vertex: RAIN_VERT, fragment: RAIN_FRAG },
+            MaterialParams {
+                pipeline_params: PipelineParams { color_blend: Some(blend), alpha_blend: Some(blend), ..Default::default() },
+                ..Default::default()
+            },
+        )
+        .expect("rain shader");
         let night_material = load_material(
             ShaderSource::Glsl { vertex: VERT, fragment: NIGHT_FRAG },
             MaterialParams {
@@ -527,7 +626,7 @@ impl Renderer {
             },
         )
         .expect("night shader");
-        let light_image = Image::gen_image_color(LW as u16, LH as u16, Color::new(0.0, 0.0, 0.0, 1.0));
+        let light_image = Image::gen_image_color(LW() as u16, LH() as u16, Color::new(0.0, 0.0, 0.0, 1.0));
         let light_texture = Texture2D::from_image(&light_image);
         light_texture.set_filter(FilterMode::Linear);
         // Lightning adds its light to what is under it.
@@ -537,17 +636,17 @@ impl Renderer {
             MaterialParams { pipeline_params: PipelineParams { color_blend: Some(add), alpha_blend: Some(add), ..Default::default() }, ..Default::default() },
         )
         .expect("bolt shader");
-        let veg_image = Image::gen_image_color(W as u16, H as u16, Color::new(0.0, 0.0, 0.0, 0.0));
+        let veg_image = Image::gen_image_color(W() as u16, H() as u16, Color::new(0.0, 0.0, 0.0, 0.0));
         let veg_texture = Texture2D::from_image(&veg_image);
         veg_texture.set_filter(FilterMode::Linear);
         Renderer {
             veg_image,
             veg_texture,
-            veg_zones: vec![vec![]; CW * CH],
+            veg_zones: vec![vec![]; CW() * CH()],
             veg_tick: -1,
             drawn_stamp: 0,
             gas_stamp: 0,
-            gas_zones: vec![0; CW * CH],
+            gas_zones: vec![0; CW() * CH()],
             band: 0,
             full: true,
             image,
@@ -556,6 +655,11 @@ impl Renderer {
             gas_image,
             gas_texture,
             gas_material,
+            gas_blur,
+            gas_field,
+            drops: vec![],
+            rev_rain: u64::MAX,
+            rain_material,
             rev_world: u64::MAX,
             rev_gas: u64::MAX,
             last_mode: 0,
@@ -578,7 +682,7 @@ impl Renderer {
         {
             let mut visible = 0;
             for (idx, out) in px.iter_mut().enumerate() {
-                *out = color(idx % W, idx / W);
+                *out = color(idx % W(), idx / W());
                 visible += (out[3] != 0) as usize;
             }
             visible
@@ -586,18 +690,18 @@ impl Renderer {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).min(8);
-            let rows = H.div_ceil(threads);
+            let rows = H().div_ceil(threads);
             let color = &color;
             std::thread::scope(|scope| {
                 let handles: Vec<_> = px
-                    .chunks_mut(rows * W)
+                    .chunks_mut(rows * W())
                     .enumerate()
                     .map(|(i, chunk)| {
                         scope.spawn(move || {
                             let mut visible = 0;
                             for (j, out) in chunk.iter_mut().enumerate() {
-                                let idx = i * rows * W + j;
-                                *out = color(idx % W, idx / W);
+                                let idx = i * rows * W() + j;
+                                *out = color(idx % W(), idx / W());
                                 visible += (out[3] != 0) as usize;
                             }
                             visible
@@ -612,13 +716,13 @@ impl Renderer {
     /// Recolours one sleeping zone of the picture. Returns how many pixels are not fully transparent.
     fn fill_zone(image: &mut Image, k: usize, color: impl Fn(usize, usize) -> [u8; 4]) -> u32 {
         let px = image.get_image_data_mut();
-        let (x0, y0) = ((k % CW) * CS, (k / CW) * CS);
+        let (x0, y0) = ((k % CW()) * CS, (k / CW()) * CS);
         let mut visible = 0;
-        for y in y0..(y0 + CS).min(H) {
-            for x in x0..(x0 + CS).min(W) {
+        for y in y0..(y0 + CS).min(H()) {
+            for x in x0..(x0 + CS).min(W()) {
                 let c = color(x, y);
                 visible += (c[3] != 0) as u32;
-                px[y * W + x] = c;
+                px[y * W() + x] = c;
             }
         }
         visible
@@ -626,18 +730,18 @@ impl Renderer {
 
     /// The zones whose cells may have changed since step count `since`.
     fn changed_zones(world: &World, since: u64) -> Vec<usize> {
-        (0..CW * CH).filter(|&k| world.zones.changed_since(k, since)).collect()
+        (0..CW() * CH()).filter(|&k| world.zones.changed_since(k, since)).collect()
     }
 
     /// The tree cells of zone `k`: (x, y, height above the ground, colour).
     fn veg_of_zone(world: &World, k: usize) -> Vec<(u16, u16, f32, [u8; 4])> {
-        let (x0, y0) = ((k % CW) * CS, (k / CW) * CS);
+        let (x0, y0) = ((k % CW()) * CS, (k / CW()) * CS);
         let mut out = vec![];
-        for y in y0..(y0 + CS).min(H) {
-            for x in x0..(x0 + CS).min(W) {
+        for y in y0..(y0 + CS).min(H()) {
+            for x in x0..(x0 + CS).min(W()) {
                 if world.cell_mat(x, y).is_vegetation() {
                     let mut h = 0usize;
-                    while h < 90 && y + h + 1 < H && {
+                    while h < 90 && y + h + 1 < H() && {
                         let m = world.cell_mat(x, y + h + 1);
                         m.is_vegetation() || !m.is_hard()
                     } {
@@ -651,7 +755,7 @@ impl Renderer {
     }
 
     pub fn draw_world(&mut self, world: &World, v: View, mode: RenderMode, time: f32) {
-        let size = DrawTextureParams { dest_size: Some(vec2(W as f32 * v.s, H as f32 * v.s)), ..Default::default() };
+        let size = DrawTextureParams { dest_size: Some(vec2(W() as f32 * v.s, H() as f32 * v.s)), ..Default::default() };
         let id = mode as u8;
         // Only rebuild the picture when the world (or the view mode) actually changed.
         if self.rev_world != world.revision || self.last_mode != id {
@@ -680,17 +784,17 @@ impl Renderer {
                     // changes (temperature tints) that do not wake a zone.
                     // A fresh world (a new game, a loaded one) counts its steps from the start again.
                     if self.full || self.last_mode != id || world.zones.stamp() < self.drawn_stamp {
-                        Self::fill(&mut self.image, |x, y| world.color_without_trees(x, y));
-                        for k in 0..CW * CH {
+                        Self::fill(&mut self.image, |x, y| landscape_color(world, x, y));
+                        for k in 0..CW() * CH() {
                             self.veg_zones[k] = Self::veg_of_zone(world, k);
                         }
                         self.full = false;
                     } else {
                         let mut zones = Self::changed_zones(world, self.drawn_stamp);
-                        self.band = (self.band + 1) % CH;
-                        zones.extend((0..CW).map(|i| self.band * CW + i));
+                        self.band = (self.band + 1) % CH();
+                        zones.extend((0..CW()).map(|i| self.band * CW() + i));
                         for k in zones {
-                            Self::fill_zone(&mut self.image, k, |x, y| world.color_without_trees(x, y));
+                            Self::fill_zone(&mut self.image, k, |x, y| landscape_color(world, x, y));
                             self.veg_zones[k] = Self::veg_of_zone(world, k);
                         }
                     }
@@ -726,13 +830,76 @@ impl Renderer {
             }
             (false, None) => vec4(0.0, 0.0, 0.0, 0.0),
         };
-        self.material.set_uniform("texel", vec2(1.0 / W as f32, 1.0 / H as f32));
+        self.material.set_uniform("texel", vec2(1.0 / W() as f32, 1.0 / H() as f32));
         self.material.set_uniform("time", time);
         self.material.set_uniform("sky", sky);
         self.material.set_texture("Light", self.light_texture.clone());
         gl_use_material(&self.material);
         draw_texture_ex(&self.texture, v.ox, v.oy, WHITE, size.clone());
         draw_texture_ex(&self.veg_texture, v.ox, v.oy, WHITE, size);
+        gl_use_default_material();
+        self.draw_rain(world, v);
+    }
+
+    /// The falling raindrops and the drops of water in flight (spray, splashes), stretched along
+    /// their flight like drops in a cartoon: a round head and a tail that tapers behind it,
+    /// longer the faster it goes (`landscape_color` leaves the raindrops' cells out of the
+    /// landscape).
+    fn draw_rain(&mut self, world: &World, v: View) {
+        if self.rev_rain != world.revision {
+            self.drops.clear();
+            for y in 1..H() - 1 {
+                for x in 0..W() {
+                    if let Some(n) = rain_drop(world, x, y) {
+                        // Its fall (eighths of a cell a step), and the wind that slants it.
+                        let fall = world.cell_fall(x, y) as f32 / 8.0;
+                        let (wx, _) = world.flow.wind_at(x as i32, y as i32);
+                        let (dx, dy) = ((wx * 0.6).clamp(-0.7, 0.7), 1.0);
+                        let norm = (dx * dx + dy * dy).sqrt();
+                        let len = (1.6 + 1.2 * fall).min(4.5) + (n - 1) as f32;
+                        self.drops.push([x as f32 + 0.5, y as f32 + 0.5, dx / norm, dy / norm, len, 1.0]);
+                    }
+                }
+            }
+            self.rev_rain = world.revision;
+        }
+        // The drops in flight move every frame: the more water, the bigger.
+        let flying = world.liquid_drops().iter().filter(|d| d.m == Mat::Water).map(|d| {
+            let (vx, vy) = d.velocity();
+            let speed = (vx * vx + vy * vy).sqrt();
+            let (dx, dy) = if speed > 1e-3 { (vx / speed, vy / speed) } else { (0.0, 1.0) };
+            let size = 0.35 + 0.65 * (d.q as f32 / 65536.0).min(1.0).sqrt();
+            [d.x, d.y, dx, dy, (0.8 + 0.3 * speed).min(4.5) * size, size]
+        });
+        let drops: Vec<[f32; 6]> = self.drops.iter().copied().chain(flying).collect();
+        if drops.is_empty() {
+            return;
+        }
+        gl_use_material(&self.rain_material);
+        let mut verts: Vec<Vertex> = vec![];
+        let mut idx: Vec<u16> = vec![];
+        for [x, y, dx, dy, len, size] in drops {
+            if idx.len() + 6 > BOLT_MESH_INDICES {
+                draw_mesh(&Mesh { vertices: std::mem::take(&mut verts), indices: std::mem::take(&mut idx), texture: None });
+            }
+            // The head's radius on screen: a little more than half a cell for a cell's worth of
+            // water, never under a pixel.
+            let r = (0.62 * v.s * size).max(1.0);
+            let head = vec2(v.ox + x * v.s, v.oy + y * v.s);
+            let back = -vec2(dx, dy);
+            let side = vec2(-back.y, back.x);
+            // In radii: the tail's length, and a margin of a pixel round the drop for its soft edge.
+            let tail = (len * v.s / r).max(1.5);
+            let m = 1.0 / r;
+            let col = Color::new((tail / 16.0).min(1.0), m, 0.0, 0.92);
+            let k = verts.len() as u16;
+            for (a, b) in [(-1.0 - m, -1.0 - m), (tail + m, -1.0 - m), (tail + m, 1.0 + m), (-1.0 - m, 1.0 + m)] {
+                let p = head + (back * a + side * b) * r;
+                verts.push(Vertex::new(p.x, p.y, 0.0, a, b, col));
+            }
+            idx.extend_from_slice(&[k, k + 1, k + 2, k, k + 2, k + 3]);
+        }
+        draw_mesh(&Mesh { vertices: verts, indices: idx, texture: None });
         gl_use_default_material();
     }
 
@@ -754,7 +921,7 @@ impl Renderer {
         if night <= 0.02 {
             return;
         }
-        self.night_material.set_uniform("texel", vec2(1.0 / LW as f32, 1.0 / LH as f32));
+        self.night_material.set_uniform("texel", vec2(1.0 / LW() as f32, 1.0 / LH() as f32));
         self.night_material.set_uniform("time", time);
         self.night_material.set_uniform("night", night);
         gl_use_material(&self.night_material);
@@ -768,9 +935,9 @@ impl Renderer {
     /// charged cloud, faint violet sparks crackle on its top.
     pub fn draw_corona(&self, world: &World, v: View, time: f32) {
         use crate::world::{GROUND_BREAKDOWN, QH, QS, QW};
-        for qy in 1..QH {
-            for qx in 0..QW {
-                let q = world.mcharge[qy * QW + qx].abs() / GROUND_BREAKDOWN;
+        for qy in 1..QH() {
+            for qx in 0..QW() {
+                let q = world.mcharge[qy * QW() + qx].abs() / GROUND_BREAKDOWN;
                 if q < 0.45 {
                     continue;
                 }
@@ -868,8 +1035,8 @@ impl Renderer {
             let hf = (h / 40.0).powf(1.4).min(2.5);
             let wave = (time * 1.9 + x as f32 * 0.07 + h * 0.03).sin() + 0.5 * (time * 3.3 + y as f32 * 0.11).sin();
             let dx = (w * 1.4 + wave * (0.35 + 0.9 * w.abs())) * hf;
-            let nx = (x as i32 + dx.round() as i32).clamp(0, W as i32 - 1) as usize;
-            px[y as usize * W + nx] = col;
+            let nx = (x as i32 + dx.round() as i32).clamp(0, W() as i32 - 1) as usize;
+            px[y as usize * W() + nx] = col;
         }
         self.veg_texture.update(&self.veg_image);
     }
@@ -878,7 +1045,7 @@ impl Renderer {
     pub fn draw_gas(&mut self, world: &World, v: View) {
         if self.rev_gas != world.revision {
             // The gas picture depends only on the cells: recolour the zones that changed.
-            let zones = if self.rev_gas == u64::MAX || world.zones.stamp() < self.gas_stamp { (0..CW * CH).collect() } else { Self::changed_zones(world, self.gas_stamp) };
+            let zones = if self.rev_gas == u64::MAX || world.zones.stamp() < self.gas_stamp { (0..CW() * CH()).collect() } else { Self::changed_zones(world, self.gas_stamp) };
             let was = self.has_gas;
             for k in zones {
                 self.gas_zones[k] = Self::fill_zone(&mut self.gas_image, k, |x, y| world.gas_color(x, y));
@@ -886,6 +1053,7 @@ impl Renderer {
             self.has_gas = self.gas_zones.iter().any(|&n| n > 0);
             if self.has_gas || was {
                 self.gas_texture.update(&self.gas_image);
+                self.blur_gas();
             }
             self.rev_gas = world.revision;
             self.gas_stamp = world.zones.stamp();
@@ -895,17 +1063,68 @@ impl Renderer {
             return;
         }
         let (dusk, sun_x) = crate::backdrop::twilight(world.phase());
-        self.gas_material.set_uniform("texel", vec2(1.0 / W as f32, 1.0 / H as f32));
+        self.gas_material.set_uniform("texel", vec2(1.0 / W() as f32, 1.0 / H() as f32));
         self.gas_material.set_uniform("dusk", vec2(dusk, sun_x));
         gl_use_material(&self.gas_material);
         draw_texture_ex(
-            &self.gas_texture,
+            &self.gas_field[1].texture,
             v.ox,
             v.oy,
             WHITE,
-            DrawTextureParams { dest_size: Some(vec2(W as f32 * v.s, H as f32 * v.s)), ..Default::default() },
+            DrawTextureParams { dest_size: Some(vec2(W() as f32 * v.s, H() as f32 * v.s)), ..Default::default() },
         );
         gl_use_default_material();
+    }
+}
+
+impl Renderer {
+    /// Blurs the gas layer into the smooth density field: across, then down, off screen.
+    fn blur_gas(&self) {
+        let (w, h) = (W() as f32, H() as f32);
+        let pass = |src: &Texture2D, dst: &RenderTarget, dir: Vec2| {
+            let mut camera = Camera2D::from_display_rect(Rect::new(0.0, 0.0, w, h));
+            // Upside down, so that the target reads the right way up when drawn (as `ui.rs` does).
+            camera.zoom.y = -camera.zoom.y;
+            camera.render_target = Some(dst.clone());
+            set_camera(&camera);
+            clear_background(Color::new(0.0, 0.0, 0.0, 0.0));
+            self.gas_blur.set_uniform("dir", dir);
+            gl_use_material(&self.gas_blur);
+            draw_texture_ex(src, 0.0, 0.0, WHITE, DrawTextureParams { dest_size: Some(vec2(w, h)), ..Default::default() });
+            gl_use_default_material();
+        };
+        pass(&self.gas_texture, &self.gas_field[0], vec2(1.0 / w, 0.0));
+        pass(&self.gas_field[0].texture, &self.gas_field[1], vec2(0.0, 1.0 / h));
+        set_default_camera();
+    }
+}
+
+/// The most cells of water one above the other that still fall as one drop.
+const DROP_CELLS: usize = 3;
+
+/// A drop of water falling through the air, whose lowest cell is (x, y): a short column of water
+/// (`DROP_CELLS` at most) with air (or gas) under it, and no block, and no liquid above it. Its number of
+/// cells; drawn as a drop (`Renderer::draw_rain`) rather than as cells.
+fn rain_drop(world: &World, x: usize, y: usize) -> Option<usize> {
+    let i = y * W() + x;
+    if world.cells[i].m != Mat::Water || y + 1 >= H() || !matches!(world.cells[i + W()].m.kind(), Kind::Empty | Kind::Gas) || !world.mask_free(x as i32, y as i32 + 1) {
+        return None;
+    }
+    let n = (0..=DROP_CELLS).take_while(|&k| k <= y && world.cells[i - k * W()].m == Mat::Water).count();
+    (n <= DROP_CELLS && y >= n && world.cells[i - n * W()].m.kind() != Kind::Liquid).then_some(n)
+}
+
+/// Whether cell (x, y) is part of a falling drop.
+fn in_drop(world: &World, x: usize, y: usize) -> bool {
+    (y..(y + DROP_CELLS).min(H())).take_while(|&yy| world.cells[yy * W() + x].m == Mat::Water).any(|yy| rain_drop(world, x, yy).is_some())
+}
+
+/// The landscape's colour of cell (x, y): the world's, but none for a falling raindrop.
+fn landscape_color(world: &World, x: usize, y: usize) -> [u8; 4] {
+    if in_drop(world, x, y) {
+        [0, 0, 0, 0]
+    } else {
+        world.color_without_trees(x, y)
     }
 }
 
@@ -1043,7 +1262,7 @@ fn stress_color(world: &World, x: usize, y: usize) -> [u8; 4] {
     if m.kind() != Kind::Static || matches!(m, Mat::Dirt | Mat::Grass) {
         return [c[0] / 3, c[1] / 3, c[2] / 3, c[3] / 2];
     }
-    let (r, g, b) = stress_rgb(world.strain[y * W + x] as f32 / 127.5);
+    let (r, g, b) = stress_rgb(world.strain[y * W() + x] as f32 / 127.5);
     let a = c[3] as f32 / 255.0;
     let mix = |k: f32, base: u8| ((k * 255.0 * 0.75 + base as f32 * 0.25) * a) as u8;
     [mix(r, c[0]), mix(g, c[1]), mix(b, c[2]), c[3]]
@@ -1381,7 +1600,7 @@ mod tests {
                 w.set(x, y, Mat::Cloud);
             }
         }
-        let at = |sh: &[f32], x: usize, y: usize| sh[(y / LS) * LW + x / LS];
+        let at = |sh: &[f32], x: usize, y: usize| sh[(y / LS) * LW() + x / LS];
         // Noon: the sun is high, the shadow falls straight down.
         w.set_phase(0.25);
         let sh = cloud_shadow(&w);
@@ -1411,12 +1630,12 @@ mod tests {
         // A pocket of hot air far from the fire.
         for y in 120..126 {
             for x in 120..126 {
-                w.temp[y * W + x] = 200.0;
+                w.temp[y * W() + x] = 200.0;
             }
         }
-        let mut px = vec![[0u8; 4]; LW * LH];
+        let mut px = vec![[0u8; 4]; LW() * LH()];
         light_map(&w, &mut px);
-        let at = |x: usize, y: usize| px[(y / LS) * LW + x / LS];
+        let at = |x: usize, y: usize| px[(y / LS) * LW() + x / LS];
         assert!(at(601, 301)[0] > 150, "the fire glows: {:?}", at(601, 301));
         assert!(at(601, 301)[1] > 50, "the air above a flame shimmers");
         assert_eq!(at(300, 300)[0], 0, "no light away from the fire");
@@ -1441,9 +1660,9 @@ mod tests {
                 w.set(x, y, Mat::Lava);
             }
         }
-        let mut px = vec![[0u8; 4]; LW * LH];
+        let mut px = vec![[0u8; 4]; LW() * LH()];
         light_map(&w, &mut px);
-        let lava = px[(300 / LS) * LW + 300 / LS];
+        let lava = px[(300 / LS) * LW() + 300 / LS];
         assert_eq!(lava[0], 0, "no flames on lava: {lava:?}");
         assert!(lava[3] > 0, "but it lights the night: {lava:?}");
     }
@@ -1472,26 +1691,26 @@ mod bench {
             }
             eprintln!("RENDER {name}: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 20.0);
         };
-        let mut light = vec![[0u8; 4]; LW * LH];
+        let mut light = vec![[0u8; 4]; LW() * LH()];
         time("carte de lumière", &mut || light_map(&w, &mut light));
         time("  dont ombre des nuages", &mut || {
             let _ = cloud_shadow(&w);
         });
-        let glows = vec![9u8; LW * LH];
+        let glows = vec![9u8; LW() * LH()];
         time("  dont halo de nuit", &mut || night_pool(&glows, &mut light));
-        let mut px = vec![[0u8; 4]; W * H];
+        let mut px = vec![[0u8; 4]; W() * H()];
         time("recoloriage complet (normal)", &mut || {
             for (i, p) in px.iter_mut().enumerate() {
-                *p = w.color_without_trees(i % W, i / W);
+                *p = w.color_without_trees(i % W(), i / W());
             }
         });
         time("recoloriage complet (thermique)", &mut || {
             for (i, p) in px.iter_mut().enumerate() {
-                *p = w.thermal_color(i % W, i / W);
+                *p = w.thermal_color(i % W(), i / W());
             }
         });
         time("cellules des arbres (toutes les zones)", &mut || {
-            for k in 0..CW * CH {
+            for k in 0..CW() * CH() {
                 let _ = Renderer::veg_of_zone(&w, k);
             }
         });

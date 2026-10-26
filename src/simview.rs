@@ -15,7 +15,7 @@ use crate::render::View;
 use crate::science::info;
 use crate::ui::{draw_icon, rrect, Icon, Ui, ACCENT, DIM, GREEN, TEXT};
 use crate::world::inspect::{Field, Motion, Source, FULL};
-use crate::world::liquid_class::{AIR, FULLISH, WET};
+use crate::world::liquid_class::{AIR, FULLISH, SOLID, WET};
 use crate::world::sleep::{CH, CS, CW};
 use crate::world::{self, Kind, Mat, World, H, W};
 
@@ -120,7 +120,7 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn take(w: &World) -> Snapshot {
         let solids = w.solid_motions();
-        let at = |i: usize| (i % W, i / W);
+        let at = |i: usize| (i % W(), i / W());
         let pa = |i: usize| {
             let (x, y) = at(i);
             match (w.field_value(Field::LiquidPa, x, y), w.field_value(Field::LiquidAtm, x, y)) {
@@ -131,11 +131,11 @@ impl Snapshot {
         };
         Snapshot {
             step: w.steps(),
-            mat: (0..W * H).map(|i| w.cells[i].m).collect(),
-            fill: (0..W * H).map(|i| w.cell_fill(i % W, i / W).unwrap_or(0)).collect(),
+            mat: (0..W() * H()).map(|i| w.cells[i].m).collect(),
+            fill: (0..W() * H()).map(|i| w.cell_fill(i % W(), i / W()).unwrap_or(0)).collect(),
             temp: w.temp.clone(),
-            pa: (0..W * H).into_par_iter().map(pa).collect(),
-            vel: (0..W * H)
+            pa: (0..W() * H()).into_par_iter().map(pa).collect(),
+            vel: (0..W() * H())
                 .into_par_iter()
                 .map(|i| {
                     let (x, y) = at(i);
@@ -184,6 +184,14 @@ pub struct SimView {
     /// Which layers are drawn over it.
     pub zones: bool,
     pub card: bool,
+    /// The liquids the solver of `liquid.rs` moves, and the gas it takes for a wall.
+    pub solver: bool,
+    /// That layer's picture, its revision, and how many cells it marks (full, film, drops left
+    /// to the cells, gas taken for a wall).
+    solver_image: Option<Image>,
+    solver_texture: Option<Texture2D>,
+    solver_key: Option<u64>,
+    solver_counts: [usize; 4],
     pub flying: bool,
     /// The particles of the game in flight last drawn, by kind (`PARTICLES`).
     particles: [usize; 2],
@@ -218,6 +226,11 @@ impl SimView {
             back: Back::Matter,
             zones: true,
             card: true,
+            solver: true,
+            solver_image: None,
+            solver_texture: None,
+            solver_key: None,
+            solver_counts: [0; 4],
             flying: true,
             particles: [0; 2],
             velocity: [true, true, false, false, true],
@@ -250,7 +263,7 @@ impl SimView {
         let mut changed = [(0usize, 0f32); 5];
         for (k, of) in DiffOf::ALL.iter().enumerate() {
             let least = of.unit().1;
-            let (n, top) = (0..W * H)
+            let (n, top) = (0..W() * H())
                 .into_par_iter()
                 .map(|i| before.delta(&after, *of, i))
                 .filter(|d| d.abs() >= least)
@@ -276,17 +289,75 @@ impl SimView {
             self.key = Some(key);
         }
         if let Some(t) = &self.texture {
-            draw_texture_ex(t, view.ox, view.oy, WHITE, DrawTextureParams { dest_size: Some(vec2(W as f32 * view.s, H as f32 * view.s)), ..Default::default() });
+            draw_texture_ex(t, view.ox, view.oy, WHITE, DrawTextureParams { dest_size: Some(vec2(W() as f32 * view.s, H() as f32 * view.s)), ..Default::default() });
+        }
+    }
+
+    /// The solver's liquids over the background: full cells in blue, films in light blue, drops
+    /// it leaves to the cells in yellow, and in orange a gas it takes for a wall beside its
+    /// liquid (a cloud or steam in the open: the liquid rests on it as on the ground). Fainter
+    /// where the calculation sleeps.
+    fn draw_solver(&mut self, w: &World, view: View) {
+        if self.solver_key != Some(w.revision) || self.solver_texture.is_none() {
+            let image = self.solver_image.get_or_insert_with(|| Image::gen_image_color(W() as u16, H() as u16, BLANK));
+            let px = image.get_image_data_mut();
+            let class = |x: usize, y: usize| w.liquid_class(x, y).unwrap_or(SOLID);
+            let liquid = |x: usize, y: usize| w.cell_mat(x, y).kind() == Kind::Liquid;
+            let counts = px
+                .par_chunks_mut(W())
+                .enumerate()
+                .map(|(y, row)| {
+                    let mut n = [0usize; 4];
+                    for (x, out) in row.iter_mut().enumerate() {
+                        let c = class(x, y);
+                        let m = w.cell_mat(x, y);
+                        let a = |a: u8| if c & 4 != 0 { a } else { a / 2 };
+                        *out = match (m.kind(), c & 3) {
+                            (Kind::Liquid, FULLISH) => {
+                                n[0] += 1;
+                                [60, 140, 255, a(150)]
+                            }
+                            (Kind::Liquid, WET) => {
+                                n[1] += 1;
+                                [150, 215, 255, a(140)]
+                            }
+                            (Kind::Liquid, AIR) => {
+                                n[2] += 1;
+                                [255, 220, 60, 200]
+                            }
+                            (Kind::Gas, SOLID) if [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)].iter().any(|&(nx, ny)| nx < W() && ny < H() && liquid(nx, ny)) => {
+                                n[3] += 1;
+                                [255, 110, 0, 230]
+                            }
+                            _ => [0, 0, 0, 0],
+                        };
+                    }
+                    n
+                })
+                .reduce(|| [0; 4], |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]);
+            self.solver_counts = counts;
+            match &self.solver_texture {
+                Some(t) => t.update(image),
+                None => {
+                    let t = Texture2D::from_image(image);
+                    t.set_filter(FilterMode::Nearest);
+                    self.solver_texture = Some(t);
+                }
+            }
+            self.solver_key = Some(w.revision);
+        }
+        if let Some(t) = &self.solver_texture {
+            draw_texture_ex(t, view.ox, view.oy, WHITE, DrawTextureParams { dest_size: Some(vec2(W() as f32 * view.s, H() as f32 * view.s)), ..Default::default() });
         }
     }
 
     fn rebuild(&mut self, w: &World) {
         let back = self.back;
         // The values first, for the scale of the colours.
-        self.values.resize(W * H, f32::NAN);
+        self.values.resize(W() * H(), f32::NAN);
         let (before, after) = (self.before.as_ref(), self.after.as_ref());
         self.values.par_iter_mut().enumerate().for_each(|(i, v)| {
-            let (x, y) = (i % W, i / W);
+            let (x, y) = (i % W(), i / W());
             *v = match back {
                 Back::Pressure => pressure_pa(w, x, y),
                 Back::Air => w.field_value(Field::Air, x, y).map_or(f32::NAN, |p| p * ATM),
@@ -307,11 +378,11 @@ impl SimView {
             let k = (mags.len() * 99 / 100).min(mags.len() - 1);
             *mags.select_nth_unstable_by(k, f32::total_cmp).1
         };
-        let image = self.image.get_or_insert_with(|| Image::gen_image_color(W as u16, H as u16, BLACK));
+        let image = self.image.get_or_insert_with(|| Image::gen_image_color(W() as u16, H() as u16, BLACK));
         let (values, scale, top) = (&self.values, self.scale, self.top);
         let after = self.after.as_ref();
         image.get_image_data_mut().par_iter_mut().enumerate().for_each(|(i, px)| {
-            let (x, y) = (i % W, i / W);
+            let (x, y) = (i % W(), i / W());
             let dim = |k: u32| {
                 let c = w.color(x, y);
                 let a = c[3] as u32;
@@ -374,16 +445,19 @@ impl SimView {
         let (a, b) = (view.to_world(vec2(area.x, area.y)), view.to_world(vec2(area.x + area.w, area.y + area.h)));
         let vis = Rect::new(a.x, a.y, b.x - a.x, b.y - a.y);
         let p = view.to_world(ui.mouse);
-        self.hover = (!ui.over_ui() && area.contains(ui.mouse) && p.x >= 0.0 && p.y >= 0.0 && (p.x as usize) < W && (p.y as usize) < H).then(|| (p.x as usize, p.y as usize));
+        self.hover = (!ui.over_ui() && area.contains(ui.mouse) && p.x >= 0.0 && p.y >= 0.0 && (p.x as usize) < W() && (p.y as usize) < H()).then(|| (p.x as usize, p.y as usize));
+        if self.solver && w.liquid_physics {
+            self.draw_solver(w, view);
+        }
         if self.zones {
-            for zy in 0..CH {
-                for zx in 0..CW {
+            for zy in 0..CH() {
+                for zx in 0..CW() {
                     let r = Rect::new((zx * CS) as f32, (zy * CS) as f32, CS as f32, CS as f32);
                     if !vis.overlaps(&r) {
                         continue;
                     }
                     let a = view.to_screen(vec2(r.x, r.y));
-                    let runs = w.zones.runs(zy * CW + zx);
+                    let runs = w.zones.runs(zy * CW() + zx);
                     let col = if runs { Color::new(0.3, 1.0, 0.4, 0.55) } else { Color::new(0.6, 0.6, 0.6, 0.18) };
                     draw_rectangle_lines(a.x, a.y, r.w * view.s, r.h * view.s, if runs { 1.5 } else { 1.0 }, col);
                 }
@@ -393,7 +467,7 @@ impl SimView {
             if let Some((y0, y1)) = w.liquid_card_rows() {
                 let col = Color::new(1.0, 0.6, 0.2, 0.8);
                 for y in [y0 as f32, y1 as f32 + 1.0] {
-                    let (a, b) = (view.to_screen(vec2(0.0, y)), view.to_screen(vec2(W as f32, y)));
+                    let (a, b) = (view.to_screen(vec2(0.0, y)), view.to_screen(vec2(W() as f32, y)));
                     draw_line(a.x, a.y, b.x, b.y, 1.5, col);
                 }
                 let a = view.to_screen(vec2(vis.x.max(0.0) + 2.0, y0 as f32));
@@ -438,16 +512,16 @@ impl SimView {
             return;
         }
         let solids = w.solid_motions();
-        let x_range = |step: usize| ((vis.x.max(0.0) as usize / step * step)..((vis.x + vis.w).max(0.0) as usize + 1).min(W)).step_by(step);
-        let y_range = |step: usize| ((vis.y.max(0.0) as usize / step * step)..((vis.y + vis.h).max(0.0) as usize + 1).min(H)).step_by(step);
+        let x_range = |step: usize| ((vis.x.max(0.0) as usize / step * step)..((vis.x + vis.w).max(0.0) as usize + 1).min(W())).step_by(step);
+        let y_range = |step: usize| ((vis.y.max(0.0) as usize / step * step)..((vis.y + vis.h).max(0.0) as usize + 1).min(H())).step_by(step);
         // One arrow a block of `step` × `step` cells: its fastest cell, so that a few grains
         // in flight are not missed between the samples.
         let step = (6.0 / view.s).ceil().max(1.0) as usize;
         for by in y_range(step) {
             for bx in x_range(step) {
                 let mut best: Option<(f32, usize, usize, Motion, usize)> = None;
-                for y in by..(by + step).min(H) {
-                    for x in bx..(bx + step).min(W) {
+                for y in by..(by + step).min(H()) {
+                    for x in bx..(bx + step).min(W()) {
                         let m = w.cell_mat(x, y);
                         let g = group(m);
                         if g == 3 || !self.velocity[g] || (g == 4 && solids.is_empty()) {
@@ -472,8 +546,8 @@ impl SimView {
             let every = if c as f32 * view.s < 10.0 { 2 } else { 1 };
             for y in y_range(c * every) {
                 for x in x_range(c * every) {
-                    let (cx, cy) = (x + c / 2, (y + c / 2).min(H - 1));
-                    if cx >= W || w.cell_mat(cx, cy).kind() != Kind::Empty {
+                    let (cx, cy) = (x + c / 2, (y + c / 2).min(H() - 1));
+                    if cx >= W() || w.cell_mat(cx, cy).kind() != Kind::Empty {
                         continue;
                     }
                     if let Some(m) = w.cell_motion(cx, cy, &solids) {
@@ -593,6 +667,24 @@ impl SimView {
         y += 28.0;
         let flying = w.liquid_drops().len() + w.ejecta_motion().count() + self.particles[0] + self.particles[1];
         let card = w.liquid_card_rows().is_some();
+        if w.liquid_physics {
+            let [full, film, drops, walls] = self.solver_counts;
+            if ui.checkbox(Rect::new(x, y, cw, 20.0), &format!("Liquides du solveur ({})", full + film), self.solver, true) {
+                self.solver = !self.solver;
+            }
+            y += 22.0;
+            if self.solver {
+                let keys = [((60, 140, 255), format!("plein {}", count(full))), ((150, 215, 255), format!("film {}", count(film))), ((255, 220, 60), format!("goutte {}", count(drops)))];
+                for (k, (c, label)) in keys.iter().enumerate() {
+                    let bx = x + 8.0 + k as f32 * (cw - 8.0) / 3.0;
+                    draw_rectangle(bx, y + 2.0, 9.0, 9.0, Color::from_rgba(c.0, c.1, c.2, 255));
+                    ui.text(label, bx + 13.0, y + 11.0, 11, DIM);
+                }
+                draw_rectangle(x + 8.0, y + 17.0, 9.0, 9.0, Color::from_rgba(255, 110, 0, 255));
+                ui.text(&format!("gaz pris pour une paroi : {} cases", count(walls)), x + 21.0, y + 26.0, 11, if walls > 0 { TEXT } else { DIM });
+                y += 32.0;
+            }
+        }
         let mut layers = vec![
             (format!("Zones de calcul actives ({})", w.zones.awake_count()), &mut self.zones),
             (format!("Particules en vol ({flying})"), &mut self.flying),
@@ -710,9 +802,9 @@ impl SimView {
         let Some((x, y)) = self.hover else {
             return vec![("(pointe une case du monde)".into(), DIM)];
         };
-        let i = y * W + x;
+        let i = y * W() + x;
         let m = w.cell_mat(x, y);
-        let zone = (y / CS) * CW + x / CS;
+        let zone = (y / CS) * CW() + x / CS;
         let mut out = vec![(format!("case ({x}, {y}) · zone {zone} {}", if w.zones.runs(zone) { "tourne" } else { "dort" }), TEXT)];
         let kind = match m.kind() {
             Kind::Empty => "vide",

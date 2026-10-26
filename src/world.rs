@@ -11,6 +11,7 @@ pub mod liquid_class {
     #[allow(unused_imports)]
     pub use super::liquid::SOLID;
 }
+pub use liquid::CELL_M;
 pub mod flow;
 mod pockets;
 mod pressure;
@@ -46,6 +47,7 @@ pub const STEP: f32 = 1.0 / 60.0;
 /// speed) is several steps: past it the heat and the liquids would need sub-steps of their own.
 pub const MAX_DT: f32 = 3.0 * STEP;
 use thermal::adiabatic_cooling_c;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 /// How the brush treats what is already there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,14 +95,64 @@ impl Biome {
 /// Room for this many materials in per-material tables.
 pub const NMAT: usize = Mat::ALL.len();
 
-pub const W: usize = 960;
-pub const H: usize = 540;
+/// The size of the world, in cells: 960 x 540 unless the game is started with another one
+/// (`--grid`, see `set_grid`). Set once, before the first world is made: every field of the
+/// world, of the renderer and of the card is sized from it.
+static GRID: [AtomicUsize; 2] = [AtomicUsize::new(960), AtomicUsize::new(540)];
+/// Columns across the world.
+#[allow(non_snake_case)]
+#[inline(always)]
+pub fn W() -> usize {
+    GRID[0].load(Relaxed)
+}
+/// Rows down the world.
+#[allow(non_snake_case)]
+#[inline(always)]
+pub fn H() -> usize {
+    GRID[1].load(Relaxed)
+}
+/// The design size, which the terrain and the sky are drawn for (see `sx`, `sy`).
+pub const BASE_W: usize = 960;
+pub const BASE_H: usize = 540;
+/// The widths and heights `--grid` takes: steps of 96 columns (whole sleeping zones, in threes
+/// for the strips of the cells' turn, see `turn.rs`) and of 18 rows (whole cells of the storms'
+/// charge and of the light map, and 16:9 every other step across: 480 x 270, 1440 x 810...).
+pub const GRID_W: (usize, usize, usize) = (384, 1920, 96);
+pub const GRID_H: (usize, usize, usize) = (216, 1080, 18);
+
+/// The nearest size `set_grid` takes.
+pub fn snap_grid(w: usize, h: usize) -> (usize, usize) {
+    let snap = |v: usize, (lo, hi, step): (usize, usize, usize)| ((v.clamp(lo, hi) + step / 2) / step * step).clamp(lo, hi);
+    (snap(w, GRID_W), snap(h, GRID_H))
+}
+
+/// Sets the size of the world (snapped, see `snap_grid`). Only before the first world is made:
+/// a world, a renderer or a card already made keep the size they were made at.
+pub fn set_grid(w: usize, h: usize) -> (usize, usize) {
+    let (w, h) = snap_grid(w, h);
+    GRID[0].store(w, Relaxed);
+    GRID[1].store(h, Relaxed);
+    turn::check_strips();
+    (w, h)
+}
+
+/// How much wider and taller the world is than the design size: the terrain and the sky are
+/// stretched by these, so that a world of more cells is the same landscape in finer cells.
+pub fn sx() -> f32 {
+    W() as f32 / BASE_W as f32
+}
+pub fn sy() -> f32 {
+    H() as f32 / BASE_H as f32
+}
 /// Resolution factor relative to the 320x180 design grid.
 pub const K: i32 = 3;
 /// Thickness, in cells, of the masonry vault the tunnel tool leaves around its hole.
 pub const TUNNEL_LINING: i32 = 3;
 /// Above this row the air is cold: steam condenses into clouds.
-const COLD_Y: i32 = (H as i32) * 3 / 10;
+#[allow(non_snake_case)]
+fn COLD_Y() -> i32 {
+    (H() as i32) * 3 / 10
+}
 /// The top of the weather (the tropopause, about 13 km up on the logarithmic altitude scale of
 /// `thermal::altitude_m`): above this row the air gets warmer again with height (an inversion).
 /// Rising steam and clouds cool as they climb, so past it they are soon colder and denser than
@@ -110,7 +162,10 @@ const COLD_Y: i32 = (H as i32) * 3 / 10;
 /// in one go.
 pub const THIN_RUN: i32 = 16 * K;
 
-pub const CEILING_Y: i32 = (H as i32) / 8;
+#[allow(non_snake_case)]
+pub fn CEILING_Y() -> i32 {
+    (H() as i32) / 8
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -262,18 +317,18 @@ pub fn grain_dot([r, g, b]: [u8; 3]) -> [u8; 4] {
 /// A coarse field of `b`×`b` squares spread back over every cell, bilinear between the centres of
 /// the squares, so the picture has no visible blocks.
 pub fn upsample(coarse: &[f32], bw: usize, bh: usize, b: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; W * H];
-    for y in 0..H {
+    let mut out = vec![0.0f32; W() * H()];
+    for y in 0..H() {
         let fy = ((y as f32 + 0.5) / b as f32 - 0.5).clamp(0.0, bh as f32 - 1.0);
         let (j0, ty) = (fy as usize, fy.fract());
         let j1 = (j0 + 1).min(bh - 1);
-        for x in 0..W {
+        for x in 0..W() {
             let fx = ((x as f32 + 0.5) / b as f32 - 0.5).clamp(0.0, bw as f32 - 1.0);
             let (i0, tx) = (fx as usize, fx.fract());
             let i1 = (i0 + 1).min(bw - 1);
             let top = coarse[j0 * bw + i0] * (1.0 - tx) + coarse[j0 * bw + i1] * tx;
             let bot = coarse[j1 * bw + i0] * (1.0 - tx) + coarse[j1 * bw + i1] * tx;
-            out[y * W + x] = top * (1.0 - ty) + bot * ty;
+            out[y * W() + x] = top * (1.0 - ty) + bot * ty;
         }
     }
     out
@@ -799,26 +854,26 @@ impl World {
     pub fn new() -> Self {
         World {
             pressure_cache: std::sync::Mutex::new(None),
-            cells: vec![EMPTY; W * H],
+            cells: vec![EMPTY; W() * H()],
             frame: 0,
             rng: 0x1234_5678,
-            seen: vec![false; W * H],
+            seen: vec![false; W() * H()],
             stack: Vec::new(),
-            released: vec![false; W * H],
+            released: vec![false; W() * H()],
             released_list: Vec::new(),
             falling: Vec::new(),
             slabs: Vec::new(),
-            level: vec![u32::MAX; W * H],
-            strain: vec![0; W * H],
+            level: vec![u32::MAX; W() * H()],
+            strain: vec![0; W() * H()],
             pushes: Vec::new(),
             strain_key: 0,
             stress_cache: std::collections::HashMap::new(),
             stress_pos: Vec::new(),
             stress_local: Vec::new(),
             ticks: 0,
-            log: vec![0; W * H],
+            log: vec![0; W() * H()],
             paint_log: 0,
-            temp: vec![15.0; W * H],
+            temp: vec![15.0; W() * H()],
             clock: DAY_STEPS / 5,
             dt: STEP,
             tick_time: 0.0,
@@ -843,8 +898,8 @@ impl World {
             autumn: 0.0,
             grass_rgb: (88, 172, 64),
             structures_fall: true,
-            mask: vec![0; W * H],
-            mask_prev: vec![0; W * H],
+            mask: vec![0; W() * H()],
+            mask_prev: vec![0; W() * H()],
             block_mat: Vec::new(),
             mask_pass: Vec::new(),
             touched: Vec::new(),
@@ -854,33 +909,33 @@ impl World {
             thuds: Vec::new(),
             water_flow: 0,
             flow: flow::Flow::new(),
-            dp: vec![0.0; flow::FW * flow::FH],
-            dp_slow: vec![0.0; flow::FW * flow::FH],
-            dpd: vec![0.0; flow::FW * flow::FH],
+            dp: vec![0.0; flow::FW() * flow::FH()],
+            dp_slow: vec![0.0; flow::FW() * flow::FH()],
+            dpd: vec![0.0; flow::FW() * flow::FH()],
             pressure_forces: true,
             lod: 0,
             parallel_cells: turn::parallel_by_default(),
             liquid_physics: liquid::physics_by_default(),
             liq: liquid::Liquids::default(),
-            fill: vec![0; W * H],
-            pocket_of: vec![0; W * H],
+            fill: vec![0; W() * H()],
+            pocket_of: vec![0; W() * H()],
             pockets: Vec::new(),
-            liq_p: vec![1.0; W * H],
-            latent: vec![0.0; W * H],
-            vel: vec![0; W * H],
-            fall_at: vec![0; W * H],
-            moisture: vec![0; W * H],
-            fuel: vec![Fuel::default(); W * H],
-            growth: vec![0; W * H],
-            jet: vec![0; W * H],
-            cls: vec![0; W * H],
-            liq_w: vec![0.0; W * H],
+            liq_p: vec![1.0; W() * H()],
+            latent: vec![0.0; W() * H()],
+            vel: vec![0; W() * H()],
+            fall_at: vec![0; W() * H()],
+            moisture: vec![0; W() * H()],
+            fuel: vec![Fuel::default(); W() * H()],
+            growth: vec![0; W() * H()],
+            jet: vec![0; W() * H()],
+            cls: vec![0; W() * H()],
+            liq_w: vec![0.0; W() * H()],
             bursts: Vec::new(),
             zones: sleep::Zones::new(),
-            charge: vec![0.0; QW * QH],
-            mcharge: vec![0.0; QW * QH],
-            magnet: vec![0.0; QW * QH],
-            polar: vec![0.0; QW * QH],
+            charge: vec![0.0; QW() * QH()],
+            mcharge: vec![0.0; QW() * QH()],
+            magnet: vec![0.0; QW() * QH()],
+            polar: vec![0.0; QW() * QH()],
             bolts: Vec::new(),
             storm_rng: storm::StormRng(0x9e37_79b9),
             prof: prof::Profile::default(),
@@ -925,8 +980,8 @@ impl World {
 
     /// Replace the grid with saved materials (row by row, W*H entries).
     pub fn load_mats(&mut self, mats: &[Mat]) {
-        for (i, m) in mats.iter().enumerate().take(W * H) {
-            self.set((i % W) as i32, (i / W) as i32, *m);
+        for (i, m) in mats.iter().enumerate().take(W() * H()) {
+            self.set((i % W()) as i32, (i / W()) as i32, *m);
         }
     }
 
@@ -1055,6 +1110,24 @@ impl World {
         n
     }
 
+    /// The census, and how much of each material there is in cells of it: a cell of liquid counts
+    /// what it holds (the liquids by their physics may fill a cell only in part), a cell of steam or
+    /// cloud the vapour packed in it as well (as it would spread at the pressure of the open air).
+    pub fn volumes(&self) -> ([u32; NMAT], [f32; NMAT]) {
+        let mut n = [0u32; NMAT];
+        let mut v = [0f64; NMAT];
+        for (i, c) in self.cells.iter().enumerate() {
+            let m = c.m as usize;
+            n[m] += 1;
+            v[m] += match c.m.kind() {
+                Kind::Liquid => self.liquid_fill(i) as f64 / field::FULL as f64,
+                Kind::Gas if matches!(c.m, Mat::Steam | Mat::Cloud) => 1.0 + self.packed(i) as f64,
+                _ => 1.0,
+            };
+        }
+        (n, v.map(|x| x as f32))
+    }
+
     /// Removes `count` cells of the given materials, nearest to `near` first.
     /// Returns false (and removes nothing) if there are not enough.
     pub fn consume(&mut self, mats: &[Mat], count: u32, near: (i32, i32)) -> bool {
@@ -1062,7 +1135,7 @@ impl World {
         let mut found: Vec<(i64, usize)> = vec![];
         for (i, c) in self.cells.iter().enumerate() {
             if mats.contains(&c.m) {
-                let (x, y) = ((i % W) as i64 - near.0 as i64, (i / W) as i64 - near.1 as i64);
+                let (x, y) = ((i % W()) as i64 - near.0 as i64, (i / W()) as i64 - near.1 as i64);
                 found.push((x * x + y * y, i));
             }
         }
@@ -1086,7 +1159,7 @@ impl World {
         taken.sort_unstable();
         let mut columns = vec![];
         for i in taken {
-            let (x, y) = ((i % W) as i32, (i / W) as i32);
+            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
             let mut top = y;
             while top > 0 && matches!(self.cells[Self::idx(x, top - 1)].m, Mat::Dirt | Mat::Grass) {
                 top -= 1;
@@ -1100,7 +1173,7 @@ impl World {
         columns.sort_unstable();
         columns.dedup();
         for x in columns {
-            let mut y = H as i32 - 1;
+            let mut y = H() as i32 - 1;
             while y >= 0 {
                 if self.cells[Self::idx(x, y)].m != Mat::Grass {
                     y -= 1;
@@ -1162,7 +1235,7 @@ impl World {
     }
 
     pub fn inb(x: i32, y: i32) -> bool {
-        x >= 0 && y >= 0 && (x as usize) < W && (y as usize) < H
+        x >= 0 && y >= 0 && (x as usize) < W() && (y as usize) < H()
     }
 
     /// Index of an in-bounds cell. Callers check `inb` first (or use `ix`): out of bounds, a
@@ -1173,7 +1246,7 @@ impl World {
         debug_assert!(Self::inb(x, y), "cell ({x}, {y}) is outside the world");
         #[cfg(debug_assertions)]
         turn::guard(x);
-        y as usize * W + x as usize
+        y as usize * W() + x as usize
     }
 
     /// Index of a cell, or None outside the world. Mind that `at` reads Empty past the sides
@@ -1184,7 +1257,7 @@ impl World {
         if Self::inb(x, y) {
             turn::guard(x);
         }
-        if Self::inb(x, y) { Some(y as usize * W + x as usize) } else { None }
+        if Self::inb(x, y) { Some(y as usize * W() + x as usize) } else { None }
     }
 
     /// Material at a cell, blocks included. The ceiling is stone; sides and
@@ -1267,7 +1340,7 @@ impl World {
     /// has no floor below it.
     pub fn hard_for_car(&self, x: i32, y: i32) -> bool {
         // Beyond the edges there is nothing to hold a car back.
-        if y >= H as i32 || y < 0 || x < 0 || x >= W as i32 {
+        if y >= H() as i32 || y < 0 || x < 0 || x >= W() as i32 {
             return false;
         }
         let i = Self::idx(x, y);
@@ -1417,7 +1490,7 @@ impl World {
 
     /// Pushes loose matter out of cells newly covered by a block.
     pub fn end_blocks(&mut self) {
-        for i in 0..W * H {
+        for i in 0..W() * H() {
             if (self.mask[i] != 0) != (self.mask_prev[i] != 0) {
                 // A block moved here or away: what is around may move now.
                 self.zones.wake(i);
@@ -1429,13 +1502,13 @@ impl World {
             if !matches!(c.m.kind(), Kind::Powder | Kind::Liquid | Kind::Gas | Kind::Flame) {
                 continue;
             }
-            let (x, y) = ((i % W) as i32, (i / W) as i32);
+            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
             let mut moved = false;
             for dy in 1..=30 {
                 if y - dy < 0 {
                     break;
                 }
-                let j = (y - dy) as usize * W + x as usize;
+                let j = (y - dy) as usize * W() + x as usize;
                 if self.mask[j] == 0 && self.cells[j].m == Mat::Empty {
                     self.carry(i, j);
                     self.cells[j].stamp = self.frame;
@@ -1620,7 +1693,8 @@ impl World {
         }
     }
 
-    fn mask_free(&self, x: i32, y: i32) -> bool {
+    /// Whether no block or car stands in cell (x, y) (outside the world counts as free).
+    pub fn mask_free(&self, x: i32, y: i32) -> bool {
         !Self::inb(x, y) || self.mask[Self::idx(x, y)] == 0
     }
 
@@ -1648,10 +1722,14 @@ impl World {
         self.rng = seed.wrapping_mul(2654435761) | 1;
         let p: Vec<f32> = (0..6).map(|_| (self.rand() % 6283) as f32 / 1000.0).collect();
         let island: Vec<f32> = (0..3).map(|_| 60.0 + (self.rand() % 200) as f32).collect();
-        let mut hs = vec![0i32; W];
-        for x in 0..W {
-            let xf = x as f32 / K as f32;
-            let edge = (x.min(W - 1 - x) as f32 / (40 * K) as f32).min(1.0);
+        // The landscape is drawn on the design grid (`BASE_W` x `BASE_H`), then stretched over the
+        // world's cells.
+        let (sx, sy) = (sx(), sy());
+        let row = |v: i32| (v as f32 * sy) as i32;
+        let mut hs = vec![0i32; W()];
+        for x in 0..W() {
+            let xf = x as f32 / sx / K as f32;
+            let edge = (x.min(W() - 1 - x) as f32 / sx / (40 * K) as f32).min(1.0);
             let edge = edge * edge * (3.0 - 2.0 * edge);
             let h = match biome {
                 Biome::Countryside => {
@@ -1674,22 +1752,22 @@ impl World {
                     118.0 + (h - 118.0) * edge
                 }
             };
-            hs[x] = ((h * K as f32) as i32).clamp(40, H as i32 - 40);
+            hs[x] = ((h * K as f32 * sy) as i32).clamp(row(40), H() as i32 - row(40));
         }
-        let sea = match biome {
+        let sea = row(match biome {
             Biome::Countryside => 122 * K,
             Biome::Mountain => 135 * K,
             Biome::Sea => 128 * K,
-        };
-        for x in 0..W {
+        });
+        for x in 0..W() {
             let top = hs[x];
-            let beach = top > sea - 5 * K;
-            for y in top..H as i32 {
+            let beach = top > sea - row(5 * K);
+            for y in top..H() as i32 {
                 let depth = y - top;
                 let m = match biome {
                     // Snow caps (ice) on the peaks, bare rock below them, grass in the valleys.
-                    Biome::Mountain if top < 250 && depth < 3 * K => Mat::Ice,
-                    Biome::Mountain if top < 320 && depth < 5 * K => Mat::Stone,
+                    Biome::Mountain if top < row(250) && depth < 3 * K => Mat::Ice,
+                    Biome::Mountain if top < row(320) && depth < 5 * K => Mat::Stone,
                     _ if depth < 2 * K && beach => Mat::Sand,
                     _ if depth < K => Mat::Grass,
                     _ if depth < 6 * K && !beach => Mat::Dirt,
@@ -1708,13 +1786,13 @@ impl World {
         }
         let (tries, min_top) = match biome {
             Biome::Countryside => (6, 0),
-            Biome::Mountain => (6, 330),
+            Biome::Mountain => (6, row(330)),
             Biome::Sea => (3, 0),
         };
         for _ in 0..tries {
-            let x = (50 * K) + (self.rand() % (W as u32 - 100 * K as u32)) as i32;
+            let x = (50 * K) + (self.rand() % (W() as u32 - 100 * K as u32)) as i32;
             let base = hs[x as usize];
-            if base >= sea - 4 * K || base < min_top {
+            if base >= sea - row(4 * K) || base < min_top {
                 continue;
             }
             let hgt = (8 + (self.rand() % 6) as i32) * K;
@@ -1723,7 +1801,7 @@ impl World {
             self.grow_crown(x, top);
         }
         self.reset_temps();
-        ((16 * K, hs[16 * K as usize] - 8 * K), (W as i32 - 16 * K, hs[W - 16 * K as usize] - 8 * K))
+        ((16 * K, hs[16 * K as usize] - 8 * K), (W() as i32 - 16 * K, hs[W() - 16 * K as usize] - 8 * K))
     }
 
     // ----- simulation -------------------------------------------------------
@@ -1901,7 +1979,7 @@ impl World {
         // (The table holds for the whole turn: the sky's reservoir moves by a few thousandths
         // of a degree at most during one, and recomputing the profile for every cell of gas
         // once it had moved cost 6 % of a turn full of clouds.)
-        match self.air_rows.get(y.clamp(0, H as i32 - 1) as usize) {
+        match self.air_rows.get(y.clamp(0, H() as i32 - 1) as usize) {
             Some(&t) => t,
             None => self.ambient_c(y),
         }
@@ -2274,11 +2352,11 @@ impl World {
     /// For the screenshots: soil soaked on the left of the world, drying across the middle and
     /// dry on the right, then `steps` steps so the grass answers to it.
     pub fn demo_lawn(&mut self, steps: u32) {
-        for y in 0..H as i32 {
-            for x in 0..W as i32 {
+        for y in 0..H() as i32 {
+            for x in 0..W() as i32 {
                 let i = Self::idx(x, y);
                 if matches!(self.cells[i].m, Mat::Dirt | Mat::Grass) {
-                    let f = (1.0 - (x as f32 - W as f32 * 0.3) / (W as f32 * 0.4)).clamp(0.0, 1.0);
+                    let f = (1.0 - (x as f32 - W() as f32 * 0.3) / (W() as f32 * 0.4)).clamp(0.0, 1.0);
                     self.moisture[i] = (f * 170.0) as u16;
                 }
             }
@@ -2491,16 +2569,16 @@ impl World {
     /// ground to stand on, or no room for it.
     pub fn plant_tree(&mut self, x: i32, y: i32, size: f32) -> bool {
         let ground = |m: Mat| matches!(m.kind(), Kind::Static | Kind::Powder) && !m.is_vegetation();
-        let mut y = y.clamp(0, H as i32 - 1);
+        let mut y = y.clamp(0, H() as i32 - 1);
         if ground(self.raw(x, y)) {
             while y > 0 && ground(self.raw(x, y - 1)) {
                 y -= 1;
             }
         } else {
-            while y < H as i32 && !ground(self.raw(x, y)) {
+            while y < H() as i32 && !ground(self.raw(x, y)) {
                 y += 1;
             }
-            if y >= H as i32 {
+            if y >= H() as i32 {
                 return false;
             }
         }
@@ -2767,7 +2845,7 @@ impl World {
         // Above the top of the weather, vapour or cloud that cannot rise any more (painted there,
         // or an updraft that overshot) settles back down: its ice crystals slowly fall out of the
         // thin air, and it ends up spread under the tropopause.
-        if y < CEILING_Y && !self.gas_may_rise_to(x, y, y - 1) && self.chance(3) {
+        if y < CEILING_Y() && !self.gas_may_rise_to(x, y, y - 1) && self.chance(3) {
             let d = self.dir();
             for dx in [0, d, -d] {
                 let t = (self.edge_x(x, y, x + dx), y + 1);
@@ -2833,7 +2911,7 @@ impl World {
     /// cooled by the climb, they would still be warmer (lighter) than the air there, which they
     /// soon are not. (Smoke is left free: it thins out in the open air by itself.)
     pub(super) fn gas_may_rise_to(&self, x: i32, y: i32, to: i32) -> bool {
-        if to >= CEILING_Y || !Self::inb(x, y) || !matches!(self.raw(x, y), Mat::Steam | Mat::Cloud) {
+        if to >= CEILING_Y() || !Self::inb(x, y) || !matches!(self.raw(x, y), Mat::Steam | Mat::Cloud) {
             return true;
         }
         // The air it would rise into (open air there, else the usual air of that height).
@@ -2845,7 +2923,7 @@ impl World {
     /// left or right edge leave the world (an open sky: they do not pile up). Smoke, which thins
     /// out in the open air on its own, comes back on the other side.
     pub(super) fn edge_x(&self, x: i32, y: i32, to: i32) -> i32 {
-        if self.raw(x, y) == Mat::Smoke { to.rem_euclid(W as i32) } else { to }
+        if self.raw(x, y) == Mat::Smoke { to.rem_euclid(W() as i32) } else { to }
     }
 
     /// Oil is a slow, light liquid: it floats on water and burns ferociously.
@@ -3315,7 +3393,7 @@ impl World {
         }
         // Up at the top of the weather the jet stream sweeps the cloud along before anything
         // else: the top of a storm cloud is dragged downwind into an anvil.
-        if y < CEILING_Y + 10 {
+        if y < CEILING_Y() + 10 {
             if let Some(t) = self.wind_target(x, y) {
                 if self.at(t.0, t.1) == Mat::Empty {
                     self.swap((x, y), t);
@@ -3334,7 +3412,7 @@ impl World {
             let r = self.rand() % 10;
             if r < 2 {
                 (x + d, y)
-            } else if r == 2 && y > COLD_Y {
+            } else if r == 2 && y > COLD_Y() {
                 (x, y - 1)
             } else {
                 return;
@@ -3587,7 +3665,7 @@ impl World {
         }
         // Breadth first from the fixed things, so that each cell learns how far it is from them.
         let mut order: Vec<usize> = Vec::new();
-        for i in 0..W * H {
+        for i in 0..W() * H() {
             if !seen[i] && self.anchors(i) {
                 seen[i] = true;
                 level[i] = 0;
@@ -3598,7 +3676,7 @@ impl World {
         while head < order.len() {
             let i = order[head];
             head += 1;
-            let (x, y) = ((i % W) as i32, (i / W) as i32);
+            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
             let from = self.cells[i].m;
             for (nx, ny) in Self::neighbors(x, y) {
                 if Self::inb(nx, ny) {
@@ -3625,7 +3703,7 @@ impl World {
         self.falling.clear();
         let mut free = vec![];
         let mut budget = 300_000usize;
-        for start in 0..W * H {
+        for start in 0..W() * H() {
             if seen[start] || !Self::structural(self.cells[start].m) {
                 continue;
             }
@@ -3634,7 +3712,7 @@ impl World {
             stack.push(start);
             while let Some(i) = stack.pop() {
                 cells.push(i);
-                let (x, y) = ((i % W) as i32, (i / W) as i32);
+                let (x, y) = ((i % W()) as i32, (i / W()) as i32);
                 for (nx, ny) in Self::neighbors(x, y) {
                     if Self::inb(nx, ny) {
                         let j = Self::idx(nx, ny);
@@ -3665,12 +3743,12 @@ impl World {
         if !Self::structural(m) || self.mask[i] != 0 {
             return false;
         }
-        if i / W == H - 1 || m == Mat::Vault {
+        if i / W() == H() - 1 || m == Mat::Vault {
             return true;
         }
         if matches!(m, Mat::Trunk | Mat::Sapling) {
             // Roots: a tree holds to the ground it stands on.
-            let (x, y) = ((i % W) as i32, (i / W) as i32);
+            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
             let ground = |m: Mat| m.is_hard() && !m.is_vegetation();
             return ground(self.raw(x, y + 1)) || Self::neighbors(x, y).iter().any(|&(nx, ny)| matches!(self.raw(nx, ny), Mat::Dirt | Mat::Grass | Mat::Mud));
         }
@@ -3715,7 +3793,7 @@ impl World {
                     if piece.vy > 1.4 {
                         if self.thuds.len() < 8 {
                             let c = piece.cells[0];
-                            self.thuds.push(((c % W) as i32, (c / W) as i32, piece.vy));
+                            self.thuds.push(((c % W()) as i32, (c / W()) as i32, piece.vy));
                         }
                         piece.vy = -piece.vy * 0.34;
                         self.rise(piece);
@@ -3737,8 +3815,8 @@ impl World {
         let in_piece = |i: usize| piece.cells.binary_search_by(|p| i.cmp(p)).is_ok();
         let mut foliage = vec![];
         for &i in &piece.cells {
-            let t = i + W;
-            if t >= W * H || in_piece(t) || self.mask[t] != 0 {
+            let t = i + W();
+            if t >= W() * H() || in_piece(t) || self.mask[t] != 0 {
                 continue;
             }
             match self.cells[t].m {
@@ -3751,7 +3829,7 @@ impl World {
             return false;
         }
         for t in foliage {
-            self.set((t % W) as i32, (t / W) as i32, Mat::DeadLeaf);
+            self.set((t % W()) as i32, (t / W()) as i32, Mat::DeadLeaf);
         }
         self.piece_can_move(piece, 1)
     }
@@ -3764,13 +3842,13 @@ impl World {
     fn buoyed(&self, piece: &Piece) -> bool {
         let in_piece = |i: usize| piece.cells.binary_search_by(|p| i.cmp(p)).is_ok();
         let lighter = |j: usize| self.mask[j] == 0 && self.cells[j].m.kind() == Kind::Liquid && piece.density < density(self.cells[j].m);
-        let body = |j: usize| lighter(j) && ((j >= W && lighter(j - W)) || (j % W > 0 && lighter(j - 1)) || (j % W + 1 < W && lighter(j + 1)));
+        let body = |j: usize| lighter(j) && ((j >= W() && lighter(j - W())) || (j % W() > 0 && lighter(j - 1)) || (j % W() + 1 < W() && lighter(j + 1)));
         let mut under_liquid = false;
         for &i in &piece.cells {
-            if i < W {
+            if i < W() {
                 return false;
             }
-            let j = i - W;
+            let j = i - W();
             if in_piece(j) {
                 continue;
             }
@@ -3780,7 +3858,7 @@ impl World {
                 return false;
             }
         }
-        under_liquid && piece.cells.iter().any(|&i| i + W < W * H && !in_piece(i + W) && lighter(i + W))
+        under_liquid && piece.cells.iter().any(|&i| i + W() < W() * H() && !in_piece(i + W()) && lighter(i + W()))
     }
 
     fn rise(&mut self, piece: &mut Piece) {
@@ -3798,12 +3876,12 @@ impl World {
     fn piece_can_move(&self, piece: &Piece, dir: i32) -> bool {
         let in_piece = |i: usize| piece.cells.binary_search_by(|p| i.cmp(p)).is_ok();
         piece.cells.iter().all(|&i| {
-            let target = i as i64 + dir as i64 * W as i64;
+            let target = i as i64 + dir as i64 * W() as i64;
             if target < 0 {
                 return false;
             }
             let target = target as usize;
-            if target >= W * H {
+            if target >= W() * H() {
                 // Off the bottom of the world: it simply disappears.
                 return true;
             }
@@ -3819,8 +3897,8 @@ impl World {
                             if piece.density >= density(self.cells[target].m) {
                                 true
                             } else {
-                                let under = target + W;
-                                let settled = under >= W * H || matches!(self.cells[under].m.kind(), Kind::Liquid | Kind::Static | Kind::Powder);
+                                let under = target + W();
+                                let settled = under >= W() * H() || matches!(self.cells[under].m.kind(), Kind::Liquid | Kind::Static | Kind::Powder);
                                 !settled
                             }
                         }
@@ -3835,9 +3913,9 @@ impl World {
         let mut gone = vec![];
         for k in order {
             let i = piece.cells[k];
-            let target = i as i64 + dir as i64 * W as i64;
+            let target = i as i64 + dir as i64 * W() as i64;
             self.zones.wake(i);
-            if target as usize >= W * H {
+            if target as usize >= W() * H() {
                 self.cells[i] = EMPTY;
                 self.clear_states(i);
                 gone.push(k);
@@ -3898,10 +3976,10 @@ impl World {
     /// The pressure everywhere, in atmospheres (absolute): the air thins with height and moves with the
     /// flow, liquids add their weight with depth, and solids carry the weight of everything above them.
     pub fn pressure_field(&self) -> Vec<f32> {
-        let raw = self.pressure_rows(H - 1);
+        let raw = self.pressure_rows(H() - 1);
         let mut out = raw.clone();
-        for y in 0..H {
-            self.smooth_pressure_row(&raw, y, &mut out[y * W..(y + 1) * W]);
+        for y in 0..H() {
+            self.smooth_pressure_row(&raw, y, &mut out[y * W()..(y + 1) * W()]);
         }
         out
     }
@@ -3926,19 +4004,19 @@ impl World {
     fn smooth_pressure_row(&self, raw: &[f32], y: usize, out: &mut [f32]) {
         let open = |x: usize| matches!(self.at(x as i32, y as i32).kind(), Kind::Empty | Kind::Gas | Kind::Flame);
         let mut x = 0;
-        while x < W {
+        while x < W() {
             if open(x) {
-                out[x] = raw[y * W + x];
+                out[x] = raw[y * W() + x];
                 x += 1;
                 continue;
             }
             let mut end = x;
-            while end < W && !open(end) {
+            while end < W() && !open(end) {
                 end += 1;
             }
             for xx in x..end {
                 let (lo, hi) = (xx.saturating_sub(6).max(x), (xx + 6).min(end - 1));
-                let sum: f32 = (lo..=hi).map(|q| raw[y * W + q]).sum();
+                let sum: f32 = (lo..=hi).map(|q| raw[y * W() + q]).sum();
                 out[xx] = sum / (hi - lo + 1) as f32;
             }
             x = end;
@@ -3958,24 +4036,24 @@ impl World {
         const PER_CELL: f32 = 1.0 / 60.0;
         // How far each row spreads the load of the row above, either side.
         const SPREAD: usize = 2;
-        let mut out = vec![0.0f32; W * (until + 1)];
+        let mut out = vec![0.0f32; W() * (until + 1)];
         // The pressure of the closed pocket just above each column, if a liquid lies in one.
-        let mut pocket_top: Vec<Option<f32>> = vec![None; W];
+        let mut pocket_top: Vec<Option<f32>> = vec![None; W()];
         // Pressure carried down from the row above, without the excess (which is added once, per cell).
-        let mut prev = vec![0.0f32; W];
-        let mut cur = vec![0.0f32; W];
-        let mut prev_dense = vec![false; W];
-        let mut dense = vec![false; W];
+        let mut prev = vec![0.0f32; W()];
+        let mut cur = vec![0.0f32; W()];
+        let mut prev_dense = vec![false; W()];
+        let mut dense = vec![false; W()];
         for y in 0..=until {
             // The still air at this height (the same atmosphere as the sensors read).
             let air = air_pressure_atm(y as i32);
             // The wind solver's pressure is only read for its changes along the row (a gust, the
             // push in front of a blast): its level, row by row, is the solver's own and not the
             // atmosphere's.
-            let row_flow: Vec<Option<f32>> = (0..W).map(|x| self.flow.air_pressure(x as i32, y as i32)).collect();
+            let row_flow: Vec<Option<f32>> = (0..W()).map(|x| self.flow.air_pressure(x as i32, y as i32)).collect();
             let (sum, n) = row_flow.iter().flatten().fold((0.0f32, 0usize), |(s, n), p| (s + p, n + 1));
             let row_mean = if n > 0 { (sum / n as f32).max(1e-3) } else { 1.0 };
-            for x in 0..W {
+            for x in 0..W() {
                 let m = self.at(x as i32, y as i32);
                 match m.kind() {
                     Kind::Empty | Kind::Gas | Kind::Flame => {
@@ -3995,12 +4073,12 @@ impl World {
                                 // quarter as strong, still enough to see a gust or a blast.
                                 Some(p) => air * (1.0 + (p / row_mean - 1.0) * 0.25).clamp(0.8, 1.6),
                                 None => {
-                                    let kelvin = (self.temp[y * W + x] + 273.15).max(1.0) / (self.ambient_c(y as i32) + 273.15).max(1.0);
+                                    let kelvin = (self.temp[y * W() + x] + 273.15).max(1.0) / (self.ambient_c(y as i32) + 273.15).max(1.0);
                                     air * dynamic * kelvin.clamp(0.5, 3.0)
                                 }
                             }
                         };
-                        out[y * W + x] = p_air;
+                        out[y * W() + x] = p_air;
                         dense[x] = false;
                         pocket_top[x] = closed.map(|_| p_air);
                     }
@@ -4012,12 +4090,12 @@ impl World {
                         } else if kind == Kind::Liquid {
                             prev[x]
                         } else {
-                            let (lo, hi) = (x.saturating_sub(SPREAD), (x + SPREAD).min(W - 1));
+                            let (lo, hi) = (x.saturating_sub(SPREAD), (x + SPREAD).min(W() - 1));
                             let (sum, n) = (lo..=hi).filter(|&q| prev_dense[q]).fold((0.0, 0.0), |(s, n), q| (s + prev[q], n + 1.0));
                             sum / n
                         };
                         cur[x] = above + density(m) * PER_CELL;
-                        out[y * W + x] = cur[x] + self.excess_pressure_at(x as f32 + 0.5, y as f32 + 0.5);
+                        out[y * W() + x] = cur[x] + self.excess_pressure_at(x as f32 + 0.5, y as f32 + 0.5);
                         dense[x] = true;
                     }
                 }
@@ -4033,7 +4111,7 @@ impl World {
         let m = self.at(x as i32, y as i32);
         // Two scales: the air's changes are a few hundredths of an atmosphere, the ground's tens of
         // atmospheres; on one scale either the sky or the ground would be a flat colour.
-        let (r, g, b) = if matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) { air_pressure_rgb(field[y * W + x]) } else { ground_pressure_rgb(field[y * W + x]) };
+        let (r, g, b) = if matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) { air_pressure_rgb(field[y * W() + x]) } else { ground_pressure_rgb(field[y * W() + x]) };
         if gas_grain(m) {
             // A grain of gas is at the pressure of the air around it (mechanical equilibrium): it
             // shows where it is, without a pressure of its own.
@@ -4058,12 +4136,12 @@ impl World {
     pub fn humidity_field(&self) -> Vec<f32> {
         // The same squares as the wind, which carries the humidity.
         const B: usize = flow::CELL;
-        let (bw, bh) = (W / B, H.div_ceil(B));
+        let (bw, bh) = (W() / B, H().div_ceil(B));
         let (mut vapour, mut wet, mut temp) = (vec![0.0f32; bw * bh], vec![0.0f32; bw * bh], vec![0.0f32; bw * bh]);
         let mut air = vec![0.0f32; bw * bh];
-        for y in 0..H {
-            for x in 0..W {
-                let i = y * W + x;
+        for y in 0..H() {
+            for x in 0..W() {
+                let i = y * W() + x;
                 let k = (y / B) * bw + (x / B).min(bw - 1);
                 match self.cells[i].m {
                     Mat::Steam | Mat::Cloud => vapour[k] += 1.0,
@@ -4118,11 +4196,11 @@ impl World {
             // Humidity is water: lava, oil and molten metal are liquids without any.
             Kind::Liquid => (m == Mat::Water).then_some(1.0),
             // Steam and cloud are air saturated with water: 100 % on the grain itself.
-            Kind::Empty | Kind::Gas => Some(if matches!(m, Mat::Cloud | Mat::Steam) { 1.0 } else { field[y * W + x] }),
+            Kind::Empty | Kind::Gas => Some(if matches!(m, Mat::Cloud | Mat::Steam) { 1.0 } else { field[y * W() + x] }),
             _ => match m {
                 // Soil holds moisture of its own.
                 Mat::Mud => Some(1.0),
-                Mat::Dirt | Mat::Grass => Some((self.moisture[y * W + x] as f32 / SOIL_FULL as f32).clamp(0.0, 1.0) * 0.8 + 0.1),
+                Mat::Dirt | Mat::Grass => Some((self.moisture[y * W() + x] as f32 / SOIL_FULL as f32).clamp(0.0, 1.0) * 0.8 + 0.1),
                 _ => None,
             },
         };
@@ -4143,19 +4221,19 @@ impl World {
     }
 
     pub fn cell_mat(&self, x: usize, y: usize) -> Mat {
-        self.cells[y * W + x].m
+        self.cells[y * W() + x].m
     }
 
     /// Everything but the trees, which are drawn as a separate swaying layer.
     pub fn color_without_trees(&self, x: usize, y: usize) -> [u8; 4] {
-        if self.cells[y * W + x].m.is_vegetation() {
+        if self.cells[y * W() + x].m.is_vegetation() {
             return [0, 0, 0, 0];
         }
         self.color(x, y)
     }
 
     pub fn color(&self, x: usize, y: usize) -> [u8; 4] {
-        let c = self.cells[y * W + x];
+        let c = self.cells[y * W() + x];
         if c.m == Mat::Empty {
             return [0, 0, 0, 0];
         }
@@ -4164,7 +4242,7 @@ impl World {
         // A fixed speckle per cell; the shimmer of water and the flicker of embers and lava move
         // in the shader (render.rs), so a cell that does not change keeps its colour.
         let flick = (h >> 11 & 31) as i32;
-        let t = self.temp[y * W + x];
+        let t = self.temp[y * W() + x];
         let (r, g, b, a): (i32, i32, i32, i32) = match c.m {
             Mat::Empty => (0, 0, 0, 0),
             Mat::Sand => (226 + v, 200 + v, 124 + v, 255),
@@ -4178,19 +4256,19 @@ impl World {
                     // A cell of the field that is not full is water mixed with air: the less water,
                     // the clearer it shows, and the paler (spray and the froth of a splash are
                     // whitish, not a deeper blue).
-                    let q = self.water_fill(y * W + x).min(field::FULL) as i32 * 256 / field::FULL as i32;
+                    let q = self.water_fill(y * W() + x).min(field::FULL) as i32 * 256 / field::FULL as i32;
                     let pale = |c: i32, to: i32| c + (to - c) * (256 - q) / 256;
                     (pale(r, 200), pale(g, 222), pale(b, 240), 205 * q / 256)
                 }
             }
-            Mat::Fire => (255, (80 + self.fuel[y * W + x].left as i32 * 3).min(235), 30, 235),
+            Mat::Fire => (255, (80 + self.fuel[y * W() + x].left as i32 * 3).min(235), 30, 235),
             Mat::Steam | Mat::Cloud => (0, 0, 0, 0),
             Mat::Iron => glow((146 + v, 156 + v, 174 + v), t),
             Mat::Wood => (146 + v / 2 + (y as i32 % 3) * 6, 98 + v / 2, 54, 255),
             Mat::Stone => {
                 // Darker with depth, with soft mineral patches.
                 let patch = (((x / 7) as u32).wrapping_mul(2654435761) ^ ((y / 7) as u32).wrapping_mul(40503)) >> 13 & 7;
-                let depth = 1.0 - (y as f32 / H as f32) * 0.35;
+                let depth = 1.0 - (y as f32 / H() as f32) * 0.35;
                 let base = (108 + patch as i32 * 2) as f32 * depth;
                 // Hot rock glows red before it melts.
                 let heat = (((t - 300.0) / 2.5).clamp(0.0, 150.0)) as i32;
@@ -4219,9 +4297,9 @@ impl World {
             Mat::Dynamite => if y % 6 == 0 { (226 + v / 2, 214 + v / 2, 190, 255) } else { (196 + v, 46 + v / 2, 38, 255) },
             Mat::Dirt => {
                 // Wet earth is darker.
-                let k = 256 - 96 * (self.moisture[y * W + x].min(SOIL_FULL) as i32) / SOIL_FULL as i32;
+                let k = 256 - 96 * (self.moisture[y * W() + x].min(SOIL_FULL) as i32) / SOIL_FULL as i32;
                 // Fertile earth shows its seeds: pale specks, more of them the more it holds.
-                let seeds = self.growth[y * W + x] as u32;
+                let seeds = self.growth[y * W() + x] as u32;
                 if seeds > 0 && (h >> 3) % 16 < 2 + seeds {
                     (184 + v, 150 + v, 96 + v / 2, 255)
                 } else {
@@ -4230,7 +4308,7 @@ impl World {
             }
             Mat::Grass => {
                 // Green on moist soil, turning straw yellow as the soil dries.
-                let d = ((GRASS_GREEN as i32 - self.moisture[y * W + x] as i32) * 256 / (GRASS_GREEN - GRASS_DRY) as i32).clamp(0, 256);
+                let d = ((GRASS_GREEN as i32 - self.moisture[y * W() + x] as i32) * 256 / (GRASS_GREEN - GRASS_DRY) as i32).clamp(0, 256);
                 let (r, g, b) = self.grass_rgb;
                 let mix = |a: i32, s: i32| a + (s - a) * d / 256;
                 (mix(r, 200) + v / 2, mix(g, 178) + v, mix(b, 84) + v / 2, 255)
@@ -4328,13 +4406,13 @@ mod tests {
                 for x in 200..210 {
                     for y in 200..210 {
                         w.set(x, y, Mat::Stone);
-                        w.temp[y as usize * W + x as usize] = 300.0;
+                        w.temp[y as usize * W() + x as usize] = 300.0;
                     }
                 }
                 for _ in 0..600 {
                     w.step();
                 }
-                w.temp[205 * W + 205]
+                w.temp[205 * W() + 205]
             };
             let (exact, simple) = (cool(0), cool(lod));
             assert!((exact - simple).abs() < 0.25 * (exact - 15.0).abs().max(10.0), "lod {lod}: stone at {simple} instead of {exact}");
@@ -4376,7 +4454,7 @@ mod tests {
             let level = time(&mut || w.level_liquids());
             let per = |d: Duration, every: f32| format!("{:6.2} ms/call x1/{every} = {:5.2} ms/tick", d.as_secs_f32() * 1000.0, d.as_secs_f32() * 1000.0 / every);
             eprintln!("=== {biome:?}: whole tick {:.2} ms", whole.as_secs_f32() * 1000.0);
-            eprintln!("  cells              {}  ({} of {} zones awake)", per(cells, 1.0), w.zones.awake_count(), sleep::CW * sleep::CH);
+            eprintln!("  cells              {}  ({} of {} zones awake)", per(cells, 1.0), w.zones.awake_count(), sleep::CW() * sleep::CH());
             eprintln!("  flow step+refresh  {}", per(flow, 1.0));
             eprintln!("  update_pressure    {}", per(press, 4.0));
             eprintln!("  pressure_push      {}", per(push, 1.0));
@@ -4402,7 +4480,7 @@ mod tests {
         // the motion alone is compared.)
         let spread = |m: Mat| {
             let mut w = World::new_static();
-            for x in 0..W as i32 {
+            for x in 0..W() as i32 {
                 w.set(x, 300, Mat::Stone);
             }
             for y in 280..300 {
@@ -4417,7 +4495,7 @@ mod tests {
                     }
                 }
             }
-            let xs: Vec<i32> = (0..W as i32).filter(|&x| (280..300).any(|y| w.raw(x, y) == m)).collect();
+            let xs: Vec<i32> = (0..W() as i32).filter(|&x| (280..300).any(|y| w.raw(x, y) == m)).collect();
             xs.last().unwrap() - xs.first().unwrap()
         };
         let (water, oil, lava) = (spread(Mat::Water), spread(Mat::Oil), spread(Mat::Lava));
@@ -4472,14 +4550,14 @@ mod tests {
             w.set(0, y, Mat::Stone);
             w.set(19, y, Mat::Stone);
         }
-        let base = w.temp[99 * W + 10];
+        let base = w.temp[99 * W() + 10];
         let mut warmed = false;
         for _ in 0..300 {
             if w.raw(5, 98) == Mat::Empty {
                 w.set(5, 98, Mat::Fire);
             }
             w.step();
-            warmed |= (1..19).any(|x| w.temp[99 * W + x] > base + 8.0);
+            warmed |= (1..19).any(|x| w.temp[99 * W() + x] > base + 8.0);
         }
         assert!(warmed, "water never warmed up");
     }
@@ -4545,7 +4623,7 @@ mod tests {
             w.set(x, 98, Mat::Water);
         }
         w.set(5, 90, Mat::Lava);
-        w.temp[90 * W + 5] = thermal::LAVA_C;
+        w.temp[90 * W() + 5] = thermal::LAVA_C;
         for _ in 0..60 {
             w.step();
         }
@@ -4571,7 +4649,7 @@ mod tests {
     fn tree_in_a_pot(physics: bool) -> World {
         let mut w = World::new_static();
         w.set_liquid_physics(physics);
-        for x in 0..W as i32 {
+        for x in 0..W() as i32 {
             w.set(x, 200, Mat::Stone);
         }
         for y in 100..200 {
@@ -4630,7 +4708,7 @@ mod tests {
         }
         let f = w.humidity_field();
         assert_eq!(w.humidity_color(&f, 120, 305), [40, 100, 235, 255], "liquids are at 100 %");
-        let (near, far, cloud) = (f[290 * W + 120], f[50 * W + 400], f[106 * W + 620]);
+        let (near, far, cloud) = (f[290 * W() + 120], f[50 * W() + 400], f[106 * W() + 620]);
         assert!(near > far + 0.15, "air over water is damper: {near} vs {far}");
         assert!(cloud > 0.95, "inside a cloud the air is saturated: {cloud}");
         assert!(far < 0.3, "dry air far from water: {far}");
@@ -4659,26 +4737,26 @@ mod tests {
     #[test]
     fn the_pressure_view_reads_the_real_atmosphere_on_its_own_scale() {
         let mut w = World::new_static();
-        for x in 0..W as i32 {
-            for y in 450..H as i32 {
+        for x in 0..W() as i32 {
+            for y in 450..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
         let f = w.pressure_field();
-        let (low, high) = (f[440 * W + 300], f[10 * W + 300]);
+        let (low, high) = (f[440 * W() + 300], f[10 * W() + 300]);
         assert!((low - air_pressure_atm(440)).abs() < 0.05, "air by the ground: {low}");
         assert!(high < 0.2 * low, "the air thins with height: {high} up high, {low} below");
         // The sky's gradient spans the air scale, and the ground has a scale of its own.
         assert!(air_scale(low) - air_scale(high) > 0.3);
         assert_ne!(air_pressure_rgb(1.0), ground_pressure_rgb(1.0), "air and ground never share a colour at the surface");
-        assert!(ground_scale(f[530 * W + 300]) > ground_scale(f[460 * W + 300]));
+        assert!(ground_scale(f[530 * W() + 300]) > ground_scale(f[460 * W() + 300]));
     }
 
     #[test]
     fn the_weight_of_a_pillar_fans_out_in_the_ground_instead_of_running_down_as_a_stripe() {
         let mut w = World::new_static();
-        for x in 0..W as i32 {
-            for y in 300..H as i32 {
+        for x in 0..W() as i32 {
+            for y in 300..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -4689,19 +4767,19 @@ mod tests {
         }
         let f = w.pressure_field();
         let load = 60.0 * density(Mat::Stone) / 60.0;
-        let (under, aside) = (|y: usize| f[y * W + 400], |y: usize| f[y * W + 480]);
+        let (under, aside) = (|y: usize| f[y * W() + 400], |y: usize| f[y * W() + 480]);
         assert!(under(302) - aside(302) > 0.3 * load, "right under the pillar its weight is felt: {} vs {}", under(302), aside(302));
         assert!(under(500) - aside(500) < 0.15 * load, "deep down it has spread out: {} vs {}", under(500), aside(500));
         // And the ground still gets steadily heavier with depth.
         assert!(aside(500) > aside(400) && aside(400) > aside(320));
-        assert_eq!(w.pressure_at_cell(400, 450), f[450 * W + 400], "the loupe reads the same pressure as the view");
+        assert_eq!(w.pressure_at_cell(400, 450), f[450 * W() + 400], "the loupe reads the same pressure as the view");
     }
 
     #[test]
     fn a_grain_of_steam_shows_as_a_dot_in_every_science_view() {
         let mut w = World::new_static();
         w.set(400, 200, Mat::Steam);
-        let i = 200 * W + 400;
+        let i = 200 * W() + 400;
         w.temp[i] = 105.0;
         let (pf, hf) = (w.pressure_field(), w.humidity_field());
         let views: [(&str, [u8; 4], [u8; 4]); 3] = [
@@ -4800,10 +4878,29 @@ mod tests {
     }
 
     #[test]
+    fn volumes_count_what_the_cells_hold() {
+        let mut w = World::new_static();
+        let before = w.volumes().1;
+        for x in 100..110 {
+            w.set(x, 200, Mat::Water);
+            w.set(x, 190, Mat::Steam);
+        }
+        let i = World::idx(100, 200);
+        w.fill[i] = field::FULL / 4;
+        w.set_packed(World::idx(100, 190), 3);
+        let (n, v) = w.volumes();
+        assert_eq!(n, w.census(), "the same census");
+        let water = v[Mat::Water as usize] - before[Mat::Water as usize];
+        assert!((water - 9.25).abs() < 1e-3, "a quarter-full cell counts a quarter: {water}");
+        let steam = v[Mat::Steam as usize] - before[Mat::Steam as usize];
+        assert!((steam - 13.0).abs() < 1e-3, "packed vapour counts its cells: {steam}");
+    }
+
+    #[test]
     fn taking_soil_lets_the_ground_sink_with_its_grass() {
         let mut w = World::new_static();
-        for x in 0..W as i32 {
-            for y in 320..H as i32 {
+        for x in 0..W() as i32 {
+            for y in 320..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
             for y in 306..320 {
@@ -4816,16 +4913,16 @@ mod tests {
         // A brick is built from the earth just under the turf.
         assert!(w.consume(&[Mat::Dirt], 120, (200, 280)));
         let grass = |w: &World| w.cells.iter().filter(|c| c.m == Mat::Grass).count();
-        assert_eq!(grass(&w), 6 * W, "no grass is lost");
-        for x in 0..W as i32 {
+        assert_eq!(grass(&w), 6 * W(), "no grass is lost");
+        for x in 0..W() as i32 {
             // No cave: from the surface down, the column is grass, then earth, then rock.
-            let top = (0..H as i32).find(|&y| w.raw(x, y) != Mat::Empty).unwrap();
-            let col: Vec<Mat> = (top..H as i32).map(|y| w.raw(x, y)).collect();
+            let top = (0..H() as i32).find(|&y| w.raw(x, y) != Mat::Empty).unwrap();
+            let col: Vec<Mat> = (top..H() as i32).map(|y| w.raw(x, y)).collect();
             assert!(col[..6].iter().all(|&m| m == Mat::Grass), "x={x}: turf on top, got {:?}", &col[..8]);
             assert!(col[6..].iter().all(|&m| m != Mat::Empty), "x={x}: a hole under the turf");
         }
         // The surface dipped where the earth was taken.
-        assert!((0..H as i32).find(|&y| w.raw(200, y) == Mat::Grass).unwrap() > 300, "the ground should sink");
+        assert!((0..H() as i32).find(|&y| w.raw(200, y) == Mat::Grass).unwrap() > 300, "the ground should sink");
         assert_eq!(w.raw(20, 300), Mat::Grass, "far away the ground is untouched");
     }
 
@@ -4853,8 +4950,8 @@ mod tests {
     fn vapour_blown_off_one_side_leaves_the_world() {
         let mut w = World::new_static();
         for k in 0..6 {
-            w.set(W as i32 - 3 + (k % 3), 60 + k / 3, Mat::Cloud);
-            w.set(W as i32 - 3 + (k % 3), 70 + k / 3, Mat::Steam);
+            w.set(W() as i32 - 3 + (k % 3), 60 + k / 3, Mat::Cloud);
+            w.set(W() as i32 - 3 + (k % 3), 70 + k / 3, Mat::Steam);
         }
         w.flow.pin_uniform(1.0, 0.0);
         let mut came_back = false;
@@ -4954,7 +5051,7 @@ mod tests {
         for _ in 0..40 {
             w.step();
         }
-        let y = (0..H as i32).find(|&y| (380..420).any(|x| w.raw(x, y) == Mat::Water)).unwrap_or(H as i32);
+        let y = (0..H() as i32).find(|&y| (380..420).any(|x| w.raw(x, y) == Mat::Water)).unwrap_or(H() as i32);
         assert!(y > 20 + 100, "in 40 steps a drop falls well over 40 cells: it is at {y}");
     }
 
@@ -4975,13 +5072,13 @@ mod tests {
             w.step();
         }
         assert_eq!(w.raw(110, 300), Mat::Dirt, "the seed does not pile up: it goes into the earth");
-        assert_eq!(w.growth[300 * W + 110], 1, "the earth under it is fertile");
+        assert_eq!(w.growth[300 * W() + 110], 1, "the earth under it is fertile");
         assert!((280..300).all(|y| w.raw(110, y) == Mat::Empty));
         for _ in 0..15_000 {
             w.step();
         }
         assert_eq!(w.cells.iter().filter(|c| c.m == Mat::Seed).count(), 0, "a seed on rock rots away");
-        assert_eq!(w.growth[300 * W + 110], 1, "the sown seed waits in the dark");
+        assert_eq!(w.growth[300 * W() + 110], 1, "the sown seed waits in the dark");
     }
 
     #[test]
@@ -4994,12 +5091,12 @@ mod tests {
         }
         w.paint(150, 310, 6, Mat::Seed);
         assert!(w.cells.iter().filter(|c| c.m == Mat::Seed).count() == 0, "painted on earth, seeds are sown into it");
-        let fertile = (0..W * H).filter(|&i| w.growth[i] > 0).count();
+        let fertile = (0..W() * H()).filter(|&i| w.growth[i] > 0).count();
         assert!(fertile > 50, "the earth under the brush is fertile: {fertile}");
         for _ in 0..12 {
             w.paint(150, 310, 6, Mat::Seed);
         }
-        assert!(w.growth[305 * W + 150] <= SOIL_SEEDS, "a cell holds at most {SOIL_SEEDS} seeds");
+        assert!(w.growth[305 * W() + 150] <= SOIL_SEEDS, "a cell holds at most {SOIL_SEEDS} seeds");
         // In the air, seeds fall as grains.
         w.paint(150, 250, 4, Mat::Seed);
         assert!(w.cells.iter().filter(|c| c.m == Mat::Seed).count() > 10);
@@ -5027,9 +5124,9 @@ mod tests {
         for _ in 0..1200 {
             w.step();
         }
-        let lowest = |x: i32| (0..H as i32).rev().find(|&y| w.raw(x, y) != Mat::Empty).unwrap_or(-1);
-        assert_eq!(lowest(150), H as i32 - 1, "the rock slab comes to rest on the base of the world");
-        assert_eq!(w.raw(150, H as i32 - 21), Mat::Dirt, "its soil rides down with it");
+        let lowest = |x: i32| (0..H() as i32).rev().find(|&y| w.raw(x, y) != Mat::Empty).unwrap_or(-1);
+        assert_eq!(lowest(150), H() as i32 - 1, "the rock slab comes to rest on the base of the world");
+        assert_eq!(w.raw(150, H() as i32 - 21), Mat::Dirt, "its soil rides down with it");
         assert_eq!(lowest(330), -1, "soil that nothing holds falls and disappears off the bottom");
     }
 
@@ -5038,9 +5135,9 @@ mod tests {
     fn dune() -> World {
         let mut w = World::new_static();
         w.structures_fall = true;
-        let floor = H as i32 - 10;
+        let floor = H() as i32 - 10;
         for x in 60..340 {
-            for y in floor..H as i32 {
+            for y in floor..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
             for y in floor - 60..floor {
@@ -5052,7 +5149,7 @@ mod tests {
 
     #[test]
     fn a_tunnel_through_sand_keeps_its_roof() {
-        let y = H as i32 - 40;
+        let y = H() as i32 - 40;
         let hole = |w: &World| (150..250).filter(|&x| w.raw(x, y) == Mat::Empty).count();
         // With the eraser, the sand pours back in.
         let mut w = dune();
@@ -5083,17 +5180,17 @@ mod tests {
             let mut w = World::new_static();
             w.structures_fall = true;
             for x in 100..300 {
-                for y in H as i32 - 10..H as i32 {
+                for y in H() as i32 - 10..H() as i32 {
                     w.set(x, y, Mat::Stone);
                 }
-                for y in H as i32 - 70..H as i32 - 10 {
+                for y in H() as i32 - 70..H() as i32 - 10 {
                     w.set(x, y, Mat::Dirt);
                 }
             }
             w
         };
-        let y = H as i32 - 40;
-        let top = H as i32 - 70;
+        let y = H() as i32 - 40;
+        let top = H() as i32 - 70;
         let mut w = build();
         w.line((90, y), (310, y), 5, Mat::Empty);
         for _ in 0..200 {
@@ -5116,17 +5213,17 @@ mod tests {
         let mut w = World::new_static();
         w.structures_fall = true;
         for x in 100..300 {
-            for y in H as i32 - 10..H as i32 {
+            for y in H() as i32 - 10..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
-            for y in H as i32 - 30..H as i32 - 10 {
+            for y in H() as i32 - 30..H() as i32 - 10 {
                 w.set(x, y, Mat::Dirt);
             }
-            for y in H as i32 - 90..H as i32 - 30 {
-                w.set(x, y, if y == H as i32 - 70 { Mat::Dirt } else { Mat::Stone });
+            for y in H() as i32 - 90..H() as i32 - 30 {
+                w.set(x, y, if y == H() as i32 - 70 { Mat::Dirt } else { Mat::Stone });
             }
         }
-        let y = H as i32 - 50;
+        let y = H() as i32 - 50;
         w.tunnel_line((90, y), (310, y), 6);
         assert_eq!(w.raw(200, y), Mat::Empty);
         assert!(w.cells.iter().any(|c| c.m == Mat::Vault), "the rock is lined");
@@ -5134,7 +5231,7 @@ mod tests {
             w.step();
         }
         assert_eq!(w.raw(200, y), Mat::Empty, "the tunnel stays open");
-        assert_eq!(w.raw(200, H as i32 - 89), Mat::Stone, "the rock over it stays up");
+        assert_eq!(w.raw(200, H() as i32 - 89), Mat::Stone, "the rock over it stays up");
     }
 
     #[test]
@@ -5142,14 +5239,14 @@ mod tests {
         let mut w = World::new_static();
         w.structures_fall = true;
         for x in 100..200 {
-            for y in H as i32 - 6..H as i32 {
+            for y in H() as i32 - 6..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
-            for y in H as i32 - 20..H as i32 - 6 {
+            for y in H() as i32 - 20..H() as i32 - 6 {
                 w.set(x, y, Mat::Water);
             }
         }
-        for y in H as i32 - 20..H as i32 {
+        for y in H() as i32 - 20..H() as i32 {
             w.set(99, y, Mat::Stone);
             w.set(200, y, Mat::Stone);
         }
@@ -5159,7 +5256,7 @@ mod tests {
         let before = w.cells.iter().filter(|c| c.m == Mat::Water).count();
         assert!(before > 1000, "the lake holds: {before}");
         for x in 140..160 {
-            for y in H as i32 - 6..H as i32 {
+            for y in H() as i32 - 6..H() as i32 {
                 w.set(x, y, Mat::Empty);
             }
         }
@@ -5177,7 +5274,7 @@ mod tests {
         w.climate_fixed = Some(-5.0);
         w.reset_temps();
         for x in 100..300 {
-            for y in 500..H as i32 {
+            for y in 500..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -5193,7 +5290,7 @@ mod tests {
         let (ice, hail) = (tally(Mat::Ice), tally(Mat::Hail));
         assert!(hail > 20, "a 15 m fall crushes part of it to hail: {hail}");
         assert!(ice + hail > 180, "nothing is lost: {ice} + {hail}");
-        assert!(w.ejecta.is_empty() && (0..W * H).filter(|&i| matches!(w.cells[i].m, Mat::Ice | Mat::Hail)).all(|i| i / W >= 470), "the pieces lie on the rock");
+        assert!(w.ejecta.is_empty() && (0..W() * H()).filter(|&i| matches!(w.cells[i].m, Mat::Ice | Mat::Hail)).all(|i| i / W() >= 470), "the pieces lie on the rock");
     }
 
     #[test]
@@ -5205,7 +5302,7 @@ mod tests {
         // Rock on the base; a block of ice dropped from a little height (it would shatter from
         // high up, see `ice_dropped_from_high_up_shatters`).
         for x in 100..300 {
-            for y in 500..H as i32 {
+            for y in 500..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -5214,7 +5311,7 @@ mod tests {
                 w.set(x, y, Mat::Ice);
             }
         }
-        let top = |w: &World| (0..H as i32).find(|&y| w.raw(190, y) == Mat::Ice).unwrap_or(-1);
+        let top = |w: &World| (0..H() as i32).find(|&y| w.raw(190, y) == Mat::Ice).unwrap_or(-1);
         let (mut went_down, mut bounced) = (false, false);
         let mut last = top(&w);
         for _ in 0..600 {
@@ -5238,7 +5335,7 @@ mod tests {
         w.climate_fixed = Some(-5.0);
         w.reset_temps();
         for x in 100..300 {
-            for y in 520..H as i32 {
+            for y in 520..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -5259,7 +5356,7 @@ mod tests {
         for _ in 0..800 {
             w.step();
         }
-        let ice_y = (0..H as i32).find(|&y| w.raw(190, y) == Mat::Ice).unwrap_or(-1);
+        let ice_y = (0..H() as i32).find(|&y| w.raw(190, y) == Mat::Ice).unwrap_or(-1);
         assert!(ice_y > 0 && ice_y < 500, "ice should float near the surface, y = {ice_y}");
     }
 
@@ -5270,7 +5367,7 @@ mod tests {
         w.climate_fixed = Some(-5.0);
         w.reset_temps();
         for x in 100..300 {
-            for y in 520..H as i32 {
+            for y in 520..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -5299,7 +5396,7 @@ mod tests {
         for _ in 0..900 {
             w.step();
         }
-        let ice_top = (0..H as i32).find(|&y| w.raw(190, y) == Mat::Ice).unwrap_or(-1);
+        let ice_top = (0..H() as i32).find(|&y| w.raw(190, y) == Mat::Ice).unwrap_or(-1);
         assert!(ice_top > 450, "the ice should have dropped through the gas and drops to the rock, top at {ice_top}");
     }
 
@@ -5314,7 +5411,7 @@ mod tests {
             for _ in 0..600 {
                 w.step();
             }
-            let high = (0..W * H).filter(|&i| w.cells[i].m == Mat::Ice && i / W < y as usize + 60 && (300..500).contains(&((i % W) as i32))).count();
+            let high = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Ice && i / W() < y as usize + 60 && (300..500).contains(&((i % W()) as i32))).count();
             eprintln!("ICESKY phase {hour} y {y}: before {before}, still high {high}");
             assert!(high < before / 4, "ice painted in the sky stayed up: {high} of {before} (phase {hour}, y {y})");
         }
@@ -5333,12 +5430,12 @@ mod tests {
             w.step();
         }
         let ice_in_air = |w: &World| -> Vec<usize> {
-            (0..W * H)
+            (0..W() * H())
                 .filter(|&i| {
                     w.cells[i].m == Mat::Ice
-                        && i / W < 330
+                        && i / W() < 330
                         && (0..4).all(|k| {
-                            let (x, y) = ((i % W) as i32, (i / W) as i32);
+                            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
                             let (nx, ny) = [(x, y + 1), (x + 1, y), (x - 1, y), (x, y - 1)][k];
                             // Ice floating on a lake is not hanging in the air either.
                             !matches!(w.raw(nx, ny), Mat::Stone | Mat::Dirt | Mat::Grass | Mat::Ice | Mat::Trunk | Mat::Leaf | Mat::Branch | Mat::Water)
@@ -5377,7 +5474,7 @@ mod tests {
             for _ in 0..500 {
                 w.step();
             }
-            let ice_rows: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Ice && (380..420).contains(&((i % W) as i32))).map(|i| i / W).collect();
+            let ice_rows: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Ice && (380..420).contains(&((i % W()) as i32))).map(|i| i / W()).collect();
             let top = ice_rows.iter().min().copied().unwrap_or(0);
             eprintln!("LAYER {layer:?}: {} ice cells left, highest row {top}", ice_rows.len());
             assert!(ice_rows.is_empty() || top > 190, "ice stayed up in a layer of {layer:?}: top row {top}");
@@ -5389,20 +5486,20 @@ mod tests {
         let mut w = World::new();
         w.day_cycle = false;
         w.set_phase(0.75);
-        for x in 0..W as i32 {
-            for y in H as i32 - 10..H as i32 {
+        for x in 0..W() as i32 {
+            for y in H() as i32 - 10..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
         // (Banks as wide as the world: a wall one cell thick gives way under 32 m of water and
         // the splash of the rock, see `statics.rs`, and the lake would drain away.)
-        for y in 300..H as i32 - 10 {
-            for x in (0..100).chain(300..W as i32) {
+        for y in 300..H() as i32 - 10 {
+            for x in (0..100).chain(300..W() as i32) {
                 w.set(x, y, Mat::Stone);
             }
         }
         for x in 100..300 {
-            for y in 340..H as i32 - 10 {
+            for y in 340..H() as i32 - 10 {
                 w.set(x, y, Mat::Water);
             }
         }
@@ -5420,7 +5517,7 @@ mod tests {
         for _ in 0..600 {
             w.step();
         }
-        let rows = |m: Mat, x0: i32, x1: i32| (0..H as i32).filter(|&y| (x0..x1).any(|x| w.raw(x, y) == m)).collect::<Vec<_>>();
+        let rows = |m: Mat, x0: i32, x1: i32| (0..H() as i32).filter(|&y| (x0..x1).any(|x| w.raw(x, y) == m)).collect::<Vec<_>>();
         let rock = rows(Mat::Stone, 120, 160);
         let wood = rows(Mat::Wood, 200, 290);
         assert!(rock.iter().min().is_some_and(|&y| y > 400), "the rock sank: rows {:?}", rock.first());
@@ -5429,8 +5526,8 @@ mod tests {
 
     /// A floor of rock on the base of the world, `top` rows thick.
     fn rock_floor(w: &mut World, top: i32) {
-        for x in 0..W as i32 {
-            for y in H as i32 - top..H as i32 {
+        for x in 0..W() as i32 {
+            for y in H() as i32 - top..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -5443,16 +5540,16 @@ mod tests {
         w.reset_temps();
         rock_floor(&mut w, 10);
         for x in 190..=210 {
-            for y in 200..H as i32 - 10 {
+            for y in 200..H() as i32 - 10 {
                 w.set(x, y, Mat::Stone);
             }
         }
         // A stroke of wood that touches the side of the cliff: it does not stick to it.
         w.new_log();
         w.line((217, 150), (240, 150), 5, Mat::Wood);
-        let cells = |w: &World| (0..W * H).filter(|&i| w.cells[i].m == Mat::Wood).collect::<Vec<_>>();
+        let cells = |w: &World| (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Wood).collect::<Vec<_>>();
         let before = cells(&w);
-        let rows = |c: &[usize]| (c.iter().map(|i| i / W).min().unwrap(), c.iter().map(|i| i / W).max().unwrap());
+        let rows = |c: &[usize]| (c.iter().map(|i| i / W()).min().unwrap(), c.iter().map(|i| i / W()).max().unwrap());
         for _ in 0..400 {
             w.step();
         }
@@ -5460,7 +5557,7 @@ mod tests {
         assert_eq!(after.len(), before.len(), "the log keeps all its wood");
         let ((t0, b0), (t1, b1)) = (rows(&before), rows(&after));
         assert_eq!(b1 - t1, b0 - t0, "it keeps its shape");
-        assert_eq!(b1, H - 11, "it lies on the floor");
+        assert_eq!(b1, H() - 11, "it lies on the floor");
     }
 
     #[test]
@@ -5471,11 +5568,11 @@ mod tests {
         rock_floor(&mut w, 10);
         // A pit in the floor, right of x = 300.
         for x in 300..350 {
-            for y in H as i32 - 10..H as i32 - 2 {
+            for y in H() as i32 - 10..H() as i32 - 2 {
                 w.set(x, y, Mat::Empty);
             }
         }
-        let floor = H as i32 - 10;
+        let floor = H() as i32 - 10;
         w.new_log();
         w.line((262, floor - 4), (297, floor - 4), 3, Mat::Wood);
         // The second log touches the end of the first one, over the pit.
@@ -5484,7 +5581,7 @@ mod tests {
         for _ in 0..300 {
             w.step();
         }
-        let lowest = |x0: i32, x1: i32| (0..H as i32).rev().find(|&y| (x0..x1).any(|x| w.raw(x, y) == Mat::Wood)).unwrap();
+        let lowest = |x0: i32, x1: i32| (0..H() as i32).rev().find(|&y| (x0..x1).any(|x| w.raw(x, y) == Mat::Wood)).unwrap();
         assert_eq!(lowest(255, 300), floor - 1, "the first log stays on the floor");
         assert!(lowest(302, 345) > floor + 4, "the second one fell into the pit: {}", lowest(302, 345));
     }
@@ -5495,9 +5592,9 @@ mod tests {
         w.climate_fixed = Some(15.0);
         w.reset_temps();
         rock_floor(&mut w, 10);
-        let sand = H as i32 - 40;
-        for x in 0..W as i32 {
-            for y in sand..H as i32 - 10 {
+        let sand = H() as i32 - 40;
+        for x in 0..W() as i32 {
+            for y in sand..H() as i32 - 10 {
                 w.set(x, y, Mat::Sand);
             }
         }
@@ -5506,7 +5603,7 @@ mod tests {
         for _ in 0..400 {
             w.step();
         }
-        let lowest = (0..H as i32).rev().find(|&y| (295..335).any(|x| w.raw(x, y) == Mat::Wood)).unwrap();
+        let lowest = (0..H() as i32).rev().find(|&y| (295..335).any(|x| w.raw(x, y) == Mat::Wood)).unwrap();
         assert!(lowest < sand + 2, "the log lies on the sand, not buried in it: {lowest}");
     }
 
@@ -5516,15 +5613,15 @@ mod tests {
         w.climate_fixed = Some(15.0);
         w.reset_temps();
         rock_floor(&mut w, 10);
-        let ground = H as i32 - 30;
-        for x in 0..W as i32 {
-            for y in ground..H as i32 - 10 {
+        let ground = H() as i32 - 30;
+        for x in 0..W() as i32 {
+            for y in ground..H() as i32 - 10 {
                 w.set(x, y, Mat::Dirt);
             }
         }
         // A click in the sky plants it on the ground below; one in the water does not.
         assert!(w.plant_tree(400, 80, 0.5));
-        let trunk = |w: &World| (0..H as i32).filter(|&y| w.raw(400, y) == Mat::Trunk).collect::<Vec<_>>();
+        let trunk = |w: &World| (0..H() as i32).filter(|&y| w.raw(400, y) == Mat::Trunk).collect::<Vec<_>>();
         let t = trunk(&w);
         assert_eq!(*t.last().unwrap(), ground - 1, "the trunk stands on the soil");
         assert!(t.len() as i32 >= 8 * K);
@@ -5574,7 +5671,7 @@ mod tests {
         for x in 101..105 {
             for y in 296..300 {
                 w.set(x, y, Mat::Lava);
-                w.temp[y as usize * W + x as usize] = 1100.0;
+                w.temp[y as usize * W() + x as usize] = 1100.0;
             }
         }
         // A thin layer of lava chills against cold rock and sets before the rock under it reaches
@@ -5583,7 +5680,7 @@ mod tests {
         for _ in 0..800 {
             for x in 101..105 {
                 w.set(x, 292, Mat::Lava);
-                w.temp[292 * W + x as usize] = 1100.0;
+                w.temp[292 * W() + x as usize] = 1100.0;
             }
             w.step();
         }
@@ -5618,7 +5715,7 @@ mod tests {
         for x in 100..140 {
             for y in 306..312 {
                 w.set(x, y, Mat::Lava);
-                w.temp[y as usize * W + x as usize] = 1300.0;
+                w.temp[y as usize * W() + x as usize] = 1300.0;
             }
         }
         let mut molten = false;
@@ -5627,7 +5724,7 @@ mod tests {
                 for x in 100..140 {
                     if w.raw(x, 305) == Mat::Empty {
                         w.set(x, 305, Mat::Lava);
-                        w.temp[305 * W + x as usize] = 1300.0;
+                        w.temp[305 * W() + x as usize] = 1300.0;
                     }
                 }
             }
@@ -5641,7 +5738,7 @@ mod tests {
             w.set(x, 320, Mat::Stone);
             w.set(x, 319, Mat::Iron);
             w.set(x, 318, Mat::Lava);
-            w.temp[318 * W + x as usize] = 700.0;
+            w.temp[318 * W() + x as usize] = 700.0;
         }
         for _ in 0..800 {
             w.step();
@@ -5694,7 +5791,7 @@ mod tests {
             }
         }
         let mean_spread = |w: &World| {
-            let xs: Vec<i32> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Sand).map(|i| (i % W) as i32).collect();
+            let xs: Vec<i32> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Sand).map(|i| (i % W()) as i32).collect();
             xs.iter().map(|x| (x - 250).abs()).sum::<i32>() as f32 / xs.len().max(1) as f32
         };
         let before = mean_spread(&w);
@@ -5753,12 +5850,12 @@ mod tests {
             w.step();
         }
         // Oil stays on top of the water.
-        let oil_lowest = (0..H as i32).rev().find(|&y| (100..200).any(|x| w.raw(x, y) == Mat::Oil)).unwrap_or(0);
-        let water_top = (0..H as i32).find(|&y| (100..200).any(|x| w.raw(x, y) == Mat::Water)).unwrap();
+        let oil_lowest = (0..H() as i32).rev().find(|&y| (100..200).any(|x| w.raw(x, y) == Mat::Oil)).unwrap_or(0);
+        let water_top = (0..H() as i32).find(|&y| (100..200).any(|x| w.raw(x, y) == Mat::Water)).unwrap();
         assert!(oil_lowest <= water_top + 3, "oil should float on the water: lowest oil row {oil_lowest}, water surface {water_top}");
         // Set it alight: flames last far longer than a normal fire would.
         // (The top of the layer, not a stray drop resting on it.)
-        let oil_top = (0..H as i32).find(|&y| (100..200).filter(|&x| w.raw(x, y) == Mat::Oil).count() >= 10).unwrap();
+        let oil_top = (0..H() as i32).find(|&y| (100..200).filter(|&x| w.raw(x, y) == Mat::Oil).count() >= 10).unwrap();
         let ox = (100..200).find(|&x| w.raw(x, oil_top) == Mat::Oil).unwrap();
         for k in 0..8 {
             w.set(ox + k, oil_top - 1, Mat::Fire);
@@ -5798,9 +5895,9 @@ mod tests {
             w.step();
         }
         assert_eq!(w.raw(105, 329), Mat::Grass, "grass lands on soil");
-        let sand_grass = (0..H as i32).find(|&y| w.raw(205, y) == Mat::Grass).expect("grass should be resting on the sand");
+        let sand_grass = (0..H() as i32).find(|&y| w.raw(205, y) == Mat::Grass).expect("grass should be resting on the sand");
         assert_eq!(w.raw(205, sand_grass + 1), Mat::Sand, "grass lands on sand");
-        assert!((0..H as i32).all(|y| w.raw(300, y) != Mat::Grass), "grass over a void falls out of the world");
+        assert!((0..H() as i32).all(|y| w.raw(300, y) != Mat::Grass), "grass over a void falls out of the world");
     }
 
     #[test]
@@ -5839,7 +5936,7 @@ mod tests {
         let mut noon = |s: Season| {
             w.set_season(s);
             w.set_phase(0.25);
-            (w.surface_temp_c(), w.ambient_c(0), w.ambient_c(H as i32 / 2))
+            (w.surface_temp_c(), w.ambient_c(0), w.ambient_c(H() as i32 / 2))
         };
         let (summer_ground, summer_top, summer_mid) = noon(Season::Summer);
         let (winter_ground, _, _) = noon(Season::Winter);
@@ -5900,7 +5997,7 @@ mod tests {
         let mut w = World::new();
         w.set_phase(0.25);
         w.day_cycle = false;
-        for x in 0..W as i32 {
+        for x in 0..W() as i32 {
             for y in 300..320 {
                 w.set(x, y, Mat::Stone);
             }
@@ -5909,7 +6006,7 @@ mod tests {
         for _ in 0..600 {
             w.step();
         }
-        let under = w.temp_c(W as i32 / 2, 300);
+        let under = w.temp_c(W() as i32 / 2, 300);
         let far = w.temp_c(40, 300);
         assert!(under > far + 1.5, "ground under the sun {under} vs far {far}");
         // Away from the sun's halo, the air gets colder toward the top of the screen.
@@ -5924,8 +6021,8 @@ mod tests {
             w.day_cycle = false;
             w.flow.pin_uniform(0.0, 0.0);
             // Rock down to the base of the world (only that holds it up).
-            for x in 0..W as i32 {
-                for y in 300..H as i32 {
+            for x in 0..W() as i32 {
+                for y in 300..H() as i32 {
                     w.set(x, y, Mat::Stone);
                 }
             }
@@ -5938,9 +6035,9 @@ mod tests {
             }
             w.reset_temps();
             // Ground chilled by the night: the morning sun warms it up, where it reaches it.
-            for x in 0..W {
+            for x in 0..W() {
                 for y in 300..320 {
-                    w.temp[y * W + x] = 0.0;
+                    w.temp[y * W() + x] = 0.0;
                 }
             }
             for _ in 0..600 {
@@ -5963,26 +6060,26 @@ mod tests {
         for x in 300..340 {
             for y in 250..260 {
                 w.set(x, y, Mat::Steam);
-                w.temp[y as usize * W + x as usize] = 90.0;
+                w.temp[y as usize * W() + x as usize] = 90.0;
             }
             for y in 80..90 {
                 w.set(x + 200, y, Mat::Cloud);
-                w.temp[y as usize * W + x as usize + 200] = 40.0;
+                w.temp[y as usize * W() + x as usize + 200] = 40.0;
             }
             w.set(x + 400, 10, Mat::Cloud);
         }
         // A strong updraft may push the top of a storm cloud a little past the tropopause (an
         // overshooting top), but cooling as it climbs it is soon heavier than the warm air there.
-        let mut highest = H;
+        let mut highest = H();
         for _ in 0..800 {
             w.step();
-            highest = (0..W * H).filter(|&i| matches!(w.cells[i].m, Mat::Steam | Mat::Cloud) && (i % W) < 640).map(|i| i / W).min().unwrap_or(H).min(highest);
+            highest = (0..W() * H()).filter(|&i| matches!(w.cells[i].m, Mat::Steam | Mat::Cloud) && (i % W()) < 640).map(|i| i / W()).min().unwrap_or(H()).min(highest);
         }
-        assert!(highest as i32 >= CEILING_Y - 20, "rising cloud overshot up to row {highest}");
-        let gas: Vec<usize> = (0..W * H).filter(|&i| matches!(w.cells[i].m, Mat::Steam | Mat::Cloud)).collect();
+        assert!(highest as i32 >= CEILING_Y() - 20, "rising cloud overshot up to row {highest}");
+        let gas: Vec<usize> = (0..W() * H()).filter(|&i| matches!(w.cells[i].m, Mat::Steam | Mat::Cloud)).collect();
         assert!(!gas.is_empty());
-        assert!(gas.iter().all(|&i| (i / W) as i32 >= CEILING_Y - 12), "gas above the tropopause settled back down to it");
-        let near_top = gas.iter().filter(|&&i| ((i / W) as i32) < CEILING_Y + 12).count();
+        assert!(gas.iter().all(|&i| (i / W()) as i32 >= CEILING_Y() - 12), "gas above the tropopause settled back down to it");
+        let near_top = gas.iter().filter(|&&i| ((i / W()) as i32) < CEILING_Y() + 12).count();
         assert!(near_top * 3 > gas.len(), "the rising gas gathers in a layer under the ceiling: {near_top} of {}", gas.len());
     }
 
@@ -6002,8 +6099,8 @@ mod tests {
         for _ in 0..600 {
             w.step();
         }
-        let under = (0..W * H).filter(|&i| w.cells[i].m == Mat::Steam && (230..260).contains(&(i / W)) && (380..460).contains(&(i % W))).count();
-        let above = (0..W * H).filter(|&i| matches!(w.cells[i].m, Mat::Steam | Mat::Cloud) && i / W < 200).count();
+        let under = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Steam && (230..260).contains(&(i / W())) && (380..460).contains(&(i % W()))).count();
+        let above = (0..W() * H()).filter(|&i| matches!(w.cells[i].m, Mat::Steam | Mat::Cloud) && i / W() < 200).count();
         assert!(under < 100, "steam stays trapped under the crown: {under} cells");
         assert!(above > 300, "the steam went up through the leaves: {above} cells above");
     }
@@ -6017,10 +6114,10 @@ mod tests {
             // Hot smoke and cold smoke, side by side, mid-air.
             w.set(300 + k, 200, Mat::Smoke);
             w.set(500 + k, 200, Mat::Smoke);
-            w.temp[200 * W + 500 + k as usize] = -15.0;
+            w.temp[200 * W() + 500 + k as usize] = -15.0;
         }
         let mean_y = |w: &World, left: bool| {
-            let ys: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Smoke && ((i % W) < 400) == left).map(|i| i / W).collect();
+            let ys: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Smoke && ((i % W()) < 400) == left).map(|i| i / W()).collect();
             ys.iter().sum::<usize>() as f32 / ys.len().max(1) as f32
         };
         let (smoke0, cloud0) = (mean_y(&w, true), mean_y(&w, false));
@@ -6040,7 +6137,7 @@ mod tests {
             w.set(300 + k * 2, 140 + k % 5, Mat::Steam);
         }
         let mean_x = |w: &World| {
-            let xs: Vec<i32> = (0..W * H).filter(|&i| matches!(w.cells[i].m, Mat::Cloud | Mat::Steam)).map(|i| (i % W) as i32).collect();
+            let xs: Vec<i32> = (0..W() * H()).filter(|&i| matches!(w.cells[i].m, Mat::Cloud | Mat::Steam)).map(|i| (i % W()) as i32).collect();
             xs.iter().sum::<i32>() as f32 / xs.len().max(1) as f32
         };
         let before = mean_x(&w);
@@ -6108,9 +6205,9 @@ mod tests {
             w.step();
             w.wind = 0.9;
         }
-        for i in 0..W * H {
+        for i in 0..W() * H() {
             if w.cells[i].m == Mat::Water {
-                positions.push((i % W) as i32);
+                positions.push((i % W()) as i32);
             }
         }
         for p in positions {
@@ -6164,7 +6261,7 @@ mod tests {
         let mut w = World::new_static();
         let (e, _) = w.generate(7);
         assert_eq!(w.at(e.0, e.1), Mat::Empty);
-        assert!(w.at(200, H as i32 - 2) == Mat::Stone);
+        assert!(w.at(200, H() as i32 - 2) == Mat::Stone);
     }
 }
 
@@ -6364,7 +6461,7 @@ mod science {
                 for y in 296..300 {
                     w.set(x, y, solid);
                     // Hot enough above its melting point to have the heat that melts it.
-                    w.temp[y as usize * W + x as usize] = thermal::METAL_MELT_C + 400.0;
+                    w.temp[y as usize * W() + x as usize] = thermal::METAL_MELT_C + 400.0;
                 }
             }
             let mut seen = false;
@@ -6374,7 +6471,7 @@ mod science {
             }
             assert!(seen, "{solid:?} above its melting point turns {liquid:?}");
             // Cooled down, it sets again into what it was.
-            for k in 0..W * H {
+            for k in 0..W() * H() {
                 if w.cells[k].m == liquid {
                     w.temp[k] = 300.0;
                 }
@@ -6394,14 +6491,14 @@ mod science {
         let mut w = World::new_static();
         floor(&mut w, 300, 60, 200);
         w.paint(130, 280, 4, Mat::Molten);
-        let cells: Vec<usize> = (0..W * H).filter(|&k| w.cells[k].m == Mat::Molten).collect();
+        let cells: Vec<usize> = (0..W() * H()).filter(|&k| w.cells[k].m == Mat::Molten).collect();
         assert!(!cells.is_empty());
         assert!(cells.iter().all(|&k| w.temp[k] > thermal::METAL_MELT_C), "poured molten metal is above its melting point");
         for _ in 0..60 {
             w.step();
         }
         assert!(count(&w, Mat::Molten) > 0, "it does not set at once");
-        assert!((0..W * H).any(|k| w.cells[k].m == Mat::Molten && k / W == 299), "it ran down onto the floor");
+        assert!((0..W() * H()).any(|k| w.cells[k].m == Mat::Molten && k / W() == 299), "it ran down onto the floor");
     }
 
     #[test]
@@ -6642,7 +6739,7 @@ mod science {
         // The bank by the puddle is moist.
         for x in 110..125 {
             for y in 310..320 {
-                w.moisture[y * W + x] = 120;
+                w.moisture[y * W() + x] = 120;
             }
         }
         // Seeds sown on the moist bank, and on dry earth far from it.
@@ -6656,7 +6753,7 @@ mod science {
         let wood = count(&w, Mat::Wood) + count(&w, Mat::Trunk) + count(&w, Mat::Sapling);
         assert!(wood >= 6, "tree only {wood} cells tall");
         assert!((190..215).all(|x| (280..310).all(|y| !matches!(w.raw(x, y), Mat::Sapling | Mat::Trunk))), "on dry earth the seeds wait");
-        assert!(w.growth[310 * W + 200] > 0, "still there, in the earth");
+        assert!(w.growth[310 * W() + 200] > 0, "still there, in the earth");
     }
 
     /// Cells of water a wide pan held at `t` °C loses in 3000 steps, under air of humidity
@@ -6746,7 +6843,7 @@ mod science {
     fn a_falling_grain_speeds_up() {
         let mut w = World::new_static();
         w.set(200, 20, Mat::Sand);
-        let at = |w: &World| (0..H as i32).find(|&y| w.raw(200, y) == Mat::Sand).unwrap();
+        let at = |w: &World| (0..H() as i32).find(|&y| w.raw(200, y) == Mat::Sand).unwrap();
         let mut ys = vec![at(&w)];
         for _ in 0..40 {
             w.step();
@@ -6764,7 +6861,7 @@ mod science {
         // Just below freezing: snow neither melts nor gets pressed into ice.
         w.climate_fixed = Some(-1.0);
         w.reset_temps();
-        floor(&mut w, 300, 0, W as i32);
+        floor(&mut w, 300, 0, W() as i32);
         // A tall block of it, left to slump.
         for x in 285..315 {
             for y in 200..300 {
@@ -6804,7 +6901,7 @@ mod science {
         let mut w = World::new_static();
         w.climate_fixed = Some(-1.0);
         w.reset_temps();
-        floor(&mut w, 300, 0, W as i32);
+        floor(&mut w, 300, 0, W() as i32);
         for x in 290..310 {
             for y in 220..300 {
                 w.set(x, y, Mat::Snow);
@@ -6838,7 +6935,7 @@ mod science {
         for _ in 0..40 {
             w.step();
         }
-        let y = (0..H as i32).find(|&y| (370..430).any(|x| w.raw(x, y) == Mat::Snow)).unwrap_or(H as i32);
+        let y = (0..H() as i32).find(|&y| (370..430).any(|x| w.raw(x, y) == Mat::Snow)).unwrap_or(H() as i32);
         assert!(y > 40 && y <= 20 + 45, "a flake falls about a cell a step: it is at {y}");
     }
 
@@ -6849,8 +6946,8 @@ mod science {
         w.climate_fixed = Some(-5.0);
         w.reset_temps();
         // Ground resting on the base of the world (only that holds things up).
-        for x in 0..W as i32 {
-            for y in 400..H as i32 {
+        for x in 0..W() as i32 {
+            for y in 400..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -6880,8 +6977,8 @@ mod science {
             w.step();
         }
         // A 5 m fall breaks it: pieces of ice and hail.
-        let ice: Vec<usize> = (0..W * H).filter(|&i| matches!(w.cells[i].m, Mat::Ice | Mat::Hail)).collect();
-        let highest = ice.iter().map(|i| i / W).min().unwrap_or(0);
+        let ice: Vec<usize> = (0..W() * H()).filter(|&i| matches!(w.cells[i].m, Mat::Ice | Mat::Hail)).collect();
+        let highest = ice.iter().map(|i| i / W()).min().unwrap_or(0);
         assert!(ice.len() * 10 > n * 9, "the ice is still there: {} of {n}", ice.len());
         assert!(highest > 350, "the ice fell to the ground through the crown (highest ice row {highest})");
         assert!(w.cells.iter().any(|c| c.m == Mat::DeadLeaf), "it broke leaves on its way down");
@@ -6922,9 +7019,9 @@ mod science {
     #[test]
     fn floating_stone_falls_but_attached_stone_stays() {
         let mut w = World::new();
-        floor(&mut w, H as i32 - 1, 0, W as i32);
+        floor(&mut w, H() as i32 - 1, 0, W() as i32);
         // Attached pillar.
-        for y in 400..H as i32 - 1 {
+        for y in 400..H() as i32 - 1 {
             w.set(50, y, Mat::Stone);
         }
         // Floating slab.
@@ -6940,14 +7037,14 @@ mod science {
         assert_eq!(w.raw(215, 200), Mat::Empty, "slab still floating");
         // (A fall of 56 m crushes a corner or two of the slab into sand, which may lie under it:
         // the stone is on the floor, not necessarily the cell that was under its middle.)
-        assert!((150..300).any(|x| w.raw(x, H as i32 - 2) == Mat::Stone), "slab did not land");
+        assert!((150..300).any(|x| w.raw(x, H() as i32 - 2) == Mat::Stone), "slab did not land");
         assert!((150..300).all(|x| (150..400).all(|y| w.raw(x, y) != Mat::Stone)), "the slab is still high in the air");
     }
 
     #[test]
     fn liquids_rest_on_trees_and_do_not_drip_through() {
     let mut w = World::new_static();
-    for y in 0..H as i32 {
+    for y in 0..H() as i32 {
         for x in 100..140 {
             w.set(x, y, Mat::Empty);
         }
@@ -6975,7 +7072,7 @@ mod science {
         w.step();
     }
     let above = (100..140).flat_map(|x| (150..200).map(move |y| (x, y))).filter(|&(x, y)| matches!(w.at(x, y), Mat::Water | Mat::Oil)).count();
-    let total = (0..W as i32).flat_map(|x| (0..H as i32).map(move |y| (x, y))).filter(|&(x, y)| matches!(w.at(x, y), Mat::Water | Mat::Oil)).count();
+    let total = (0..W() as i32).flat_map(|x| (0..H() as i32).map(move |y| (x, y))).filter(|&(x, y)| matches!(w.at(x, y), Mat::Water | Mat::Oil)).count();
     let below = (100..140).flat_map(|x| (203..300).map(move |y| (x, y))).filter(|&(x, y)| matches!(w.at(x, y), Mat::Water | Mat::Oil)).count();
     assert!(below == 0 && above >= 8, "the liquid went down through the tree: {below} below, {above} above, {total} total");
     assert_eq!(w.at(115, 200), Mat::Leaf, "the tree itself must stay");
@@ -6995,7 +7092,7 @@ fn clouds_ride_opposing_winds_at_different_heights() {
     patch(&mut w, 100); // upper layer: towards the right
     patch(&mut w, 400); // lower layer: towards the left
     let mean_x = |w: &World, lo: i32, hi: i32| {
-        let xs: Vec<f32> = (lo..hi).flat_map(|y| (0..W as i32).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Cloud).map(|(x, _)| x as f32).collect();
+        let xs: Vec<f32> = (lo..hi).flat_map(|y| (0..W() as i32).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Cloud).map(|(x, _)| x as f32).collect();
         (xs.iter().sum::<f32>() / xs.len().max(1) as f32, xs.len())
     };
     for _ in 0..150 {
@@ -7018,7 +7115,7 @@ fn rain_slants_with_the_local_wind() {
     for _ in 0..40 {
         w.step();
     }
-    let xs: Vec<i32> = (0..H as i32).flat_map(|y| (0..W as i32).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water && y < 300).map(|(x, _)| x).collect();
+    let xs: Vec<i32> = (0..H() as i32).flat_map(|y| (0..W() as i32).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water && y < 300).map(|(x, _)| x).collect();
     assert!(!xs.is_empty());
     let mean = xs.iter().sum::<i32>() as f32 / xs.len() as f32;
     assert!(mean > 312.0, "falling drops are pushed along: mean x {mean}");
@@ -7028,7 +7125,7 @@ fn rain_slants_with_the_local_wind() {
 fn crucible_world(wall: Mat) -> World {
     let mut w = World::new_static();
     let floor = 300;
-    for x in 0..W as i32 {
+    for x in 0..W() as i32 {
         for y in floor..floor + 20 {
             w.set(x, y, Mat::Stone);
         }
@@ -7165,7 +7262,7 @@ fn flowing_water_erodes_bare_soil() {
     /// All the water in the world, in sixteenths of a cell: in the soil, in liquid water, and in
     /// vapour (a cell of water is `SOIL_WATER`, a cell of vapour a quarter of that).
     fn all_water(w: &World) -> u32 {
-        (0..W * H)
+        (0..W() * H())
             .map(|i| match w.cells[i].m {
                 Mat::Dirt | Mat::Grass | Mat::Mud => w.moisture[i] as u32,
                 Mat::Water => SOIL_WATER as u32,

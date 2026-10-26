@@ -60,7 +60,7 @@ impl Planes {
         }
         let dir = if world.wind >= 0.0 { 1.0 } else { -1.0 };
         let y = self.between(50.0, 190.0);
-        let x = if dir > 0.0 { -LENGTH } else { W as f32 + LENGTH };
+        let x = if dir > 0.0 { -LENGTH } else { W() as f32 + LENGTH };
         self.plane = Some(Plane { pos: vec2(x, y), heading: 0.0, dir, roll: 0.0, age: 0.0, turned: 0.0 });
     }
 
@@ -78,7 +78,7 @@ impl Planes {
         let ticks = dt * 60.0;
         let mut plane = self.plane.take().unwrap();
         plane.age += dt;
-        let at = |dx: f32, dy: f32| world.flow.sample((plane.pos.x + dx) as i32, (plane.pos.y + dy).clamp(0.0, H as f32 - 1.0) as i32);
+        let at = |dx: f32, dy: f32| world.flow.sample((plane.pos.x + dx) as i32, (plane.pos.y + dy).clamp(0.0, H() as f32 - 1.0) as i32);
         let (fx, fy) = at(0.0, 0.0);
         // The air's spin where it is (flow units per cell): this alone turns the plane round.
         let d = 12.0;
@@ -107,7 +107,7 @@ impl Planes {
             return Some(plane.pos);
         }
         // Gone once it has left the world, or has stayed too long.
-        let out = plane.pos.x < -LENGTH * 2.0 || plane.pos.x > W as f32 + LENGTH * 2.0 || plane.pos.y < -LENGTH * 2.0 || plane.pos.y > H as f32;
+        let out = plane.pos.x < -LENGTH * 2.0 || plane.pos.x > W() as f32 + LENGTH * 2.0 || plane.pos.y < -LENGTH * 2.0 || plane.pos.y > H() as f32;
         if !(out && plane.age > 3.0 || plane.age > MAX_AGE) {
             self.plane = Some(plane);
         }
@@ -236,7 +236,7 @@ mod tests {
         let (mut crossed, mut turned) = (false, 0.0f32);
         for _ in 0..(30 * 90) {
             if let Some(p) = &planes.plane {
-                crossed |= p.pos.x > 0.0 && p.pos.x < W as f32;
+                crossed |= p.pos.x > 0.0 && p.pos.x < W() as f32;
                 turned = turned.max(p.turned);
                 assert!(p.heading.abs() < 0.2, "no loops without a vortex: {}", p.heading);
             }

@@ -24,8 +24,14 @@ const fn zone_side(v: &[u8]) -> usize {
     }
 }
 /// Zones across and down.
-pub const CW: usize = W.div_ceil(CS);
-pub const CH: usize = H.div_ceil(CS);
+#[allow(non_snake_case)]
+pub fn CW() -> usize {
+    W().div_ceil(CS)
+}
+#[allow(non_snake_case)]
+pub fn CH() -> usize {
+    H().div_ceil(CS)
+}
 
 /// The state of the zones: which run this step, which were woken for the next one, and which
 /// hold a cell that can change on its own.
@@ -44,7 +50,7 @@ pub struct Zones {
 
 impl Zones {
     pub fn new() -> Self {
-        Zones { awake: vec![true; CW * CH], woke: vec![true; CW * CH], restless: vec![true; CW * CH], enabled: true, stamp: 1, changed: vec![1; CW * CH] }
+        Zones { awake: vec![true; CW() * CH()], woke: vec![true; CW() * CH()], restless: vec![true; CW() * CH()], enabled: true, stamp: 1, changed: vec![1; CW() * CH()] }
     }
 
     /// Zones with no storage (to put in place of a view's zones once it is done with).
@@ -55,12 +61,12 @@ impl Zones {
     /// The zones for a strip of the cells' turn (see `turn.rs`): which run this step, and marks of
     /// its own for what it wakes, finds restless or changes.
     pub(super) fn view(&self) -> Self {
-        Zones { awake: self.awake.clone(), woke: vec![false; CW * CH], restless: vec![false; CW * CH], enabled: self.enabled, stamp: self.stamp, changed: vec![0; CW * CH] }
+        Zones { awake: self.awake.clone(), woke: vec![false; CW() * CH()], restless: vec![false; CW() * CH()], enabled: self.enabled, stamp: self.stamp, changed: vec![0; CW() * CH()] }
     }
 
     /// Takes in the marks of a strip's zones.
     pub(super) fn absorb(&mut self, v: &Zones) {
-        for k in 0..CW * CH {
+        for k in 0..CW() * CH() {
             self.woke[k] |= v.woke[k];
             self.restless[k] |= v.restless[k];
             if v.changed[k] == self.stamp {
@@ -78,31 +84,31 @@ impl Zones {
     /// Wakes the zone of cell `i`, and the zone next door when the cell is on its edge.
     #[inline]
     pub fn wake(&mut self, i: usize) {
-        let (x, y) = (i % W, i / W);
+        let (x, y) = (i % W(), i / W());
         let (cx, cy) = (x / CS, y / CS);
         let (lx, ly) = (x % CS, y % CS);
         let x0 = if lx == 0 && cx > 0 { cx - 1 } else { cx };
-        let x1 = if lx == CS - 1 && cx + 1 < CW { cx + 1 } else { cx };
+        let x1 = if lx == CS - 1 && cx + 1 < CW() { cx + 1 } else { cx };
         let y0 = if ly == 0 && cy > 0 { cy - 1 } else { cy };
-        let y1 = if ly == CS - 1 && cy + 1 < CH { cy + 1 } else { cy };
+        let y1 = if ly == CS - 1 && cy + 1 < CH() { cy + 1 } else { cy };
         for zy in y0..=y1 {
             for zx in x0..=x1 {
-                self.woke[zy * CW + zx] = true;
+                self.woke[zy * CW() + zx] = true;
             }
         }
-        self.changed[cy * CW + cx] = self.stamp;
+        self.changed[cy * CW() + cx] = self.stamp;
         // Gas wraps round the sides of the world.
         if x == 0 {
-            self.woke[cy * CW + CW - 1] = true;
-        } else if x == W - 1 {
-            self.woke[cy * CW] = true;
+            self.woke[cy * CW() + CW() - 1] = true;
+        } else if x == W() - 1 {
+            self.woke[cy * CW()] = true;
         }
     }
 
     /// Starts a step: the zones woken during the last one, or holding a restless cell, run.
     pub(super) fn begin(&mut self) {
         self.stamp += 1;
-        for k in 0..CW * CH {
+        for k in 0..CW() * CH() {
             self.awake[k] = !self.enabled || self.woke[k] || self.restless[k];
             if self.awake[k] {
                 self.changed[k] = self.stamp;
@@ -212,8 +218,8 @@ mod tests {
     #[test]
     fn rock_and_settled_sand_fall_asleep_and_a_change_wakes_them() {
         let mut w = World::new_static();
-        for x in 0..W as i32 {
-            for y in 400..H as i32 {
+        for x in 0..W() as i32 {
+            for y in 400..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
             for y in 380..400 {
@@ -229,15 +235,15 @@ mod tests {
         // A grain dropped from above wakes its zone, which runs again.
         w.set(300, 100, Mat::Sand);
         w.zones.begin();
-        assert!(w.zones.awake[(100 / CS) * CW + 300 / CS]);
+        assert!(w.zones.awake[(100 / CS) * CW() + 300 / CS]);
         assert!(w.zones.awake_count() <= 4);
     }
 
     #[test]
     fn the_renderer_learns_which_zones_changed() {
         let mut w = World::new_static();
-        for x in 0..W as i32 {
-            for y in 400..H as i32 {
+        for x in 0..W() as i32 {
+            for y in 400..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -246,11 +252,11 @@ mod tests {
         }
         let drawn = w.zones.stamp() + 1;
         w.step();
-        assert!((0..CW * CH).all(|k| !w.zones.changed_since(k, drawn)), "nothing moved: nothing to redraw");
+        assert!((0..CW() * CH()).all(|k| !w.zones.changed_since(k, drawn)), "nothing moved: nothing to redraw");
         w.set(300, 100, Mat::Sand);
-        let k = (100 / CS) * CW + 300 / CS;
+        let k = (100 / CS) * CW() + 300 / CS;
         assert!(w.zones.changed_since(k, drawn), "a painted cell marks its zone");
-        assert_eq!((0..CW * CH).filter(|&k| w.zones.changed_since(k, drawn)).count(), 1);
+        assert_eq!((0..CW() * CH()).filter(|&k| w.zones.changed_since(k, drawn)).count(), 1);
     }
 
     #[test]
@@ -280,7 +286,7 @@ mod tests {
             for _ in 0..600 {
                 w.step();
             }
-            let water_top = (0..H as i32).find(|&y| (101..399).any(|x| w.raw(x, y) == Mat::Water)).unwrap();
+            let water_top = (0..H() as i32).find(|&y| (101..399).any(|x| w.raw(x, y) == Mat::Water)).unwrap();
             let water_right = (101..399).rev().find(|&x| (300..400).any(|y| w.raw(x, y) == Mat::Water)).unwrap();
             let sand_low = (300..310).all(|x| w.raw(x, 200) != Mat::Sand);
             (water_top, water_right, sand_low)

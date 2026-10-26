@@ -45,6 +45,11 @@ const STEPS_PER_SECOND: f32 = 60.0;
 const PANEL_W: f32 = 244.0;
 /// No top bar any more: the world starts at the very top.
 const TOP_H: f32 = 0.0;
+/// Height of the materials' table at the foot of the world's menu, and its rows per column.
+const VOLUMES_H: f32 = 196.0;
+/// The size of the world's sliders, under the wind in the world's menu.
+const GRID_SIZE_H: f32 = 72.0;
+const VOLUMES_ROWS: usize = 7;
 /// Width of the sliding views palette on the right, and of its always-visible tab.
 const VIEWS_W: f32 = 176.0;
 const VIEWS_TAB: f32 = 22.0;
@@ -194,6 +199,10 @@ struct Game {
     hud_hit: Rect,
     /// The world's settings (sun, escape to space) and its energy budget, under the day pill.
     climate_menu: bool,
+    /// The size of world the sliders of the Monde tab are on (columns, rows), and the size to
+    /// start the game again at once the frame is over (see `relaunch`).
+    grid_pick: (f32, f32),
+    relaunch: Option<(usize, usize)>,
     /// The left palette hides like the views on the right; pinned, it stays out (and the picture
     /// beside it).
     panel: Drawer,
@@ -308,6 +317,8 @@ struct Game {
     unlimited: bool,
     unlimited_sim: bool,
     census: [u32; world::NMAT],
+    /// How much of each material the world holds, counted every half second (`World::volumes`).
+    volumes: [f32; world::NMAT],
     show_science: bool,
     hover_info: Option<(String, String)>,
 }
@@ -350,6 +361,8 @@ impl Game {
             fireworks_told: 0,
             hud_hit: Rect::new(-10.0, -10.0, 0.0, 0.0),
             climate_menu: false,
+            grid_pick: (W() as f32, H() as f32),
+            relaunch: None,
             panel: Drawer { open: 1.0, pin: false, peek: 0.0 },
             car_remote: false,
             selection: None,
@@ -423,6 +436,7 @@ impl Game {
             unlimited: true,
             unlimited_sim: false,
             census: [0; world::NMAT],
+            volumes: [0.0; world::NMAT],
             show_science: false,
             hover_info: None,
         }
@@ -1128,7 +1142,7 @@ impl Game {
     /// Shows where an end will be fixed: a dot on the anchor, a thread to it from the cursor,
     /// and the world edge lit up when the cursor is close enough to stick to it.
     fn draw_anchor_hint(&self, ui: &Ui, view: View, at: Vec2) {
-        let (w, h) = (W as f32, H as f32);
+        let (w, h) = (W() as f32, H() as f32);
         let near = blocks::BORDER_REACH;
         let lit = Color::new(1.0, 0.85, 0.3, 0.8);
         let edge = |a: Vec2, b: Vec2| {
@@ -1742,7 +1756,8 @@ impl Game {
             eprint!("--- profil sur 600 pas (vitesse x{}, simplification {})\n{report}", self.speed, self.world.lod);
         }
         if (self.time * 2.0) as u32 != ((self.time - dt) * 2.0) as u32 {
-            let n = self.world.census();
+            let (n, v) = self.world.volumes();
+            self.volumes = v;
             self.heat_cells = n[Mat::Fire as usize] + n[Mat::Lava as usize] / 3 + n[Mat::Ember as usize] / 2;
         }
         let rpm = self
@@ -1768,7 +1783,7 @@ impl Game {
         }
         let info = metrics::Info {
             awake: self.world.zones.awake_count(),
-            zones: world::sleep::CW * world::sleep::CH,
+            zones: world::sleep::CW() * world::sleep::CH(),
             lod: self.world.lod,
             speed: self.speed,
             blocks: self.blocks.len(),
@@ -1794,7 +1809,7 @@ impl Game {
                 self.blow_up_truck();
             }
             let end = *bolt.path.last().unwrap_or(&(0.0, 0.0));
-            let far = vec2(end.0 - world::W as f32 * 0.5, end.1 - 360.0).length();
+            let far = vec2(end.0 - world::W() as f32 * 0.5, end.1 - 360.0).length();
             let loud = bolt.power.max(0.3) * (1.0 - far / 900.0).clamp(0.15, 1.0) * if bolt.ground { 1.0 } else { 0.6 };
             self.thunder.push((0.15 + far / 320.0, loud));
             if bolt.ground {
@@ -2081,7 +2096,7 @@ impl Game {
         if let Some(&(_, _, atm)) = std::mem::take(&mut self.world.bursts).iter().max_by(|a, b| a.2.total_cmp(&b.2)) {
             self.say(format!("Une paroi a cédé sous la pression : {atm:.1} atm (l'air libre est à 1 atm)"));
         }
-        let outside = |p: Vec2| p.y > H as f32 + 60.0 || p.x < -60.0 || p.x > W as f32 + 60.0;
+        let outside = |p: Vec2| p.y > H() as f32 + 60.0 || p.x < -60.0 || p.x > W() as f32 + 60.0;
         let mut gone: Vec<(usize, u8)> = vec![];
         for i in 0..self.blocks.len() {
             if outside(self.blocks[i].pos) {
@@ -2272,6 +2287,10 @@ impl Game {
         }
         // Drops of liquid in flight (spray, splashes): the more liquid, the bigger.
         for d in self.world.liquid_drops() {
+            // The drops of water are drawn with the landscape, as cartoon drops (`Renderer::draw_rain`).
+            if d.m == Mat::Water && render_mode == RenderMode::Normal && self.mode != ViewMode::Simulation {
+                continue;
+            }
             let s = view.to_screen(vec2(d.x, d.y));
             let r = size * (0.35 + 0.65 * (d.q as f32 / 65536.0).min(1.0).sqrt());
             draw_rectangle(s.x - r * 0.5, s.y - r * 0.5, r, r, mat_color(d.m));
@@ -2533,16 +2552,48 @@ impl Game {
         ui.text(label, r.x + r.w - bw + 16.0 - gap, r.y + 26.0, 14, WHITE);
     }
 
+    /// The size of the world: two sliders, and a button that starts the game again with a new
+    /// world of that size.
+    fn draw_grid_size(&mut self, ui: &mut Ui, x: f32, top: f32, w: f32) {
+        let (gw, gh) = world::snap_grid(self.grid_pick.0 as usize, self.grid_pick.1 as usize);
+        ui.text(&format!("Taille du monde : {} × {}", W(), H()), x, top, 16, ACCENT);
+        let mut vals = [self.grid_pick.0, self.grid_pick.1];
+        let rows = [("Largeur", world::GRID_W, gw), ("Hauteur", world::GRID_H, gh)];
+        for (k, (label, (lo, hi, _), shown)) in rows.iter().enumerate() {
+            let y = top + 8.0 + k as f32 * 24.0;
+            ui.text(label, x, y + 13.0, 12, TEXT);
+            ui.slider(Rect::new(x + 96.0, y, w - 96.0 - 66.0, 18.0), &mut vals[k], *lo as f32, *hi as f32, GREEN);
+            ui.text(&format!("{shown}"), x + w - 58.0, y + 13.0, 12, DIM);
+        }
+        self.grid_pick = (vals[0], vals[1]);
+        let changed = (gw, gh) != (W(), H());
+        let r = Rect::new(x, top + 8.0 + 2.0 * 24.0 + 2.0, w, 26.0);
+        let label = if changed { format!("Recréer le monde en {gw} × {gh}") } else { "Glisse pour changer la taille".to_string() };
+        if ui.button(r, &label, Icon::World, false, changed && cfg!(not(target_arch = "wasm32")), GREEN) {
+            self.relaunch = Some((gw, gh));
+        }
+        if ui.hover(Rect::new(x, top - 16.0, w, r.y + r.h - top + 16.0)) {
+            let times = (gw * gh) as f32 / (world::BASE_W * world::BASE_H) as f32;
+            let how = if cfg!(target_arch = "wasm32") {
+                "Pas encore dans le navigateur : la taille se change dans le jeu installé."
+            } else {
+                "Le jeu redémarre avec un monde neuf : ce qui est construit est perdu (sauvegarde avant), et une sauvegarde ne se charge que dans un monde de sa taille."
+            };
+            self.hover_info = Some(("Taille du monde".to_string(), format!("{gw} × {gh} cellules, {times:.1} fois le monde d'origine (960 × 540) : plus de cellules, c'est un paysage plus fin mais plus lent à calculer. {how}")));
+        }
+    }
+
     /// Under the day pill: where the world's energy comes from and goes, how much it holds over the
     /// last day, and the settings of the sun and of the escape to space.
     fn draw_climate_menu(&mut self, ui: &mut Ui) {
         let pill = self.hud_hit;
-        let r = Rect::new(pill.x, pill.y + pill.h + 6.0, 640.0, 332.0);
+        let r = Rect::new(pill.x, pill.y + pill.h + 6.0, 640.0, 332.0 + GRID_SIZE_H + VOLUMES_H);
         ui.layer("climate");
         // From under the pill, which stays clickable to close the menu.
         ui.claim("climate", Rect::new(r.x, pill.y + pill.h, r.w, r.y + r.h - pill.y - pill.h));
         rrect(r, 14.0, Color::new(0.06, 0.07, 0.13, 0.94));
-        self.draw_live_weather(ui, Rect::new(r.x + 340.0, r.y, r.w - 340.0, r.h));
+        self.draw_live_weather(ui, Rect::new(r.x + 340.0, r.y, r.w - 340.0, r.h - VOLUMES_H));
+        self.draw_volumes(ui, Rect::new(r.x, r.y + r.h - VOLUMES_H, r.w, VOLUMES_H));
         let (x, w) = (r.x + 14.0, 340.0 - 28.0);
         let c = &self.world.climate;
         ui.text("Bilan d'énergie (par heure)", x, r.y + 24.0, 16, ACCENT);
@@ -2591,9 +2642,59 @@ impl Game {
         let c = &mut self.world.climate;
         (c.sun_gain, c.space_gain, c.greenhouse) = (vals[0], vals[1], vals[2]);
         let neutral = (c.sun_gain - 1.0).abs() < 0.01 && (c.space_gain - 1.0).abs() < 0.01 && (c.greenhouse - 1.0).abs() < 0.01;
-        if ui.button(Rect::new(x, r.y + r.h - 36.0, w, 26.0), "Revenir au neutre", Icon::None, neutral, !neutral, GREEN) {
+        if ui.button(Rect::new(x, r.y + 296.0, w, 26.0), "Revenir au neutre", Icon::None, neutral, !neutral, GREEN) {
             c.reset_settings();
             self.say("Le soleil et le ciel reprennent leur cycle habituel".to_string());
+        }
+    }
+
+    /// At the foot of the world's menu: how much of each material the world holds, the most first,
+    /// each with its curve over the last day (counted with the heat, every quarter of an hour).
+    fn draw_volumes(&mut self, ui: &mut Ui, r: Rect) {
+        let x = r.x + 14.0;
+        draw_line(x, r.y + 2.0, r.x + r.w - 14.0, r.y + 2.0, 1.0, Color::new(1.0, 1.0, 1.0, 0.12));
+        ui.text("Matières du monde", x, r.y + 26.0, 16, ACCENT);
+        let litres = world::CELL_M.powi(3) * 1000.0;
+        let note = format!("une cellule : un cube de {:.0} cm, {:.1} L  ·  courbes : dernières 24 h", world::CELL_M * 100.0, litres);
+        ui.text(&note, x + 156.0, r.y + 25.0, 12, DIM);
+        let mut mats: Vec<(Mat, f32)> = Mat::ALL.iter().map(|&m| (m, self.volumes[m as usize])).filter(|&(m, v)| m != Mat::Empty && v > 0.0).collect();
+        mats.sort_by(|a, b| b.1.total_cmp(&a.1));
+        if mats.is_empty() {
+            ui.text("Le monde est vide : rien que de l'air.", x, r.y + 52.0, 13, DIM);
+            return;
+        }
+        let shown = if mats.len() > VOLUMES_ROWS * 2 { VOLUMES_ROWS * 2 - 1 } else { mats.len() };
+        let past = &self.world.climate.volumes;
+        let col_w = (r.w - 28.0 - 16.0) / 2.0;
+        for (k, &(m, v)) in mats.iter().take(shown).enumerate() {
+            let cx = x + (k / VOLUMES_ROWS) as f32 * (col_w + 16.0);
+            let y = r.y + 36.0 + (k % VOLUMES_ROWS) as f32 * 20.0;
+            let col = mat_color(m);
+            rrect(Rect::new(cx, y + 4.0, 11.0, 11.0), 3.0, col);
+            ui.text(info(m).name, cx + 17.0, y + 14.0, 13, TEXT);
+            let text = volume_label(v * litres);
+            ui.text(&text, cx + 200.0 - ui.text_w(&text, 13), y + 14.0, 13, TEXT);
+            // Its curve: the samples of the last day, then what there is now.
+            let h: Vec<f32> = past.iter().map(|s| s[m as usize]).chain(std::iter::once(v)).collect();
+            let g = Rect::new(cx + 210.0, y + 2.0, col_w - 210.0, 15.0);
+            if h.len() >= 2 {
+                let (lo, hi) = h.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+                let span = (hi - lo).max(hi * 0.02).max(1.0);
+                let mid = 0.5 * (hi + lo);
+                let pt = |i: usize, v: f32| vec2(g.x + g.w * i as f32 / 96.0, g.y + g.h * 0.5 - (v - mid) / span * g.h);
+                let line = Color::new(col.r * 0.8 + 0.2, col.g * 0.8 + 0.2, col.b * 0.8 + 0.2, 0.9);
+                for i in 1..h.len() {
+                    let (a, b) = (pt(i - 1, h[i - 1]), pt(i, h[i]));
+                    draw_line(a.x, a.y, b.x, b.y, 1.5, line);
+                }
+            }
+        }
+        if shown < mats.len() {
+            let rest: f32 = mats[shown..].iter().map(|m| m.1).sum();
+            let (cx, y) = (x + col_w + 16.0, r.y + 36.0 + (VOLUMES_ROWS - 1) as f32 * 20.0);
+            ui.text(&format!("{} autres", mats.len() - shown), cx + 17.0, y + 14.0, 13, DIM);
+            let text = volume_label(rest * litres);
+            ui.text(&text, cx + 200.0 - ui.text_w(&text, 13), y + 14.0, 13, DIM);
         }
     }
 
@@ -2636,6 +2737,7 @@ impl Game {
             ui.text(shown, x + w - 58.0, y + 13.0, 12, DIM);
         }
         (self.world.wind_max, self.world.wind_changes, self.world.windiness) = (vals[0], vals[1], vals[2]);
+        self.draw_grid_size(ui, x, vy + 8.0 + 3.0 * 24.0 + 30.0, w);
     }
 
     /// Left edge of the picture: beside the palette when it is pinned, else the whole window.
@@ -3783,8 +3885,8 @@ impl Game {
     fn draw_wind_field(&self, view: View) {
         let flow = &self.world.flow;
         let step = 3;
-        for j in (1..world::flow::FH).step_by(step) {
-            for i in (0..world::flow::FW).step_by(step) {
+        for j in (1..world::flow::FH()).step_by(step) {
+            for i in (0..world::flow::FW()).step_by(step) {
                 if flow.is_solid(i, j) {
                     continue;
                 }
@@ -3922,6 +4024,17 @@ impl Game {
     }
 }
 
+/// A volume in litres as the menu shows it: litres up to a cubic metre, then cubic metres.
+fn volume_label(l: f32) -> String {
+    if l < 1000.0 {
+        format!("{:.0} L", l.max(1.0))
+    } else if l < 10_000.0 {
+        format!("{:.1} m³", l / 1000.0).replace('.', ",")
+    } else {
+        format!("{:.0} m³", l / 1000.0)
+    }
+}
+
 fn ctrl_down() -> bool {
     is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl)
 }
@@ -3952,7 +4065,7 @@ fn off_rot(a: f32, v: Vec2) -> Vec2 {
 }
 
 fn ground_y(world: &World, x: i32) -> i32 {
-    (0..H as i32).find(|&y| world.raw(x, y).is_hard()).unwrap_or(H as i32 - 1)
+    (0..H() as i32).find(|&y| world.raw(x, y).is_hard()).unwrap_or(H() as i32 - 1)
 }
 
 /// Builds a little scene for `--demo`: a bridge over a pit, a tower, a wheel.
@@ -4007,8 +4120,8 @@ fn demo_logs(g: &mut Game) {
     g.cables.clear();
     g.members.clear();
     let ground = 430;
-    for x in 0..W as i32 {
-        for y in ground..H as i32 {
+    for x in 0..W() as i32 {
+        for y in ground..H() as i32 {
             g.world.set(x, y, if y < ground + 3 { Mat::Grass } else if y < ground + 20 { Mat::Dirt } else { Mat::Stone });
         }
     }
@@ -4042,7 +4155,7 @@ fn demo_siphon(g: &mut Game) {
             }
         }
     };
-    rect(g, 0, 470, W as i32 - 1, H as i32 - 1, Mat::Stone);
+    rect(g, 0, 470, W() as i32 - 1, H() as i32 - 1, Mat::Stone);
     // Two vessels, the left one full.
     rect(g, 60, 300, 260, 469, Mat::Stone);
     rect(g, 70, 300, 120, 460, Mat::Empty);
@@ -4080,8 +4193,8 @@ fn demo_siphon(g: &mut Game) {
 fn demo_tunnel(g: &mut Game) {
     g.empty_world();
     let floor = 420;
-    for x in 0..W as i32 {
-        for y in floor..H as i32 {
+    for x in 0..W() as i32 {
+        for y in floor..H() as i32 {
             g.world.set(x, y, Mat::Stone);
         }
     }
@@ -4108,8 +4221,8 @@ fn demo_dam(g: &mut Game) {
     g.empty_world();
     g.world.set_liquid_physics(true);
     let floor = 440;
-    for x in 0..W as i32 {
-        for y in floor..H as i32 {
+    for x in 0..W() as i32 {
+        for y in floor..H() as i32 {
             g.world.set(x, y, Mat::Stone);
         }
     }
@@ -4126,7 +4239,7 @@ fn demo_dam(g: &mut Game) {
     rect(514, 370, 519, floor - 1, Mat::Stone);
     rect(700, 380, 700, floor - 1, Mat::Glass);
     rect(520, 390, 699, floor - 1, Mat::Water);
-    for i in 0..W * H {
+    for i in 0..W() * H() {
         g.world.temp[i] = 15.0;
     }
     g.set_running(true);
@@ -4137,8 +4250,8 @@ fn demo_dam(g: &mut Game) {
 fn demo_magnet(g: &mut Game) {
     g.empty_world();
     let floor = 420;
-    for x in 0..W as i32 {
-        for y in floor..H as i32 {
+    for x in 0..W() as i32 {
+        for y in floor..H() as i32 {
             g.world.set(x, y, Mat::Stone);
         }
     }
@@ -4154,9 +4267,9 @@ fn demo_magnet(g: &mut Game) {
 /// one planted in the ground, one sinking in a pond (`--frames` before 180 to see them burn).
 fn demo_sticks(g: &mut Game) {
     g.empty_world();
-    for x in 0..W as i32 {
+    for x in 0..W() as i32 {
         g.world.set(x, 330, Mat::Grass);
-        for y in 331..H as i32 {
+        for y in 331..H() as i32 {
             g.world.set(x, y, if y > 430 { Mat::Stone } else { Mat::Dirt });
         }
     }
@@ -4179,8 +4292,8 @@ fn demo_sticks(g: &mut Game) {
 /// a little apart, which the shock of the first sets off one after the other.
 fn demo_quarry(g: &mut Game) {
     g.empty_world();
-    for x in 0..W as i32 {
-        for y in 300..H as i32 {
+    for x in 0..W() as i32 {
+        for y in 300..H() as i32 {
             g.world.set(x, y, Mat::Stone);
         }
     }
@@ -4196,15 +4309,34 @@ fn demo_quarry(g: &mut Game) {
     g.set_running(true);
 }
 
+/// A bank of cloud raining over the meadow, and a plume of steam: `--rain`, for the pictures of
+/// the clouds and the drops.
+fn demo_rain(g: &mut Game) {
+    for (k, x) in (150..820).step_by(13).enumerate() {
+        g.world.paint(x, 120 + (k as i32 * 7) % 15, 15 + (k as i32 * 5) % 6, Mat::Cloud);
+    }
+    for k in 0..6 {
+        g.world.paint(560 + k * 4, 330 - k * 22, 8 + k * 2, Mat::Steam);
+    }
+    for i in 0..2400u32 {
+        let h = i.wrapping_mul(2654435761);
+        let (x, y) = (160 + (h % 640) as i32, 160 + ((h >> 12) % 200) as i32);
+        if g.world.raw(x, y) == Mat::Empty {
+            g.world.set(x, y, Mat::Water);
+        }
+    }
+    g.set_running(true);
+}
+
 /// A meadow over rock with a big charge of powder buried in it: `--crater` lights it. With
 /// `dynamite`, the charge is a stick of dynamite packed in charcoal (it leaves diamonds).
 fn demo_crater(g: &mut Game, dynamite: bool) {
     g.empty_world();
     let ground = 330;
-    for x in 0..W as i32 {
+    for x in 0..W() as i32 {
         let top = ground + ((x as f32 * 0.02).sin() * 4.0) as i32;
         g.world.set(x, top, Mat::Grass);
-        for y in top + 1..H as i32 {
+        for y in top + 1..H() as i32 {
             g.world.set(x, y, if y > 430 + (x * 7 % 5) { Mat::Stone } else { Mat::Dirt });
         }
     }
@@ -4222,9 +4354,9 @@ fn demo_crater(g: &mut Game, dynamite: bool) {
 /// cast at night, and a heap of charcoal and an iron post on the surface (for `--lightning`).
 fn demo_lava(g: &mut Game) {
     g.empty_world();
-    for x in 0..W as i32 {
+    for x in 0..W() as i32 {
         g.world.set(x, 330, Mat::Grass);
-        for y in 331..H as i32 {
+        for y in 331..H() as i32 {
             g.world.set(x, y, Mat::Stone);
         }
     }
@@ -4252,15 +4384,15 @@ fn demo_lava(g: &mut Game) {
 fn demo_topple(g: &mut Game) {
     g.empty_world();
     // Fields of earth over the rock, and a pond in a hollow.
-    for x in 0..W as i32 {
+    for x in 0..W() as i32 {
         let top = 330 + ((x as f32 * 0.013).sin() * 8.0) as i32;
         let bed = if (380..540).contains(&x) { top + (40.0 * (std::f32::consts::PI * (x - 380) as f32 / 160.0).sin()) as i32 } else { top };
-        for y in top..H as i32 {
+        for y in top..H() as i32 {
             let m = if y > 380 + (x * 7 % 5) { Mat::Stone } else if y < bed { Mat::Water } else if y == top { Mat::Grass } else { Mat::Dirt };
             g.world.set(x, y, m);
         }
     }
-    let ground = |w: &World, x: i32| (0..H as i32).find(|&y| w.at(x, y).is_hard()).unwrap_or(H as i32);
+    let ground = |w: &World, x: i32| (0..H() as i32).find(|&y| w.at(x, y).is_hard()).unwrap_or(H() as i32);
     let foot = (440, ground(&g.world, 440) - 2);
     let stroke: [(i32, i32); 5] = [foot, (520, 140), (545, 122), (600, 150), (720, 134)];
     for seg in stroke.windows(2) {
@@ -4275,11 +4407,11 @@ fn demo_topple(g: &mut Game) {
 
 fn demo_bridge(g: &mut Game) {
     g.empty_world();
-    for x in 0..W as i32 {
+    for x in 0..W() as i32 {
         if (430..530).contains(&x) {
             continue;
         }
-        for y in 330..H as i32 {
+        for y in 330..H() as i32 {
             g.world.set(x, y, Mat::Stone);
         }
     }
@@ -4321,7 +4453,7 @@ fn demo_mech(g: &mut Game) {
 fn demo_pipes(g: &mut Game) {
     g.empty_world();
     g.world.structures_fall = false;
-    for x in 0..W as i32 {
+    for x in 0..W() as i32 {
         for y in 330..360 {
             g.world.set(x, y, Mat::Stone);
         }
@@ -4429,6 +4561,12 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let shot = arg("--demo");
+    // `--grid 1440x810` (or `AWORLD_GRID`): the size of the world, in cells, before anything is
+    // sized from it.
+    if let Some((w, h)) = arg("--grid").or_else(|| std::env::var("AWORLD_GRID").ok()).as_deref().and_then(parse_grid) {
+        world::set_grid(w, h);
+    }
+
 
     let font = load_ttf_font_from_bytes(include_bytes!("../assets/font.ttf")).expect("font");
     let mut ui = Ui::new(font);
@@ -4458,8 +4596,8 @@ async fn main() {
         };
         // `--sow`: seeds sown along the ground, all across the world (before `--lawn`'s steps).
         if args.iter().any(|a| a == "--sow") {
-            for x in (0..W as i32).step_by(7) {
-                let y = (0..H as i32).find(|&y| matches!(game.world.raw(x, y), Mat::Dirt | Mat::Grass)).unwrap_or(0);
+            for x in (0..W() as i32).step_by(7) {
+                let y = (0..H() as i32).find(|&y| matches!(game.world.raw(x, y), Mat::Dirt | Mat::Grass)).unwrap_or(0);
                 game.world.paint(x, y + 2, 2, Mat::Seed);
             }
         }
@@ -4571,6 +4709,9 @@ async fn main() {
         if args.iter().any(|a| a == "--crater") {
             demo_crater(&mut game, args.iter().any(|a| a == "--dynamite"));
         }
+        if args.iter().any(|a| a == "--rain") {
+            demo_rain(&mut game);
+        }
         if args.iter().any(|a| a == "--sticks") {
             demo_sticks(&mut game);
         }
@@ -4653,7 +4794,7 @@ async fn main() {
         // `--boom`: an explosion 25 cells under the water surface at x (default 360), shortly before the shot.
         if shot.is_some() && frame == 357 && args.iter().any(|a| a == "--boom") {
             let x = arg("--boom").and_then(|v| v.parse().ok()).unwrap_or(360);
-            if let Some(top) = (0..H as i32).find(|&y| game.world.at(x, y) == Mat::Water) {
+            if let Some(top) = (0..H() as i32).find(|&y| game.world.at(x, y) == Mat::Water) {
                 game.world.explode(x, top + 25, 18);
             }
         }
@@ -4689,7 +4830,7 @@ async fn main() {
                     game.trucks.call(&game.world, vec2(x, 300.0));
                     if let Some(t) = &mut game.trucks.truck {
                         t.x = x - t.dir * 200.0;
-                        t.y = (0..H as i32).find(|&y| game.world.hard_for_car(t.x as i32, y)).unwrap_or(400) as f32;
+                        t.y = (0..H() as i32).find(|&y| game.world.hard_for_car(t.x as i32, y)).unwrap_or(400) as f32;
                     }
                 }
             }
@@ -4727,11 +4868,11 @@ async fn main() {
             for step in from..to {
                 for k in 0..8u32 {
                     let x = 600 + ((step * 7919 + k * 104729) % 120) as i32;
-                    let ground = (0..H as i32).find(|&y| !matches!(game.world.at(x, y), Mat::Empty | Mat::Steam | Mat::Cloud | Mat::Smoke)).unwrap_or(H as i32);
+                    let ground = (0..H() as i32).find(|&y| !matches!(game.world.at(x, y), Mat::Empty | Mat::Steam | Mat::Cloud | Mat::Smoke)).unwrap_or(H() as i32);
                     let y = ground - 2 - ((step + k * 13) % 6) as i32;
                     if game.world.at(x, y) == Mat::Empty {
                         game.world.set(x, y, Mat::Steam);
-                        game.world.temp[y as usize * world::W + x as usize] = 32.0;
+                        game.world.temp[y as usize * world::W() + x as usize] = 32.0;
                     }
                 }
                 if frame == 1 {
@@ -4748,13 +4889,13 @@ async fn main() {
                     game.world.set(x, y, Mat::Cloud);
                 }
             }
-            for qy in 0..world::QH {
-                for qx in 0..world::QW {
+            for qy in 0..world::QH() {
+                for qx in 0..world::QW() {
                     let (x, y) = ((qx * world::QS) as f32, (qy * world::QS) as f32);
                     let inside = (280.0..680.0).contains(&x) && (70.0..200.0).contains(&y);
                     if inside {
                         let u = ((x - 480.0) / 200.0).powi(2);
-                        game.world.charge[qy * world::QW + qx] = (if y < 120.0 { 0.8 } else if y > 150.0 { -0.95 } else { 0.0 }) * (1.0 - u);
+                        game.world.charge[qy * world::QW() + qx] = (if y < 120.0 { 0.8 } else if y > 150.0 { -0.95 } else { 0.0 }) * (1.0 - u);
                     }
                 }
             }
@@ -4783,6 +4924,17 @@ async fn main() {
                 let y = ground_y(&game.world, x) as i32;
                 game.world.paint(x - 14, y - 40, 8, Mat::Sand);
                 game.world.paint(x + 14, y - 46, 9, Mat::Water);
+            }
+        }
+        // `--steam x`: a layer of steam on the ground at x, under a layer of water.
+        if shot.is_some() && frame == 300 {
+            if let Some(x) = arg("--steam").and_then(|v| v.parse::<i32>().ok()) {
+                let y = ground_y(&game.world, x);
+                for dy in 1..=24 {
+                    for dx in -24..=24 {
+                        game.world.set(x + dx, y - dy, if dy <= 10 { Mat::Steam } else { Mat::Water });
+                    }
+                }
             }
         }
         // `--sim-steps n`: the simulation view's step by step, n steps just before the shot.
@@ -4826,8 +4978,52 @@ async fn main() {
                 std::process::exit(0);
             }
         }
+        if let Some((w, h)) = game.relaunch.take() {
+            relaunch(&args, w, h);
+        }
         next_frame().await;
     }
+}
+
+/// `1440x810` as (1440, 810).
+fn parse_grid(v: &str) -> Option<(usize, usize)> {
+    let (w, h) = v.split_once(['x', 'X', '*'])?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+}
+
+/// The game again, from the start, with a world of `w` x `h` cells: the world, the renderer and
+/// the card are all sized for the world as the game starts, so a new size takes a new start. The
+/// same arguments, but for `--grid`.
+fn relaunch(args: &[String], w: usize, h: usize) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut rest: Vec<String> = Vec::new();
+        let mut it = args.iter().skip(1);
+        while let Some(a) = it.next() {
+            if a == "--grid" {
+                it.next();
+            } else {
+                rest.push(a.clone());
+            }
+        }
+        rest.extend(["--grid".to_string(), format!("{w}x{h}")]);
+        let Ok(exe) = std::env::current_exe() else { return };
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(&rest).env_remove("AWORLD_GRID");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let e = cmd.exec();
+            eprintln!("aworld: impossible de relancer le jeu : {e}");
+        }
+        #[cfg(not(unix))]
+        match cmd.spawn() {
+            Ok(_) => std::process::exit(0),
+            Err(e) => eprintln!("aworld: impossible de relancer le jeu : {e}"),
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (args, w, h);
 }
 
 #[cfg(test)]
@@ -4839,7 +5035,7 @@ mod tests {
         let mut g = Game::new();
         g.world = World::new_static();
         g.empty_world();
-        for x in 0..W as i32 {
+        for x in 0..W() as i32 {
             for y in 300..320 {
                 g.world.set(x, y, Mat::Stone);
             }
@@ -4908,7 +5104,7 @@ mod tests {
         let plan = g.plan.as_ref().unwrap();
         let bytes = save::encode_cells(g.world.biome, plan.state.clock(), |x, y| World::raw_in(&plan.state, x, y), None, None, &plan.blocks, &plan.cables, &plan.members, &plan.springs, &plan.mech);
         let l = save::decode(&bytes).unwrap();
-        assert_eq!(l.mats[100 * W + 200], Mat::Sand, "the save holds the world as built");
+        assert_eq!(l.mats[100 * W() + 200], Mat::Sand, "the save holds the world as built");
         g.reset();
         assert!(!g.challenge && g.building());
     }
@@ -5364,8 +5560,8 @@ mod tests {
     }
 
     fn level(g: &Game, x: i32) -> f32 {
-        let y = (0..H as i32).find(|&y| g.world.raw(x, y) == Mat::Water).unwrap_or(H as i32);
-        H as f32 - y as f32
+        let y = (0..H() as i32).find(|&y| g.world.raw(x, y) == Mat::Water).unwrap_or(H() as i32);
+        H() as f32 - y as f32
     }
 
     #[test]
@@ -5548,10 +5744,10 @@ mod tests {
         for x in 200..212 {
             for y in 292..300 {
                 g.world.set(x, y, Mat::Ash);
-                g.world.temp[y as usize * W + x as usize] = 480.0;
+                g.world.temp[y as usize * W() + x as usize] = 480.0;
             }
         }
-        let ash = |g: &Game, x0: i32, x1: i32| (0..H as i32).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| g.world.raw(x, y) == Mat::Ash).count();
+        let ash = |g: &Game, x0: i32, x1: i32| (0..H() as i32).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| g.world.raw(x, y) == Mat::Ash).count();
         assert_eq!(ash(&g, 190, 230), 96);
         g.brush = 6;
         g.tool = Tool::Shovel;
@@ -5578,13 +5774,13 @@ mod tests {
         g.shovel_release(vec2(205.0, 296.0));
         let after = g.shovel.map_or(0, |l| l.count);
         assert!(after < mid.count - quick, "a held click pours a bigger part: {} -> {after}", mid.count);
-        assert_eq!(ash(&g, 0, W as i32) + after as usize, 96, "what poured went back into the world; nothing was scooped again");
+        assert_eq!(ash(&g, 0, W() as i32) + after as usize, 96, "what poured went back into the world; nothing was scooped again");
         // Poured out elsewhere, all of it, nothing lost.
         g.shovel_dump(vec2(400.0, 295.0));
         assert!(g.shovel.is_none());
         assert_eq!(ash(&g, 380, 420), after as usize);
-        assert_eq!(ash(&g, 0, W as i32), 96, "the matter is moved, not created or lost");
-        let hot = (380..420).flat_map(|x| (0..H as i32).map(move |y| (x, y))).filter(|&(x, y)| g.world.raw(x, y) == Mat::Ash && g.world.temp[y as usize * W + x as usize] > 400.0).count();
+        assert_eq!(ash(&g, 0, W() as i32), 96, "the matter is moved, not created or lost");
+        let hot = (380..420).flat_map(|x| (0..H() as i32).map(move |y| (x, y))).filter(|&(x, y)| g.world.raw(x, y) == Mat::Ash && g.world.temp[y as usize * W() + x as usize] > 400.0).count();
         assert!(hot > 0, "the poured ash is still hot");
         // A shovel with nothing in reach says so.
         g.shovel_scoop(vec2(600.0, 100.0));
@@ -5803,5 +5999,23 @@ mod tests {
         g.undo();
         assert!(g.blocks.is_empty());
         assert!(g.phys.is_some(), "physics is rebuilt when running");
+    }
+    #[test]
+    fn a_grid_is_read_and_snapped_to_sizes_the_world_takes() {
+        assert_eq!(parse_grid("1440x810"), Some((1440, 810)));
+        assert_eq!(parse_grid(" 480 X 270"), Some((480, 270)));
+        assert_eq!(parse_grid("960"), None);
+        assert_eq!(world::snap_grid(960, 540), (960, 540), "the size the game was drawn for");
+        assert_eq!(world::snap_grid(1000, 560), (960, 558));
+        assert_eq!(world::snap_grid(10, 99999), (384, 1080));
+        // Every width cuts into whole strips of the cells' turn, every height into whole cells
+        // of the storms' charge and of the light map.
+        for w in (world::GRID_W.0..=world::GRID_W.1).step_by(world::GRID_W.2) {
+            assert_eq!(w.div_ceil(world::sleep::CS) % 3, 0, "{w}");
+        }
+        for h in (world::GRID_H.0..=world::GRID_H.1).step_by(world::GRID_H.2) {
+            assert_eq!(h % world::QS, 0, "{h}");
+            assert_eq!(h % render::LS, 0, "{h}");
+        }
     }
 }

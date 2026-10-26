@@ -91,7 +91,7 @@ impl World {
         }
         for s in &self.slabs {
             for &i in s.cells() {
-                let (vx, vy) = s.velocity_at(((i % W) as f32 + 0.5, (i / W) as f32 + 0.5));
+                let (vx, vy) = s.velocity_at(((i % W()) as f32 + 0.5, (i / W()) as f32 + 0.5));
                 out.insert(i, Motion { vx: vx * CELL_STEP_MS, vy: vy * CELL_STEP_MS, source: Source::Slab });
             }
         }
@@ -102,7 +102,7 @@ impl World {
     /// None for a solid that stands, or a liquid before the liquids' first step.
     /// `solids` is `solid_motions`.
     pub fn cell_motion(&self, x: usize, y: usize, solids: &HashMap<usize, Motion>) -> Option<Motion> {
-        let i = y * W + x;
+        let i = y * W() + x;
         let m = self.cells[i].m;
         let fall = |v: u8| (v != 0).then(|| Motion { vx: 0.0, vy: v as f32 / super::FALL_UNIT as f32 * CELL_STEP_MS, source: Source::Fall });
         // A drop shot out of a jet flies a cell down and `v` cells sideways a step (see `fly`).
@@ -133,9 +133,9 @@ impl World {
     /// The value of `field` at cell (x, y), in its own unit (see `Field`); None where the field
     /// has no value (a liquid's pressure outside the liquid, the air's in the ground).
     pub fn field_value(&self, field: Field, x: usize, y: usize) -> Option<f32> {
-        let i = y * W + x;
+        let i = y * W() + x;
         let m = self.cells[i].m;
-        let (fi, fj) = ((x / FLOW_CELL).min(FW - 1), (y / FLOW_CELL).min(FH - 1));
+        let (fi, fj) = ((x / FLOW_CELL).min(FW() - 1), (y / FLOW_CELL).min(FH() - 1));
         match field {
             Field::LiquidPa => self.liquid_pa(x, y),
             Field::LiquidAtm => (m.kind() == Kind::Liquid && !self.liquid_physics).then(|| self.liq_p[i]),
@@ -152,13 +152,13 @@ impl World {
 
     /// The units of liquid in cell (x, y) (`field::FULL` a full cell); None if it is no liquid.
     pub fn cell_fill(&self, x: usize, y: usize) -> Option<u32> {
-        let i = y * W + x;
+        let i = y * W() + x;
         (self.cells[i].m.kind() == Kind::Liquid).then(|| self.water_fill(i))
     }
 
     /// The falling speed a grain or a drop keeps (`vel`, in `FALL_UNIT`ths of a cell a tick).
     pub fn cell_fall(&self, x: usize, y: usize) -> u8 {
-        self.vel[y * W + x]
+        self.vel[y * W() + x]
     }
 
     /// The clods thrown out of craters, in flight: where they are (cells) and their velocity (m/s).
@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn each_kind_reads_its_own_velocity() {
         let mut w = World::new_static();
-        for x in 0..W as i32 {
+        for x in 0..W() as i32 {
             w.set(x, 300, Mat::Stone);
         }
         w.set(100, 100, Mat::Sand);
@@ -189,7 +189,7 @@ mod tests {
             w.step();
         }
         let solids = w.solid_motions();
-        let y = (0..H).find(|&y| w.cell_mat(100, y) == Mat::Sand).expect("the grain");
+        let y = (0..H()).find(|&y| w.cell_mat(100, y) == Mat::Sand).expect("the grain");
         let grain = w.cell_motion(100, y, &solids).expect("a falling grain has a speed");
         assert_eq!(grain.source, Source::Fall);
         assert!(grain.vy > 0.0 && grain.vx == 0.0, "{grain:?}");
@@ -206,7 +206,7 @@ mod tests {
         let mut w = World::new_static();
         w.set(300, 100, Mat::Water);
         // Three cells a step to the left.
-        w.jet[100 * W + 300] = 3 << 1;
+        w.jet[100 * W() + 300] = 3 << 1;
         let m = w.cell_motion(300, 100, &HashMap::new()).expect("a flying drop");
         assert_eq!(m.source, Source::Jet);
         assert!((m.vx + 3.0 * CELL_STEP_MS).abs() < 1e-3 && (m.vy - CELL_STEP_MS).abs() < 1e-3, "{m:?}");
@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn the_fields_have_values_only_where_they_are_defined() {
         let mut w = World::new_static();
-        for x in 0..W as i32 {
+        for x in 0..W() as i32 {
             w.set(x, 300, Mat::Stone);
         }
         for y in 280..300 {

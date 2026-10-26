@@ -90,8 +90,8 @@ impl Sensors {
 /// above plus the gas pressing on it). Humidity is water: in water (or mud) it is full, in another
 /// liquid (lava, oil, molten metal) there is none.
 pub fn read(world: &World, x: i32, y: i32) -> Reading {
-    let (cx, cy) = (x.clamp(0, W as i32 - 1), y.clamp(0, H as i32 - 1));
-    let temp = world.temp[cy as usize * W + cx as usize];
+    let (cx, cy) = (x.clamp(0, W() as i32 - 1), y.clamp(0, H() as i32 - 1));
+    let temp = world.temp[cy as usize * W() + cx as usize];
     let liquid = matches!(world.raw(cx, cy).kind(), world::Kind::Liquid);
     let press = if liquid {
         world.liquid_pressure(cx, cy)
@@ -199,7 +199,7 @@ mod tests {
         for _ in 0..7500 {
             // A hot plate under the pot.
             for x in 100..141 {
-                w.temp[300 * W + x] = 180.0;
+                w.temp[300 * W() + x] = 180.0;
             }
             w.step();
             s.step(&w);

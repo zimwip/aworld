@@ -45,25 +45,27 @@ const TROP_DIP_C: f32 = 10.0;
 const LAPSE_STEAM_C_PER_KM: f32 = 9.8;
 const LAPSE_CLOUD_C_PER_KM: f32 = 6.0;
 
-fn altitude_table() -> &'static [f32; H] {
-    static T: std::sync::OnceLock<[f32; H]> = std::sync::OnceLock::new();
+/// The altitude of every row. The rows above are the design rows (540 down the world): in a world
+/// of another height a row stands for `1 / sy` of them, so the sky reaches as high.
+fn altitude_table() -> &'static [f32] {
+    static T: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        let mut t = [0.0; H];
-        for (y, z) in t.iter_mut().enumerate() {
-            let y = y as i32;
-            *z = if y >= ALT_LINEAR_Y {
-                (GROUND_Y - y as f32) * ROW_M
-            } else {
-                (GROUND_Y - ALT_LINEAR_Y as f32) * ROW_M + ROW_M * ALT_E_ROWS * (((ALT_LINEAR_Y - y) as f32 / ALT_E_ROWS).exp() - 1.0)
-            };
-        }
-        t
+        (0..H())
+            .map(|y| {
+                let y = y as f32 / super::sy();
+                if y >= ALT_LINEAR_Y as f32 {
+                    (GROUND_Y - y) * ROW_M
+                } else {
+                    (GROUND_Y - ALT_LINEAR_Y as f32) * ROW_M + ROW_M * ALT_E_ROWS * (((ALT_LINEAR_Y as f32 - y) / ALT_E_ROWS).exp() - 1.0)
+                }
+            })
+            .collect()
     })
 }
 
 /// Altitude above the valley floor (m) that a row stands for (negative underground).
 pub fn altitude_m(y: i32) -> f32 {
-    altitude_table()[y.clamp(0, H as i32 - 1) as usize]
+    altitude_table()[y.clamp(0, H() as i32 - 1) as usize]
 }
 
 /// Pressure of the open air at a row (atm): 1 at the valley floor, thinning out with altitude.
@@ -158,11 +160,13 @@ pub struct Climate {
     /// Heat held by the world (the cells and the sky), oldest first, one sample every
     /// quarter of an hour over the last day.
     pub history: std::collections::VecDeque<f32>,
+    /// How much of each material the world holds (see `World::volumes`), at the same samples.
+    pub volumes: std::collections::VecDeque<[f32; NMAT]>,
 }
 
 impl Default for Climate {
     fn default() -> Self {
-        Climate { sky_dev: 0.0, sun_gain: 1.0, space_gain: 1.0, greenhouse: 1.0, acc: [0.0; 3], acc_steps: 0.0, rates: [0.0; 3], history: Default::default() }
+        Climate { sky_dev: 0.0, sun_gain: 1.0, space_gain: 1.0, greenhouse: 1.0, acc: [0.0; 3], acc_steps: 0.0, rates: [0.0; 3], history: Default::default(), volumes: Default::default() }
     }
 }
 
@@ -170,7 +174,7 @@ impl Climate {
     /// A copy for a strip of the cells' turn (see `turn.rs`): the rules only read it, but for the
     /// heat they give the sky; the record of the past stays behind.
     pub(super) fn view(&self) -> Climate {
-        Climate { history: Default::default(), ..*self }
+        Climate { history: Default::default(), volumes: Default::default(), ..*self }
     }
 
     /// Heat the player puts in by hand (the flamethrower), counted with the flames.
@@ -203,7 +207,7 @@ fn sun_step(dir: (f32, f32)) -> (f32, f32) {
 /// every column), on the side facing the sun when it is low (high enough to reach every row).
 /// A ray that would start beside the world starts where it comes into it.
 fn sun_rays(sx: f32, sy: f32) -> impl Iterator<Item = (f32, f32)> {
-    let (w, h) = (W as f32, H as f32);
+    let (w, h) = (W() as f32, H() as f32);
     let starts: Vec<(f32, f32)> = if sy == 1.0 {
         let reach = (h * sx).ceil();
         let (a, b) = if reach >= 0.0 { (-reach, w) } else { (0.0, w - reach) };
@@ -211,7 +215,7 @@ fn sun_rays(sx: f32, sy: f32) -> impl Iterator<Item = (f32, f32)> {
     } else {
         let x0 = if sx > 0.0 { 0.0 } else { w - 1.0 };
         let reach = (w * sy).ceil();
-        (-(reach as i32)..H as i32).map(|y| (x0, y as f32)).collect()
+        (-(reach as i32)..H() as i32).map(|y| (x0, y as f32)).collect()
     };
     starts.into_iter().map(move |(x, y)| {
         let k = if x < 0.0 && sx > 0.0 {
@@ -615,7 +619,7 @@ impl World {
         }
         let top = self.sky_top_c();
         let trop = top - TROP_DIP_C;
-        let (z, zt, z0) = (altitude_m(y), altitude_m(CEILING_Y), altitude_m(0));
+        let (z, zt, z0) = (altitude_m(y), altitude_m(CEILING_Y()), altitude_m(0));
         if z <= zt {
             trop + (self.surface_temp_c() - trop) * (1.0 - z.max(0.0) / zt)
         } else {
@@ -627,7 +631,7 @@ impl World {
     /// the valley, so it comes in low at sunrise and sunset and from above at noon.
     pub fn sun_ray_dir(&self) -> (f32, f32) {
         let (sx, sy) = self.sun_position();
-        let (dx, dy) = (W as f32 * 0.5 - sx, H as f32 * 0.9 - sy);
+        let (dx, dy) = (W() as f32 * 0.5 - sx, H() as f32 * 0.9 - sy);
         let n = (dx * dx + dy * dy).sqrt().max(1e-3);
         (dx / n, dy / n)
     }
@@ -635,7 +639,7 @@ impl World {
     /// Where the sun (by day) sits in the world, in cells; matches the backdrop.
     pub fn sun_position(&self) -> (f32, f32) {
         let u = (self.phase() / 0.5).min(1.0);
-        (W as f32 * (0.08 + 0.84 * u), H as f32 * (0.64 - 0.52 * (std::f32::consts::PI * u).sin()))
+        (W() as f32 * (0.08 + 0.84 * u), H() as f32 * (0.64 - 0.52 * (std::f32::consts::PI * u).sin()))
     }
 
     // ----- the moon ---------------------------------------------------------
@@ -661,7 +665,7 @@ impl World {
 
     /// Where the moon sits in the world, in cells (same arc as the sun's), if it is up.
     pub fn moon_position(&self) -> Option<(f32, f32)> {
-        self.moon_arc().map(|u| (W as f32 * (0.08 + 0.84 * u), H as f32 * (0.64 - 0.52 * (std::f32::consts::PI * u).sin())))
+        self.moon_arc().map(|u| (W() as f32 * (0.08 + 0.84 * u), H() as f32 * (0.64 - 0.52 * (std::f32::consts::PI * u).sin())))
     }
 
     /// The name of tonight's moon.
@@ -705,10 +709,10 @@ impl World {
     /// Everything starts at the temperature of the air around it.
     pub fn reset_temps(&mut self) {
         self.revision += 1;
-        for y in 0..H {
+        for y in 0..H() {
             let amb = self.ambient_c(y as i32);
-            for x in 0..W {
-                let i = y * W + x;
+            for x in 0..W() {
+                let i = y * W() + x;
                 self.temp[i] = match self.cells[i].m {
                     Mat::Fire => FIRE_C,
                     Mat::Ember => EMBER_C,
@@ -821,8 +825,8 @@ impl World {
         let clock = self.prof.start();
         let lod3 = self.lod >= 3;
         if horizontal {
-            self.temp.par_chunks_mut(W).zip(self.cells.par_chunks(W)).for_each(|(temp, cells)| {
-                for x in 0..W - 1 {
+            self.temp.par_chunks_mut(W()).zip(self.cells.par_chunks(W())).for_each(|(temp, cells)| {
+                for x in 0..W() - 1 {
                     conduct(temp, x, x + 1, cells[x].m, cells[x + 1].m, ts, lod3, tb);
                 }
             });
@@ -830,9 +834,9 @@ impl World {
             let temp = super::par::Shared::new(&mut self.temp);
             let cells = &self.cells;
             super::par::column_bands(|xs| {
-                for y in 0..H - 1 {
+                for y in 0..H() - 1 {
                     for x in xs.clone() {
-                        let (i, j) = (y * W + x, (y + 1) * W + x);
+                        let (i, j) = (y * W() + x, (y + 1) * W() + x);
                         // SAFETY: the bands are apart, and a band only touches its own columns.
                         let pair = unsafe { [temp.at(i), temp.at(j)] };
                         conduct_pair(pair, cells[i].m, cells[j].m, ts, lod3, tb);
@@ -845,14 +849,14 @@ impl World {
 
     /// The sun's warmth over the world (a gradient round the sun), the ambient air of each row,
     /// and the surface temperature: what parts 2 and 3 of the heat pass both read.
-    fn heat_frame(&self) -> (f32, Vec<f32>, Vec<f32>, [f32; H], f32, bool) {
+    fn heat_frame(&self) -> (f32, Vec<f32>, Vec<f32>, Vec<f32>, f32, bool) {
         // The sun radiates: the air and the ground are warmest near it and the
         // warmth fades with distance. Up in the sky it gets colder with altitude.
         let sun = self.sun();
         let (sx, sy) = self.sun_position();
-        let gx: Vec<f32> = (0..W).map(|x| (-((x as f32 - sx) / (0.42 * W as f32)).powi(2)).exp()).collect();
-        let gy: Vec<f32> = (0..H).map(|y| (-((y as f32 - sy) / (0.55 * H as f32)).powi(2)).exp()).collect();
-        let mut row_amb = [0.0f32; H];
+        let gx: Vec<f32> = (0..W()).map(|x| (-((x as f32 - sx) / (0.42 * W() as f32)).powi(2)).exp()).collect();
+        let gy: Vec<f32> = (0..H()).map(|y| (-((y as f32 - sy) / (0.55 * H() as f32)).powi(2)).exp()).collect();
+        let mut row_amb = vec![0.0f32; H()];
         for (y, r) in row_amb.iter_mut().enumerate() {
             *r = self.ambient_c(y as i32);
         }
@@ -879,19 +883,19 @@ impl World {
         let (sun, gx, gy, row_amb, _surf, fixed) = self.heat_frame();
         let shut = self.shut_in_means();
         let mut took = std::mem::take(&mut self.heat_took);
-        took.resize(W * H, 0.0);
+        took.resize(W() * H(), 0.0);
         // 2a. The air relaxes, on every core.
         let (cells, pocket_of, latent) = (&self.cells, &self.pocket_of, &self.latent);
         let busy: Vec<Vec<u32>> = self
             .temp
-            .par_chunks_mut(W)
-            .zip(took.par_chunks_mut(W))
+            .par_chunks_mut(W())
+            .zip(took.par_chunks_mut(W()))
             .enumerate()
             .map(|(y, (temp, took))| {
                 let base = row_amb[y];
                 let mut busy = Vec::new();
-                for x in 0..W {
-                    let i = y * W + x;
+                for x in 0..W() {
+                    let i = y * W() + x;
                     let m = cells[i].m;
                     let t = temp[x];
                     let amb = if fixed { base } else { base + 12.0 * sun * gx[x] * gy[y] };
@@ -926,13 +930,13 @@ impl World {
             .collect();
         // 2b. In order: the heat the air took, then flames, embers and the reactions.
         let (mut to_cells, mut flames) = (0.0f32, 0.0f32);
-        for y in 0..H {
-            for v in &took[y * W..(y + 1) * W] {
+        for y in 0..H() {
+            for v in &took[y * W()..(y + 1) * W()] {
                 to_cells += v;
             }
             for &i in &busy[y] {
                 let i = i as usize;
-                let (x, y) = ((i % W) as i32, (i / W) as i32);
+                let (x, y) = ((i % W()) as i32, (i / W()) as i32);
                 let m = self.cells[i].m;
                 let t = self.temp[i];
                 match m {
@@ -991,15 +995,15 @@ impl World {
         let mut to_space = 0.0f32;
         if !fixed {
             // (Each column on its own, side by side; what they give off is added up in order.)
-            let mut given = [0.0f32; W];
+            let mut given = vec![0.0f32; W()];
             let temp = super::par::Shared::new(&mut self.temp);
             let out = super::par::Shared::new(&mut given);
             let cells = &self.cells;
             super::par::column_bands(|xs| {
                 for x in xs {
                     let mut cover = 0.0f32;
-                    for y in 0..H {
-                        let i = y * W + x;
+                    for y in 0..H() {
+                        let i = y * W() + x;
                         let m = cells[i].m;
                         match m {
                             Mat::Empty | Mat::Fire => {}
@@ -1038,11 +1042,11 @@ impl World {
             let dir = if fixed { (0.0, 1.0) } else { self.sun_ray_dir() };
             // The highest cell of each column that is not open air: above it a ray has nothing
             // to look at (that table stays in the cache, the grid does not).
-            let mut top = [H as i32; W];
-            for x in 0..W {
-                top[x] = (0..H).find(|&y| self.cells[y * W + x].m != Mat::Empty).unwrap_or(H) as i32;
+            let mut top = vec![H() as i32; W()];
+            for x in 0..W() {
+                top[x] = (0..H()).find(|&y| self.cells[y * W() + x].m != Mat::Empty).unwrap_or(H()) as i32;
             }
-            let highest = top.iter().copied().min().unwrap_or(H as i32) as f32;
+            let highest = top.iter().copied().min().unwrap_or(H() as i32) as f32;
             let (sx, sy) = sun_step(dir);
             for (px0, py0) in sun_rays(sx, sy) {
                 let mut light = sun * sun_gain;
@@ -1050,20 +1054,20 @@ impl World {
                 let skip = ((highest - py0) / sy).floor().max(0.0);
                 let (px0, py0) = (px0 + skip * sx, py0 + skip * sy);
                 // (Offset so that truncating rounds to the nearest cell, also beside the world.)
-                let (mut px, mut py) = (px0 + 0.5 + W as f32, py0 + 0.5 + H as f32);
+                let (mut px, mut py) = (px0 + 0.5 + W() as f32, py0 + 0.5 + H() as f32);
                 loop {
-                    let (x, y) = (px as i32 - W as i32, py as i32 - H as i32);
+                    let (x, y) = (px as i32 - W() as i32, py as i32 - H() as i32);
                     px += sx;
                     py += sy;
                     // Rays that start beside the world come into it; once out again they are done.
-                    if y >= H as i32 || (x < 0 && sx <= 0.0) || (x >= W as i32 && sx >= 0.0) {
+                    if y >= H() as i32 || (x < 0 && sx <= 0.0) || (x >= W() as i32 && sx >= 0.0) {
                         break;
                     }
-                    if y < 0 || x < 0 || x >= W as i32 || y < top[x as usize] {
+                    if y < 0 || x < 0 || x >= W() as i32 || y < top[x as usize] {
                         continue;
                     }
                     let (x, y) = (x as usize, y as usize);
-                    let i = y * W + x;
+                    let i = y * W() + x;
                     let m = self.cells[i].m;
                     if matches!(m, Mat::Empty | Mat::Fire | Mat::Ember | Mat::Lava) {
                         continue;
@@ -1200,6 +1204,12 @@ impl World {
             c.history.pop_front();
         }
         c.history.push_back(total);
+        let held = self.volumes().1;
+        let c = &mut self.climate;
+        if c.volumes.len() >= SAMPLES {
+            c.volumes.pop_front();
+        }
+        c.volumes.push_back(held);
     }
 
     /// Heat held by the world: every cell (temperature times heat capacity, from 0 °C) and the
@@ -1246,14 +1256,14 @@ impl World {
         let stride = if self.lod >= 1 { 2 } else { 1 };
         let tb = tables();
         let cell = super::flow::CELL;
-        let fw = super::flow::FW;
+        let fw = super::flow::FW();
         // First the air is carried: each cell only reads the grid as it was (`old`), so the rows
         // of flow blocks are carried side by side.
         let (flow, cells, old_t) = (&self.flow, &self.cells, &old);
         // Each row of blocks also lists, in order, its air cells with something beside them for
         // the convection below, and the gust there.
         let convective = |m: Mat| !(m == Mat::Empty || matches!(m.kind(), super::Kind::Gas | super::Kind::Flame) || matches!(m, Mat::Fire | Mat::Ember | Mat::Lava));
-        let beside: Vec<Vec<(u32, f32)>> = self.temp.par_chunks_mut(cell * W).enumerate().map(|(bj, band)| {
+        let beside: Vec<Vec<(u32, f32)>> = self.temp.par_chunks_mut(cell * W()).enumerate().map(|(bj, band)| {
             let mut beside = vec![];
             for bi in 0..fw {
                 let (vx, vy) = flow.at_cell(bi, bj);
@@ -1276,10 +1286,10 @@ impl World {
                 let (ix, iy) = (ox.floor(), oy.floor());
                 let (tx, ty) = (ox - ix, oy - iy);
                 let (ix, iy) = (ix as i32, iy as i32);
-                for y in (bj * cell..((bj + 1) * cell).min(H)).step_by(stride) {
-                    let sy0 = (y as i32 + iy).clamp(0, H as i32 - 2) as usize;
+                for y in (bj * cell..((bj + 1) * cell).min(H())).step_by(stride) {
+                    let sy0 = (y as i32 + iy).clamp(0, H() as i32 - 2) as usize;
                     for x in (bi * cell..(bi + 1) * cell).step_by(stride) {
-                        let i = y * W + x;
+                        let i = y * W() + x;
                         if cells[i].m != Mat::Empty {
                             continue;
                         }
@@ -1291,25 +1301,25 @@ impl World {
                             };
                             Self::carry_fine(cells, old_t, i, x, y, -lerp(0) * reach, -lerp(1) * reach)
                         } else {
-                            let sx0 = (x as i32 + ix).rem_euclid(W as i32 - 1) as usize;
+                            let sx0 = (x as i32 + ix).rem_euclid(W() as i32 - 1) as usize;
                             // Free air is read as it is; anything else counts as the cell's own temperature.
                             let air = |j: usize| if cells[j].m == Mat::Empty { old_t[j] } else { old_t[i] };
-                            let top = air(sy0 * W + sx0) * (1.0 - tx) + air(sy0 * W + sx0 + 1) * tx;
-                            let bot = air((sy0 + 1) * W + sx0) * (1.0 - tx) + air((sy0 + 1) * W + sx0 + 1) * tx;
+                            let top = air(sy0 * W() + sx0) * (1.0 - tx) + air(sy0 * W() + sx0 + 1) * tx;
+                            let bot = air((sy0 + 1) * W() + sx0) * (1.0 - tx) + air((sy0 + 1) * W() + sx0 + 1) * tx;
                             top * (1.0 - ty) + bot * ty
                         };
-                        let k = i - bj * cell * W;
+                        let k = i - bj * cell * W();
                         band[k] = old_t[i] + (upwind - old_t[i]) * blend;
                         if stride == 2 {
                             // Simplified: the other three cells of the 2 x 2 block follow.
                             let t = band[k];
-                            for j in [i + 1, i + W, i + W + 1] {
-                                if j < W * H && cells[j].m == Mat::Empty {
-                                    band[j - bj * cell * W] = t;
+                            for j in [i + 1, i + W(), i + W() + 1] {
+                                if j < W() * H() && cells[j].m == Mat::Empty {
+                                    band[j - bj * cell * W()] = t;
                                 }
                             }
                         }
-                        if [i + 1, i.wrapping_sub(1), i + W, i.wrapping_sub(W)].iter().any(|&j| j < W * H && convective(cells[j].m)) {
+                        if [i + 1, i.wrapping_sub(1), i + W(), i.wrapping_sub(W())].iter().any(|&j| j < W() * H() && convective(cells[j].m)) {
                             beside.push((i as u32, gust));
                         }
                     }
@@ -1321,8 +1331,8 @@ impl World {
         // A solid cell can lie between two rows of blocks, so this part goes in order.
         for &(i, gust) in beside.iter().flatten() {
             let i = i as usize;
-            for j in [i + 1, i.wrapping_sub(1), i + W, i.wrapping_sub(W)] {
-                if j >= W * H {
+            for j in [i + 1, i.wrapping_sub(1), i + W(), i.wrapping_sub(W())] {
+                if j >= W() * H() {
                     continue;
                 }
                 let m = self.cells[j].m;
@@ -1336,7 +1346,7 @@ impl World {
                 // part of the heat pass runs on its own step, after the reactions: a cell must not
                 // be left past its change point until the next one).
                 if flux > 0.0 && super::matter::fusion(m).is_some() {
-                    self.latent_heat(j, (j % W) as i32, (j / W) as i32, m, self.temp[j]);
+                    self.latent_heat(j, (j % W()) as i32, (j / W()) as i32, m, self.temp[j]);
                 }
             }
         }
@@ -1352,9 +1362,9 @@ impl World {
         let (px, py) = (x as f32 + ox, y as f32 + oy);
         let (fx, fy) = (floor_f(px), floor_f(py));
         let (tx, ty) = (px - fx, py - fy);
-        let sx0 = (fx as i32).rem_euclid(W as i32 - 1) as usize;
-        let sy0 = (fy as i32).clamp(0, H as i32 - 2) as usize;
-        let corners = [sy0 * W + sx0, sy0 * W + sx0 + 1, (sy0 + 1) * W + sx0, (sy0 + 1) * W + sx0 + 1];
+        let sx0 = (fx as i32).rem_euclid(W() as i32 - 1) as usize;
+        let sy0 = (fy as i32).clamp(0, H() as i32 - 2) as usize;
+        let corners = [sy0 * W() + sx0, sy0 * W() + sx0 + 1, (sy0 + 1) * W() + sx0, (sy0 + 1) * W() + sx0 + 1];
         let open = corners.iter().all(|&j| cells[j].m == Mat::Empty);
         let far = if open {
             let top = old[corners[0]] * (1.0 - tx) + old[corners[1]] * tx;
@@ -1372,7 +1382,7 @@ impl World {
         let (mut sum, mut count) = (0.0, 0.0);
         for k in 1..n {
             let f = k as f32 / n as f32;
-            let j = round_i(y as f32 + oy * f).clamp(0, H as i32 - 1) as usize * W + round_i(x as f32 + ox * f).rem_euclid(W as i32) as usize;
+            let j = round_i(y as f32 + oy * f).clamp(0, H() as i32 - 1) as usize * W() + round_i(x as f32 + ox * f).rem_euclid(W() as i32) as usize;
             if cells[j].m != Mat::Empty {
                 return if count > 0.0 { sum / count } else { old[i] };
             }
@@ -1648,7 +1658,7 @@ impl World {
 
     /// False-colour temperature map: blue (cold) to red (hot) to white.
     pub fn thermal_color(&self, x: usize, y: usize) -> [u8; 4] {
-        let i = y * W + x;
+        let i = y * W() + x;
         if self.mask[i] != 0 {
             return [60, 60, 70, 255];
         }
@@ -1679,7 +1689,7 @@ impl World {
     /// Density sample for the cloud/steam layer: premultiplied RGBA that the
     /// renderer blurs into soft, blobby puffs.
     pub fn gas_color(&self, x: usize, y: usize) -> [u8; 4] {
-        let c = self.cells[y * W + x];
+        let c = self.cells[y * W() + x];
         let h = (x as u32).wrapping_mul(73856093) ^ (y as u32).wrapping_mul(19349663);
         let v = ((h >> 9) & 31) as i32;
         let (r, g, b, a): (i32, i32, i32, i32) = match c.m {
@@ -1705,10 +1715,10 @@ mod carry_tests {
         let (x0, y) = (300usize, 100usize);
         for dx in 0..12 {
             for dy in 0..12 {
-                w.temp[(y + dy) * W + x0 + dx] = 80.0;
+                w.temp[(y + dy) * W() + x0 + dx] = 80.0;
             }
         }
-        let mean = |w: &World, x: usize| (0..12).map(|dy| w.temp[(y + dy) * W + x]).sum::<f32>() / 12.0;
+        let mean = |w: &World, x: usize| (0..12).map(|dy| w.temp[(y + dy) * W() + x]).sum::<f32>() / 12.0;
         let mut passed = 0.0f32;
         for _ in 0..40 {
             w.carry_air_heat();
@@ -1732,17 +1742,17 @@ mod plume_tests {
         w.reset_temps();
         w.flow.pin_uniform(0.0, -4.5);
         let floor = 400;
-        for x in 0..W {
+        for x in 0..W() {
             w.set(x as i32, floor as i32, Mat::Lava);
         }
         for _ in 0..80 {
-            for x in 0..W {
-                w.temp[floor * W + x] = 1000.0;
+            for x in 0..W() {
+                w.temp[floor * W() + x] = 1000.0;
             }
             w.thermal_pass();
         }
         // Up the column: the temperature should only fall, give or take a little.
-        let col: Vec<f32> = (300..floor).rev().map(|y| (0..W).map(|x| w.temp[y * W + x]).sum::<f32>() / W as f32).collect();
+        let col: Vec<f32> = (300..floor).rev().map(|y| (0..W()).map(|x| w.temp[y * W() + x]).sum::<f32>() / W() as f32).collect();
         let bumps = col.windows(2).filter(|p| p[1] > p[0] + 3.0).count();
         assert_eq!(bumps, 0, "the plume rises in bands: {:?}", col.iter().map(|t| t.round()).collect::<Vec<_>>());
     }
@@ -1807,10 +1817,10 @@ mod latent_tests {
         let mut w = still();
         // Water that has taken in all its heat of boiling, and cold water evaporating.
         w.set(100, 200, Mat::Water);
-        w.temp[200 * W + 100] = 100.0;
-        w.latent[200 * W + 100] = LATENT_VAPOUR;
+        w.temp[200 * W() + 100] = 100.0;
+        w.latent[200 * W() + 100] = LATENT_VAPOUR;
         w.set(300, 200, Mat::Water);
-        w.temp[200 * W + 300] = 20.0;
+        w.temp[200 * W() + 300] = 20.0;
         let before = w.total_heat();
         let sky = w.climate.sky_dev;
         w.vaporize(100, 200);
@@ -1818,14 +1828,14 @@ mod latent_tests {
         assert!(close(w.total_heat(), before), "{} vs {before}", w.total_heat());
         // Boiling water held its own heat; cold water evaporating took heat from around.
         assert!(w.climate.sky_dev < sky, "evaporation cools: {} vs {sky}", w.climate.sky_dev);
-        let steam = (0..W * H).filter(|&k| w.cells[k].m == Mat::Steam).count();
+        let steam = (0..W() * H()).filter(|&k| w.cells[k].m == Mat::Steam).count();
         assert_eq!(steam, 2 * VAPOUR_PER_WATER, "each cell of water swells into four of steam");
 
         // The vapour condenses: it gives its heat of boiling back.
         let (before, sky) = (w.total_heat(), w.climate.sky_dev);
-        for k in 0..W * H {
+        for k in 0..W() * H() {
             if w.cells[k].m == Mat::Steam {
-                w.condense((k % W) as i32, (k / W) as i32);
+                w.condense((k % W()) as i32, (k / W()) as i32);
             }
         }
         assert!(close(w.total_heat(), before));
@@ -1839,7 +1849,7 @@ mod latent_tests {
             for y in 100..106 {
                 for x in x0..x0 + 6 {
                     w.set(x, y, Mat::Cloud);
-                    w.temp[y as usize * W + x as usize] = t;
+                    w.temp[y as usize * W() + x as usize] = t;
                 }
             }
         }
@@ -1849,7 +1859,7 @@ mod latent_tests {
             for y in 100..106 {
                 for x in x0..x0 + 6 {
                     if w.raw(x, y) == Mat::Cloud && w.gather_vapour(x, y) {
-                        let i = y as usize * W + x as usize;
+                        let i = y as usize * W() + x as usize;
                         let t = w.temp[i];
                         let own = heat_of(Mat::Cloud, t) + w.packed(i) as f32 * latent0(Mat::Cloud);
                         let to = if t > 2.0 { Mat::Water } else { Mat::Snow };
@@ -1875,20 +1885,20 @@ mod latent_tests {
             }
         }
         w.set(100, 200, Mat::Water);
-        w.temp[200 * W + 100] = 100.0;
-        w.latent[200 * W + 100] = LATENT_VAPOUR;
+        w.temp[200 * W() + 100] = 100.0;
+        w.latent[200 * W() + 100] = LATENT_VAPOUR;
         let before = w.total_heat();
         w.vaporize(100, 200);
         assert_eq!(w.raw(100, 200), Mat::Steam);
-        assert_eq!(w.vapour_units(200 * W + 100), VAPOUR_PER_WATER as u32, "no water lost");
+        assert_eq!(w.vapour_units(200 * W() + 100), VAPOUR_PER_WATER as u32, "no water lost");
         assert!(close(w.total_heat(), before));
         // Opened, the packed vapour spreads out.
         w.set(100, 199, Mat::Empty);
         for _ in 0..200 {
             w.step();
         }
-        let units: u32 = (0..W * H).map(|k| w.vapour_units(k)).sum();
-        let cells = (0..W * H).filter(|&k| matches!(w.cells[k].m, Mat::Steam | Mat::Cloud)).count();
+        let units: u32 = (0..W() * H()).map(|k| w.vapour_units(k)).sum();
+        let cells = (0..W() * H()).filter(|&k| matches!(w.cells[k].m, Mat::Steam | Mat::Cloud)).count();
         assert!(cells >= 2 && units >= cells as u32, "it spread: {cells} cells, {units} units");
     }
 
@@ -1909,13 +1919,13 @@ mod latent_tests {
             }
             for y in 298..300 {
                 w.set(x, y, Mat::Lava);
-                w.temp[y as usize * W + x as usize] = LAVA_C;
+                w.temp[y as usize * W() + x as usize] = LAVA_C;
             }
         }
         let (mut plateau, mut set) = (false, false);
         for _ in 0..6000 {
             w.step();
-            let i = 299 * W + 120;
+            let i = 299 * W() + 120;
             if w.cells[i].m == Mat::Lava && w.latent[i] < -10.0 {
                 plateau |= (w.temp[i] - ROCK_MELT_C).abs() < 0.5;
             }
@@ -1929,9 +1939,9 @@ mod latent_tests {
     fn quenched_lava_boils_the_water_with_its_own_heat() {
         let mut w = still();
         w.set(100, 200, Mat::Lava);
-        w.temp[200 * W + 100] = LAVA_C;
+        w.temp[200 * W() + 100] = LAVA_C;
         w.set(100, 201, Mat::Water);
-        w.temp[201 * W + 100] = 20.0;
+        w.temp[201 * W() + 100] = 20.0;
         let before = w.total_heat();
         w.step_hot_liquid(100, 200, Mat::Stone);
         assert_eq!(w.raw(100, 200), Mat::Stone);
@@ -1959,7 +1969,7 @@ mod latent_tests {
                 w.set(x, 301, Mat::Fire);
             }
             w.step();
-            for i in 0..W * H {
+            for i in 0..W() * H() {
                 if w.cells[i].m == Mat::Water {
                     // (Deeper down the pressure makes the boiling point a little higher.)
                     hottest = hottest.max(w.temp[i] - super::super::boil_c(w.liq_p[i]) + 100.0);
@@ -1983,13 +1993,13 @@ mod latent_tests {
             w.set(x, 300, Mat::Stone);
             for y in 290..300 {
                 w.set(x, y, Mat::Ice);
-                w.temp[y as usize * W + x as usize] = -5.0;
+                w.temp[y as usize * W() + x as usize] = -5.0;
             }
         }
         let mut seen_zero = false;
         for _ in 0..3000 {
             w.step();
-            let i = 295 * W + 210;
+            let i = 295 * W() + 210;
             if w.cells[i].m == Mat::Ice && w.temp[i].abs() < 0.01 {
                 seen_zero = true;
             }
@@ -2009,7 +2019,7 @@ mod latent_tests {
             c.set(x, 300, Mat::Terracotta);
             for y in 296..300 {
                 c.set(x, y, Mat::Water);
-                c.temp[y as usize * W + x as usize] = 2.0;
+                c.temp[y as usize * W() + x as usize] = 2.0;
             }
         }
         let mut froze = false;
@@ -2035,8 +2045,8 @@ mod budget_tests {
         w.structures_fall = false;
         w.day_cycle = false;
         w.set_phase(phase);
-        for y in 400..H as i32 {
-            for x in 0..W as i32 {
+        for y in 400..H() as i32 {
+            for x in 0..W() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -2045,16 +2055,16 @@ mod budget_tests {
     }
 
     fn mean(w: &World, x0: usize, y0: usize, n: usize) -> f32 {
-        (y0..y0 + n).flat_map(|y| (x0..x0 + n).map(move |x| w.temp[y * W + x])).sum::<f32>() / (n * n) as f32
+        (y0..y0 + n).flat_map(|y| (x0..x0 + n).map(move |x| w.temp[y * W() + x])).sum::<f32>() / (n * n) as f32
     }
 
     #[test]
     fn hot_ground_under_the_open_sky_radiates_to_space_and_clouds_hold_it_in() {
         let mut w = open_world(0.75);
         // Two hot patches of floor; a thick cloud sits above the second one.
-        for x in 0..W {
+        for x in 0..W() {
             for y in 400..410 {
-                w.temp[y * W + x] = 80.0;
+                w.temp[y * W() + x] = 80.0;
             }
         }
         for y in 300..330 {
@@ -2065,7 +2075,7 @@ mod budget_tests {
         for _ in 0..400 {
             w.thermal_pass();
         }
-        let (open, covered) = (w.temp[400 * W + 200], w.temp[400 * W + 650]);
+        let (open, covered) = (w.temp[400 * W() + 200], w.temp[400 * W() + 650]);
         assert!(open < 60.0, "the open floor gave its warmth to the night sky: {open}");
         assert!(covered > open + 5.0, "the cloud kept the floor beneath it warmer: {covered} vs {open}");
     }
@@ -2076,7 +2086,7 @@ mod budget_tests {
         let (mut calm, mut hot) = (open_world(0.75), open_world(0.75));
         for y in 200..260 {
             for x in 400..520 {
-                hot.temp[y * W + x] = 400.0;
+                hot.temp[y * W() + x] = 400.0;
             }
         }
         for _ in 0..20 {
@@ -2127,8 +2137,8 @@ mod budget_tests {
             w.thermal_pass();
         }
         let surface = |x: i32| {
-            let top = (0..H as i32).find(|&y| w.raw(x, y) != Mat::Empty).unwrap();
-            w.temp[top as usize * W + x as usize]
+            let top = (0..H() as i32).find(|&y| w.raw(x, y) != Mat::Empty).unwrap();
+            w.temp[top as usize * W() + x as usize]
         };
         let (lit, shade) = (surface(420), surface(540));
         assert!(lit > shade + 3.0, "the slope facing the rising sun is warmer: {lit} vs {shade}");
@@ -2188,7 +2198,7 @@ mod energy_probe {
     use super::*;
     fn report(w: &World, tag: &str) {
         let (mut air, mut na, mut solid, mut ns) = (0.0f64, 0u32, 0.0f64, 0u32);
-        for i in 0..W * H {
+        for i in 0..W() * H() {
             let m = w.cells[i].m;
             let t = w.temp[i] as f64;
             if matches!(m, Mat::Empty) { air += t; na += 1; } else if !matches!(m, Mat::Fire | Mat::Ember | Mat::Lava) { solid += t; ns += 1; }
@@ -2206,7 +2216,7 @@ mod energy_probe {
         for d in 0..days * 8 {
             if std::env::var("BONFIRE").is_ok() && d == 1 {
                 for x in 380..580 {
-                    let g = (0..H as i32).find(|&y| w.raw(x, y) != Mat::Empty).unwrap_or(400);
+                    let g = (0..H() as i32).find(|&y| w.raw(x, y) != Mat::Empty).unwrap_or(400);
                     for y in g - 60..g { w.set(x, y, Mat::Wood); }
                     w.set(x, g - 61, Mat::Fire);
                 }
@@ -2229,15 +2239,15 @@ mod atmosphere_tests {
         // Near the ground a row is 10 m; up high a row stands for hundreds of metres.
         assert_eq!(altitude_m(GROUND_Y as i32), 0.0);
         assert!((altitude_m(ALT_LINEAR_Y) - 800.0).abs() < 1e-3);
-        assert!((10..=13).contains(&((altitude_m(CEILING_Y) / 1000.0) as i32)), "tropopause {} m", altitude_m(CEILING_Y));
+        assert!((10..=13).contains(&((altitude_m(CEILING_Y()) / 1000.0) as i32)), "tropopause {} m", altitude_m(CEILING_Y()));
         assert!(altitude_m(0) > 25_000.0, "the top of the screen is in the stratosphere: {} m", altitude_m(0));
-        assert!((1..H as i32).all(|y| altitude_m(y - 1) > altitude_m(y)));
-        assert!(air_pressure_atm(0) < 0.05 && air_pressure_atm(CEILING_Y) < 0.3);
+        assert!((1..H() as i32).all(|y| altitude_m(y - 1) > altitude_m(y)));
+        assert!(air_pressure_atm(0) < 0.05 && air_pressure_atm(CEILING_Y()) < 0.3);
         // Colder with height up to the tropopause, then warmer again.
         let w = World::new();
-        let t: Vec<f32> = (0..H as i32).map(|y| w.ambient_c(y)).collect();
-        let coldest = (0..H).min_by(|&a, &b| t[a].total_cmp(&t[b])).unwrap();
-        assert!((coldest as i32 - CEILING_Y).abs() <= 1, "coldest row {coldest}");
+        let t: Vec<f32> = (0..H() as i32).map(|y| w.ambient_c(y)).collect();
+        let coldest = (0..H()).min_by(|&a, &b| t[a].total_cmp(&t[b])).unwrap();
+        assert!((coldest as i32 - CEILING_Y()).abs() <= 1, "coldest row {coldest}");
         assert!(t[0] > t[coldest] + 5.0 && t[GROUND_Y as usize] > t[coldest] + 5.0);
     }
 }

@@ -218,6 +218,13 @@ pub struct Drop {
     pub(super) t: f32,
 }
 
+impl Drop {
+    /// Its velocity, m/s (down positive): for the picture, which stretches it along its flight.
+    pub fn velocity(&self) -> (f32, f32) {
+        (self.vx, self.vy)
+    }
+}
+
 impl Liquids {
     /// What the picture of the world needs (see `World::copy_picture`): the velocities, the
     /// pressure, the kind of each cell and the drops in flight, not the scratch nor the solver.
@@ -231,22 +238,22 @@ impl Liquids {
     }
 
     fn ready(&mut self) {
-        if self.u.len() != (W + 1) * H {
-            self.u = vec![0.0; (W + 1) * H];
-            self.v = vec![0.0; W * (H + 1)];
-            self.p = vec![0.0; W * H];
-            self.class = vec![SOLID; W * H];
-            self.rows = vec![None; H + 1];
-            self.u2 = vec![0.0; (W + 1) * H];
-            self.v2 = vec![0.0; W * (H + 1)];
-            self.u3 = vec![0.0; (W + 1) * H];
-            self.v3 = vec![0.0; W * (H + 1)];
-            self.nu = vec![0.0; W * H];
-            self.rhs = vec![0.0; W * H];
-            self.fu = vec![0; (W + 1) * H];
-            self.fv = vec![0; W * (H + 1)];
-            self.want = vec![Mat::Empty; W * H];
-            self.scale = vec![1.0; W * H];
+        if self.u.len() != (W() + 1) * H() {
+            self.u = vec![0.0; (W() + 1) * H()];
+            self.v = vec![0.0; W() * (H() + 1)];
+            self.p = vec![0.0; W() * H()];
+            self.class = vec![SOLID; W() * H()];
+            self.rows = vec![None; H() + 1];
+            self.u2 = vec![0.0; (W() + 1) * H()];
+            self.v2 = vec![0.0; W() * (H() + 1)];
+            self.u3 = vec![0.0; (W() + 1) * H()];
+            self.v3 = vec![0.0; W() * (H() + 1)];
+            self.nu = vec![0.0; W() * H()];
+            self.rhs = vec![0.0; W() * H()];
+            self.fu = vec![0; (W() + 1) * H()];
+            self.fv = vec![0; W() * (H() + 1)];
+            self.want = vec![Mat::Empty; W() * H()];
+            self.scale = vec![1.0; W() * H()];
         }
     }
 
@@ -269,11 +276,11 @@ impl Liquids {
 
 #[inline]
 pub(super) fn ui(x: usize, y: usize) -> usize {
-    y * (W + 1) + x
+    y * (W() + 1) + x
 }
 #[inline]
 pub(super) fn vi(x: usize, y: usize) -> usize {
-    y * W + x
+    y * W() + x
 }
 
 /// Bilinear sample of a grid `w` wide (`h` rows) at (x, y) in its own index space.
@@ -313,7 +320,7 @@ impl World {
                     self.temp[Self::idx(x, y)] = d.t;
                 }
             }
-            for i in 0..W * H {
+            for i in 0..W() * H() {
                 if self.cells[i].m.kind() == Kind::Liquid && self.fill[i] != 0 {
                     if self.fill[i] < field::FULL / 2 {
                         self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
@@ -341,18 +348,18 @@ impl World {
     /// The pressure of the liquid at (x, y) over the ambient one, Pa, while the liquids run by
     /// their physics (None in a cell that holds no pressure).
     pub fn liquid_pa(&self, x: usize, y: usize) -> Option<f32> {
-        let i = y * W + x;
-        (self.liquid_physics && self.liq.p.len() == W * H && self.liq.class[i] & 3 == FULLISH && self.cells[i].m.kind() == Kind::Liquid).then(|| self.liq.p[i])
+        let i = y * W() + x;
+        (self.liquid_physics && self.liq.p.len() == W() * H() && self.liq.class[i] & 3 == FULLISH && self.cells[i].m.kind() == Kind::Liquid).then(|| self.liq.p[i])
     }
 
     /// The push of the liquids on the solid cell `i`, from the pressure on each of its wet sides,
     /// as a weight (x, y; down positive): in cells of water, the column of water that would press
     /// as hard (none unless the liquids run by their physics).
     pub(super) fn liquid_push(&self, i: usize) -> (f32, f32) {
-        if !self.liquid_physics || self.liq.p.len() != W * H {
+        if !self.liquid_physics || self.liq.p.len() != W() * H() {
             return (0.0, 0.0);
         }
-        let (x, y) = (i % W, i / W);
+        let (x, y) = (i % W(), i / W());
         let head = |j: usize| -> f32 {
             if self.liq.class[j] & 3 == FULLISH && self.cells[j].m.kind() == Kind::Liquid {
                 (self.liq.p[j] / (1000.0 * G * CELL_M)).max(0.0)
@@ -364,14 +371,14 @@ impl World {
         if x > 0 {
             fx += head(i - 1);
         }
-        if x + 1 < W {
+        if x + 1 < W() {
             fx -= head(i + 1);
         }
         if y > 0 {
-            fy += head(i - W);
+            fy += head(i - W());
         }
-        if y + 1 < H {
-            fy -= head(i + W);
+        if y + 1 < H() {
+            fy -= head(i + W());
         }
         (fx, fy)
     }
@@ -397,13 +404,13 @@ impl World {
     /// The class of cell (x, y) as the liquids last saw it (`SOLID`, `AIR`, `WET`, `FULLISH`,
     /// with bit 4 set where its zone runs), for the simulation view; None before the first step.
     pub fn liquid_class(&self, x: usize, y: usize) -> Option<u8> {
-        self.liq.class.get(y * W + x).copied()
+        self.liq.class.get(y * W() + x).copied()
     }
 
     /// Whether the liquids put a drop's velocity (m/s) at the centre of cell (x, y); None before
     /// the first step.
     pub fn liquid_velocity(&self, x: usize, y: usize) -> Option<(f32, f32)> {
-        if self.liq.u.len() != (W + 1) * H {
+        if self.liq.u.len() != (W() + 1) * H() {
             return None;
         }
         Some((0.5 * (self.liq.u[ui(x, y)] + self.liq.u[ui(x + 1, y)]), 0.5 * (self.liq.v[vi(x, y)] + self.liq.v[vi(x, y + 1)])))
@@ -427,7 +434,7 @@ impl World {
 
     /// Units of water in the cells and the drops (the mass audit, `AWORLD_DEBUG_MASS`).
     pub(super) fn water_units_audit(&self) -> u64 {
-        (0..W * H).filter(|&i| self.cells[i].m == Mat::Water).map(|i| self.liquid_fill(i) as u64).sum::<u64>() + self.liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>()
+        (0..W() * H()).filter(|&i| self.cells[i].m == Mat::Water).map(|i| self.liquid_fill(i) as u64).sum::<u64>() + self.liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>()
     }
 
     /// What the card did with the last step, into the world: before the cells' turn, so that
@@ -451,7 +458,7 @@ impl World {
     /// (after a sub-step, or after the card's step), and what left is counted in `gone`.
     pub(super) fn drain_sides(&mut self, rows: impl Iterator<Item = usize>) {
         for y in rows {
-            for i in [y * W, y * W + W - 1] {
+            for i in [y * W(), y * W() + W() - 1] {
                 if self.cells[i].m.kind() == Kind::Liquid && self.mask[i] == 0 {
                     self.gone += self.liquid_fill(i) as u64;
                     self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
@@ -470,7 +477,7 @@ impl World {
         let mut liq = std::mem::take(&mut self.liq);
         liq.ready();
         let audit = std::env::var_os("AWORLD_DEBUG_MASS").is_some();
-        let units = |w: &World, liq: &Liquids| (0..W * H).filter(|&i| w.cells[i].m == Mat::Water).map(|i| w.liquid_fill(i) as u64).sum::<u64>() + liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>();
+        let units = |w: &World, liq: &Liquids| (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Water).map(|i| w.liquid_fill(i) as u64).sum::<u64>() + liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>();
         let before = if audit { units(self, &liq) } else { 0 };
         // The whole turn on the card, where there is one (and it is wanted): the card works on
         // the step while the CPU does the rest of it, and the CPU takes its result at the next.
@@ -501,10 +508,10 @@ impl World {
             return;
         }
         // A drop that lands gives its speed to the edges under and over it.
-        for y in 0..H {
+        for y in 0..H() {
             let Some((x0, x1)) = liq.span(y) else { continue };
             for x in x0..=x1 {
-                let i = y * W + x;
+                let i = y * W() + x;
                 if liq.class[i] & 3 >= WET && self.vel[i] != 0 && !self.lone_liquid(x as i32, y as i32) {
                     let speed = self.vel[i] as f32 / super::FALL_UNIT as f32 * CELL_M / DT;
                     liq.v[vi(x, y + 1)] = liq.v[vi(x, y + 1)].max(speed);
@@ -514,7 +521,7 @@ impl World {
             }
         }
         // As many sub-steps as it takes for the fastest liquid to cross at most a cell in each.
-        let fastest = (0..H)
+        let fastest = (0..H())
             .into_par_iter()
             .map(|y| {
                 let Some((x0, x1)) = liq.span(y) else { return 0.0 };
@@ -556,7 +563,7 @@ impl World {
             let clock = self.prof.start();
             self.carry_liquids(&mut liq, dt);
             self.prof.stop(prof::LIQ_CARRY, clock);
-            self.drain_sides((0..H).filter(|&y| liq.rows[y].is_some()));
+            self.drain_sides((0..H()).filter(|&y| liq.rows[y].is_some()));
         }
         self.liq = liq;
     }
@@ -571,20 +578,20 @@ impl World {
     /// graphics card does not keep), in the zones that run.
     pub(super) fn seep_through_thin(&mut self) {
         let sides = if self.frame & 1 == 0 { [1, -1] } else { [-1, 1] };
-        for k in 0..sleep::CW * sleep::CH {
+        for k in 0..sleep::CW() * sleep::CH() {
             if !self.zones.awake.get(k).copied().unwrap_or(true) {
                 continue;
             }
-            let (zx, zy) = ((k % sleep::CW) * sleep::CS, (k / sleep::CW) * sleep::CS);
-            for (x, y) in (zy..(zy + sleep::CS).min(H)).flat_map(|y| (zx..(zx + sleep::CS).min(W)).map(move |x| (x, y))) {
-                let i = y * W + x;
+            let (zx, zy) = ((k % sleep::CW()) * sleep::CS, (k / sleep::CW()) * sleep::CS);
+            for (x, y) in (zy..(zy + sleep::CS).min(H())).flat_map(|y| (zx..(zx + sleep::CS).min(W())).map(move |x| (x, y))) {
+                let i = y * W() + x;
                 let m = self.cells[i].m;
-                if m.kind() != Kind::Liquid || self.mask[i] != 0 || (y + 1 < H && self.cells[i + W].m == Mat::Empty) {
+                if m.kind() != Kind::Liquid || self.mask[i] != 0 || (y + 1 < H() && self.cells[i + W()].m == Mat::Empty) {
                     continue;
                 }
                 for dir in sides {
                     let Some(px) = self.past_thin(x as i32, y as i32, dir) else { continue };
-                    let j = y * W + px as usize;
+                    let j = y * W() + px as usize;
                     let had = match self.cells[j].m {
                         Mat::Empty if self.mask[j] == 0 => 0,
                         n if n == m => self.liquid_fill(j),
@@ -627,19 +634,19 @@ impl World {
     fn throw_drops(&mut self, liq: &mut Liquids) {
         let (class, rows, u, v) = (&liq.class, &liq.rows, &liq.u, &liq.v);
         let world: &World = self;
-        let throws: Vec<(usize, u32, f32, f32, f32, f32)> = (0..H)
+        let throws: Vec<(usize, u32, f32, f32, f32, f32)> = (0..H())
             .into_par_iter()
             .flat_map_iter(|y| {
                 let (x0, x1) = rows[y].unwrap_or((1, 0));
                 (x0..=x1).filter_map(move |x| {
-                    let i = y * W + x;
+                    let i = y * W() + x;
                     if class[i] & 3 < WET || class[i] & 4 == 0 {
                         return None;
                     }
                     // Air, or the thin film of spray over a surface.
                     let air = |nx: usize, ny: usize| {
-                        nx < W && ny < H && {
-                            let j = ny * W + nx;
+                        nx < W() && ny < H() && {
+                            let j = ny * W() + nx;
                             match class[j] & 3 {
                                 AIR => world.cells[j].m == Mat::Empty,
                                 WET => world.cells[j].m == world.cells[i].m && world.liquid_fill(j) < field::FULL / 4,
@@ -666,12 +673,12 @@ impl World {
                     if k == 2 {
                         // Falling: a body of liquid holds together (its bottom does not peel
                         // off), but a thin stream or a lip with nothing over it breaks into drops.
-                        let held = y > 0 && class[i - W] & 3 == FULLISH;
+                        let held = y > 0 && class[i - W()] & 3 == FULLISH;
                         share = if held { 0.0 } else if speed > THROW { 1.0 } else { 0.0 };
                     }
                     let lone = fill < field::FULL / 4
                         && air(x, y + 1)
-                        && [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)].iter().all(|&(nx, ny)| nx >= W || ny >= H || class[ny * W + nx] & 3 != FULLISH);
+                        && [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)].iter().all(|&(nx, ny)| nx >= W() || ny >= H() || class[ny * W() + nx] & 3 != FULLISH);
                     if lone && vx.hypot(vy) > 0.5 {
                         share = 1.0;
                     }
@@ -728,7 +735,7 @@ impl World {
             for _ in 0..n {
                 let (nx, ny) = (d.x + dx / n as f32, d.y + dy / n as f32);
                 let (ix, iy) = (nx.floor() as i32, ny.floor() as i32);
-                if ix < 0 || ix >= W as i32 || iy >= H as i32 {
+                if ix < 0 || ix >= W() as i32 || iy >= H() as i32 {
                     // Off the side or the bottom of the world: gone (and counted).
                     self.gone += d.q as u64;
                     return false;
@@ -775,7 +782,7 @@ impl World {
         self.fill[j] = if q == field::FULL { 0 } else { q };
         // Its speed goes to the edges of the cell, in proportion to what it brings.
         let w = d.q as f32 / q as f32;
-        let (x, y) = (j % W, j / W);
+        let (x, y) = (j % W(), j / W());
         if let Some(Some(card)) = liq.card.as_mut() {
             for e in [ui(x, y), ui(x + 1, y)] {
                 card.patches_up.push(liquid_gpu::Patch { edge: e as u32, mode: 1, value: d.vx, weight: w });
@@ -783,7 +790,7 @@ impl World {
             for e in [vi(x, y), vi(x, y + 1)] {
                 card.patches_up.push(liquid_gpu::Patch { edge: e as u32 | 0x8000_0000, mode: 1, value: d.vy, weight: w });
             }
-        } else if liq.u.len() == (W + 1) * H {
+        } else if liq.u.len() == (W() + 1) * H() {
             for e in [ui(x, y), ui(x + 1, y)] {
                 liq.u[e] += w * (d.vx - liq.u[e]);
             }
@@ -804,27 +811,27 @@ impl World {
         let old = &liq.rows;
         let range = |y: usize| -> (usize, usize) {
             if !again {
-                return (0, W - 1);
+                return (0, W() - 1);
             }
             let mut span: Option<(usize, usize)> = None;
-            for yy in y.saturating_sub(1)..=(y + 1).min(H - 1) {
+            for yy in y.saturating_sub(1)..=(y + 1).min(H() - 1) {
                 if let Some((a, b)) = old[yy] {
                     span = Some(span.map_or((a, b), |(c, d)| (a.min(c), b.max(d))));
                 }
             }
-            span.map_or((1, 0), |(a, b)| (a.saturating_sub(1), (b + 1).min(W - 1)))
+            span.map_or((1, 0), |(a, b)| (a.saturating_sub(1), (b + 1).min(W() - 1)))
         };
         // The first and last cell of each row that holds liquid that runs.
         let ends: Vec<(usize, usize)> = liq
             .class
-            .par_chunks_mut(W)
+            .par_chunks_mut(W())
             .enumerate()
             .map(|(y, row)| {
                 let (mut first, mut last) = (usize::MAX, 0);
                 let (a, b) = range(y);
                 for (x, c) in row.iter_mut().enumerate().take(b + 1).skip(a) {
-                    let i = y * W + x;
-                    let run = awake[y / sleep::CS * sleep::CW + x / sleep::CS];
+                    let i = y * W() + x;
+                    let run = awake[y / sleep::CS * sleep::CW() + x / sleep::CS];
                     let what = if self.mask[i] != 0 {
                         SOLID
                     } else {
@@ -842,7 +849,7 @@ impl World {
                             // water over a gas that is not open air at its pocket's pressure (a
                             // cloud), alone or not: the gas is a wall to the liquids, and the
                             // water would lie on the cloud (see `World::step_water`).
-                            Kind::Liquid if self.cells[i].m == Mat::Water && y + 1 < H && matches!(self.cells[i + W].m.kind(), Kind::Empty | Kind::Gas) && (self.lone_liquid(x as i32, y as i32) || self.rain_over_gas(x as i32, y as i32)) => AIR,
+                            Kind::Liquid if self.cells[i].m == Mat::Water && y + 1 < H() && matches!(self.cells[i + W()].m.kind(), Kind::Empty | Kind::Gas) && (self.lone_liquid(x as i32, y as i32) || self.rain_over_gas(x as i32, y as i32)) => AIR,
                             Kind::Liquid if self.liquid_fill(i) >= field::FULL / HOLDS => FULLISH,
                             Kind::Liquid => WET,
                             _ => SOLID,
@@ -858,15 +865,15 @@ impl World {
             })
             .collect();
         // The rows around them too, a cell wider on each side.
-        for y in 0..=H {
+        for y in 0..=H() {
             let mut span: Option<(usize, usize)> = None;
-            for yy in y.saturating_sub(1)..=(y + 1).min(H - 1) {
+            for yy in y.saturating_sub(1)..=(y + 1).min(H() - 1) {
                 let (f, l) = ends[yy];
                 if f <= l {
                     span = Some(span.map_or((f, l), |(a, b)| (a.min(f), b.max(l))));
                 }
             }
-            liq.rows[y] = if y < H { span.map(|(a, b)| (a.saturating_sub(1), (b + 1).min(W - 1))) } else { None };
+            liq.rows[y] = if y < H() { span.map(|(a, b)| (a.saturating_sub(1), (b + 1).min(W() - 1))) } else { None };
         }
     }
 
@@ -876,8 +883,8 @@ impl World {
     /// velocities out, so that waves die and splashes never rise.
     fn forces(&self, liq: &mut Liquids, dt: f32) {
         let class = &liq.class;
-        let kind = |x: i32, y: i32| if x < 0 || y < 0 || x >= W as i32 || y >= H as i32 { SOLID } else { class[y as usize * W + x as usize] & 3 };
-        let runs = |x: i32, y: i32| (0..W as i32).contains(&x) && (0..H as i32).contains(&y) && class[y as usize * W + x as usize] & 4 != 0;
+        let kind = |x: i32, y: i32| if x < 0 || y < 0 || x >= W() as i32 || y >= H() as i32 { SOLID } else { class[y as usize * W() + x as usize] & 3 };
+        let runs = |x: i32, y: i32| (0..W() as i32).contains(&x) && (0..H() as i32).contains(&y) && class[y as usize * W() + x as usize] & 4 != 0;
         let wet = |c: u8| c >= WET;
         let step = dt / CELL_M;
         let rows = &liq.rows;
@@ -913,7 +920,7 @@ impl World {
         // rows beside, up to two cells off (a cell of carrying, and the node after).
         let wide = |y: usize, w: usize| -> Option<(usize, usize)> {
             let mut span: Option<(usize, usize)> = None;
-            for yy in y.saturating_sub(1)..=(y + 1).min(H - 1) {
+            for yy in y.saturating_sub(1)..=(y + 1).min(H() - 1) {
                 if let Some((a, b)) = rows[yy] {
                     span = Some(span.map_or((a, b), |(c, d)| (a.min(c), b.max(d))));
                 }
@@ -922,24 +929,24 @@ impl World {
         };
         // Carried forward (in the index space of each grid: edge (x, y) of `u` sits at x, y + 1/2
         // in cells, its index is (x, y)).
-        liq.u2.par_chunks_mut(W + 1).enumerate().for_each(|(y, row)| {
-            let Some((a, b)) = wide(y, W + 1) else { return };
+        liq.u2.par_chunks_mut(W() + 1).enumerate().for_each(|(y, row)| {
+            let Some((a, b)) = wide(y, W() + 1) else { return };
             row[a..=b].copy_from_slice(&u[ui(a, y)..=ui(b, y)]);
             let Some((x0, x1)) = rows[y] else { return };
-            for x in x0..=(x1 + 1).min(W) {
+            for x in x0..=(x1 + 1).min(W()) {
                 row[x] = match u_vel(x, y) {
-                    Ok((vx, vy)) => sample(u, W + 1, H, x as f32 - vx * step, y as f32 - vy * step),
+                    Ok((vx, vy)) => sample(u, W() + 1, H(), x as f32 - vx * step, y as f32 - vy * step),
                     Err(keep) => keep,
                 };
             }
         });
-        liq.v2.par_chunks_mut(W).enumerate().for_each(|(y, row)| {
-            let Some((a, b)) = wide(y, W) else { return };
+        liq.v2.par_chunks_mut(W()).enumerate().for_each(|(y, row)| {
+            let Some((a, b)) = wide(y, W()) else { return };
             row[a..=b].copy_from_slice(&v[vi(a, y)..=vi(b, y)]);
             let Some((x0, x1)) = rows[y] else { return };
             for x in x0..=x1 {
                 row[x] = match v_vel(x, y) {
-                    Ok((vx, vy)) => sample(v, W, H + 1, x as f32 - vx * step, y as f32 - vy * step),
+                    Ok((vx, vy)) => sample(v, W(), H() + 1, x as f32 - vx * step, y as f32 - vy * step),
                     Err(keep) => keep,
                 };
             }
@@ -949,14 +956,14 @@ impl World {
         // The free surface is calmed (implicit, before gravity: a surface at rest stays so).
         let calm = 1.0 / (1.0 + CALM * dt);
         let (skim, sky) = (self.flow.skim_table(), self.flow.sky_table());
-        liq.u3.par_chunks_mut(W + 1).enumerate().for_each(|(y, row)| {
+        liq.u3.par_chunks_mut(W() + 1).enumerate().for_each(|(y, row)| {
             let Some((x0, x1)) = rows[y] else { return };
-            row[x0..=(x1 + 1).min(W)].copy_from_slice(&uf[ui(x0, y)..=ui((x1 + 1).min(W), y)]);
-            for x in x0..=(x1 + 1).min(W) {
+            row[x0..=(x1 + 1).min(W())].copy_from_slice(&uf[ui(x0, y)..=ui((x1 + 1).min(W()), y)]);
+            for x in x0..=(x1 + 1).min(W()) {
                 let Ok((vx, vy)) = u_vel(x, y) else { continue };
                 let (px, py) = (x as f32 - vx * step, y as f32 - vy * step);
-                let back = sample(uf, W + 1, H, x as f32 + vx * step, y as f32 + vy * step);
-                let (lo, hi) = around(u, W + 1, H, px, py);
+                let back = sample(uf, W() + 1, H(), x as f32 + vx * step, y as f32 + vy * step);
+                let (lo, hi) = around(u, W() + 1, H(), px, py);
                 let to = (uf[ui(x, y)] + 0.5 * (u[ui(x, y)] - back)).clamp(lo, hi);
                 // Away from any full cell, liquid in the air is slowed by it (drops and spray, at
                 // most as fast as falling rain).
@@ -965,23 +972,23 @@ impl World {
                 // The wind over a free surface drags it along.
                 let open = |c: u8| c == AIR || c == WET;
                 let to = if a == AIR || b == AIR || open(kind(x as i32 - 1, y as i32 - 1)) || open(kind(x as i32, y as i32 - 1)) {
-                    let i = if wet(b) { y * W + x } else { y * W + x - 1 };
+                    let i = if wet(b) { y * W() + x } else { y * W() + x - 1 };
                     let rho = density(self.cells[i].m) * 1000.0;
-                    to + dt * wind_push(flow::skim_at(skim, sky, x.min(W - 1), y), to, rho)
+                    to + dt * wind_push(flow::skim_at(skim, sky, x.min(W() - 1), y), to, rho)
                 } else {
                     to
                 };
                 row[x] = if a != FULLISH && b != FULLISH { to.clamp(-SPRAY, SPRAY) } else { to };
             }
         });
-        liq.v3.par_chunks_mut(W).enumerate().for_each(|(y, row)| {
+        liq.v3.par_chunks_mut(W()).enumerate().for_each(|(y, row)| {
             let Some((x0, x1)) = rows[y] else { return };
             row[x0..=x1].copy_from_slice(&vf[vi(x0, y)..=vi(x1, y)]);
             for x in x0..=x1 {
                 let Ok((vx, vy)) = v_vel(x, y) else { continue };
                 let (px, py) = (x as f32 - vx * step, y as f32 - vy * step);
-                let back = sample(vf, W, H + 1, x as f32 + vx * step, y as f32 + vy * step);
-                let (lo, hi) = around(v, W, H + 1, px, py);
+                let back = sample(vf, W(), H() + 1, x as f32 + vx * step, y as f32 + vy * step);
+                let (lo, hi) = around(v, W(), H() + 1, px, py);
                 let (xi, yi) = (x as i32, y as i32);
                 let (a, b) = (kind(xi, yi - 1), kind(xi, yi));
                 let was = (vf[vi(x, y)] + 0.5 * (v[vi(x, y)] - back)).clamp(lo, hi);
@@ -1001,9 +1008,9 @@ impl World {
         });
         // Back into the grids, in the spans (the rest did not move).
         let (u3, v3) = (&liq.u3, &liq.v3);
-        liq.u.par_chunks_mut(W + 1).zip(liq.v.par_chunks_mut(W)).enumerate().for_each(|(y, (u, v))| {
+        liq.u.par_chunks_mut(W() + 1).zip(liq.v.par_chunks_mut(W())).enumerate().for_each(|(y, (u, v))| {
             let Some((x0, x1)) = rows[y] else { return };
-            let x2 = (x1 + 1).min(W);
+            let x2 = (x1 + 1).min(W());
             u[x0..=x2].copy_from_slice(&u3[ui(x0, y)..=ui(x2, y)]);
             v[x0..=x1].copy_from_slice(&v3[vi(x0, y)..=vi(x1, y)]);
         });
@@ -1019,13 +1026,13 @@ impl World {
         let (u, v, class, rows) = (&liq.u, &liq.v, &liq.class, &liq.rows);
         liq.thick = liq
             .nu
-            .par_chunks_mut(W)
+            .par_chunks_mut(W())
             .enumerate()
             .map(|(y, row)| {
                 let Some((x0, x1)) = rows[y] else { return false };
                 let mut any = false;
                 for x in x0..=x1 {
-                    let i = y * W + x;
+                    let i = y * W() + x;
                     if class[i] & 3 < WET || class[i] & 4 == 0 {
                         continue;
                     }
@@ -1039,8 +1046,8 @@ impl World {
                         let vy = (v[vi(x, y + 1)] - v[vi(x, y)]) / CELL_M;
                         let uc = |y: usize| 0.5 * (u[ui(x, y)] + u[ui(x + 1, y)]);
                         let vc = |x: usize| 0.5 * (v[vi(x, y)] + v[vi(x, y + 1)]);
-                        let uy = (uc((y + 1).min(H - 1)) - uc(y.saturating_sub(1))) / (2.0 * CELL_M);
-                        let vx = (vc((x + 1).min(W - 1)) - vc(x.saturating_sub(1))) / (2.0 * CELL_M);
+                        let uy = (uc((y + 1).min(H() - 1)) - uc(y.saturating_sub(1))) / (2.0 * CELL_M);
+                        let vx = (vc((x + 1).min(W() - 1)) - vc(x.saturating_sub(1))) / (2.0 * CELL_M);
                         let rate = (2.0 * (ux * ux + vy * vy) + (uy + vx) * (uy + vx)).sqrt();
                         n += tau / (rho * (rate + 1e-3));
                     }
@@ -1055,16 +1062,16 @@ impl World {
         }
         let c = dt / (CELL_M * CELL_M);
         let nu = &liq.nu;
-        let cell_nu = |x: i32, y: i32| if x < 0 || y < 0 || x >= W as i32 || y >= H as i32 { 0.0 } else { nu[y as usize * W + x as usize] };
+        let cell_nu = |x: i32, y: i32| if x < 0 || y < 0 || x >= W() as i32 || y >= H() as i32 { 0.0 } else { nu[y as usize * W() + x as usize] };
         // Rightward edges.
         liq.u2.copy_from_slice(&liq.u);
         let before = std::mem::take(&mut liq.u2);
         for sweep in 0..2 * VISCOUS_SWEEPS {
             let colour = sweep % 2;
             let us = Shared::new(&mut liq.u);
-            (0..H).into_par_iter().for_each(|y| {
+            (0..H()).into_par_iter().for_each(|y| {
                 let Some((x0, x1)) = rows[y] else { return };
-                for x in x0.max(1)..=x1.min(W - 1) {
+                for x in x0.max(1)..=x1.min(W() - 1) {
                     if (x + y) % 2 != colour {
                         continue;
                     }
@@ -1076,7 +1083,7 @@ impl World {
                     let at = |x: usize, y: usize| unsafe { *us.at(ui(x, y)) };
                     let (mut sum, mut diag) = (0.0, 1.0);
                     for (nx, ny, nn) in [(x - 1, y, cell_nu(x as i32 - 1, y as i32)), (x + 1, y, cell_nu(x as i32, y as i32))] {
-                        if nx == 0 || nx >= W {
+                        if nx == 0 || nx >= W() {
                             diag += c * nn;
                         } else {
                             sum += c * nn * at(nx, ny);
@@ -1086,7 +1093,7 @@ impl World {
                     for dy in [-1i32, 1] {
                         let ny = y as i32 + dy;
                         let nn = 0.25 * (cell_nu(x as i32 - 1, y as i32) + cell_nu(x as i32, y as i32) + cell_nu(x as i32 - 1, ny) + cell_nu(x as i32, ny));
-                        let wall = ny < 0 || ny >= H as i32 || class[ny as usize * W + x - 1] & 3 == SOLID || class[ny as usize * W + x] & 3 == SOLID;
+                        let wall = ny < 0 || ny >= H() as i32 || class[ny as usize * W() + x - 1] & 3 == SOLID || class[ny as usize * W() + x] & 3 == SOLID;
                         if wall {
                             diag += c * n;
                         } else if nn > 0.0 {
@@ -1105,7 +1112,7 @@ impl World {
         for sweep in 0..2 * VISCOUS_SWEEPS {
             let colour = sweep % 2;
             let vs = Shared::new(&mut liq.v);
-            (1..H).into_par_iter().for_each(|y| {
+            (1..H()).into_par_iter().for_each(|y| {
                 let Some((x0, x1)) = rows[y] else { return };
                 for x in x0..=x1 {
                     if (x + y) % 2 != colour {
@@ -1119,7 +1126,7 @@ impl World {
                     let at = |x: usize, y: usize| unsafe { *vs.at(vi(x, y)) };
                     let (mut sum, mut diag) = (0.0, 1.0);
                     for (ny, nn) in [(y - 1, cell_nu(x as i32, y as i32 - 1)), (y + 1, cell_nu(x as i32, y as i32))] {
-                        if ny == 0 || ny >= H {
+                        if ny == 0 || ny >= H() {
                             diag += c * nn;
                         } else {
                             sum += c * nn * at(x, ny);
@@ -1129,7 +1136,7 @@ impl World {
                     for dx in [-1i32, 1] {
                         let nx = x as i32 + dx;
                         let nn = 0.25 * (cell_nu(x as i32, y as i32 - 1) + cell_nu(x as i32, y as i32) + cell_nu(nx, y as i32 - 1) + cell_nu(nx, y as i32));
-                        let wall = nx < 0 || nx >= W as i32 || class[(y - 1) * W + nx as usize] & 3 == SOLID || class[y * W + nx as usize] & 3 == SOLID;
+                        let wall = nx < 0 || nx >= W() as i32 || class[(y - 1) * W() + nx as usize] & 3 == SOLID || class[y * W() + nx as usize] & 3 == SOLID;
                         if wall {
                             diag += c * n;
                         } else if nn > 0.0 {
@@ -1176,10 +1183,10 @@ impl World {
         let k = CELL_M / dt;
         let (u, v) = (&liq.u, &liq.v);
         let mut rhs_buf = std::mem::take(&mut liq.rhs);
-        rhs_buf.par_chunks_mut(W).enumerate().for_each(|(y, row)| {
+        rhs_buf.par_chunks_mut(W()).enumerate().for_each(|(y, row)| {
             let Some((x0, x1)) = rows[y] else { return };
             for x in x0..=x1 {
-                let i = y * W + x;
+                let i = y * W() + x;
                 if class[i] != FULLISH | 4 {
                     row[x] = 0.0;
                     continue;
@@ -1193,7 +1200,7 @@ impl World {
                 // and gives up through its film), and the froth grows without end.
                 let inside = [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)]
                     .iter()
-                    .all(|&(nx, ny)| nx >= W || ny >= H || matches!(class[ny * W + nx] & 3, SOLID | FULLISH));
+                    .all(|&(nx, ny)| nx >= W() || ny >= H() || matches!(class[ny * W() + nx] & 3, SOLID | FULLISH));
                 let fix = if inside { REFILL * (self.liquid_fill(i) as f32 / field::FULL as f32 - 1.0).clamp(-1.0, 1.0) } else { 0.0 };
                 row[x] = (u[ui(x + 1, y)] - u[ui(x, y)] + v[vi(x, y + 1)] - v[vi(x, y)]) * k - fix * CELL_M / dt * k;
             }
@@ -1212,9 +1219,9 @@ impl World {
         let rhs = &rhs_buf;
         let p_old = &liq.p;
         let solver = &mut liq.solver;
-        solver.ready(W, H);
+        solver.ready(W(), H());
         let f = solver.fine();
-        f.rows[..H].copy_from_slice(&rows[..H]);
+        f.rows[..H()].copy_from_slice(&rows[..H()]);
         // The conductance of the edge between cells a and b (of kinds ka, kb), 0 unless one of
         // them is an unknown.
         let cond = |a: usize, b: usize, ka: u8, kb: u8| -> f32 {
@@ -1228,10 +1235,10 @@ impl World {
         };
         // The kind of each cell, and the edges along the row (one pass: an edge reads the kinds
         // of its row alone; the cell before the span is nothing, from the last `clear`).
-        f.kind.par_chunks_mut(W).zip(f.ax.par_chunks_mut(W + 1)).enumerate().for_each(|(y, (krow, row))| {
+        f.kind.par_chunks_mut(W()).zip(f.ax.par_chunks_mut(W() + 1)).enumerate().for_each(|(y, (krow, row))| {
             let Some((x0, x1)) = rows[y] else { return };
             for x in x0..=x1 {
-                let c = class[y * W + x];
+                let c = class[y * W() + x];
                 krow[x] = if c == FULLISH | 4 {
                     mgpcg::FLUID
                 } else if c & 3 == SOLID {
@@ -1240,20 +1247,20 @@ impl World {
                     mgpcg::FIXED
                 };
             }
-            for x in x0.max(1)..=(x1 + 1).min(W - 1) {
-                row[x] = cond(y * W + x - 1, y * W + x, krow[x - 1], krow[x]);
+            for x in x0.max(1)..=(x1 + 1).min(W() - 1) {
+                row[x] = cond(y * W() + x - 1, y * W() + x, krow[x - 1], krow[x]);
             }
             if x0 == 0 {
                 row[0] = 0.0;
             }
-            if x1 + 1 == W {
-                row[W] = 0.0;
+            if x1 + 1 == W() {
+                row[W()] = 0.0;
             }
         });
         let kind = &f.kind;
-        f.ay.par_chunks_mut(W).enumerate().for_each(|(y, row)| {
-            if y == 0 || y == H {
-                if let Some((x0, x1)) = rows[y.min(H - 1)] {
+        f.ay.par_chunks_mut(W()).enumerate().for_each(|(y, row)| {
+            if y == 0 || y == H() {
+                if let Some((x0, x1)) = rows[y.min(H() - 1)] {
                     row[x0..=x1].fill(0.0);
                 }
                 return;
@@ -1264,7 +1271,7 @@ impl World {
             };
             let Some((x0, x1)) = span else { return };
             for x in x0..=x1 {
-                let (a, b) = ((y - 1) * W + x, y * W + x);
+                let (a, b) = ((y - 1) * W() + x, y * W() + x);
                 row[x] = cond(a, b, kind[a], kind[b]);
             }
         });
@@ -1279,18 +1286,18 @@ impl World {
         let kind = |c: usize| unsafe { kinds.get(c) };
         let (diag, b, x) = (&mut f.diag, &mut f.b, &mut f.x);
         // (How many unknowns there are decides whether the card takes the system.)
-        let unknowns: usize = diag.par_chunks_mut(W).zip(b.par_chunks_mut(W)).zip(x.par_chunks_mut(W)).enumerate().map(|(y, ((diag, b), x))| {
+        let unknowns: usize = diag.par_chunks_mut(W()).zip(b.par_chunks_mut(W())).zip(x.par_chunks_mut(W())).enumerate().map(|(y, ((diag, b), x))| {
             let Some((x0, x1)) = rows[y] else { return 0 };
             let mut n = 0;
             for i in x0..=x1 {
-                let c = y * W + i;
+                let c = y * W() + i;
                 if kind(c) != mgpcg::FLUID {
                     diag[i] = 0.0;
                     b[i] = 0.0;
                     x[i] = 0.0;
                     continue;
                 }
-                let edges = [(ax[y * (W + 1) + i], c.wrapping_sub(1), i > 0), (ax[y * (W + 1) + i + 1], c + 1, i + 1 < W), (ay[c], c.wrapping_sub(W), y > 0), (ay[c + W], c + W, y + 1 < H)];
+                let edges = [(ax[y * (W() + 1) + i], c.wrapping_sub(1), i > 0), (ax[y * (W() + 1) + i + 1], c + 1, i + 1 < W()), (ay[c], c.wrapping_sub(W()), y > 0), (ay[c + W()], c + W(), y + 1 < H())];
                 let (mut d, mut rhs_i) = (0.0, -rhs[c]);
                 for &(a, j, inside) in &edges {
                     if a == 0.0 || !inside {
@@ -1300,7 +1307,7 @@ impl World {
                     if kind(j) == mgpcg::FIXED {
                         // The fixed pressure beside: the gas over the liquid (or over its film),
                         // or the liquid that sleeps.
-                        let pj = if class[j] & 3 == FULLISH { p_old[j] } else { self.gas_pa_over((j % W) as i32, (j / W) as i32) };
+                        let pj = if class[j] & 3 == FULLISH { p_old[j] } else { self.gas_pa_over((j % W()) as i32, (j / W()) as i32) };
                         rhs_i += a * pj;
                     }
                 }
@@ -1321,7 +1328,7 @@ impl World {
             }
             n
         }).sum();
-        let gpu = if unknowns >= mgpcg_gpu::threshold() { liq.gpu.get_or_insert_with(|| mgpcg_gpu::PressureGpu::new(W, H)).as_mut() } else { None };
+        let gpu = if unknowns >= mgpcg_gpu::threshold() { liq.gpu.get_or_insert_with(|| mgpcg_gpu::PressureGpu::new(W(), H())).as_mut() } else { None };
         let iterations = if let Some(gpu) = gpu {
             gpu.solve(solver.fine(), SETTLED, RELATIVE, MAX_ITER)
         } else {
@@ -1332,11 +1339,11 @@ impl World {
         {
             let f = solver.fine();
             let (x, kind) = (&f.x, &f.kind);
-            liq.p.par_chunks_mut(W).enumerate().for_each(|(y, row)| {
+            liq.p.par_chunks_mut(W()).enumerate().for_each(|(y, row)| {
                 let Some((x0, x1)) = rows[y] else { return };
                 for i in x0..=x1 {
-                    if kind[y * W + i] == mgpcg::FLUID {
-                        row[i] = x[y * W + i];
+                    if kind[y * W() + i] == mgpcg::FLUID {
+                        row[i] = x[y * W() + i];
                     }
                 }
             });
@@ -1346,16 +1353,16 @@ impl World {
         {
             let f = solver.fine();
             let (x, kind) = (&f.x, &f.kind);
-            liq.p.par_chunks_mut(W).enumerate().for_each(|(y, row)| {
+            liq.p.par_chunks_mut(W()).enumerate().for_each(|(y, row)| {
                 let Some((x0, x1)) = rows[y] else { return };
                 for i in x0..=x1 {
-                    let j = y * W + i;
+                    let j = y * W() + i;
                     if class[j] != FULLISH {
                         continue;
                     }
                     let weight = rho(j) * G * CELL_M;
                     let (mut sum, mut n) = (0.0, 0);
-                    for (c, dp, inside) in [(j.wrapping_sub(1), 0.0, i > 0), (j + 1, 0.0, i + 1 < W), (j.wrapping_sub(W), weight, y > 0), (j + W, -weight, y + 1 < H)] {
+                    for (c, dp, inside) in [(j.wrapping_sub(1), 0.0, i > 0), (j + 1, 0.0, i + 1 < W()), (j.wrapping_sub(W()), weight, y > 0), (j + W(), -weight, y + 1 < H())] {
                         if inside && kind[c] == mgpcg::FLUID {
                             sum += x[c] + dp;
                             n += 1;
@@ -1373,15 +1380,15 @@ impl World {
         // The push of the pressure, on every edge beside a full cell that runs.
         let p = &liq.p;
         let pa = |x: i32, y: i32| {
-            let j = y as usize * W + x as usize;
+            let j = y as usize * W() + x as usize;
             if class[j] & 3 == FULLISH { p[j] } else { self.gas_pa_over(x, y) }
         };
         let s = dt / CELL_M;
         let (skim, sky) = (self.flow.skim_table(), self.flow.sky_table());
-        liq.u.par_chunks_mut(W + 1).enumerate().for_each(|(y, row)| {
+        liq.u.par_chunks_mut(W() + 1).enumerate().for_each(|(y, row)| {
             let Some((x0, x1)) = rows[y] else { return };
-            for x in x0.max(1)..=(x1 + 1).min(W - 1) {
-                let (a, b) = (y * W + x - 1, y * W + x);
+            for x in x0.max(1)..=(x1 + 1).min(W() - 1) {
+                let (a, b) = (y * W() + x - 1, y * W() + x);
                 let (ca, cb) = (class[a], class[b]);
                 if ca & 3 == SOLID || cb & 3 == SOLID || !(ca == FULLISH | 4 || cb == FULLISH | 4) {
                     continue;
@@ -1389,19 +1396,19 @@ impl World {
                 let r = if ca & 3 >= WET && cb & 3 >= WET { 0.5 * (rho(a) + rho(b)) } else if ca & 3 >= WET { rho(a) } else { rho(b) };
                 row[x] -= s / r * (pa(x as i32, y as i32) - pa(x as i32 - 1, y as i32));
                 // (The surface the wind stirs is pushed a little at a time: it is let move.)
-                let stirred = y > 0 && (class[a - W] & 3 == AIR || class[b - W] & 3 == AIR) && flow::skim_at(skim, sky, x, y).abs() > flow::STIR;
+                let stirred = y > 0 && (class[a - W()] & 3 == AIR || class[b - W()] & 3 == AIR) && flow::skim_at(skim, sky, x, y).abs() > flow::STIR;
                 if ca & 3 == FULLISH && cb & 3 == FULLISH && row[x].abs() < REST && !stirred {
                     row[x] = 0.0;
                 }
             }
         });
-        liq.v.par_chunks_mut(W).enumerate().for_each(|(y, row)| {
-            if y == 0 || y == H {
+        liq.v.par_chunks_mut(W()).enumerate().for_each(|(y, row)| {
+            if y == 0 || y == H() {
                 return;
             }
             let Some((x0, x1)) = rows[y] else { return };
             for x in x0..=x1 {
-                let (a, b) = ((y - 1) * W + x, y * W + x);
+                let (a, b) = ((y - 1) * W() + x, y * W() + x);
                 let (ca, cb) = (class[a], class[b]);
                 if ca & 3 == SOLID || cb & 3 == SOLID || !(ca == FULLISH | 4 || cb == FULLISH | 4) {
                     continue;
@@ -1452,28 +1459,28 @@ impl World {
         let (mut fu, mut fv) = (std::mem::take(&mut liq.fu), std::mem::take(&mut liq.fv));
         // The edges of a row of cells: those along it (`fu`, W + 1) and those over it (`fv`, W);
         // the edges under the last row are never written. One pass does both.
-        let x_range = |x0: usize, x1: usize| x0.max(1)..=(x1 + 1).min(W - 1);
-        fu.par_chunks_mut(W + 1).zip(fv.par_chunks_mut(W)).enumerate().for_each(|(y, (urow, vrow))| {
+        let x_range = |x0: usize, x1: usize| x0.max(1)..=(x1 + 1).min(W() - 1);
+        fu.par_chunks_mut(W() + 1).zip(fv.par_chunks_mut(W())).enumerate().for_each(|(y, (urow, vrow))| {
             let Some((x0, x1)) = rows[y] else { return };
             for x in x_range(x0, x1) {
-                urow[x] = flow(liq.u[ui(x, y)], y * W + x - 1, y * W + x);
+                urow[x] = flow(liq.u[ui(x, y)], y * W() + x - 1, y * W() + x);
             }
             if y > 0 {
                 for x in x0..=x1 {
-                    vrow[x] = flow(liq.v[vi(x, y)], (y - 1) * W + x, y * W + x);
+                    vrow[x] = flow(liq.v[vi(x, y)], (y - 1) * W() + x, y * W() + x);
                 }
             }
         });
         // An empty cell takes only one liquid: the one that gives it most.
         let mut want = std::mem::take(&mut liq.want);
-        want.par_chunks_mut(W).enumerate().for_each(|(y, row)| {
+        want.par_chunks_mut(W()).enumerate().for_each(|(y, row)| {
             let Some((x0, x1)) = rows[y] else { return };
             for x in x0..=x1 {
-                let i = y * W + x;
+                let i = y * W() + x;
                 if self.cells[i].m.kind() != Kind::Empty || class[i] & 3 == SOLID {
                     continue;
                 }
-                let ins = [(fu[ui(x, y)], x > 0, i.wrapping_sub(1)), (-fu[ui(x + 1, y)], x + 1 < W, i + 1), (fv[vi(x, y)], y > 0, i.wrapping_sub(W)), (-fv[vi(x, y + 1)], y + 1 < H, i + W)];
+                let ins = [(fu[ui(x, y)], x > 0, i.wrapping_sub(1)), (-fu[ui(x + 1, y)], x + 1 < W(), i + 1), (fv[vi(x, y)], y > 0, i.wrapping_sub(W())), (-fv[vi(x, y + 1)], y + 1 < H(), i + W())];
                 if let Some(&(_, _, j)) = ins.iter().filter(|&&(q, inside, _)| inside && q > 0).max_by_key(|&&(q, _, _)| q) {
                     row[x] = m(j);
                 }
@@ -1492,17 +1499,17 @@ impl World {
         };
         // No cell gives more than it holds: its outflows are cut down to that.
         let mut scale = std::mem::take(&mut liq.scale);
-        scale.par_chunks_mut(W).enumerate().for_each(|(y, row)| {
+        scale.par_chunks_mut(W()).enumerate().for_each(|(y, row)| {
             let Some((x0, x1)) = rows[y] else { return };
             for x in x0..=x1 {
-                let i = y * W + x;
+                let i = y * W() + x;
                 if class[i] & 3 < WET {
                     continue;
                 }
                 let out = kept(fu[ui(x + 1, y)], i, i + 1).max(0)
                     + (-kept(fu[ui(x, y)], i.wrapping_sub(1), i)).max(0)
-                    + kept(fv[vi(x, y + 1)], i, i + W).max(0)
-                    + (-kept(fv[vi(x, y)], i.wrapping_sub(W), i)).max(0);
+                    + kept(fv[vi(x, y + 1)], i, i + W()).max(0)
+                    + (-kept(fv[vi(x, y)], i.wrapping_sub(W()), i)).max(0);
                 let have = self.liquid_fill(i) as i64;
                 if out > have {
                     row[x] = have as f64 / out as f64;
@@ -1516,27 +1523,27 @@ impl World {
             let from = if q > 0 { a } else { b };
             (q as f64 * scale_ref[from]) as i64
         };
-        fu.par_chunks_mut(W + 1).zip(fv.par_chunks_mut(W)).enumerate().for_each(|(y, (urow, vrow))| {
+        fu.par_chunks_mut(W() + 1).zip(fv.par_chunks_mut(W())).enumerate().for_each(|(y, (urow, vrow))| {
             let Some((x0, x1)) = rows[y] else { return };
             for x in x_range(x0, x1) {
-                urow[x] = settle(urow[x], y * W + x - 1, y * W + x);
+                urow[x] = settle(urow[x], y * W() + x - 1, y * W() + x);
             }
             if y > 0 {
                 for x in x0..=x1 {
-                    vrow[x] = settle(vrow[x], (y - 1) * W + x, y * W + x);
+                    vrow[x] = settle(vrow[x], (y - 1) * W() + x, y * W() + x);
                 }
             }
         });
         // Each cell takes what flows in and gives what flows out, with the heat it carries.
         let world: &World = self;
-        let changes: Vec<(usize, i64, f32, Option<Mat>)> = (0..H)
+        let changes: Vec<(usize, i64, f32, Option<Mat>)> = (0..H())
             .into_par_iter()
             .flat_map_iter(|y| {
                 let (x0, x1) = rows[y].unwrap_or((1, 0));
                 let (fu, fv) = (&fu, &fv);
                 (x0..=x1).filter_map(move |x| {
-                    let i = y * W + x;
-                    let edges = [(fu[ui(x, y)], i.wrapping_sub(1)), (-fu[ui(x + 1, y)], i + 1), (fv[vi(x, y)], i.wrapping_sub(W)), (-fv[vi(x, y + 1)], i + W)];
+                    let i = y * W() + x;
+                    let edges = [(fu[ui(x, y)], i.wrapping_sub(1)), (-fu[ui(x + 1, y)], i + 1), (fv[vi(x, y)], i.wrapping_sub(W())), (-fv[vi(x, y + 1)], i + W())];
                     if edges.iter().all(|&(q, _)| q == 0) {
                         return None;
                     }
@@ -1559,9 +1566,9 @@ impl World {
             })
             .collect();
         // The scratch back to blank where it was used, for the next sub-step.
-        fu.par_chunks_mut(W + 1).zip(fv.par_chunks_mut(W)).zip(want.par_chunks_mut(W)).zip(scale.par_chunks_mut(W)).enumerate().for_each(|(y, (((urow, vrow), w), sc))| {
+        fu.par_chunks_mut(W() + 1).zip(fv.par_chunks_mut(W())).zip(want.par_chunks_mut(W())).zip(scale.par_chunks_mut(W())).enumerate().for_each(|(y, (((urow, vrow), w), sc))| {
             if let Some((x0, x1)) = rows[y] {
-                urow[x0..=(x1 + 1).min(W)].fill(0);
+                urow[x0..=(x1 + 1).min(W())].fill(0);
                 vrow[x0..=x1].fill(0);
                 w[x0..=x1].fill(Mat::Empty);
                 sc[x0..=x1].fill(1.0);
@@ -1594,14 +1601,14 @@ impl World {
     /// A cell holding more than full pushes the extra up, into air or the same liquid.
     fn overflow(&mut self, liq: &Liquids) {
         let full = field::FULL;
-        for y in (1..H).rev() {
+        for y in (1..H()).rev() {
             let Some((x0, x1)) = liq.span(y) else { continue };
             for x in x0..=x1 {
-                let i = y * W + x;
+                let i = y * W() + x;
                 if self.cells[i].m.kind() != Kind::Liquid || self.fill[i] <= full + CRUMB {
                     continue;
                 }
-                let j = i - W;
+                let j = i - W();
                 let m = self.cells[i].m;
                 let up = match self.cells[j].m {
                     Mat::Empty if self.mask[j] == 0 => 0,
@@ -1628,20 +1635,20 @@ impl World {
         // would leave a crumb behind goes whole (a cell may hold a crumb over full). A crumb
         // (`CRUMB` units or less: so little moves no more, what an edge passes rounding to
         // nothing) joins the liquid under or over it, or goes if there is none.
-        for y in 0..H {
+        for y in 0..H() {
             let Some((x0, x1)) = liq.span(y) else { continue };
             for x in x0..=x1 {
-                let i = y * W + x;
+                let i = y * W() + x;
                 let m = self.cells[i].m;
                 if m.kind() != Kind::Liquid || self.mask[i] != 0 {
                     continue;
                 }
-                let runs = |yy: usize| self.zones.awake[yy / sleep::CS * sleep::CW + x / sleep::CS];
+                let runs = |yy: usize| self.zones.awake[yy / sleep::CS * sleep::CW() + x / sleep::CS];
                 let have = self.liquid_fill(i);
                 let same = |j: usize| self.cells[j].m == m && self.mask[j] == 0;
-                let below = (y + 1 < H && same(i + W)).then_some(i + W);
+                let below = (y + 1 < H() && same(i + W())).then_some(i + W());
                 let to = if have <= CRUMB {
-                    match below.or((y > 0 && same(i - W)).then_some(i - W)) {
+                    match below.or((y > 0 && same(i - W())).then_some(i - W())) {
                         Some(j) => j,
                         None => {
                             self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
@@ -1658,7 +1665,7 @@ impl World {
                 };
                 let there = self.liquid_fill(to);
                 let gap = full.saturating_sub(there);
-                if gap == 0 && have > CRUMB || !(runs(y) || runs(to / W)) {
+                if gap == 0 && have > CRUMB || !(runs(y) || runs(to / W())) {
                     continue;
                 }
                 let moved = if have.min(gap) + CRUMB >= have { have } else { gap };
@@ -1683,7 +1690,7 @@ impl World {
     #[cfg(test)]
     pub(super) fn liquid_units(&self, m: Mat) -> u64 {
         let flying: u64 = self.liq.drops.iter().filter(|d| d.m == m).map(|d| d.q as u64).sum();
-        (0..W * H).filter(|&i| self.cells[i].m == m).map(|i| self.liquid_fill(i) as u64).sum::<u64>() + flying
+        (0..W() * H()).filter(|&i| self.cells[i].m == m).map(|i| self.liquid_fill(i) as u64).sum::<u64>() + flying
     }
 }
 
@@ -1779,9 +1786,9 @@ mod tests {
     fn a_pool_on_a_hillside_runs_through_a_tree() {
         let mut w = world();
         // The ground: a slope down to the left, from (300, 400) to (100, 460), flat beyond.
-        for x in 0..W as i32 {
+        for x in 0..W() as i32 {
             let top = if x >= 300 { 400 } else if x >= 100 { 400 + (300 - x) * 60 / 200 } else { 460 };
-            for y in top..H as i32 {
+            for y in top..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -1860,8 +1867,8 @@ mod tests {
                 let short = cells.iter().filter(|&&f| f < field::FULL).count();
                 let mean = cells.iter().map(|&f| f as f64).sum::<f64>() / cells.len() as f64 / field::FULL as f64;
                 let top = (400..450).find(|&y| (100..340).any(|x| w.raw(x, y) == Mat::Water)).unwrap_or(450);
-                let fastest = if w.liq.u.len() == (W + 1) * H { w.liq.u.iter().chain(w.liq.v.iter()).fold(0.0f32, |a, v| a.max(v.abs())) } else { 0.0 };
-                let awake = (12..15).flat_map(|zy| (3..=10).map(move |zx| (zx, zy))).filter(|&(zx, zy)| w.zones.awake[zy * sleep::CW + zx]).count();
+                let fastest = if w.liq.u.len() == (W() + 1) * H() { w.liq.u.iter().chain(w.liq.v.iter()).fold(0.0f32, |a, v| a.max(v.abs())) } else { 0.0 };
+                let awake = (12..15).flat_map(|zy| (3..=10).map(move |zx| (zx, zy))).filter(|&(zx, zy)| w.zones.awake[zy * sleep::CW() + zx]).count();
                 println!("t {:4.1} s: {} cells, {short} short, mean fill {mean:.3}, top y {top}, fastest {fastest:.2} m/s, {awake} zones run", t as f32 / 60.0, cells.len());
             }
             w.step();
@@ -2045,7 +2052,7 @@ mod tests {
         // (Its surface dries into the air: about a cell of water in these 4 s, a quarter at a time.)
         let after = w.liquid_units(Mat::Water);
         assert!(after <= before && before - after < before / 1_000, "{before} -> {after}");
-        let awake = (0..sleep::CW * sleep::CH).filter(|&z| w.zones.awake[z]).count();
+        let awake = (0..sleep::CW() * sleep::CH()).filter(|&z| w.zones.awake[z]).count();
         // Only the zones along the surface (8), where the water dries into the air, stay awake,
         // and a couple over them where the vapour rises; the cells' own water keeps 11 of them
         // awake.
@@ -2072,7 +2079,7 @@ mod tests {
                 for _ in 0..30 {
                     w.step();
                 }
-                (0..W * H).map(|i| (w.cells[i].m, w.liquid_fill(i))).collect::<Vec<_>>()
+                (0..W() * H()).map(|i| (w.cells[i].m, w.liquid_fill(i))).collect::<Vec<_>>()
             })
         };
         assert!(run(1) == run(4));
@@ -2102,7 +2109,7 @@ mod tests {
     fn dam_wall(m: Mat, thick: i32, wet: bool) -> (u8, bool, Vec<statics::LiquidPush>) {
         let mut w = world();
         w.structures_fall = true;
-        let b = H as i32 - 1;
+        let b = H() as i32 - 1;
         rect(&mut w, 100, b - 4, 400, b, Mat::Stone);
         rect(&mut w, 99, b - 60, 99, b - 5, Mat::Stone);
         rect(&mut w, 200, b - 54, 199 + thick, b - 5, m);
@@ -2155,7 +2162,7 @@ mod tests {
     /// A basin open to the sky, 240 x 15 of water, its walls 15 cells over the water.
     fn basin(m: Mat) -> World {
         let mut w = world();
-        rect(&mut w, 0, 450, W as i32 - 1, H as i32 - 1, Mat::Brick);
+        rect(&mut w, 0, 450, W() as i32 - 1, H() as i32 - 1, Mat::Brick);
         rect(&mut w, 99, 420, 99, 449, Mat::Brick);
         rect(&mut w, 340, 420, 340, 449, Mat::Brick);
         rect(&mut w, 100, 435, 339, 449, m);
@@ -2209,7 +2216,7 @@ mod tests {
                 let h = levels(&w);
                 let mean = h.iter().sum::<f32>() / h.len() as f32;
                 let rms = (h.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / h.len() as f32).sqrt();
-                let surface = if w.liq.u.len() == (W + 1) * H { (100..340).map(|x| w.liq.u[ui(x, (420..450).find(|&y| w.raw(x as i32, y) == Mat::Water).unwrap_or(449) as usize)]).sum::<f32>() / 240.0 } else { 0.0 };
+                let surface = if w.liq.u.len() == (W() + 1) * H() { (100..340).map(|x| w.liq.u[ui(x, (420..450).find(|&y| w.raw(x as i32, y) == Mat::Water).unwrap_or(449) as usize)]).sum::<f32>() / 240.0 } else { 0.0 };
                 let dried = (before - w.liquid_units(Mat::Water)) as f32 / field::FULL as f32;
                 let row: Vec<String> = h.iter().step_by(20).map(|v| format!("{v:4.1}")).collect();
                 println!("t {:4.1} s: rms {rms:.2} cells, surface {surface:.2} m/s, dried {dried:.1} cells | {}", t as f32 / 60.0, row.join(" "));
@@ -2227,9 +2234,9 @@ mod tests {
                 let top_cell = (400..450).find(|&y| (100..340).any(|x| w.raw(x, y) == Mat::Water)).unwrap_or(450);
                 let top_drop = w.liquid_drops().iter().map(|d| d.y).fold(450.0, f32::min);
                 let wet = (400..450).flat_map(|y| (100..340).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water && w.liquid_fill(World::idx(x, y)) < field::FULL / 2).count();
-                let fastest = if w.liq.u.len() == (W + 1) * H { w.liq.u.iter().chain(w.liq.v.iter()).fold(0.0f32, |a, v| a.max(v.abs())) } else { 0.0 };
+                let fastest = if w.liq.u.len() == (W() + 1) * H() { w.liq.u.iter().chain(w.liq.v.iter()).fold(0.0f32, |a, v| a.max(v.abs())) } else { 0.0 };
                 let (mut pool_fast, mut pool_sq, mut n) = (0.0f32, 0.0f64, 0usize);
-                if w.liq.u.len() == (W + 1) * H {
+                if w.liq.u.len() == (W() + 1) * H() {
                     for y in 435..450usize {
                         for x in 100..340usize {
                             let s = w.liq.u[ui(x, y)].abs().max(w.liq.v[vi(x, y)].abs());
@@ -2240,24 +2247,24 @@ mod tests {
                     }
                 }
                 println!("t {:5.2} s: top cell y {top_cell}, top drop y {top_drop:.1}, {} drops, {wet} wet cells, fastest {fastest:.2} m/s, pool fastest {pool_fast:.2} rms {:.3}", t as f32 / 60.0, w.liquid_drops().len(), (pool_sq / n.max(1) as f64).sqrt());
-                if t % 120 == 0 && w.liq.u.len() == (W + 1) * H {
+                if t % 120 == 0 && w.liq.u.len() == (W() + 1) * H() {
                     // Where the fastest edge is, and whether its zone runs.
                     let (mut best, mut at) = (0.0f32, (0usize, 0usize, 'u'));
-                    for y in 0..H {
-                        for x in 0..=W {
+                    for y in 0..H() {
+                        for x in 0..=W() {
                             if w.liq.u[ui(x, y)].abs() > best { best = w.liq.u[ui(x, y)].abs(); at = (x, y, 'u'); }
                         }
                     }
-                    for y in 0..=H {
-                        for x in 0..W {
+                    for y in 0..=H() {
+                        for x in 0..W() {
                             if w.liq.v[vi(x, y)].abs() > best { best = w.liq.v[vi(x, y)].abs(); at = (x, y, 'v'); }
                         }
                     }
                     let (x, y, _) = at;
-                    let awake = w.zones.awake[(y.min(H - 1)) / sleep::CS * sleep::CW + x.min(W - 1) / sleep::CS];
-                    let awake_wet = (400..450).flat_map(|y| (100..340).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water && w.liquid_fill(World::idx(x, y)) < field::FULL / 2 && w.zones.awake[y as usize / sleep::CS * sleep::CW + x as usize / sleep::CS]).count();
+                    let awake = w.zones.awake[(y.min(H() - 1)) / sleep::CS * sleep::CW() + x.min(W() - 1) / sleep::CS];
+                    let awake_wet = (400..450).flat_map(|y| (100..340).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water && w.liquid_fill(World::idx(x, y)) < field::FULL / 2 && w.zones.awake[y as usize / sleep::CS * sleep::CW() + x as usize / sleep::CS]).count();
                     println!("  fastest at {at:?} (zone awake {awake}); wet cells in zones that run: {awake_wet}");
-                    let short = |awake: bool| (400..450).flat_map(|y| (100..340).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water && (field::FULL / 2..field::FULL).contains(&w.liquid_fill(World::idx(x, y))) && w.zones.awake[y as usize / sleep::CS * sleep::CW + x as usize / sleep::CS] == awake).count();
+                    let short = |awake: bool| (400..450).flat_map(|y| (100..340).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water && (field::FULL / 2..field::FULL).contains(&w.liquid_fill(World::idx(x, y))) && w.zones.awake[y as usize / sleep::CS * sleep::CW() + x as usize / sleep::CS] == awake).count();
                     println!("  cells between half and full: {} in zones that run, {} in zones that sleep", short(true), short(false));
                     for y in 425..450 {
                         let fills: Vec<u32> = (100..340).filter(|&x| w.raw(x, y) == Mat::Water).map(|x| w.liquid_fill(World::idx(x, y))).collect();
@@ -2269,7 +2276,7 @@ mod tests {
                         println!("    row {y}: {} cells, {short} short, {half} under half, mean {mean:.3}, fastest {fast:.2}", fills.len());
                     }
                     for zy in 12..=14 {
-                        println!("  zones y {zy}: {}", (3..=10).map(|zx| if w.zones.awake[zy * sleep::CW + zx] { '*' } else { '.' }).collect::<String>());
+                        println!("  zones y {zy}: {}", (3..=10).map(|zx| if w.zones.awake[zy * sleep::CW() + zx] { '*' } else { '.' }).collect::<String>());
                     }
                     // The cells around the highest water cell, with their class, fill and edges.
                     let tx = (100..340).find(|&x| w.raw(x, top_cell) == Mat::Water).unwrap_or(0) as usize;

@@ -14,7 +14,7 @@ use std::time::Instant;
 
 /// The ground of a countryside world, `n` cells below the top of the land at `x`.
 fn ground(w: &World, x: i32) -> i32 {
-    (0..H as i32).find(|&y| w.raw(x, y).is_hard() || matches!(w.raw(x, y), Mat::Dirt | Mat::Grass | Mat::Sand | Mat::Water)).unwrap_or(H as i32)
+    (0..H() as i32).find(|&y| w.raw(x, y).is_hard() || matches!(w.raw(x, y), Mat::Dirt | Mat::Grass | Mat::Sand | Mat::Water)).unwrap_or(H() as i32)
 }
 
 fn countryside() -> World {
@@ -64,12 +64,12 @@ fn storm() -> World {
             w.set(x, y, Mat::Cloud);
         }
     }
-    for qy in 0..QH {
-        for qx in 0..QW {
+    for qy in 0..QH() {
+        for qx in 0..QW() {
             let (x, y) = ((qx * QS) as f32, (qy * QS) as f32);
             if (280.0..680.0).contains(&x) && (70.0..200.0).contains(&y) {
                 let u = ((x - 480.0) / 200.0).powi(2);
-                w.charge[qy * QW + qx] = (if y < 120.0 { 0.8 } else if y > 150.0 { -0.95 } else { 0.0 }) * (1.0 - u);
+                w.charge[qy * QW() + qx] = (if y < 120.0 { 0.8 } else if y > 150.0 { -0.95 } else { 0.0 }) * (1.0 - u);
             }
         }
     }
@@ -79,7 +79,7 @@ fn storm() -> World {
 /// A forest fire: the trees and the grass of the countryside set alight.
 fn fire() -> World {
     let mut w = countryside();
-    for x in (20..W as i32 - 20).step_by(25) {
+    for x in (20..W() as i32 - 20).step_by(25) {
         let g = ground(&w, x);
         w.paint(x, g - 2, 3, Mat::Fire);
     }
@@ -175,7 +175,7 @@ fn bench_fingerprint() {
             h ^= v;
             h = h.wrapping_mul(0x100_0000_01b3);
         };
-        for i in 0..W * H {
+        for i in 0..W() * H() {
             eat(w.cells[i].m as u64);
             eat(w.temp[i].to_bits() as u64);
         }
@@ -205,19 +205,19 @@ fn the_cells_turn_on_every_core_is_the_same_on_one_core() {
 /// the water (its amount, and the height of its centre), the mean temperature, what burns.
 fn summary(w: &World) -> (f64, f64, f64, usize) {
     let (mut water, mut wy, mut temp, mut burning) = (0f64, 0f64, 0f64, 0usize);
-    for i in 0..W * H {
+    for i in 0..W() * H() {
         let m = w.cells[i].m;
         if m == Mat::Water {
             let f = w.liquid_fill(i) as f64;
             water += f;
-            wy += f * (i / W) as f64;
+            wy += f * (i / W()) as f64;
         }
         if matches!(m, Mat::Fire | Mat::Ember) {
             burning += 1;
         }
         temp += w.temp[i] as f64;
     }
-    (water, wy / water.max(1.0), temp / (W * H) as f64, burning)
+    (water, wy / water.max(1.0), temp / (W() * H()) as f64, burning)
 }
 
 /// The same seconds of a scene at steps of 1/120, 1/60, 1/30 and 1/20 s:
@@ -286,11 +286,11 @@ fn falls_probe() {
     // The centre of the matter (weighted by its fill for a liquid), and its lowest cell.
     let lowest = |w: &World, m: Mat| {
         let (mut s, mut n, mut low) = (0f64, 0f64, 0);
-        for i in (0..W * H).filter(|&i| w.cells[i].m == m) {
+        for i in (0..W() * H()).filter(|&i| w.cells[i].m == m) {
             let f = if m.kind() == Kind::Liquid { w.liquid_fill(i) as f64 } else { 1.0 };
-            s += f * (i / W) as f64;
+            s += f * (i / W()) as f64;
             n += f;
-            low = low.max(i / W);
+            low = low.max(i / W());
         }
         format!("{:.1} (bas {low})", s / n.max(1.0))
     };
@@ -332,7 +332,7 @@ fn a_block_of_sand_falls_by_gravity_at_any_step() {
         for _ in 0..(1.0 / dt).round() as u32 {
             w.step_dt(dt);
         }
-        let ys: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Sand).map(|i| i / W).collect();
+        let ys: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Sand).map(|i| i / W()).collect();
         let (low, high) = (*ys.iter().max().unwrap(), *ys.iter().min().unwrap());
         assert!((24..=31).contains(&(low - 49)), "steps of 1/{:.0} s: the bottom fell {} cells in a second", 1.0 / dt, low - 49);
         assert!(low - high <= 12, "steps of 1/{:.0} s: the block spread over {} rows", 1.0 / dt, low - high + 1);

@@ -458,7 +458,7 @@ impl World {
         if m.is_wooden() && !self.chance(3) {
             return;
         }
-        let (x, y) = ((i % W) as i32, (i / W) as i32);
+        let (x, y) = ((i % W()) as i32, (i / W()) as i32);
         if p >= CRUSH * sigma {
             self.set(x, y, into);
             return;
@@ -701,7 +701,7 @@ impl World {
         // A fixed order, so that the same blast always gives the same crater.
         cells.sort_unstable_by_key(|c| c.0);
         for (i, f) in cells {
-            let (x, y) = ((i % W) as i32, (i / W) as i32);
+            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
             let m = self.cells[i].m;
             if passable(m) {
                 continue;
@@ -738,7 +738,7 @@ impl World {
         fire.sort_unstable();
         fire.dedup();
         for i in fire {
-            let (x, y) = ((i % W) as i32, (i / W) as i32);
+            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
             let m = self.cells[i].m;
             if self.mask[i] != 0 || !(passable(m) || m.kind() == Kind::Liquid) {
                 continue;
@@ -767,7 +767,7 @@ impl World {
             for _ in 0..steps {
                 let (nx, ny) = (p.x + p.vx / steps as f32, p.y + p.vy / steps as f32);
                 let (ix, iy) = (nx.floor() as i32, ny.floor() as i32);
-                if ix < 0 || ix >= W as i32 || iy >= H as i32 {
+                if ix < 0 || ix >= W() as i32 || iy >= H() as i32 {
                     return false;
                 }
                 if iy >= 0 && !passable(self.at(ix, iy)) {
@@ -786,7 +786,7 @@ impl World {
 
     /// Lays a landed clod down where it fell, rolling down the slope like sand would.
     fn settle(&mut self, x: i32, mut y: i32, m: Mat) {
-        let mut x = x.clamp(0, W as i32 - 1);
+        let mut x = x.clamp(0, W() as i32 - 1);
         while y >= 0 && !passable(self.at(x, y)) {
             y -= 1;
         }
@@ -794,7 +794,7 @@ impl World {
             return;
         }
         for _ in 0..12 {
-            if passable(self.at(x, y + 1)) && y + 1 < H as i32 {
+            if passable(self.at(x, y + 1)) && y + 1 < H() as i32 {
                 y += 1;
                 continue;
             }
@@ -881,9 +881,9 @@ mod tests {
     /// A meadow over rock: grass on top at y = 300, dirt down to 420, stone below.
     fn ground() -> World {
         let mut w = World::new_static();
-        for x in 0..W as i32 {
+        for x in 0..W() as i32 {
             w.set(x, 300, Mat::Grass);
-            for y in 301..H as i32 {
+            for y in 301..H() as i32 {
                 w.set(x, y, if y < 420 { Mat::Dirt } else { Mat::Stone });
             }
         }
@@ -971,7 +971,7 @@ mod tests {
         let (l, r) = (rim(300, 470), rim(490, 660));
         assert!(l > 100 && r > 100, "a rim on both sides: {l} / {r}");
         // The bottom of the hole is well under where the charge was.
-        let lowest = (300..H as i32).rev().find(|&y| passable(w.raw(480, y))).unwrap_or(0);
+        let lowest = (300..H() as i32).rev().find(|&y| passable(w.raw(480, y))).unwrap_or(0);
         assert!(lowest > 335, "the crater goes below the charge: {lowest}");
     }
 
@@ -979,8 +979,8 @@ mod tests {
     fn rock_resists_better_than_earth() {
         let dig = |m: Mat| {
             let mut w = World::new_static();
-            for x in 0..W as i32 {
-                for y in 300..H as i32 {
+            for x in 0..W() as i32 {
+                for y in 300..H() as i32 {
                     w.set(x, y, m);
                 }
             }
@@ -1008,8 +1008,8 @@ mod tests {
     /// Charcoal packed around a charge of `m`, buried in rock; how many cells of diamond it leaves.
     fn diamonds(m: Mat) -> usize {
         let mut w = World::new_static();
-        for x in 0..W as i32 {
-            for y in 300..H as i32 {
+        for x in 0..W() as i32 {
+            for y in 300..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -1051,8 +1051,8 @@ mod tests {
     fn a_detonation_shatters_rock_but_not_iron() {
         let shattered = |m: Mat| {
             let mut w = World::new_static();
-            for x in 0..W as i32 {
-                for y in 300..H as i32 {
+            for x in 0..W() as i32 {
+                for y in 300..H() as i32 {
                     w.set(x, y, m);
                 }
             }
@@ -1065,8 +1065,8 @@ mod tests {
         assert!(iron < 100, "{iron}");
         // Black powder only deflagrates: its shock barely cracks the rock.
         let mut w = World::new_static();
-        for x in 0..W as i32 {
-            for y in 300..H as i32 {
+        for x in 0..W() as i32 {
+            for y in 300..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -1078,16 +1078,16 @@ mod tests {
     #[test]
     fn a_charge_at_the_edges_of_the_world_stays_inside_it() {
         // The cracked edge of the hole used to be looked up past the bottom and sides of the grid.
-        for (x, y) in [(480, H as i32 - 2), (1, 400), (W as i32 - 2, 400), (1, H as i32 - 2), (480, 1)] {
+        for (x, y) in [(480, H() as i32 - 2), (1, 400), (W() as i32 - 2, 400), (1, H() as i32 - 2), (480, 1)] {
             let mut w = World::new_static();
-            for xx in 0..W as i32 {
-                for yy in 0..H as i32 {
+            for xx in 0..W() as i32 {
+                for yy in 0..H() as i32 {
                     w.set(xx, yy, Mat::Stone);
                 }
             }
             for dx in -4..=4 {
                 for dy in -4..=4 {
-                    w.set((x + dx).clamp(0, W as i32 - 1), (y + dy).clamp(0, H as i32 - 1), Mat::Dynamite);
+                    w.set((x + dx).clamp(0, W() as i32 - 1), (y + dy).clamp(0, H() as i32 - 1), Mat::Dynamite);
                 }
             }
             w.set_off_powder(x, y);
