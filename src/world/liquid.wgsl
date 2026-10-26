@@ -312,7 +312,16 @@ fn classify(@builtin(global_invocation_id) id: vec3<u32>) {
 
 // ---- The forces: the velocities carried along the flow (MacCormack), gravity, the drag.
 
-fn sample_u(px: f32, py: f32) -> f32 {
+/// An edge in the air (air on both sides): read as the edge carried, `here`, by the samplers
+/// below (the air carries no momentum, and a body falling through it sampled zeros from above,
+/// so that its top fell at a metre a second and held the rest back through the pressure).
+fn air_u(xx: u32, yy: u32) -> bool {
+    return kind_at(i32(xx) - 1, i32(yy)) == AIR && kind_at(i32(xx), i32(yy)) == AIR;
+}
+fn air_v(xx: u32, yy: u32) -> bool {
+    return kind_at(i32(xx), i32(yy) - 1) == AIR && kind_at(i32(xx), i32(yy)) == AIR;
+}
+fn sample_u(px: f32, py: f32, here: f32) -> f32 {
     let w = P.w + 1u;
     let sx = clamp(px, 0.0, f32(w - 1u) - 0.001);
     let sy = clamp(py, 0.0, f32(P.h - 1u) - 0.001);
@@ -320,9 +329,17 @@ fn sample_u(px: f32, py: f32) -> f32 {
     let y0 = u32(sy);
     let fx = sx - f32(x0);
     let fy = sy - f32(y0);
-    return u[y0 * w + x0] * (1.0 - fx) * (1.0 - fy) + u[y0 * w + x0 + 1u] * fx * (1.0 - fy) + u[(y0 + 1u) * w + x0] * (1.0 - fx) * fy + u[(y0 + 1u) * w + x0 + 1u] * fx * fy;
+    var a = u[y0 * w + x0];
+    var bb = u[y0 * w + x0 + 1u];
+    var cc = u[(y0 + 1u) * w + x0];
+    var d = u[(y0 + 1u) * w + x0 + 1u];
+    if air_u(x0, y0) { a = here; }
+    if air_u(x0 + 1u, y0) { bb = here; }
+    if air_u(x0, y0 + 1u) { cc = here; }
+    if air_u(x0 + 1u, y0 + 1u) { d = here; }
+    return a * (1.0 - fx) * (1.0 - fy) + bb * fx * (1.0 - fy) + cc * (1.0 - fx) * fy + d * fx * fy;
 }
-fn sample_u2(px: f32, py: f32) -> f32 {
+fn sample_u2(px: f32, py: f32, here: f32) -> f32 {
     let w = P.w + 1u;
     let sx = clamp(px, 0.0, f32(w - 1u) - 0.001);
     let sy = clamp(py, 0.0, f32(P.h - 1u) - 0.001);
@@ -330,21 +347,33 @@ fn sample_u2(px: f32, py: f32) -> f32 {
     let y0 = u32(sy);
     let fx = sx - f32(x0);
     let fy = sy - f32(y0);
-    return u2[y0 * w + x0] * (1.0 - fx) * (1.0 - fy) + u2[y0 * w + x0 + 1u] * fx * (1.0 - fy) + u2[(y0 + 1u) * w + x0] * (1.0 - fx) * fy + u2[(y0 + 1u) * w + x0 + 1u] * fx * fy;
+    var a = u2[y0 * w + x0];
+    var bb = u2[y0 * w + x0 + 1u];
+    var cc = u2[(y0 + 1u) * w + x0];
+    var d = u2[(y0 + 1u) * w + x0 + 1u];
+    if air_u(x0, y0) { a = here; }
+    if air_u(x0 + 1u, y0) { bb = here; }
+    if air_u(x0, y0 + 1u) { cc = here; }
+    if air_u(x0 + 1u, y0 + 1u) { d = here; }
+    return a * (1.0 - fx) * (1.0 - fy) + bb * fx * (1.0 - fy) + cc * (1.0 - fx) * fy + d * fx * fy;
 }
-fn around_u(px: f32, py: f32) -> vec2<f32> {
+fn around_u(px: f32, py: f32, here: f32) -> vec2<f32> {
     let w = P.w + 1u;
     let sx = clamp(px, 0.0, f32(w - 1u) - 0.001);
     let sy = clamp(py, 0.0, f32(P.h - 1u) - 0.001);
     let x0 = u32(sx);
     let y0 = u32(sy);
-    let a = u[y0 * w + x0];
-    let bb = u[y0 * w + x0 + 1u];
-    let cc = u[(y0 + 1u) * w + x0];
-    let d = u[(y0 + 1u) * w + x0 + 1u];
+    var a = u[y0 * w + x0];
+    var bb = u[y0 * w + x0 + 1u];
+    var cc = u[(y0 + 1u) * w + x0];
+    var d = u[(y0 + 1u) * w + x0 + 1u];
+    if air_u(x0, y0) { a = here; }
+    if air_u(x0 + 1u, y0) { bb = here; }
+    if air_u(x0, y0 + 1u) { cc = here; }
+    if air_u(x0 + 1u, y0 + 1u) { d = here; }
     return vec2<f32>(min(min(a, bb), min(cc, d)), max(max(a, bb), max(cc, d)));
 }
-fn sample_v(px: f32, py: f32) -> f32 {
+fn sample_v(px: f32, py: f32, here: f32) -> f32 {
     let w = P.w;
     let sx = clamp(px, 0.0, f32(w - 1u) - 0.001);
     let sy = clamp(py, 0.0, f32(P.h) - 0.001);
@@ -352,9 +381,17 @@ fn sample_v(px: f32, py: f32) -> f32 {
     let y0 = u32(sy);
     let fx = sx - f32(x0);
     let fy = sy - f32(y0);
-    return v[y0 * w + x0] * (1.0 - fx) * (1.0 - fy) + v[y0 * w + x0 + 1u] * fx * (1.0 - fy) + v[(y0 + 1u) * w + x0] * (1.0 - fx) * fy + v[(y0 + 1u) * w + x0 + 1u] * fx * fy;
+    var a = v[y0 * w + x0];
+    var bb = v[y0 * w + x0 + 1u];
+    var cc = v[(y0 + 1u) * w + x0];
+    var d = v[(y0 + 1u) * w + x0 + 1u];
+    if air_v(x0, y0) { a = here; }
+    if air_v(x0 + 1u, y0) { bb = here; }
+    if air_v(x0, y0 + 1u) { cc = here; }
+    if air_v(x0 + 1u, y0 + 1u) { d = here; }
+    return a * (1.0 - fx) * (1.0 - fy) + bb * fx * (1.0 - fy) + cc * (1.0 - fx) * fy + d * fx * fy;
 }
-fn sample_v2(px: f32, py: f32) -> f32 {
+fn sample_v2(px: f32, py: f32, here: f32) -> f32 {
     let w = P.w;
     let sx = clamp(px, 0.0, f32(w - 1u) - 0.001);
     let sy = clamp(py, 0.0, f32(P.h) - 0.001);
@@ -362,18 +399,30 @@ fn sample_v2(px: f32, py: f32) -> f32 {
     let y0 = u32(sy);
     let fx = sx - f32(x0);
     let fy = sy - f32(y0);
-    return v2[y0 * w + x0] * (1.0 - fx) * (1.0 - fy) + v2[y0 * w + x0 + 1u] * fx * (1.0 - fy) + v2[(y0 + 1u) * w + x0] * (1.0 - fx) * fy + v2[(y0 + 1u) * w + x0 + 1u] * fx * fy;
+    var a = v2[y0 * w + x0];
+    var bb = v2[y0 * w + x0 + 1u];
+    var cc = v2[(y0 + 1u) * w + x0];
+    var d = v2[(y0 + 1u) * w + x0 + 1u];
+    if air_v(x0, y0) { a = here; }
+    if air_v(x0 + 1u, y0) { bb = here; }
+    if air_v(x0, y0 + 1u) { cc = here; }
+    if air_v(x0 + 1u, y0 + 1u) { d = here; }
+    return a * (1.0 - fx) * (1.0 - fy) + bb * fx * (1.0 - fy) + cc * (1.0 - fx) * fy + d * fx * fy;
 }
-fn around_v(px: f32, py: f32) -> vec2<f32> {
+fn around_v(px: f32, py: f32, here: f32) -> vec2<f32> {
     let w = P.w;
     let sx = clamp(px, 0.0, f32(w - 1u) - 0.001);
     let sy = clamp(py, 0.0, f32(P.h) - 0.001);
     let x0 = u32(sx);
     let y0 = u32(sy);
-    let a = v[y0 * w + x0];
-    let bb = v[y0 * w + x0 + 1u];
-    let cc = v[(y0 + 1u) * w + x0];
-    let d = v[(y0 + 1u) * w + x0 + 1u];
+    var a = v[y0 * w + x0];
+    var bb = v[y0 * w + x0 + 1u];
+    var cc = v[(y0 + 1u) * w + x0];
+    var d = v[(y0 + 1u) * w + x0 + 1u];
+    if air_v(x0, y0) { a = here; }
+    if air_v(x0 + 1u, y0) { bb = here; }
+    if air_v(x0, y0 + 1u) { cc = here; }
+    if air_v(x0 + 1u, y0 + 1u) { d = here; }
     return vec2<f32>(min(min(a, bb), min(cc, d)), max(max(a, bb), max(cc, d)));
 }
 
@@ -425,7 +474,7 @@ fn forward_u(@builtin(global_invocation_id) id: vec3<u32>) {
     let r = u_vel(xx, yy);
     let step = P.dt / CELL_M;
     if r.x != 0.0 {
-        u2[e] = sample_u(f32(xx) - r.y * step, f32(yy) - r.z * step);
+        u2[e] = sample_u(f32(xx) - r.y * step, f32(yy) - r.z * step, u[e]);
     } else {
         u2[e] = r.y;
     }
@@ -440,7 +489,7 @@ fn forward_v(@builtin(global_invocation_id) id: vec3<u32>) {
     let r = v_vel(xx, yy);
     let step = P.dt / CELL_M;
     if r.x != 0.0 {
-        v2[e] = sample_v(f32(xx) - r.y * step, f32(yy) - r.z * step);
+        v2[e] = sample_v(f32(xx) - r.y * step, f32(yy) - r.z * step, v[e]);
     } else {
         v2[e] = r.y;
     }
@@ -461,8 +510,8 @@ fn back_u(@builtin(global_invocation_id) id: vec3<u32>) {
     let step = P.dt / CELL_M;
     let px = f32(xx) - r.y * step;
     let py = f32(yy) - r.z * step;
-    let back = sample_u2(f32(xx) + r.y * step, f32(yy) + r.z * step);
-    let lh = around_u(px, py);
+    let back = sample_u2(f32(xx) + r.y * step, f32(yy) + r.z * step, u2[e]);
+    let lh = around_u(px, py, u[e]);
     var to = clamp(u2[e] + 0.5 * (u[e] - back), lh.x, lh.y);
     let a = kind_at(i32(xx) - 1, i32(yy));
     let bb = kind_at(i32(xx), i32(yy));
@@ -496,15 +545,15 @@ fn back_v(@builtin(global_invocation_id) id: vec3<u32>) {
     let step = P.dt / CELL_M;
     let px = f32(xx) - r.y * step;
     let py = f32(yy) - r.z * step;
-    let back = sample_v2(f32(xx) + r.y * step, f32(yy) + r.z * step);
-    let lh = around_v(px, py);
+    let back = sample_v2(f32(xx) + r.y * step, f32(yy) + r.z * step, v2[e]);
+    let lh = around_v(px, py, v[e]);
     let xi = i32(xx);
     let yi = i32(yy);
     let a = kind_at(xi, yi - 1);
     let bb = kind_at(xi, yi);
     var was = clamp(v2[e] + 0.5 * (v[e] - back), lh.x, lh.y);
     // (Not a surface that falls: liquid over air, or liquid under air with air under it.)
-    let falls = (a >= WET && bb == AIR) || (a == AIR && bb >= WET && kind_at(xi, yi + 1) == AIR);
+    let falls = (a >= WET && bb == AIR) || (bb >= WET && kind_at(xi, yi + 1) == AIR);
     if a != bb && !falls { was = was / (1.0 + CALM * P.dt); }
     let fall = was + G * P.dt;
     if a != FULLISH && bb != FULLISH {
@@ -1091,6 +1140,33 @@ fn carry_commit(@builtin(global_invocation_id) id: vec3<u32>) {
     if nm != 0xffu {
         code[c] = (code[c] & ~0xffu) | nm;
     }
+    if u32(q) >= FULL / 4u {
+        // The edge across from the one that feeds the cell most, if it is in the air, takes
+        // the speed of the liquid that comes in (see the CPU).
+        let xx = c % P.w;
+        let yy = c / P.w;
+        let ins = vec4<i32>(fu[ui(xx, yy)], -fu[ui(xx + 1u, yy)], fv[c], -fv[c + P.w]);
+        var k = 0u;
+        var best = ins.x;
+        if ins.y > best { k = 1u; best = ins.y; }
+        if ins.z > best { k = 2u; best = ins.z; }
+        if ins.w > best { k = 3u; best = ins.w; }
+        if best > 0 {
+            if k == 0u && xx + 1u < P.w && raw_kind(c + 1u) == K_EMPTY && (code[c + 1u] & MASKED) == 0u {
+                let sp = u[ui(xx, yy)];
+                if abs(u[ui(xx + 1u, yy)]) < abs(sp) { u[ui(xx + 1u, yy)] = sp; }
+            } else if k == 1u && xx > 0u && raw_kind(c - 1u) == K_EMPTY && (code[c - 1u] & MASKED) == 0u {
+                let sp = u[ui(xx + 1u, yy)];
+                if abs(u[ui(xx, yy)]) < abs(sp) { u[ui(xx, yy)] = sp; }
+            } else if k == 2u && yy + 1u < P.h && raw_kind(c + P.w) == K_EMPTY && (code[c + P.w] & MASKED) == 0u {
+                let sp = v[c];
+                if abs(v[c + P.w]) < abs(sp) { v[c + P.w] = sp; }
+            } else if k == 3u && yy > 0u && raw_kind(c - P.w) == K_EMPTY && (code[c - P.w] & MASKED) == 0u {
+                let sp = v[c + P.w];
+                if abs(v[c]) < abs(sp) { v[c] = sp; }
+            }
+        }
+    }
     temp[c] = tnew[c];
     fill[c] = u32(q);
 }
@@ -1127,8 +1203,9 @@ fn overflow(@builtin(global_invocation_id) id: vec3<u32>) {
         note_change(j);
         note_change(c);
     }
-    // Liquid over a short cell of the same liquid sinks into it, from the top down, and a
-    // crumb joins the liquid under or over it, or goes (see the CPU).
+    // Liquid over a short cell of the same liquid sinks into it, from the top down (not into
+    // one that is not held up, unless a wisp), and a crumb joins the liquid under or over
+    // it, or goes (see the CPU).
     yy = P.y0;
     while yy < P.y0 + P.rows {
         let c = yy * P.w + xx;
@@ -1152,6 +1229,10 @@ fn overflow(@builtin(global_invocation_id) id: vec3<u32>) {
             }
         } else {
             if !has_under { continue; }
+            // (Held, or a wisp: see the CPU.)
+            let u2 = under + P.w;
+            let held = u2 >= P.w * P.h || !(raw_kind(u2) == K_EMPTY || (mat_of(u2) == m && fill[u2] < FULL / HOLDS));
+            if !held && have >= FULL / 4u { continue; }
             to = under;
         }
         let there = fill[to];

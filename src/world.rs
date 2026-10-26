@@ -1796,7 +1796,10 @@ impl World {
             }
             if self.liquid_physics {
                 if last {
-                    timed!(self, prof::LIQUIDS, self.step_liquids(self.dt));
+                    // (The liquids go by the ticks: a turn of `STEP` for each, see
+                    // `liquid::turns`; a step shorter than a tick leaves them where they are,
+                    // as it does the cells.)
+                    timed!(self, prof::LIQUIDS, self.step_liquids(ticks as f32 * STEP));
                 }
                 if !self.liquids_on_card() {
                     self.seep_through_thin();
@@ -1811,9 +1814,6 @@ impl World {
             }
         }
         if ticks == 0 {
-            if self.liquid_physics {
-                timed!(self, prof::LIQUIDS, self.step_liquids(self.dt));
-            }
             self.heat_turn();
             if audit {
                 marks.push(("liquides et chaleur", self.water_units_audit()));
@@ -5299,6 +5299,12 @@ mod tests {
             w.step();
         }
         let ice_top = (0..H as i32).find(|&y| w.raw(190, y) == Mat::Ice).unwrap_or(-1);
+        if std::env::var_os("DBG_ICE").is_some() {
+            for y in (ice_top - 6).max(0)..(ice_top + 20).min(H as i32) {
+                let line: String = (170..210).map(|x| match w.raw(x, y) { Mat::Empty => '.', Mat::Ice => '#', Mat::Water => if w.liquid_fill(World::idx(x, y)) >= field::FULL / 2 { 'W' } else { 'w' }, Mat::Cloud => 'c', Mat::Steam => 's', Mat::Smoke => 'k', Mat::Snow => '*', _ => '?' }).collect();
+                eprintln!("{y:4} {line}");
+            }
+        }
         assert!(ice_top > 450, "the ice should have dropped through the gas and drops to the rock, top at {ice_top}");
     }
 

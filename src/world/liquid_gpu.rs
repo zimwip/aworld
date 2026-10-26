@@ -426,7 +426,7 @@ mod native {
 
     /// The most time stamps a step writes (one before the first kernel, one after each phase of
     /// each sub-step, one after the copies back).
-    const MAX_STAMPS: usize = 2 + 5 * MAX_SUB_ALL + 2 + 2 + 4 * (MAX_ITER as usize + 1);
+    const MAX_STAMPS: usize = 2 + 5 * MAX_SUB_ALL + 2 + 2 + MAX_TURNS * 4 * (MAX_ITER as usize + 1);
     /// The card's time in each phase, in ns, summed over the steps (`AWORLD_DEBUG_CARD`).
     static CARD: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
     const PHASES: [&str; 10] = ["envoi", "forces", "viscosité", "pression", "pression: préparation", "pression: gradients", "pression: lissage fin", "pression: niveaux grossiers", "transport", "retour"];
@@ -745,7 +745,8 @@ mod native {
                 fastest = fastest.max(pt.value.abs());
             }
             patches.truncate(MAX_PATCHES);
-            let sub = (((fastest + G * step) * step / CELL_M).ceil() as usize).clamp(1, max_sub(step));
+            let (turns, per_turn) = turns(step, fastest);
+            let sub = turns * per_turn;
             let dt = step / sub as f32;
             // To the card.
             let q = &card.gpu.queue;
@@ -830,7 +831,7 @@ mod native {
                     drop(pass);
                     stamp_at(&mut enc, &mut stamps, "viscosité");
                 }
-                if s + 1 == sub {
+                if (s + 1) % per_turn == 0 {
                     {
                         let mut pass = Pass::new(&mut enc);
                         card.run(&mut pass, &k.system_cells, 0, ncell);
