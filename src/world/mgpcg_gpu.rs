@@ -189,8 +189,6 @@ mod native {
         kind32: Vec<u32>,
         /// How many levels this solve uses.
         used: usize,
-        /// Workgroups of the reductions over the finest grid, at most.
-        groups: usize,
         /// The band of rows of each level this solve works on, and the workgroups of the
         /// reductions over the finest band.
         bands: Vec<(usize, usize)>,
@@ -282,7 +280,7 @@ mod native {
                 let pre = (l == 0).then(|| d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("level pre"), layout: &level_layout, entries: &entries(&[&kind, &ax, &ay, &diag, &r, &z]) }));
                 levels.push(GpuLevel { w: lw, h: lh, kind, ax, ay, diag, b, x, bind, pre });
             }
-            Some(PressureGpu { gpu, levels, kernels, params, params_bind, cg, z, sc, sc_read, x_read, sent: None, kind32: vec![0; n], used: 1, groups, bands: Vec::new(), line_groups: 1 })
+            Some(PressureGpu { gpu, levels, kernels, params, params_bind, cg, z, sc, sc_read, x_read, sent: None, kind32: vec![0; n], used: 1, bands: Vec::new(), line_groups: 1 })
         }
 
         /// The slot of level `l`'s parameters for `colour`, as a dynamic offset.
@@ -571,15 +569,6 @@ mod native {
             [&l.kind, &l.ax, &l.ay, &l.diag, &l.b, &l.x]
         }
 
-        /// Solves the system that sits in the finest level's grids on the card already (rows
-        /// `y0..=y1`, about `fluid` unknowns): what `enc` holds runs first, and the encoder
-        /// returned takes what comes after. Returns the iterations.
-        pub fn solve_resident(&mut self, enc: wgpu::CommandEncoder, y0: usize, y1: usize, fluid: usize, tol: f32, rel: f32, max_iter: u32) -> (u32, wgpu::CommandEncoder) {
-            self.sent = None;
-            self.prepare(y0, y1, fluid, tol, rel);
-            self.iterate(enc, max_iter)
-        }
-
         /// The levels a system of `fluid` unknowns uses, the band of each, and the scalars.
         fn prepare(&mut self, y0: usize, y1: usize, fluid: usize, tol: f32, rel: f32) {
             let mut nodes = fluid;
@@ -653,8 +642,8 @@ mod native {
             }
         }
 
-        /// Solves the system in the finest level's grids as `solve_resident`, but with exactly
-        /// `n` iterations encoded and no look at the card in between (for a step the CPU does
+        /// Solves the system that sits in the finest level's grids on the card already (rows
+        /// `y0..=y1`, about `fluid` unknowns), with exactly `n` iterations encoded and no look at the card in between (for a step the CPU does
         /// not wait for): the scalars (`scalars`) say afterwards how many it took and whether
         /// it was done.
         pub fn solve_fixed(&mut self, enc: &mut wgpu::CommandEncoder, y0: usize, y1: usize, fluid: usize, tol: f32, rel: f32, n: u32, stamps: &mut Stamper) {

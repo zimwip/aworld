@@ -190,9 +190,6 @@ pub struct Liquids {
     pub(super) gpu: Option<Option<mgpcg_gpu::PressureGpu>>,
     /// The whole turn on the card (`None` until asked for, and where there is no card).
     pub(super) card: Option<Option<liquid_gpu::LiquidGpu>>,
-    /// The fastest edge at the end of the last step, m/s (the card's turn keeps it to choose
-    /// its sub-steps without a look at its grids).
-    pub(super) fastest: f32,
     /// In a picture of the world (see `World::copy_picture`), the rows the card worked on.
     pub(super) card_rows: Option<(usize, usize)>,
 }

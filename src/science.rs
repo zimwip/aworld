@@ -103,6 +103,7 @@ pub const MATTERS: [Matter; 17] = [
 
 impl Matter {
     /// The matter's name is that of its usual state: water for ice, snow and steam.
+    #[cfg(test)]
     pub fn name(&self) -> &'static str {
         info(self.states[self.default]).name
     }
