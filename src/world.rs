@@ -91,6 +91,10 @@ const COLD_Y: i32 = (H as i32) * 3 / 10;
 /// Rising steam and clouds cool as they climb, so past it they are soon colder and denser than
 /// the air around them: they stop under it and spread out sideways, the way a storm cloud
 /// flattens into an anvil.
+/// The widest run of thin matter (a crown, see `Mat::one_way`) a liquid passes through sideways
+/// in one go.
+pub const THIN_RUN: i32 = 16 * K;
+
 pub const CEILING_Y: i32 = (H as i32) / 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -192,9 +196,18 @@ impl Mat {
         matches!(self.kind(), Kind::Static | Kind::Powder)
     }
 
-    /// Living tree parts: cars drive through them (trees never block the road).
+    /// Living tree parts (they take root, grow, let the air through; see also `one_way`).
     pub fn is_vegetation(self) -> bool {
         matches!(self, Mat::Trunk | Mat::Leaf | Mat::Branch | Mat::Sapling)
+    }
+
+    /// Thin matter of a 2-D world, a "one-way platform": a tree stands in a plane of its own, so
+    /// what moves sideways goes past it (in front of it or behind), but what comes down on it
+    /// from above rests on it. The kid and the cars walk and drive through a trunk and stand on a
+    /// crown (`World::bears`); a liquid passes through sideways but does not go down through it
+    /// (`World::past_thin`).
+    pub fn one_way(self) -> bool {
+        matches!(self, Mat::Trunk | Mat::Branch | Mat::Leaf | Mat::Sapling)
     }
 
     /// Anything that burns like wood.
@@ -1171,7 +1184,34 @@ impl World {
         if Self::inb(x, y) { self.cells[Self::idx(x, y)].m } else { Mat::Empty }
     }
 
-    /// Obstacle test for the car; the world has no floor below it.
+    /// Whether the cell (x, y) holds up a body coming down on it whose underside was at row `feet`
+    /// before it moved: anything hard does, and so does thin matter (`Mat::one_way`) that was
+    /// under it, or whose top lies at most `climb` rows over it (a step up onto a crown). A trunk
+    /// beside the body, or the underside of a crown over it, holds nothing up: it passes through.
+    pub fn bears(&self, x: i32, y: i32, feet: f32, climb: f32) -> bool {
+        if self.hard_for_car(x, y) {
+            return true;
+        }
+        if !Self::inb(x, y) || !self.at(x, y).one_way() {
+            return false;
+        }
+        let row = y as f32;
+        row >= feet || (row >= feet - climb && !self.at(x, y - 1).one_way() && !self.hard_for_car(x, y - 1))
+    }
+
+    /// The column just past the thin matter (`Mat::one_way`) beside (x, y) on side `dir`, if
+    /// there is some (at most `THIN_RUN` cells of it): where a liquid that passes through it
+    /// comes out.
+    pub fn past_thin(&self, x: i32, y: i32, dir: i32) -> Option<i32> {
+        let mut k = 1;
+        while k <= THIN_RUN && Self::inb(x + dir * k, y) && self.at(x + dir * k, y).one_way() {
+            k += 1;
+        }
+        (k > 1 && k <= THIN_RUN && Self::inb(x + dir * k, y)).then_some(x + dir * k)
+    }
+
+    /// Obstacle test for the car (hard all round; thin matter is not, see `bears`); the world
+    /// has no floor below it.
     pub fn hard_for_car(&self, x: i32, y: i32) -> bool {
         // Beyond the edges there is nothing to hold a car back.
         if y >= H as i32 || y < 0 || x < 0 || x >= W as i32 {
@@ -1182,10 +1222,10 @@ impl World {
         if b != 0 && self.mask_pass.get(b as usize - 1).copied().unwrap_or(false) {
             // Load-bearing structure: the car passes through; only what is under it counts.
             let m = self.cells[i].m;
-            return m.is_hard() && !m.is_vegetation();
+            return m.is_hard() && !m.one_way();
         }
         let m = self.at(x, y);
-        m.is_hard() && !m.is_vegetation()
+        m.is_hard() && !m.one_way()
     }
 
     pub fn set(&mut self, x: i32, y: i32, m: Mat) {
@@ -1640,6 +1680,7 @@ impl World {
         timed!(self, 0, self.step_cells());
         if self.liquid_physics {
             timed!(self, prof::LIQUIDS, self.step_liquids());
+            self.seep_through_thin();
         }
         self.after_cells();
         self.prof.stop(prof::TOTAL, clock);
@@ -1685,7 +1726,7 @@ impl World {
             Mat::DeadLeaf => self.step_dead_leaf(x, y),
             Mat::Cloud => self.step_cloud(x, y),
             Mat::Oil => {
-                if !self.fly(x, y) && !self.jet(x, y) && !self.seep(x, y) {
+                if !self.fly(x, y) && !self.jet(x, y) {
                     self.step_oil(x, y);
                 }
             }
@@ -1694,28 +1735,16 @@ impl World {
             Mat::Gunpowder | Mat::Dynamite => self.step_gunpowder(x, y),
             Mat::Saltpeter => self.step_saltpeter(x, y),
             Mat::Water => {
-                if !self.fly(x, y) && !self.jet(x, y) && !self.seep(x, y) {
+                if !self.fly(x, y) && !self.jet(x, y) {
                     self.step_water(x, y);
                 }
             }
             Mat::Steam => self.step_steam(x, y),
             Mat::Fire => self.step_fire(x, y),
             Mat::Ember => self.step_ember(x, y),
-            Mat::Lava => {
-                if !self.seep(x, y) {
-                    self.step_hot_liquid(x, y, Mat::Stone);
-                }
-            }
-            Mat::Molten => {
-                if !self.seep(x, y) {
-                    self.step_hot_liquid(x, y, Mat::Iron);
-                }
-            }
-            Mat::MoltenSteel => {
-                if !self.seep(x, y) {
-                    self.step_hot_liquid(x, y, Mat::Steel);
-                }
-            }
+            Mat::Lava => self.step_hot_liquid(x, y, Mat::Stone),
+            Mat::Molten => self.step_hot_liquid(x, y, Mat::Iron),
+            Mat::MoltenSteel => self.step_hot_liquid(x, y, Mat::Steel),
             Mat::Iron => self.step_iron(x, y, 300),
             _ => {}
         }
@@ -2639,23 +2668,6 @@ impl World {
         if self.raw(x, y) == Mat::Smoke { to.rem_euclid(W as i32) } else { to }
     }
 
-    /// Trees are porous: a liquid resting on foliage, branches or a trunk drips straight
-    /// through to the first free cell below instead of being held up.
-    fn seep(&mut self, x: i32, y: i32) -> bool {
-        if !self.at(x, y + 1).is_vegetation() {
-            return false;
-        }
-        let mut k = 2;
-        while k <= 10 && self.at(x, y + k).is_vegetation() {
-            k += 1;
-        }
-        if matches!(self.at(x, y + k).kind(), Kind::Empty | Kind::Gas) {
-            self.swap((x, y), (x, y + k));
-            return true;
-        }
-        false
-    }
-
     /// Oil is a slow, light liquid: it floats on water and burns ferociously.
     fn step_oil(&mut self, x: i32, y: i32) {
         for (nx, ny) in Self::neighbors(x, y) {
@@ -2777,18 +2789,6 @@ impl World {
                 }
             }
         }
-        // Foliage lets water through: a drop that lands on leaves or branches trickles down to the
-        // first free cell beneath them instead of piling up on the tree.
-        if matches!(self.at(x, y + 1), Mat::Leaf | Mat::Branch | Mat::Sapling) {
-            let mut k = 1;
-            while k <= 12 * K && matches!(self.at(x, y + k), Mat::Leaf | Mat::Branch | Mat::Sapling) {
-                k += 1;
-            }
-            if matches!(self.at(x, y + k).kind(), Kind::Empty | Kind::Gas) {
-                self.swap((x, y), (x, y + k));
-                return;
-            }
-        }
         // A drop in the air falls like any heavy particle: gravity speeds it up to a terminal speed
         // (air drag) and the wind carries it along on the way down, so the rain slants and gusts.
         // Water with more water on top of it (the roof of a hole in a lake, a thick stream) just
@@ -2846,12 +2846,24 @@ impl World {
             return false;
         }
         for dir in [d, -d] {
-            let mut k = 0;
-            while k < reach && self.at(x + dir * (k + 1), y) == Mat::Empty {
-                k += 1;
+            // Thin matter (a tree) does not hold it back: it runs on past it, the way the water
+            // of a 2-D world goes in front of a trunk or behind it.
+            let (mut to, mut cx, mut run) = (x, x, 0);
+            while run < reach {
+                if self.at(cx + dir, y) == Mat::Empty {
+                    cx += dir;
+                    to = cx;
+                    run += 1;
+                } else if let Some(past) = self.past_thin(cx, y, dir).filter(|&px| self.at(px, y) == Mat::Empty) {
+                    cx = past;
+                    to = cx;
+                    run += 1;
+                } else {
+                    break;
+                }
             }
-            if k > 0 {
-                self.swap((x, y), (x + dir * k, y));
+            if to != x {
+                self.swap((x, y), (to, y));
                 return true;
             }
         }
@@ -4316,15 +4328,19 @@ mod tests {
         assert!((0..10).all(|x| w.at(x, 99) != Mat::Water));
     }
 
-    #[test]
-    fn water_trickles_through_the_foliage_of_a_tree() {
+    /// A tree in a pot of water, for `water_passes_a_tree_sideways_but_not_down_through_it`: a
+    /// crown across the pot between its walls (water poured on it), and beside it a trunk
+    /// standing on the bottom with water on one side only.
+    fn tree_in_a_pot(physics: bool) -> World {
         let mut w = World::new_static();
+        w.set_liquid_physics(physics);
         for x in 0..W as i32 {
             w.set(x, 200, Mat::Stone);
         }
         for y in 100..200 {
-            w.set(3, y, Mat::Stone);
-            w.set(17, y, Mat::Stone);
+            for x in [3, 17, 60] {
+                w.set(x, y, Mat::Stone);
+            }
         }
         for y in 150..160 {
             for x in 4..17 {
@@ -4334,12 +4350,32 @@ mod tests {
         for x in 6..14 {
             w.set(x, 140, Mat::Water);
         }
-        for _ in 0..400 {
-            w.step();
+        for y in 120..200 {
+            for x in 36..39 {
+                w.set(x, y, Mat::Trunk);
+            }
         }
-        let above = (4..17).filter(|&x| (100..150).any(|y| w.at(x, y) == Mat::Water)).count();
-        let below = (4..17).filter(|&x| (160..200).any(|y| w.at(x, y) == Mat::Water)).count();
-        assert!(above == 0 && below > 0, "the water went through the leaves (above {above}, below {below})");
+        for y in 185..200 {
+            for x in 18..36 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        w
+    }
+
+    #[test]
+    fn water_passes_a_tree_sideways_but_not_down_through_it() {
+        for physics in [false, true] {
+            let mut w = tree_in_a_pot(physics);
+            for _ in 0..600 {
+                w.step();
+            }
+            let water = |w: &World, xs: std::ops::Range<i32>, ys: std::ops::Range<i32>| xs.flat_map(|x| ys.clone().map(move |y| (x, y))).filter(|&(x, y)| w.at(x, y) == Mat::Water).count();
+            let (above, below) = (water(&w, 4..17, 100..150), water(&w, 4..17, 160..200));
+            assert!(above > 0 && below == 0, "physics {physics}: the crown holds the water up (above {above}, below {below})");
+            let (left, right) = (water(&w, 18..36, 150..200), water(&w, 39..60, 150..200));
+            assert!(right > 10 && left > 10, "physics {physics}: the water ran through the trunk (left {left}, right {right})");
+        }
     }
 
     #[test]
@@ -6666,7 +6702,7 @@ mod science {
     }
 
     #[test]
-    fn liquids_drip_through_trees() {
+    fn liquids_rest_on_trees_and_do_not_drip_through() {
     let mut w = World::new_static();
     for y in 0..H as i32 {
         for x in 100..140 {
@@ -6676,7 +6712,8 @@ mod science {
     for x in 100..140 {
         w.set(x, 300, Mat::Stone);
     }
-    // A canopy of leaves with a branch and a trunk stub under it.
+    // A canopy of leaves with a branch and a trunk stub under it, wall to wall: thin matter
+    // (`Mat::one_way`) holds a liquid up.
     for y in 150..301 {
         w.set(99, y, Mat::Stone);
         w.set(140, y, Mat::Stone);
@@ -6697,7 +6734,7 @@ mod science {
     let above = (100..140).flat_map(|x| (150..200).map(move |y| (x, y))).filter(|&(x, y)| matches!(w.at(x, y), Mat::Water | Mat::Oil)).count();
     let total = (0..W as i32).flat_map(|x| (0..H as i32).map(move |y| (x, y))).filter(|&(x, y)| matches!(w.at(x, y), Mat::Water | Mat::Oil)).count();
     let below = (100..140).flat_map(|x| (203..300).map(move |y| (x, y))).filter(|&(x, y)| matches!(w.at(x, y), Mat::Water | Mat::Oil)).count();
-    assert!(below >= 8, "liquid stayed on top of the tree: {below} below, {above} above, {total} total");
+    assert!(below == 0 && above >= 8, "the liquid went down through the tree: {below} below, {above} above, {total} total");
     assert_eq!(w.at(115, 200), Mat::Leaf, "the tree itself must stay");
 }
 

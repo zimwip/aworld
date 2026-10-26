@@ -393,6 +393,66 @@ impl World {
         self.liq = liq;
     }
 
+    /// Thin matter (a tree, `Mat::one_way`) holds a liquid up but does not hold it back: the
+    /// grid has no room for both in a cell, so the liquid beside it seeps through, levelling the
+    /// cell on each side of it by half its gap each step (into air, or into the same liquid). A
+    /// lake rises through a trunk; a flood runs through a crown. Liquid falling through the air
+    /// falls on.
+    ///
+    /// It reads only the cells (not the classes or spans of the step, which the step on the
+    /// graphics card does not keep), in the zones that run.
+    pub(super) fn seep_through_thin(&mut self) {
+        let sides = if self.frame & 1 == 0 { [1, -1] } else { [-1, 1] };
+        for k in 0..sleep::CW * sleep::CH {
+            if !self.zones.awake.get(k).copied().unwrap_or(true) {
+                continue;
+            }
+            let (zx, zy) = ((k % sleep::CW) * sleep::CS, (k / sleep::CW) * sleep::CS);
+            for (x, y) in (zy..(zy + sleep::CS).min(H)).flat_map(|y| (zx..(zx + sleep::CS).min(W)).map(move |x| (x, y))) {
+                let i = y * W + x;
+                let m = self.cells[i].m;
+                if m.kind() != Kind::Liquid || self.mask[i] != 0 || (y + 1 < H && self.cells[i + W].m == Mat::Empty) {
+                    continue;
+                }
+                for dir in sides {
+                    let Some(px) = self.past_thin(x as i32, y as i32, dir) else { continue };
+                    let j = y * W + px as usize;
+                    let had = match self.cells[j].m {
+                        Mat::Empty if self.mask[j] == 0 => 0,
+                        n if n == m => self.liquid_fill(j),
+                        _ => continue,
+                    };
+                    let f = if self.cells[i].m == m { self.liquid_fill(i) } else { 0 };
+                    let q = f.saturating_sub(had) / 2;
+                    if q == 0 {
+                        continue;
+                    }
+                    let t = self.temp[i];
+                    if had == 0 {
+                        self.cells[j] = Cell { m, stamp: self.frame };
+                        self.clear_states(j);
+                        self.latent[j] = 0.0;
+                        self.vel[j] = 0;
+                        self.temp[j] = t;
+                    } else {
+                        self.temp[j] = (self.temp[j] * had as f32 + t * q as f32) / (had + q) as f32;
+                    }
+                    self.put_fill(j, had + q);
+                    if f == q {
+                        self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
+                        self.clear_states(i);
+                        self.vel[i] = 0;
+                    } else {
+                        self.put_fill(i, f - q);
+                    }
+                    self.revision += 1;
+                    self.zones.wake(i);
+                    self.zones.wake(j);
+                }
+            }
+        }
+    }
+
     /// Liquid thrown at the air faster than `THROW` comes off as drops: a share of the cell that
     /// grows with the speed, all of it when it falls into the air, and so do the crumbs left
     /// alone in the air (a thin film with air under it and no body beside it).
