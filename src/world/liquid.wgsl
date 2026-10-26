@@ -112,6 +112,8 @@ const G: f32 = 9.81;
 const REST: f32 = 0.01;
 const REFILL: f32 = 0.1;
 const SPRAY: f32 = 9.0;
+const CALM: f32 = 3.0;
+const CRUMB: u32 = 8u;
 const THROW: f32 = 2.0;
 const THROW_SHARE: f32 = 0.5;
 const MAX_THROWS: u32 = 16384u;
@@ -430,9 +432,10 @@ fn back_u(@builtin(global_invocation_id) id: vec3<u32>) {
     let py = f32(yy) - r.z * step;
     let back = sample_u2(f32(xx) + r.y * step, f32(yy) + r.z * step);
     let lh = around_u(px, py);
-    let to = clamp(u2[e] + 0.5 * (u[e] - back), lh.x, lh.y);
+    var to = clamp(u2[e] + 0.5 * (u[e] - back), lh.x, lh.y);
     let a = kind_at(i32(xx) - 1, i32(yy));
     let bb = kind_at(i32(xx), i32(yy));
+    if a != bb { to = to / (1.0 + CALM * P.dt); }
     if a != FULLISH && bb != FULLISH {
         u3[e] = clamp(to, -SPRAY, SPRAY);
     } else {
@@ -456,11 +459,13 @@ fn back_v(@builtin(global_invocation_id) id: vec3<u32>) {
     let py = f32(yy) - r.z * step;
     let back = sample_v2(f32(xx) + r.y * step, f32(yy) + r.z * step);
     let lh = around_v(px, py);
-    let fall = clamp(v2[e] + 0.5 * (v[e] - back), lh.x, lh.y) + G * P.dt;
     let xi = i32(xx);
     let yi = i32(yy);
     let a = kind_at(xi, yi - 1);
     let bb = kind_at(xi, yi);
+    var was = clamp(v2[e] + 0.5 * (v[e] - back), lh.x, lh.y);
+    if a != bb { was = was / (1.0 + CALM * P.dt); }
+    let fall = was + G * P.dt;
     if a != FULLISH && bb != FULLISH {
         let f = clamp(fall, -SPRAY, SPRAY);
         let under = kind_at(xi, yi + 1);
@@ -1025,7 +1030,7 @@ fn carry_commit(@builtin(global_invocation_id) id: vec3<u32>) {
     if c == 0xffffffffu { return; }
     let q = qnew[c];
     if q == -2147483647 - 1 { return; }
-    if q <= 0 {
+    if q <= i32(CRUMB) {
         if raw_kind(c) == K_LIQUID {
             note_change(c);
             code[c] = (code[c] & ~0xffu) | MAT_EMPTY;
@@ -1073,6 +1078,31 @@ fn overflow(@builtin(global_invocation_id) id: vec3<u32>) {
         fill[c] = FULL;
         note_change(j);
         note_change(c);
+    }
+    // Liquid over a short cell of the same liquid sinks into it, from the top down (see the CPU).
+    yy = P.y0;
+    while yy + 1 < P.h && yy < P.y0 + P.rows {
+        let c = yy * P.w + xx;
+        let j = c + P.w;
+        yy += 1u;
+        let m = mat_of(c);
+        if raw_kind(c) != K_LIQUID || mat_of(j) != m || (code[c] & MASKED) != 0u || (code[j] & MASKED) != 0u { continue; }
+        if (code[c] & AWAKE) == 0u && (code[j] & AWAKE) == 0u { continue; }
+        let have = fill[c];
+        let below = min(fill[j], FULL);
+        let gap = FULL - below;
+        if gap == 0u { continue; }
+        let moved = min(have, gap);
+        temp[j] = (temp[j] * f32(below) + temp[c] * f32(moved)) / f32(below + moved);
+        fill[j] = below + moved;
+        if have - moved <= CRUMB {
+            code[c] = (code[c] & ~0xffu) | MAT_EMPTY;
+            fill[c] = 0u;
+        } else {
+            fill[c] = have - moved;
+        }
+        note_change(c);
+        note_change(j);
     }
 }
 

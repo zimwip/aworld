@@ -66,6 +66,14 @@ pub(super) const THROW_SHARE: f32 = 0.5;
 pub(super) const DROP_DRAG: f32 = 0.998;
 /// At most this many sub-steps a step (fast flows take smaller ones).
 pub(super) const MAX_SUB: usize = 4;
+/// A cell left with this little liquid or less (units of fill, 1/8192 of a cell) is emptied: so
+/// little moves no more (what an edge passes rounds to nothing) and would hang in the air for
+/// ever, keeping its zone awake.
+pub(super) const CRUMB: u32 = 8;
+/// The free surface (an edge between a full cell and the air or a film, or between a film and
+/// the air) loses this part of its speed a second: waves and the slosh of a pool die out, where
+/// the model alone (no surface tension, no breaking) would keep them for ever.
+pub(super) const CALM: f32 = 3.0;
 
 /// Whether new worlds take their liquids by physics: `AWORLD_LIQUIDS=1`.
 pub(super) fn physics_by_default() -> bool {
@@ -73,12 +81,12 @@ pub(super) fn physics_by_default() -> bool {
 }
 
 /// What a cell is to the liquids.
-pub(super) const SOLID: u8 = 0;
-pub(super) const AIR: u8 = 1;
+pub const SOLID: u8 = 0;
+pub const AIR: u8 = 1;
 /// Liquid, less than half full: it moves with the edges around it, but holds no pressure.
-pub(super) const WET: u8 = 2;
+pub const WET: u8 = 2;
 /// Liquid, at least half full: it holds a pressure.
-pub(super) const FULLISH: u8 = 3;
+pub const FULLISH: u8 = 3;
 
 /// Density (kg/m³), kinematic viscosity (m²/s) and yield stress (Pa) of liquid `m` at `t` °C.
 pub(super) fn props(m: Mat, t: f32) -> (f32, f32, f32) {
@@ -316,12 +324,51 @@ impl World {
         [(x - 1, y), (x + 1, y), (x, y - 1)].iter().all(|&(nx, ny)| self.at(nx, ny).kind() != Kind::Liquid)
     }
 
+    /// The class of cell (x, y) as the liquids last saw it (`SOLID`, `AIR`, `WET`, `FULLISH`,
+    /// with bit 4 set where its zone runs), for the simulation view; None before the first step.
+    pub fn liquid_class(&self, x: usize, y: usize) -> Option<u8> {
+        self.liq.class.get(y * W + x).copied()
+    }
+
+    /// Whether the liquids put a drop's velocity (m/s) at the centre of cell (x, y); None before
+    /// the first step.
+    pub fn liquid_velocity(&self, x: usize, y: usize) -> Option<(f32, f32)> {
+        if self.liq.u.len() != (W + 1) * H {
+            return None;
+        }
+        Some((0.5 * (self.liq.u[ui(x, y)] + self.liq.u[ui(x + 1, y)]), 0.5 * (self.liq.v[vi(x, y)] + self.liq.v[vi(x, y + 1)])))
+    }
+
+    /// The drops' velocity, m/s (down positive).
+    pub fn drop_velocity(d: &Drop) -> (f32, f32) {
+        (d.vx, d.vy)
+    }
+
+    /// The rows the card works on (the band of the last step given to it), when the liquids
+    /// run on a card.
+    pub fn liquid_card_rows(&self) -> Option<(usize, usize)> {
+        self.liq.card.as_ref().and_then(|c| c.as_ref()).and_then(|c| c.rows())
+    }
+
+    /// What the card did with the last step, into the world: before the cells' turn, so that
+    /// the rain of the cells and the card never move the same liquid at once (the card works
+    /// from the cells as they were after the cells' turn, and what it did is in before the next).
+    pub(super) fn take_liquids_from_card(&mut self) {
+        let mut liq = std::mem::take(&mut self.liq);
+        let mut card = liq.card.take();
+        if let Some(Some(c)) = card.as_mut() {
+            self.collect_liquids(&mut liq, c);
+        }
+        liq.card = card;
+        self.liq = liq;
+    }
+
     /// The liquids' turn.
     pub(super) fn step_liquids(&mut self) {
         let mut liq = std::mem::take(&mut self.liq);
         liq.ready();
-        self.fly_drops(&mut liq);
-        // The whole turn on the card, where there is one (and it is wanted).
+        // The whole turn on the card, where there is one (and it is wanted): the card works on
+        // the step while the CPU does the rest of it, and the CPU takes its result at the next.
         if gpu::wanted() != gpu::Use::Off {
             let mut card = liq.card.take().unwrap_or_else(liquid_gpu::LiquidGpu::new);
             if let Some(c) = card.as_mut() {
@@ -333,6 +380,7 @@ impl World {
                 return;
             }
         }
+        self.fly_drops(&mut liq);
         let clock = self.prof.start();
         self.classify(&mut liq, false);
         self.prof.stop(prof::LIQ_CLASSIFY, clock);
@@ -487,7 +535,7 @@ impl World {
 
     /// Moves the drops in flight a step; those that land go back into the liquid (or make a cell
     /// of it on the ground) with their speed and their heat.
-    fn fly_drops(&mut self, liq: &mut Liquids) {
+    pub(super) fn fly_drops(&mut self, liq: &mut Liquids) {
         if liq.drops.is_empty() {
             return;
         }
@@ -716,6 +764,8 @@ impl World {
         });
         // Carried back, the gap corrected, then gravity and the drag of the air.
         let (uf, vf) = (&liq.u2, &liq.v2);
+        // The free surface is calmed (implicit, before gravity: a surface at rest stays so).
+        let calm = 1.0 / (1.0 + CALM * dt);
         liq.u3.par_chunks_mut(W + 1).enumerate().for_each(|(y, row)| {
             let Some((x0, x1)) = rows[y] else { return };
             row[x0..=(x1 + 1).min(W)].copy_from_slice(&uf[ui(x0, y)..=ui((x1 + 1).min(W), y)]);
@@ -728,6 +778,7 @@ impl World {
                 // Away from any full cell, liquid in the air is slowed by it (drops and spray, at
                 // most as fast as falling rain).
                 let (a, b) = (kind(x as i32 - 1, y as i32), kind(x as i32, y as i32));
+                let to = if a != b { to * calm } else { to };
                 row[x] = if a != FULLISH && b != FULLISH { to.clamp(-SPRAY, SPRAY) } else { to };
             }
         });
@@ -739,9 +790,10 @@ impl World {
                 let (px, py) = (x as f32 - vx * step, y as f32 - vy * step);
                 let back = sample(vf, W, H + 1, x as f32 + vx * step, y as f32 + vy * step);
                 let (lo, hi) = around(v, W, H + 1, px, py);
-                let fall = (vf[vi(x, y)] + 0.5 * (v[vi(x, y)] - back)).clamp(lo, hi) + G * dt;
                 let (xi, yi) = (x as i32, y as i32);
                 let (a, b) = (kind(xi, yi - 1), kind(xi, yi));
+                let was = (vf[vi(x, y)] + 0.5 * (v[vi(x, y)] - back)).clamp(lo, hi);
+                let fall = if a != b { was * calm } else { was } + G * dt;
                 row[x] = if a != FULLISH && b != FULLISH {
                     // A film lying on liquid or on the ground goes no faster than what is under it
                     // (it has nowhere to fall).
@@ -1315,7 +1367,7 @@ impl World {
         });
         (liq.fu, liq.fv, liq.want, liq.scale) = (fu, fv, want, scale);
         for (i, q, t, new) in changes {
-            if q <= 0 {
+            if q <= CRUMB as i64 {
                 if self.cells[i].m.kind() == Kind::Liquid {
                     self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
                     self.clear_states(i);
@@ -1364,6 +1416,39 @@ impl World {
                 self.fill[j] = if q == full { 0 } else { q };
                 self.fill[i] = 0;
                 self.revision += 1;
+                self.zones.wake(j);
+            }
+        }
+        // Liquid lying on a cell of the same liquid that is short of full sinks into it (from
+        // the top down, so that a film on the surface sinks through to the first gap): the
+        // pressure alone never fills a cell under a film, since the film holds no pressure and
+        // the surface edge under it comes to rest, and the film would lie there for ever.
+        for y in 0..H - 1 {
+            let Some((x0, x1)) = liq.span(y) else { continue };
+            for x in x0..=x1 {
+                let (i, j) = (y * W + x, (y + 1) * W + x);
+                let m = self.cells[i].m;
+                if m.kind() != Kind::Liquid || self.cells[j].m != m || self.mask[i] != 0 || self.mask[j] != 0 {
+                    continue;
+                }
+                let (have, gap) = (self.liquid_fill(i), full - self.liquid_fill(j).min(full));
+                if gap == 0 || !(self.zones.awake[y / sleep::CS * sleep::CW + x / sleep::CS] || self.zones.awake[(y + 1) / sleep::CS * sleep::CW + x / sleep::CS]) {
+                    continue;
+                }
+                let moved = have.min(gap);
+                let below = self.liquid_fill(j);
+                self.temp[j] = ((self.temp[j] as f64 * below as f64 + self.temp[i] as f64 * moved as f64) / (below + moved) as f64) as f32;
+                let q = below + moved;
+                self.fill[j] = if q == full { 0 } else { q };
+                if have - moved <= CRUMB {
+                    self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
+                    self.clear_states(i);
+                    self.vel[i] = 0;
+                } else {
+                    self.fill[i] = have - moved;
+                }
+                self.revision += 1;
+                self.zones.wake(i);
                 self.zones.wake(j);
             }
         }
@@ -1423,6 +1508,33 @@ mod tests {
         rect(&mut w, 212, 404, 227, 419, Mat::Water);
         w.temp.fill(15.0);
         w
+    }
+
+    /// How a pool whose cells start short of full (froth) comes back to full: every second, how
+    /// many cells are short, the mean fill and the fastest edge.
+    #[test]
+    #[ignore]
+    fn probe_froth() {
+        let mut w = world();
+        tank(&mut w, 100, 400, 339, 449);
+        rect(&mut w, 100, 435, 339, 449, Mat::Water);
+        for y in 435..450 {
+            for x in 100..340 {
+                w.fill[World::idx(x, y)] = (field::FULL as f32 * 0.7) as u32;
+            }
+        }
+        for t in 0..=600 {
+            if t % 60 == 0 {
+                let cells: Vec<u32> = (400..450).flat_map(|y| (100..340).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water).map(|(x, y)| w.liquid_fill(World::idx(x, y))).collect();
+                let short = cells.iter().filter(|&&f| f < field::FULL).count();
+                let mean = cells.iter().map(|&f| f as f64).sum::<f64>() / cells.len() as f64 / field::FULL as f64;
+                let top = (400..450).find(|&y| (100..340).any(|x| w.raw(x, y) == Mat::Water)).unwrap_or(450);
+                let fastest = if w.liq.u.len() == (W + 1) * H { w.liq.u.iter().chain(w.liq.v.iter()).fold(0.0f32, |a, v| a.max(v.abs())) } else { 0.0 };
+                let awake = (12..15).flat_map(|zy| (3..=10).map(move |zx| (zx, zy))).filter(|&(zx, zy)| w.zones.awake[zy * sleep::CW + zx]).count();
+                println!("t {:4.1} s: {} cells, {short} short, mean fill {mean:.3}, top y {top}, fastest {fastest:.2} m/s, {awake} zones run", t as f32 / 60.0, cells.len());
+            }
+            w.step();
+        }
     }
 
     #[test]
@@ -1671,5 +1783,92 @@ mod tests {
             assert!(!dam_wall(m, thick, true).1, "{m:?} wet");
         }
     }
-}
 
+    /// How a splash dies down: every half second, the highest water (cell or drop), the drops in
+    /// flight, the cells under half full, and the fastest edge.
+    #[test]
+    #[ignore]
+    fn probe_splash() {
+        let mut w = chute();
+        for t in 0..=600 {
+            if t % 30 == 0 {
+                let top_cell = (400..450).find(|&y| (100..340).any(|x| w.raw(x, y) == Mat::Water)).unwrap_or(450);
+                let top_drop = w.liquid_drops().iter().map(|d| d.y).fold(450.0, f32::min);
+                let wet = (400..450).flat_map(|y| (100..340).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water && w.liquid_fill(World::idx(x, y)) < field::FULL / 2).count();
+                let fastest = if w.liq.u.len() == (W + 1) * H { w.liq.u.iter().chain(w.liq.v.iter()).fold(0.0f32, |a, v| a.max(v.abs())) } else { 0.0 };
+                let (mut pool_fast, mut pool_sq, mut n) = (0.0f32, 0.0f64, 0usize);
+                if w.liq.u.len() == (W + 1) * H {
+                    for y in 435..450usize {
+                        for x in 100..340usize {
+                            let s = w.liq.u[ui(x, y)].abs().max(w.liq.v[vi(x, y)].abs());
+                            pool_fast = pool_fast.max(s);
+                            pool_sq += (s * s) as f64;
+                            n += 1;
+                        }
+                    }
+                }
+                println!("t {:5.2} s: top cell y {top_cell}, top drop y {top_drop:.1}, {} drops, {wet} wet cells, fastest {fastest:.2} m/s, pool fastest {pool_fast:.2} rms {:.3}", t as f32 / 60.0, w.liquid_drops().len(), (pool_sq / n.max(1) as f64).sqrt());
+                if t % 120 == 0 && w.liq.u.len() == (W + 1) * H {
+                    // Where the fastest edge is, and whether its zone runs.
+                    let (mut best, mut at) = (0.0f32, (0usize, 0usize, 'u'));
+                    for y in 0..H {
+                        for x in 0..=W {
+                            if w.liq.u[ui(x, y)].abs() > best { best = w.liq.u[ui(x, y)].abs(); at = (x, y, 'u'); }
+                        }
+                    }
+                    for y in 0..=H {
+                        for x in 0..W {
+                            if w.liq.v[vi(x, y)].abs() > best { best = w.liq.v[vi(x, y)].abs(); at = (x, y, 'v'); }
+                        }
+                    }
+                    let (x, y, _) = at;
+                    let awake = w.zones.awake[(y.min(H - 1)) / sleep::CS * sleep::CW + x.min(W - 1) / sleep::CS];
+                    let awake_wet = (400..450).flat_map(|y| (100..340).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water && w.liquid_fill(World::idx(x, y)) < field::FULL / 2 && w.zones.awake[y as usize / sleep::CS * sleep::CW + x as usize / sleep::CS]).count();
+                    println!("  fastest at {at:?} (zone awake {awake}); wet cells in zones that run: {awake_wet}");
+                    let short = |awake: bool| (400..450).flat_map(|y| (100..340).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water && (field::FULL / 2..field::FULL).contains(&w.liquid_fill(World::idx(x, y))) && w.zones.awake[y as usize / sleep::CS * sleep::CW + x as usize / sleep::CS] == awake).count();
+                    println!("  cells between half and full: {} in zones that run, {} in zones that sleep", short(true), short(false));
+                    for y in 425..450 {
+                        let fills: Vec<u32> = (100..340).filter(|&x| w.raw(x, y) == Mat::Water).map(|x| w.liquid_fill(World::idx(x, y))).collect();
+                        if fills.is_empty() { continue; }
+                        let short = fills.iter().filter(|&&f| f < field::FULL).count();
+                        let half = fills.iter().filter(|&&f| f < field::FULL / 2).count();
+                        let mean = fills.iter().map(|&f| f as f64).sum::<f64>() / fills.len() as f64 / field::FULL as f64;
+                        let fast = (100..340).map(|x| w.liq.u[ui(x as usize, y as usize)].abs().max(w.liq.v[vi(x as usize, y as usize)].abs())).fold(0.0f32, f32::max);
+                        println!("    row {y}: {} cells, {short} short, {half} under half, mean {mean:.3}, fastest {fast:.2}", fills.len());
+                    }
+                    for zy in 12..=14 {
+                        println!("  zones y {zy}: {}", (3..=10).map(|zx| if w.zones.awake[zy * sleep::CW + zx] { '*' } else { '.' }).collect::<String>());
+                    }
+                    // The cells around the highest water cell, with their class, fill and edges.
+                    let tx = (100..340).find(|&x| w.raw(x, top_cell) == Mat::Water).unwrap_or(0) as usize;
+                    for y in (top_cell as usize).saturating_sub(1)..=(top_cell as usize + 2) {
+                        println!("  y {y} rows {:?}", w.liq.rows[y]);
+                        for x in tx.saturating_sub(2)..=tx + 3 {
+                            let i = World::idx(x as i32, y as i32);
+                            println!("    ({x},{y}) {:?} fill {} class {} u {:.2}|{:.2} v {:.2}/{:.2}", w.cells[i].m, w.liquid_fill(i), w.liq.class[i], w.liq.u[ui(x, y)], w.liq.u[ui(x + 1, y)], w.liq.v[vi(x, y)], w.liq.v[vi(x, y + 1)]);
+                        }
+                    }
+                    for y in 400..450 {
+                        let mut row = String::new();
+                        for x in 100..340 {
+                            let i = World::idx(x, y);
+                            row.push(match w.raw(x, y) {
+                                Mat::Empty => if w.liquid_drops().iter().any(|d| d.x as i32 == x && d.y as i32 == y) { 'o' } else { ' ' },
+                                Mat::Water => match w.liquid_fill(i) * 64 / field::FULL {
+                                    0..=15 => '.',
+                                    16..=40 => ':',
+                                    41..=63 => '~',
+                                    _ => 'W',
+                                },
+                                Mat::Stone => '#',
+                                _ => '?',
+                            });
+                        }
+                        println!("{row}");
+                    }
+                }
+            }
+            w.step();
+        }
+    }
+}

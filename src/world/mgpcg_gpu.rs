@@ -29,7 +29,7 @@ pub fn threshold() -> usize {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::PressureGpu;
+pub use native::{PressureGpu, SC_DONE, SC_ITER, SC_N};
 
 #[cfg(target_arch = "wasm32")]
 pub struct PressureGpu;
@@ -90,9 +90,9 @@ mod native {
     }
 
     /// The scalars of the conjugate gradients on the card (`sc` in the kernels).
-    const SC_DONE: usize = 8;
-    const SC_ITER: usize = 9;
-    const SC_N: usize = 11;
+    pub const SC_DONE: usize = 8;
+    pub const SC_ITER: usize = 9;
+    pub const SC_N: usize = 11;
     /// Iterations run on the card between two looks at whether it is done.
     const BATCH: u32 = 2;
 
@@ -532,9 +532,24 @@ mod native {
         /// `BATCH` iterations at a time until done or `max_iter`. Returns the iterations and
         /// the encoder for what comes after.
         fn iterate(&self, mut enc: wgpu::CommandEncoder, max_iter: u32) -> (u32, wgpu::CommandEncoder) {
+            self.begin(&mut enc);
+            let mut done = 0;
+            while done < max_iter {
+                self.iterations(&mut enc, BATCH.min(max_iter - done));
+                enc.copy_buffer_to_buffer(&self.sc, 0, &self.sc_read, 0, (SC_N * 4) as u64);
+                let sc = self.read(std::mem::replace(&mut enc, self.encoder()), &self.sc_read, SC_N);
+                done = sc[SC_ITER] as u32;
+                if sc[SC_DONE] != 0.0 {
+                    break;
+                }
+            }
+            (done, enc)
+        }
+
+        /// The coarse levels, the first residual, the tolerance, and the first direction.
+        fn begin(&self, enc: &mut wgpu::CommandEncoder) {
             let k = &self.kernels;
             let line = self.line();
-            // The coarse levels, the first residual, the tolerance, and the first direction.
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 for l in 0..self.used - 1 {
@@ -546,32 +561,44 @@ mod native {
                 self.run(&mut pass, &k.residual, 0, 0, false, line);
                 self.run(&mut pass, &k.start, 0, 0, false, (1, 1));
             }
-            self.precondition(&mut enc);
-            let mut done = 0;
-            while done < max_iter {
-                // `BATCH` iterations, each: s = z + beta s; q = A s; alpha; x and r advanced; the
-                // step looked at; the advance undone if it ran away; z = M⁻¹ r; rho and beta.
-                // (The card counts the iterations it really did: once done, a kernel does nothing.)
-                for _ in 0..BATCH.min(max_iter - done) {
-                    {
-                        let mut pass = enc.begin_compute_pass(&Default::default());
-                        self.run(&mut pass, &k.direction, 0, 0, false, line);
-                        self.run(&mut pass, &k.apply, 0, 0, false, line);
-                        self.run(&mut pass, &k.alpha, 0, 0, false, (1, 1));
-                        self.run(&mut pass, &k.advance, 0, 0, false, line);
-                        self.run(&mut pass, &k.step, 0, 0, false, (1, 1));
-                        self.run(&mut pass, &k.undo, 0, 0, false, line);
-                    }
-                    self.precondition(&mut enc);
+            self.precondition(enc);
+        }
+
+        /// `n` iterations, each: s = z + beta s; q = A s; alpha; x and r advanced; the step
+        /// looked at; the advance undone if it ran away; z = M⁻¹ r; rho and beta. (The card
+        /// counts the iterations it really did: once done, a kernel does nothing.)
+        fn iterations(&self, enc: &mut wgpu::CommandEncoder, n: u32) {
+            let k = &self.kernels;
+            let line = self.line();
+            for _ in 0..n {
+                {
+                    let mut pass = enc.begin_compute_pass(&Default::default());
+                    self.run(&mut pass, &k.direction, 0, 0, false, line);
+                    self.run(&mut pass, &k.apply, 0, 0, false, line);
+                    self.run(&mut pass, &k.alpha, 0, 0, false, (1, 1));
+                    self.run(&mut pass, &k.advance, 0, 0, false, line);
+                    self.run(&mut pass, &k.step, 0, 0, false, (1, 1));
+                    self.run(&mut pass, &k.undo, 0, 0, false, line);
                 }
-                enc.copy_buffer_to_buffer(&self.sc, 0, &self.sc_read, 0, (SC_N * 4) as u64);
-                let sc = self.read(std::mem::replace(&mut enc, self.encoder()), &self.sc_read, SC_N);
-                done = sc[SC_ITER] as u32;
-                if sc[SC_DONE] != 0.0 {
-                    break;
-                }
+                self.precondition(enc);
             }
-            (done, enc)
+        }
+
+        /// Solves the system in the finest level's grids as `solve_resident`, but with exactly
+        /// `n` iterations encoded and no look at the card in between (for a step the CPU does
+        /// not wait for): the scalars (`scalars`) say afterwards how many it took and whether
+        /// it was done.
+        pub fn solve_fixed(&mut self, enc: &mut wgpu::CommandEncoder, y0: usize, y1: usize, fluid: usize, tol: f32, rel: f32, n: u32) {
+            self.sent = None;
+            self.prepare(y0, y1, fluid, tol, rel);
+            self.begin(enc);
+            self.iterations(enc, n);
+        }
+
+        /// The scalars of the conjugate gradients (`SC_N` numbers: the iterations at `SC_ITER`,
+        /// done at `SC_DONE`).
+        pub fn scalars(&self) -> &wgpu::Buffer {
+            &self.sc
         }
 
         /// Submits what is encoded, then reads `n` numbers back from a staging buffer.

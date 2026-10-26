@@ -5,6 +5,10 @@
 mod blast;
 pub mod matter;
 pub use blast::Ejecta;
+/// The classes of the liquids' cells, for the simulation view.
+pub mod liquid_class {
+    pub use super::liquid::{AIR, FULLISH, SOLID, WET};
+}
 pub mod flow;
 mod pockets;
 mod pressure;
@@ -1566,6 +1570,9 @@ impl World {
         self.revision += 1;
         self.frame = self.frame.wrapping_add(1);
         let clock = self.prof.start();
+        if self.liquid_physics {
+            self.take_liquids_from_card();
+        }
         timed!(self, 0, self.step_cells());
         if self.water_field {
             timed!(self, prof::FIELD, self.step_water_field());
@@ -3873,9 +3880,17 @@ impl World {
             Mat::Water => {
                 // Warm water shifts toward a pale, reddish tone just before it boils.
                 let warm = ((t - 30.0).max(0.0) * 1.3) as i32;
-                // A cell of the field that is not full shows paler.
-                let a = if self.partial_liquids() { 60 + (145 * self.water_fill(y * W + x).min(field::FULL) as u64 / field::FULL as u64) as i32 } else { 205 };
-                (44 + v / 2 + warm, 124 + v + flick / 4 + warm / 3, (224 + v - warm).max(0), a)
+                let (r, g, b) = (44 + v / 2 + warm, 124 + v + flick / 4 + warm / 3, (224 + v - warm).max(0));
+                if !self.partial_liquids() {
+                    (r, g, b, 205)
+                } else {
+                    // A cell of the field that is not full is water mixed with air: the less water,
+                    // the clearer it shows, and the paler (spray and the froth of a splash are
+                    // whitish, not a deeper blue).
+                    let q = self.water_fill(y * W + x).min(field::FULL) as i32 * 256 / field::FULL as i32;
+                    let pale = |c: i32, to: i32| c + (to - c) * (256 - q) / 256;
+                    (pale(r, 200), pale(g, 222), pale(b, 240), 205 * q / 256)
+                }
             }
             Mat::Fire => (255, (80 + self.fuel[y * W + x].left as i32 * 3).min(235), 30, 235),
             Mat::Steam | Mat::Cloud => (0, 0, 0, 0),

@@ -113,6 +113,11 @@ impl Zones {
         self.changed[k] >= s
     }
 
+    /// Whether zone `k` runs this step.
+    pub fn runs(&self, k: usize) -> bool {
+        self.awake.get(k).copied().unwrap_or(true)
+    }
+
     /// How many zones run this step (for the cost measure and the tests).
     pub fn awake_count(&self) -> usize {
         self.awake.iter().filter(|&&a| a).count()
