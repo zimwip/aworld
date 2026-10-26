@@ -3,13 +3,14 @@
 //! while the simulation runs. A stick pushed into matter stays planted there, like a charge in a
 //! blast hole: its blast starts from inside.
 //!
-//! When the fuse is out, the stick becomes cells of dynamite, set off at once (see `world/blast.rs`):
-//! sticks that touch go off as one bigger charge. The shock of a blast sets off the sticks around it
+//! A stick lies over the matter, it never takes its place: only its blast changes that matter. When
+//! the fuse is out it goes off (see `world/blast.rs`), and sticks that touch, or lie one over the
+//! other, go off as one charge that adds up all of theirs. The shock of a blast sets off the sticks around it
 //! a few steps later, before their own fuse (sympathetic detonation): a heap of sticks goes off
 //! almost together, much faster than fuse after fuse.
 
 use crate::render::View;
-use crate::world::{Kind, Mat, World, H, W};
+use crate::world::{Kind, World, H, W};
 use macroquad::prelude::*;
 
 /// Size of a stick lying down, cells (5 cm each: a fat stick, so that it can be seen).
@@ -166,23 +167,13 @@ impl Dynamite {
             }
             group.sort_unstable();
             let fired: Vec<Stick> = group.iter().rev().map(|&j| self.sticks.remove(j)).collect();
-            let mut lit = None;
-            for s in &fired {
-                for y in s.y..s.y + THICK {
-                    for x in s.x..s.x + LEN {
-                        if (0..W as i32).contains(&x) && (0..H as i32).contains(&y) && world.block_at_cell(x, y).is_none() {
-                            world.set(x, y, Mat::Dynamite);
-                            lit = Some((x, y));
-                        }
-                    }
-                }
-            }
+            // The sticks lie over the matter they were pushed into: each one adds its own charge,
+            // even where they overlap, and the blast breaks that matter like the rest.
+            let mut room: Vec<(i32, i32)> = fired.iter().flat_map(|s| (s.y..s.y + THICK).flat_map(move |y| (s.x..s.x + LEN).map(move |x| (x, y)))).collect();
+            room.sort_unstable();
+            room.dedup();
             let c = fired.iter().fold(Vec2::ZERO, |a, s| a + s.centre()) / fired.len() as f32;
-            match lit {
-                Some((x, y)) => world.set_off(x, y),
-                // Wedged in a block: the blast goes off all the same.
-                None => world.explode(c.x as i32, c.y as i32, 12 + 4 * fired.len() as i32),
-            }
+            world.set_off_sticks(c.x, c.y, (fired.len() as i32 * LEN * THICK) as f32, &room);
             charges += 1;
             // The shock sets off the sticks around, the nearest first.
             let reach = SYMPATHY * (fired.len() as f32).sqrt();
@@ -243,6 +234,7 @@ pub fn draw_stick(view: View, p: Vec2, fuse: f32, burning: bool, time: f32, alph
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::Mat;
 
     /// Stone from y = 300 down.
     fn ground() -> World {
@@ -293,10 +285,54 @@ mod tests {
             assert_eq!(d.step(&mut w), 0);
         }
         assert_eq!(d.sticks[0].y, y, "it did not move");
+        assert_eq!(w.raw(480, 320), Mat::Stone, "the stick lies over the rock, it does not replace it");
         assert_eq!(d.step(&mut w), 1, "the fuse is out");
         assert!(d.sticks.is_empty());
         assert!(!w.blasts.is_empty(), "it went off");
         assert!(w.raw(480, 320) != Mat::Stone, "a hole where the stick was");
+        // The rock around is broken from the inside, well past the stick itself.
+        let broken = |x0: i32, x1: i32, y0: i32, y1: i32| (x0..x1).map(|x| (y0..y1).filter(|&y| w.raw(x, y) != Mat::Stone).count()).sum::<usize>();
+        assert!(broken(470, 490, 312, 330) > 300, "crushed round the stick: {}", broken(470, 490, 312, 330));
+        assert!(broken(380, 580, 300, 420) > 800, "and cracked further out: {}", broken(380, 580, 300, 420));
+        assert!(broken(380, 580, 360, 420) < broken(380, 580, 300, 360), "less and less far from it");
+    }
+
+    /// Cells of rock broken by `n` sticks planted in the same hole.
+    fn planted(n: usize) -> usize {
+        let mut w = ground();
+        let mut d = Dynamite::default();
+        for _ in 0..n {
+            d.drop(&w, vec2(480.0, 380.0));
+        }
+        assert!(d.sticks.iter().all(|s| s.planted && s.x == d.sticks[0].x && s.y == d.sticks[0].y));
+        run(&mut d, &mut w, FUSE as usize + 2);
+        (280..680).map(|x| (300..H as i32).filter(|&y| w.raw(x, y) != Mat::Stone).count()).sum()
+    }
+
+    #[test]
+    fn sticks_planted_in_the_same_hole_add_up() {
+        // They lie one over the other: every one of them adds its own charge.
+        let (one, four) = (planted(1), planted(4));
+        eprintln!("rock broken by one stick {one}, by four in the same hole {four}");
+        assert!(four > one * 2, "{one} vs {four}");
+    }
+
+    #[test]
+    fn the_shock_sets_off_a_stick_nearby_a_few_steps_later() {
+        let mut w = ground();
+        let mut d = Dynamite::default();
+        d.drop(&w, vec2(470.0, 380.0));
+        d.drop(&w, vec2(495.0, 380.0));
+        d.sticks[1].fuse = FUSE * 2;
+        let mut went: Vec<usize> = vec![];
+        for step in 0..FUSE as usize + 30 {
+            if d.step(&mut w) > 0 {
+                went.push(step);
+            }
+        }
+        assert_eq!(went.len(), 2, "two charges, one after the other: {went:?}");
+        let delay = went[1] - went[0];
+        assert!((2..=8).contains(&delay), "the second goes off when the front reaches it, not at once nor on its fuse: {delay}");
     }
 
     #[test]
@@ -348,3 +384,4 @@ mod tests {
         assert!(five > one, "{one} vs {five}");
     }
 }
+

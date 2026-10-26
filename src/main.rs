@@ -2721,7 +2721,7 @@ impl Game {
             (Tool::Select, "Sélection", Icon::Select, "Clique un élément (bloc, tige, engrenage, câble, tuyau, rail, voiture...) : il est entouré. Glisse-le pour le déplacer ; pour une tige, un câble, un tuyau ou un rail, glisse une poignée au bout pour le retailler. Suppr l'efface. Échap désélectionne. Une voiture sélectionnée affiche ses réglages."),
             (Tool::Eraser, "Gomme", Icon::Eraser, "Efface la matière, les blocs et les câbles (clic droit aussi)."),
             (Tool::Tunnel, "Tunnel", Icon::Tunnel, "Creuse comme la gomme, mais pose une voûte de briques au-dessus du trou : le sable, la terre ou l'eau du plafond ne s'effondrent plus dedans. La roche, elle, tient toute seule et reste telle quelle ; le sol du tunnel n'est pas touché. Le pinceau règle la largeur."),
-            (Tool::Dynamite, "Dynamite", Icon::Dynamite, "Clique : un bâton de dynamite tombe à travers l'air et l'eau et se pose sur la matière. Clique dans la roche, la terre ou un mur pour l'y planter : il saute de l'intérieur, comme dans une carrière. Sa mèche brûle 3 s quand la simulation tourne. Des bâtons qui se touchent sautent ensemble, plus fort, et l'onde de choc fait partir aussitôt les bâtons voisins. La détonation dépasse 100 000 atm : assez pour changer le charbon de bois en diamant."),
+            (Tool::Dynamite, "Dynamite", Icon::Dynamite, "Clique : un bâton de dynamite tombe à travers l'air et l'eau et se pose sur la matière. Clique dans la roche, la terre ou un mur pour l'y planter : il saute de l'intérieur et pulvérise la roche autour, comme dans une carrière. Plusieurs bâtons au même endroit s'additionnent. Sa mèche brûle 3 s quand la simulation tourne. Des bâtons qui se touchent sautent ensemble, plus fort, et l'onde de choc fait partir aussitôt les bâtons voisins. La détonation dépasse 100 000 atm : assez pour changer le charbon de bois en diamant."),
             (Tool::Flame, "Lance-flammes", Icon::Flame, "Garde le clic enfoncé : un jet de flammes à 1500 °C. Le bois prend feu, la pierre rougit puis fond en lave, le fer fond, l'eau bout. Ce qui est lourd (pierre, eau) chauffe plus lentement. Le pinceau règle la taille du jet."),
             (Tool::Lightning, "Éclair", Icon::Bolt, "Clique : la foudre tombe du ciel (du nuage au-dessus s'il y en a un) jusqu'au pointeur. Lâchée en l'air, elle saute vers le conducteur le plus proche ; sous terre, elle frappe la surface au-dessus. Tout son trajet chauffe : l'air à des milliers de degrés, le bois, l'herbe et le charbon prennent feu. Son courant file dans le sol par le meilleur conducteur, fond le sable en tube de verre (fulgurite), fait bouillir l'eau et court dans le fer. Le tonnerre suit, d'autant plus tard que c'est loin. Les gros nuages froids font leurs propres orages : vue Électricité (E)."),
             (Tool::Loupe, "Loupe", Icon::Loupe, "Le pointeur est une loupe : une vue ronde en bas à droite montre la matière sous la croix."),
@@ -4021,6 +4021,27 @@ fn demo_sticks(g: &mut Game) {
     g.set_running(true);
 }
 
+/// `--quarry`: sticks planted in rock: one alone, four in the same blast hole, and a row of three
+/// a little apart, which the shock of the first sets off one after the other.
+fn demo_quarry(g: &mut Game) {
+    g.empty_world();
+    for x in 0..W as i32 {
+        for y in 300..H as i32 {
+            g.world.set(x, y, Mat::Stone);
+        }
+    }
+    g.dynamite.drop(&g.world, vec2(180.0, 360.0));
+    for _ in 0..4 {
+        g.dynamite.drop(&g.world, vec2(470.0, 380.0));
+    }
+    for (k, x) in [720.0, 745.0, 770.0].into_iter().enumerate() {
+        g.dynamite.drop(&g.world, vec2(x, 350.0));
+        g.dynamite.sticks.last_mut().unwrap().fuse = dynamite::FUSE + 60 * k as u32;
+    }
+    g.tool = Tool::Dynamite;
+    g.set_running(true);
+}
+
 /// A meadow over rock with a big charge of powder buried in it: `--crater` lights it. With
 /// `dynamite`, the charge is a stick of dynamite packed in charcoal (it leaves diamonds).
 fn demo_crater(g: &mut Game, dynamite: bool) {
@@ -4380,6 +4401,9 @@ async fn main() {
         }
         if args.iter().any(|a| a == "--sticks") {
             demo_sticks(&mut game);
+        }
+        if args.iter().any(|a| a == "--quarry") {
+            demo_quarry(&mut game);
         }
         if args.iter().any(|a| a == "--topple") {
             demo_topple(&mut game);

@@ -87,7 +87,12 @@ cargo run --release
   de l'intérieur, comme dans un trou de mine. La mèche brûle 3 s quand la simulation tourne (en construction, le bâton attend et
   fait partie du plan : Réessayer le remet). Les bâtons qui se touchent sautent en une seule charge, plus forte, et l'onde de choc
   fait partir les bâtons voisins quelques pas plus tard (détonation par influence) : un tas saute presque d'un coup.
-  Verrouillée pendant le Défi, comme la construction (`--demo out.png --sticks --frames 120`).
+  Le bâton est posé par-dessus la matière, sans la remplacer : seule son explosion la transforme. Des bâtons plantés
+  dans le même trou s'additionnent. Dans la roche, l'onde de choc broie la pierre en gravats autour de la charge (zone
+  broyée, là où le choc dépasse sa résistance à la compression) et la fend en fissures rayonnantes plus loin (là où il
+  dépasse sa résistance à la traction) : la roche est pulvérisée de l'intérieur, comme dans une carrière.
+  Verrouillée pendant le Défi, comme la construction (`--demo out.png --sticks --frames 120`,
+  `--demo out.png --quarry --frames 400` : un bâton seul, quatre dans le même trou et trois en chaîne dans la roche).
 - Le **bois flotte** (une voiture peut rouler dessus, mais ça bouge), le fer et la pierre coulent.
 
 ## Voitures
