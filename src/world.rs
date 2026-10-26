@@ -2850,6 +2850,11 @@ impl World {
             self.fall_drop(x, y);
             return;
         }
+        // A drop that has joined other water (or landed) no longer falls freely: its speed goes
+        // (moved by their physics, the liquids take it over, see `liquid.rs`).
+        if !self.liquid_physics {
+            self.vel[i] = 0;
+        }
         self.step_liquid(x, y);
     }
 

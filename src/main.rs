@@ -1806,6 +1806,17 @@ impl Game {
         self.thunder.retain(|t| t.0 > 0.0);
     }
 
+    /// The particles the game moves besides the world's cells, for the simulation view: the
+    /// pieces of wrecked cars (cells a step) and the fireworks (cells a second), in m/s.
+    fn flying_particles(&self) -> Vec<simview::Particle> {
+        use world::inspect::{CELL_METRES, CELL_STEP_MS};
+        let debris = self.debris.pieces.iter().filter(|p| !p.rest).map(|p| simview::Particle { x: p.p.x, y: p.p.y, vx: p.v.x * CELL_STEP_MS, vy: p.v.y * CELL_STEP_MS, kind: 0 });
+        let rockets = self.fireworks.rockets.iter().map(|r| (r.pos, r.vel));
+        let sparks = self.fireworks.sparks.iter().map(|s| (s.pos, s.vel));
+        let fireworks = rockets.chain(sparks).map(|(p, v)| simview::Particle { x: p.x, y: p.y, vx: v.x * CELL_METRES, vy: v.y * CELL_METRES, kind: 1 });
+        debris.chain(fireworks).collect()
+    }
+
     /// The simulation view's step by step: `n` steps, the world paused after them, and what they
     /// changed kept for its diff.
     fn step_by_step(&mut self, n: usize) {
@@ -2258,7 +2269,8 @@ impl Game {
             self.draw_wind_field(view);
         }
         if self.mode == ViewMode::Simulation {
-            self.simview.draw_layers(&self.world, view, ui);
+            let particles = self.flying_particles();
+            self.simview.draw_layers(&self.world, view, ui, &particles);
         }
         // What the little boy says, over the night and the science views so it can be read.
         self.kids.draw_bubble(view, ui);
@@ -4459,19 +4471,16 @@ async fn main() {
         // `--sim-back`: the simulation view's background.
         if let Some(b) = arg("--sim-back") {
             use simview::{Back, DiffOf};
-            use world::inspect::Field;
             game.simview.back = match b.as_str() {
                 "matiere" => Back::Matter,
-                "liquides-pa" => Back::Pressure(Field::LiquidPa),
-                "liquides-atm" => Back::Pressure(Field::LiquidAtm),
-                "air" => Back::Pressure(Field::Air),
-                "poussee" => Back::Pressure(Field::Push),
-                "poches" => Back::Pressure(Field::Pockets),
+                "pression" => Back::Pressure,
+                "air" => Back::Air,
+                "calcul" => Back::Classes,
                 "diff-remplissage" => Back::Diff(DiffOf::Fill),
                 "diff-temperature" => Back::Diff(DiffOf::Temp),
                 "diff-pression" => Back::Diff(DiffOf::Pressure),
                 "diff-vitesse" => Back::Diff(DiffOf::Velocity),
-                _ => Back::Classes,
+                _ => Back::Matter,
             };
             game.simview.velocity[3] = args.iter().any(|a| a == "--sim-air");
         }

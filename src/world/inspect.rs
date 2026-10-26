@@ -4,7 +4,8 @@
 //! Nothing here changes the world. Each reading says where it comes from, because the kinds of
 //! matter do not share one model:
 //! - a liquid moving by its physics has a velocity on the edges of its cells (`liquid.rs`), in m/s;
-//!   otherwise, like a grain, it only keeps a falling speed (`vel`, eighths of a cell a step);
+//!   otherwise (particles), like a grain, it only keeps a falling speed (`vel`, eighths of a cell
+//!   a step), or the sideways speed of a jet (`jet`, cells a step) while it flies out of one;
 //! - a grain slides down a heap from cell to cell without any speed: only its fall has one;
 //! - a gas (and a flame) has no velocity of its own: it rides the air's flow (`flow.rs`), 8 × 8
 //!   cells to a flow cell;
@@ -18,6 +19,9 @@ use std::collections::HashMap;
 
 /// Units of liquid in a full cell.
 pub const FULL: u32 = super::field::FULL;
+
+/// A cell, in metres.
+pub const CELL_METRES: f32 = CELL_M;
 
 /// A cell a step, in m/s.
 pub const CELL_STEP_MS: f32 = CELL_M / DT;
@@ -35,6 +39,9 @@ pub enum Source {
     Piece,
     /// A slab tipping over or tumbling.
     Slab,
+    /// A drop of the cells' liquids shot out of a jet (`jet`): it keeps its sideways speed as it
+    /// falls a cell a step.
+    Jet,
 }
 
 impl Source {
@@ -45,6 +52,7 @@ impl Source {
             Source::Wind => "flux de l'air (flow.rs)",
             Source::Piece => "morceau qui tombe",
             Source::Slab => "dalle, corps rigide (statics.rs)",
+            Source::Jet => "jet sous pression (jet, pockets.rs)",
         }
     }
 }
@@ -67,33 +75,6 @@ pub enum Field {
     LiquidAtm,
     /// The air's pressure over the ambient one, atm, one value a flow cell (`flow.rs`).
     Air,
-    /// The excess pressure that pushes liquids and loose matter, atm, a flow cell
-    /// (`pressure.rs`: the air's, passed on whole into the liquids).
-    Push,
-    /// The pressure of the closed pockets of gas, absolute, atm (`pockets.rs`; 1 in the open).
-    Pockets,
-}
-
-impl Field {
-    pub const ALL: [Field; 5] = [Field::LiquidPa, Field::LiquidAtm, Field::Air, Field::Push, Field::Pockets];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Field::LiquidPa => "liquides, physique (Pa)",
-            Field::LiquidAtm => "liquides, cellules (atm)",
-            Field::Air => "air, flux (atm)",
-            Field::Push => "air qui pousse (atm)",
-            Field::Pockets => "poches de gaz (atm)",
-        }
-    }
-
-    /// The value the field is measured from: its colours go either side of it.
-    pub fn rest(self) -> f32 {
-        match self {
-            Field::LiquidAtm | Field::Pockets => 1.0,
-            _ => 0.0,
-        }
-    }
 }
 
 impl World {
@@ -124,6 +105,12 @@ impl World {
         let i = y * W + x;
         let m = self.cells[i].m;
         let fall = |v: u8| (v != 0).then(|| Motion { vx: 0.0, vy: v as f32 / 8.0 * CELL_STEP_MS, source: Source::Fall });
+        // A drop shot out of a jet flies a cell down and `v` cells sideways a step (see `fly`).
+        let jet = self.jet[i];
+        if m.kind() == Kind::Liquid && jet >= 2 {
+            let v = (jet >> 1) as f32 * if jet & 1 == 1 { 1.0 } else { -1.0 };
+            return Some(Motion { vx: v * CELL_STEP_MS, vy: CELL_STEP_MS, source: Source::Jet });
+        }
         match m.kind() {
             Kind::Liquid if self.liquid_physics => {
                 let class = self.liq.class.get(i)?;
@@ -152,9 +139,7 @@ impl World {
         match field {
             Field::LiquidPa => self.liquid_pa(x, y),
             Field::LiquidAtm => (m.kind() == Kind::Liquid && !self.liquid_physics).then(|| self.liq_p[i]),
-            Field::Air => (!self.flow.is_solid(fi, fj) && self.flow.compress).then(|| self.flow.excess_at_cell(fi, fj)),
-            Field::Push => (!matches!(m.kind(), Kind::Static | Kind::Powder)).then(|| self.dp.get(fj * FW + fi).copied()).flatten(),
-            Field::Pockets => self.pocket_at(x as i32, y as i32).and_then(|k| self.pockets.get(k)).map(|p| p.pressure),
+            Field::Air => (matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) && !self.flow.is_solid(fi, fj) && self.flow.compress).then(|| self.flow.excess_at_cell(fi, fj)),
         }
     }
 
@@ -217,6 +202,17 @@ mod tests {
     }
 
     #[test]
+    fn a_drop_out_of_a_jet_keeps_its_sideways_speed() {
+        let mut w = World::new_static();
+        w.set(300, 100, Mat::Water);
+        // Three cells a step to the left.
+        w.jet[100 * W + 300] = 3 << 1;
+        let m = w.cell_motion(300, 100, &HashMap::new()).expect("a flying drop");
+        assert_eq!(m.source, Source::Jet);
+        assert!((m.vx + 3.0 * CELL_STEP_MS).abs() < 1e-3 && (m.vy - CELL_STEP_MS).abs() < 1e-3, "{m:?}");
+    }
+
+    #[test]
     fn the_fields_have_values_only_where_they_are_defined() {
         let mut w = World::new_static();
         for x in 0..W as i32 {
@@ -234,8 +230,8 @@ mod tests {
         assert!(w.field_value(Field::LiquidAtm, 220, 270).is_none());
         assert!(w.field_value(Field::LiquidPa, 220, 290).is_none(), "no physics, no liquid pressure");
         // The open air is a pocket at one atmosphere; the ground is in no pocket.
-        assert_eq!(w.field_value(Field::Pockets, 220, 100), Some(1.0));
-        assert!(w.field_value(Field::Pockets, 220, 300).is_none());
-        assert!(w.field_value(Field::Push, 220, 300).is_none());
+        assert_eq!(w.pocket_info(220, 100).map(|p| (p.2, p.3)), Some((1.0, true)));
+        assert!(w.pocket_info(220, 300).is_none());
+        assert!(w.field_value(Field::Air, 220, 300).is_none(), "no air in the ground");
     }
 }
