@@ -292,7 +292,11 @@ fn classify(@builtin(global_invocation_id) id: vec3<u32>) {
             let yi = i32(yy);
             let under = yy + 1u < P.h && (raw_kind(c + P.w) == K_EMPTY || raw_kind(c + P.w) == K_GAS);
             let lone = at_kind(xi - 1, yi) != K_LIQUID && at_kind(xi + 1, yi) != K_LIQUID && at_kind(xi, yi - 1) != K_LIQUID;
-            if m == MAT_WATER && under && lone {
+            // (Water over a gas that is not open air at its pocket's pressure, a cloud, falls
+            // through it as the cells' rain whether it is alone or not: to the liquids the gas
+            // is a wall, and the water would lie on the cloud.)
+            let on_gas = yy + 1u < P.h && raw_kind(c + P.w) == K_GAS && (code[c + P.w] & OPEN) == 0u;
+            if m == MAT_WATER && ((under && lone) || on_gas) {
                 what = AIR;
             } else if fill[c] >= FULL / HOLDS {
                 what = FULLISH;
