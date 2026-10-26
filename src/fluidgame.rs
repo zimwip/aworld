@@ -555,7 +555,7 @@ impl Game {
     /// Colour of liquid under a given head: the pressure there is the head minus the height.
     fn head_colour(&self, head: f32, p: &crate::pipes::Pipe, end: u8) -> Color {
         let q = if end == 0 { p.a } else { p.b };
-        let gauge = head - (H as f32 - q.1);
+        let gauge = head - (H() as f32 - q.1);
         // A head of 60 cells of water is one atmosphere.
         pressure_colour(1.0 + gauge / 60.0)
     }

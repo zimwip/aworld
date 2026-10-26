@@ -64,7 +64,7 @@ impl Game {
                     continue;
                 }
                 let (x, y) = (cx + i, cy + j);
-                let col = if !(0..W as i32).contains(&x) || !(0..H as i32).contains(&y) {
+                let col = if !(0..W() as i32).contains(&x) || !(0..H() as i32).contains(&y) {
                     Color::new(0.03, 0.03, 0.05, 1.0)
                 } else {
                     let m = self.world.at(x, y);

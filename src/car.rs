@@ -678,10 +678,10 @@ impl Car {
             }
         }
         self.damage += heat;
-        let left_the_world = self.p.x < -20.0 || self.p.x > W as f32 + 20.0 || self.p.y < -400.0;
+        let left_the_world = self.p.x < -20.0 || self.p.x > W() as f32 + 20.0 || self.p.y < -400.0;
         if self.damage > 40 {
             self.fate = Fate::Exploded;
-        } else if self.p.y > H as f32 + 16.0 || left_the_world {
+        } else if self.p.y > H() as f32 + 16.0 || left_the_world {
             self.fate = Fate::Dead;
         }
         if let Some(e) = exit {
@@ -1144,7 +1144,7 @@ mod tests {
     #[test]
     fn leaving_the_world_sideways_loses_the_car() {
         let mut w = World::new_static();
-        for x in 0..W as i32 {
+        for x in 0..W() as i32 {
             for y in 240..250 {
                 w.set(x, y, Mat::Stone);
             }

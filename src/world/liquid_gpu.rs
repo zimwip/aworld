@@ -217,7 +217,7 @@ mod native {
         /// The liquids' turn on the card, if the game has one.
         pub fn new() -> Option<Self> {
             let gpu = gpu()?;
-            let pressure = PressureGpu::new(W, H)?;
+            let pressure = PressureGpu::new(W(), H())?;
             let d = &gpu.device;
             assert!(Mat::Water as u8 == 2 && Mat::Stone as u8 == 7 && Mat::Empty as u8 == 0, "liquid.wgsl names these materials by their number");
             // A shader that does not compile would leave a card that does nothing, quietly: the
@@ -281,13 +281,13 @@ mod native {
                 fastest: pipeline("fastest"),
             };
             let grid = |label: &str, n: usize| d.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: (n * 4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
-            let n = W * H;
-            let (nu_, nv) = ((W + 1) * H, W * (H + 1));
+            let n = W() * H();
+            let (nu_, nv) = ((W() + 1) * H(), W() * (H() + 1));
             let params = d.create_buffer(&wgpu::BufferDescriptor { label: Some("liquid params"), size: SLOT * 2, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
             let (code, fill, temp, gaspa, class, p, nu, rhs) = (grid("code", n), grid("fill", n), grid("temp", n), grid("gaspa", n), grid("class", n), grid("p", n), grid("nu", n), grid("rhs", n));
             // The materials (256 words), then the wind over the liquids and the first hard row of
             // each column (flow.rs: `skim`, `sky`).
-            let tables = grid("tables", 256 + flow::FW * flow::FH + W);
+            let tables = grid("tables", 256 + flow::FW() * flow::FH() + W());
             let (want, scale, qnew, tnew, fu, fv, thrown, mnew) = (grid("want", n), grid("scale", n), grid("qnew", n), grid("tnew", n), grid("fu", nu_), grid("fv", nv), grid("thrown", n), grid("mnew", n));
             let groups = n.div_ceil(WG);
             let partials = grid("partials", groups);
@@ -453,7 +453,7 @@ mod native {
         pub(in super::super) fn collect_liquids(&mut self, liq: &mut Liquids, card: &mut LiquidGpu) {
             let Some(pend) = card.pending.take() else { return };
             let audit = std::env::var_os("AWORLD_DEBUG_MASS").is_some();
-            let units = |w: &World| (0..W * H).filter(|&i| w.cells[i].m == Mat::Water).map(|i| w.liquid_fill(i) as u64).sum::<u64>();
+            let units = |w: &World| (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Water).map(|i| w.liquid_fill(i) as u64).sum::<u64>();
             let before = if audit { units(self) + liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>() } else { 0 };
             let clock = self.prof.start();
             let slice = card.read.slice(..pend.total);
@@ -463,8 +463,8 @@ mod native {
             self.prof.stop(prof::LIQ_CARD, clock);
             let clock = self.prof.start();
             let (y0, rows, groups) = (pend.y0, pend.rows, pend.groups);
-            let n = rows * W;
-            let cells = y0 * W..(y0 + rows) * W;
+            let n = rows * W();
+            let cells = y0 * W()..(y0 + rows) * W();
             let data = slice.get_mapped_range();
             let data_ref: &[u8] = &data;
             let word = |k: usize| u32::from_le_bytes([data_ref[k * 4], data_ref[k * 4 + 1], data_ref[k * 4 + 2], data_ref[k * 4 + 3]]);
@@ -508,23 +508,23 @@ mod native {
             let (world_cells, world_fill, world_temp) = (&mut self.cells[cells.clone()], &mut self.fill[cells.clone()], &mut self.temp[cells.clone()]);
             let (code_up, fill_up, temp_up) = (&mut card.code_up[cells.clone()], &mut card.fill_up[cells.clone()], &mut card.temp_up[cells.clone()]);
             let (changed, woken, cleared): (usize, Vec<usize>, Vec<(usize, u32)>) = world_cells
-                .par_chunks_mut(W)
-                .zip(world_fill.par_chunks_mut(W))
-                .zip(world_temp.par_chunks_mut(W))
-                .zip(code_up.par_chunks_mut(W))
-                .zip(fill_up.par_chunks_mut(W))
-                .zip(temp_up.par_chunks_mut(W))
+                .par_chunks_mut(W())
+                .zip(world_fill.par_chunks_mut(W()))
+                .zip(world_temp.par_chunks_mut(W()))
+                .zip(code_up.par_chunks_mut(W()))
+                .zip(fill_up.par_chunks_mut(W()))
+                .zip(temp_up.par_chunks_mut(W()))
                 .enumerate()
                 .map(|(yy, (((((wc, wf), wt), cu), fu), tu))| {
                     let (mut changed, mut woken, mut cleared) = (0, Vec::new(), Vec::new());
                     let mut last_zone = usize::MAX;
-                    for x in 0..W {
-                        let j = yy * W + x;
+                    for x in 0..W() {
+                        let j = yy * W() + x;
                         if word(cells_at + 3 * n + j) != stamp {
                             continue;
                         }
                         changed += 1;
-                        let i = y0 * W + j;
+                        let i = y0 * W() + j;
                         let (c, f, t) = (word(cells_at + j), word(cells_at + n + j), f32::from_bits(word(cells_at + 2 * n + j)));
                         let known = Mat::from_u8((cu[x] & 0xff) as u8);
                         let (known_f, known_t) = (fu[x], tu[x]);
@@ -630,14 +630,14 @@ mod native {
             let mut t = std::time::Instant::now();
             // The band: the rows that hold liquid in zones that run, a margin, what was sent.
             let awake = &self.zones.awake;
-            let liquid_rows: Vec<bool> = (0..H)
+            let liquid_rows: Vec<bool> = (0..H())
                 .into_par_iter()
-                .map(|y| (0..W).any(|x| self.cells[y * W + x].m.kind() == Kind::Liquid && awake[y / sleep::CS * sleep::CW + x / sleep::CS]))
+                .map(|y| (0..W()).any(|x| self.cells[y * W() + x].m.kind() == Kind::Liquid && awake[y / sleep::CS * sleep::CW() + x / sleep::CS]))
                 .collect();
             let first = liquid_rows.iter().position(|&r| r);
             let last = liquid_rows.iter().rposition(|&r| r);
             let margin = max_sub(step) + 3;
-            let now = first.map(|a| (a.saturating_sub(margin), (last.unwrap() + margin).min(H - 1)));
+            let now = first.map(|a| (a.saturating_sub(margin), (last.unwrap() + margin).min(H() - 1)));
             let band = match (now, card.sent) {
                 (Some((a, b)), Some((c, d))) => (a.min(c), b.max(d)),
                 (Some(ab), None) | (None, Some(ab)) => Some(ab).unwrap(),
@@ -651,7 +651,7 @@ mod native {
             let stamp = card.stamp;
             let (y0, y1) = band;
             let rows = y1 + 1 - y0;
-            let cells = y0 * W..(y1 + 1) * W;
+            let cells = y0 * W()..(y1 + 1) * W();
             // The cells as the game has them now, and what the step needs to know of them: the
             // full cells that run (the size of the pressure's system), whether any is thick, the
             // cells that fell (their speed to the edges around).
@@ -659,18 +659,18 @@ mod native {
             let (code, fill, temp, gaspa) = (&mut code_v, &mut fill_v, &mut temp_v, &mut gaspa_v);
             let world: &World = self;
             let (fullish, thick, fallen): (usize, bool, Vec<(usize, f32)>) = code[cells.clone()]
-                .par_chunks_mut(W)
-                .zip(fill[cells.clone()].par_chunks_mut(W))
-                .zip(temp[cells.clone()].par_chunks_mut(W))
-                .zip(gaspa[cells.clone()].par_chunks_mut(W))
+                .par_chunks_mut(W())
+                .zip(fill[cells.clone()].par_chunks_mut(W()))
+                .zip(temp[cells.clone()].par_chunks_mut(W()))
+                .zip(gaspa[cells.clone()].par_chunks_mut(W()))
                 .enumerate()
                 .map(|(yy, (((code, fill), temp), gaspa))| {
                     let y = y0 + yy;
                     let (mut fullish, mut thick, mut fallen) = (0, false, Vec::new());
-                    for x in 0..W {
-                        let i = y * W + x;
+                    for x in 0..W() {
+                        let i = y * W() + x;
                         let m = world.cells[i].m;
-                        let run = awake[y / sleep::CS * sleep::CW + x / sleep::CS];
+                        let run = awake[y / sleep::CS * sleep::CW() + x / sleep::CS];
                         let mut c = m as u32;
                         if world.mask[i] != 0 {
                             c |= MASKED;
@@ -714,7 +714,7 @@ mod native {
                 .into_par_iter()
                 .flat_map_iter(|y| {
                     let fresh = held.is_none_or(|(a, b)| y < a || y > b);
-                    (y * W..(y + 1) * W).filter_map(move |i| {
+                    (y * W()..(y + 1) * W()).filter_map(move |i| {
                         // (A little heat or pocket pressure makes no difference to the liquid: the
                         // whole pool would go up every third step, when the heat spreads, for
                         // hundredths of a degree. The card keeps what it has until the gap counts.)
@@ -735,7 +735,7 @@ mod native {
             let mut patches = std::mem::take(&mut card.patches_up);
             let mut fastest = card.fastest;
             for (i, speed) in fallen {
-                let (x, y) = (i % W, i / W);
+                let (x, y) = (i % W(), i / W());
                 for e in [vi(x, y + 1), vi(x, y)] {
                     patches.push(Patch { edge: e as u32 | 0x8000_0000, mode: 0, value: speed, weight: 0.0 });
                 }
@@ -759,10 +759,10 @@ mod native {
             }
             q.write_buffer(&card.throws_n, 0, bytes(&[0u32]));
             q.write_buffer(&card.tables, 256 * 4, bytes(self.flow.skim_table()));
-            q.write_buffer(&card.tables, (256 + flow::FW * flow::FH) as u64 * 4, bytes(self.flow.sky_table()));
-            let groups = (rows * W).div_ceil(WG);
+            q.write_buffer(&card.tables, (256 + flow::FW() * flow::FH()) as u64 * 4, bytes(self.flow.sky_table()));
+            let groups = (rows * W()).div_ceil(WG);
             for colour in 0..2u32 {
-                let pr = Params { w: W as u32, h: H as u32, y0: y0 as u32, rows: rows as u32, dt, colour, patches: patches.len() as u32, groups: groups as u32, stamp, sent: sent.len() as u32, time: self.ticks as f32 * DT, pad: 0 };
+                let pr = Params { w: W() as u32, h: H() as u32, y0: y0 as u32, rows: rows as u32, dt, colour, patches: patches.len() as u32, groups: groups as u32, stamp, sent: sent.len() as u32, time: self.ticks as f32 * DT, pad: 0 };
                 q.write_buffer(&card.params, colour as u64 * SLOT, bytes(&[pr]));
             }
             // The game's cells are what the card holds now.
@@ -778,9 +778,9 @@ mod native {
             let clock = self.prof.start();
             // The sub-steps.
             let k = &card.kernels;
-            let ncell = rows * W;
-            let (nu_, nv) = (rows * (W + 1), rows * W);
-            let (ubytes, vbytes) = (at(y0 * (W + 1))..at((y1 + 1) * (W + 1)), at(y0 * W)..at((y1 + 1) * W));
+            let ncell = rows * W();
+            let (nu_, nv) = (rows * (W() + 1), rows * W());
+            let (ubytes, vbytes) = (at(y0 * (W() + 1))..at((y1 + 1) * (W() + 1)), at(y0 * W())..at((y1 + 1) * W()));
             let mut enc = card.encoder();
             // The time stamps, where asked for: one at the start, one at the end of each phase
             // (and inside the pressure's solve, its parts).
@@ -855,7 +855,7 @@ mod native {
                 card.run(&mut pass, &k.carry_settle, 0, ncell);
                 card.run(&mut pass, &k.carry_gather, 0, ncell);
                 card.run(&mut pass, &k.carry_commit, 0, ncell);
-                card.run(&mut pass, &k.overflow, 0, W);
+                card.run(&mut pass, &k.overflow, 0, W());
                 drop(pass);
                 stamp_at(&mut enc, &mut stamps, "transport");
             }
@@ -866,7 +866,7 @@ mod native {
             // Back: the band's class and pressure, the throws, the changed cells, the fastest
             // edge, the pressure's scalars. The card is not waited for: the result is read at
             // the next step.
-            let n = rows * W;
+            let n = rows * W();
             let mut off = 0u64;
             for buf in [&card.class, &card.p] {
                 enc.copy_buffer_to_buffer(buf, at(cells.start), &card.read, off, at(n));

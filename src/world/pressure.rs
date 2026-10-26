@@ -16,34 +16,34 @@ const PUSH: f32 = 40.0;
 
 #[inline]
 fn at(i: i32, j: i32) -> usize {
-    j as usize * FW + i.rem_euclid(FW as i32) as usize
+    j as usize * FW() + i.rem_euclid(FW() as i32) as usize
 }
 
 impl World {
     /// Re-computes the excess pressure (atmospheres over the ambient one) of every flow cell:
     /// air takes the wind solver's value, liquid cells share the pressure of the air above them.
     pub(super) fn update_pressure(&mut self) {
-        let n = FW * FH;
+        let n = FW() * FH();
         let (mut liquid, mut solid) = (vec![false; n], vec![false; n]);
-        for j in 0..FH {
-            for i in 0..FW {
+        for j in 0..FH() {
+            for i in 0..FW() {
                 let (mut cnt, mut liq, mut sol) = (0, 0, 0);
                 for dy in (0..CELL).step_by(2) {
                     let y = j * CELL + dy;
-                    if y >= H {
+                    if y >= H() {
                         break;
                     }
                     for dx in (0..CELL).step_by(2) {
                         cnt += 1;
-                        match self.cells[y * W + i * CELL + dx].m.kind() {
+                        match self.cells[y * W() + i * CELL + dx].m.kind() {
                             Kind::Liquid => liq += 1,
                             Kind::Static | Kind::Powder => sol += 1,
                             _ => {}
                         }
                     }
                 }
-                liquid[j * FW + i] = liq * 2 >= cnt;
-                solid[j * FW + i] = sol * 2 >= cnt && !liquid[j * FW + i];
+                liquid[j * FW() + i] = liq * 2 >= cnt;
+                solid[j * FW() + i] = sol * 2 >= cnt && !liquid[j * FW() + i];
             }
         }
         // Air the wind solver still counts as solid has no pressure of its own: the solver re-reads
@@ -52,21 +52,21 @@ impl World {
         // they would read as a jump of pressure that runs down with the body and blows the ground
         // away before it lands.
         let mut stale = vec![false; n];
-        for j in 0..FH {
-            for i in 0..FW {
-                let k = j * FW + i;
+        for j in 0..FH() {
+            for i in 0..FW() {
+                let k = j * FW() + i;
                 stale[k] = !liquid[k] && !solid[k] && self.flow.is_solid(i, j);
             }
         }
         // Air: the solver's pressure. Liquid: first the air just above it, then shared out.
-        for j in 0..FH {
-            for i in 0..FW {
-                let k = j * FW + i;
+        for j in 0..FH() {
+            for i in 0..FW() {
+                let k = j * FW() + i;
                 self.dp[k] = if liquid[k] || solid[k] || stale[k] { 0.0 } else { self.flow.excess_at_cell(i, j) };
             }
         }
-        for j in 0..FH as i32 {
-            for i in 0..FW as i32 {
+        for j in 0..FH() as i32 {
+            for i in 0..FW() as i32 {
                 let k = at(i, j);
                 if !liquid[k] {
                     continue;
@@ -80,8 +80,8 @@ impl World {
             }
         }
         for _ in 0..24 {
-            for j in 0..FH as i32 {
-                for i in 0..FW as i32 {
+            for j in 0..FH() as i32 {
+                for i in 0..FW() as i32 {
                     let k = at(i, j);
                     if !liquid[k] {
                         continue;
@@ -89,7 +89,7 @@ impl World {
                     let (mut sum, mut cnt) = (0.0, 0.0);
                     for (di, dj) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                         let nj = j + dj;
-                        if nj < 0 || nj >= FH as i32 {
+                        if nj < 0 || nj >= FH() as i32 {
                             continue;
                         }
                         let q = at(i + di, nj);
@@ -107,8 +107,8 @@ impl World {
         // Rock (and air with no pressure of its own) takes the pressure of what is around it, so
         // the gradient has no hole in it. With nothing around to go by, it keeps the pressure it
         // had: a body that covers a cell does not change the pressure there.
-        for j in 0..FH as i32 {
-            for i in 0..FW as i32 {
+        for j in 0..FH() as i32 {
+            for i in 0..FW() as i32 {
                 let k = at(i, j);
                 if !solid[k] && !stale[k] {
                     continue;
@@ -116,7 +116,7 @@ impl World {
                 let (mut sum, mut cnt) = (0.0, 0.0);
                 for (di, dj) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                     let nj = j + dj;
-                    if nj >= 0 && nj < FH as i32 && !solid[at(i + di, nj)] && !stale[at(i + di, nj)] {
+                    if nj >= 0 && nj < FH() as i32 && !solid[at(i + di, nj)] && !stale[at(i + di, nj)] {
                         sum += self.dp[at(i + di, nj)];
                         cnt += 1.0;
                     }
@@ -139,7 +139,7 @@ impl World {
 
     fn bilinear(field: &[f32], x: f32, y: f32) -> f32 {
         let fx = x / CELL as f32 - 0.5;
-        let fy = (y / CELL as f32 - 0.5).clamp(0.0, FH as f32 - 1.001);
+        let fy = (y / CELL as f32 - 0.5).clamp(0.0, FH() as f32 - 1.001);
         let (i0, j0) = (fx.floor(), fy.floor());
         let (tx, ty) = (fx - i0, fy - j0);
         let (i0, j0) = (i0 as i32, j0 as i32);
@@ -163,8 +163,8 @@ impl World {
         if !self.pressure_forces {
             return;
         }
-        for j in 1..FH as i32 - 1 {
-            for i in 0..FW as i32 {
+        for j in 1..FH() as i32 - 1 {
+            for i in 0..FW() as i32 {
                 let gx = (self.dpd[at(i + 1, j)] - self.dpd[at(i - 1, j)]) / (2.0 * CELL as f32);
                 let gy = (self.dpd[at(i, j + 1)] - self.dpd[at(i, j - 1)]) / (2.0 * CELL as f32);
                 let g = (gx * gx + gy * gy).sqrt();
@@ -203,7 +203,7 @@ impl World {
                                 continue;
                             }
                             let (nx, ny) = (x + tx, y + ty);
-                            if ny >= 0 && ny < H as i32 && matches!(self.at(nx, ny).kind(), Kind::Empty | Kind::Gas) {
+                            if ny >= 0 && ny < H() as i32 && matches!(self.at(nx, ny).kind(), Kind::Empty | Kind::Gas) {
                                 self.swap((x, y), (nx, ny));
                                 break;
                             }
@@ -221,7 +221,7 @@ mod tests {
     use crate::world::Mat;
 
     fn floor(w: &mut World) {
-        for x in 0..W as i32 {
+        for x in 0..W() as i32 {
             for y in 400..420 {
                 w.set(x, y, Mat::Stone);
             }
@@ -231,8 +231,8 @@ mod tests {
     fn mean_x(w: &World, m: Mat) -> f32 {
         let (mut sum, mut n) = (0.0f32, 0.0f32);
         for y in 300..420 {
-            for x in 0..W {
-                if w.cells[y * W + x].m == m {
+            for x in 0..W() {
+                if w.cells[y * W() + x].m == m {
                     sum += x as f32;
                     n += 1.0;
                 }
@@ -282,7 +282,7 @@ mod tests {
         assert!(before == after, "nothing moves without a gradient");
         // And the quiet threshold ignores the ordinary breeze.
         w.dp.fill(0.0);
-        w.dpd[49 * FW + 63] = 0.01;
+        w.dpd[49 * FW() + 63] = 0.01;
         for _ in 0..50 {
             w.pressure_push();
         }
@@ -340,7 +340,7 @@ mod boom {
     fn pool(forces: bool) -> World {
         let mut w = World::new_static();
         w.pressure_forces = forces;
-        for x in 0..W as i32 {
+        for x in 0..W() as i32 {
             for y in 400..420 {
                 w.set(x, y, Mat::Stone);
             }
@@ -371,7 +371,7 @@ mod boom {
             for _ in 0..3 {
                 w.step();
             }
-            (200..330).map(|y| (300..660).filter(|&x| w.cells[y * W + x].m == Mat::Water).count()).sum::<usize>()
+            (200..330).map(|y| (300..660).filter(|&x| w.cells[y * W() + x].m == Mat::Water).count()).sum::<usize>()
         };
         let (shallow, deep) = (spray(25), spray(62));
         assert!(shallow > 60, "a plume of spray rises above the surface: {shallow}");
@@ -392,11 +392,11 @@ mod boom {
             for t in 1..=120 {
                 w.step();
                 if [3, 10, 20, 40, 120].contains(&t) {
-                    let splash = (200..330).map(|y| (300..660).filter(|&x| w.cells[y * W + x].m == Mat::Water).count()).sum::<usize>();
-                    let top = (200..400).find(|&y| (300..660).any(|x| w.cells[y * W + x].m == Mat::Water)).unwrap_or(0);
-                    let total = (200..400).map(|y| (300..660).filter(|&x| w.cells[y * W + x].m == Mat::Water).count()).sum::<usize>();
-                    let sand_x = { let v: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Sand).map(|i| i % W).collect(); v.iter().sum::<usize>() as f32 / v.len().max(1) as f32 };
-                    let maxdp = (0..FW * FH).map(|k| w.dpd[k].abs()).fold(0.0f32, f32::max);
+                    let splash = (200..330).map(|y| (300..660).filter(|&x| w.cells[y * W() + x].m == Mat::Water).count()).sum::<usize>();
+                    let top = (200..400).find(|&y| (300..660).any(|x| w.cells[y * W() + x].m == Mat::Water)).unwrap_or(0);
+                    let total = (200..400).map(|y| (300..660).filter(|&x| w.cells[y * W() + x].m == Mat::Water).count()).sum::<usize>();
+                    let sand_x = { let v: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Sand).map(|i| i % W()).collect(); v.iter().sum::<usize>() as f32 / v.len().max(1) as f32 };
+                    let maxdp = (0..FW() * FH()).map(|k| w.dpd[k].abs()).fold(0.0f32, f32::max);
                     eprintln!("t={t:3} water {total} splash>y330 {splash} highest water y={top} sand mean x {sand_x:.1} quick-dp max {maxdp:.2}");
                 }
             }
@@ -416,7 +416,7 @@ mod boom {
             for _ in 0..300 {
                 w.step();
             }
-            let top = (0..H as i32).find(|&y| w.raw(x, y) != Mat::Empty).unwrap();
+            let top = (0..H() as i32).find(|&y| w.raw(x, y) != Mat::Empty).unwrap();
             let ground = |w: &World| -> Vec<Mat> { (top..top + 12).flat_map(|y| (x - 40..x + 40).map(move |xx| w.raw(xx, y))).collect() };
             let before = ground(&w);
             for y in 40..60 {

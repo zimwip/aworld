@@ -46,5 +46,5 @@ impl<T> Shared<T> {
 
 /// Runs `f` on every band of columns (`x0..x1`), side by side.
 pub fn column_bands(f: impl Fn(std::ops::Range<usize>) + Sync) {
-    (0..W.div_ceil(COLUMN_BAND)).into_par_iter().for_each(|b| f(b * COLUMN_BAND..((b + 1) * COLUMN_BAND).min(W)));
+    (0..W().div_ceil(COLUMN_BAND)).into_par_iter().for_each(|b| f(b * COLUMN_BAND..((b + 1) * COLUMN_BAND).min(W())));
 }

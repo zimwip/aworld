@@ -287,7 +287,7 @@ impl World {
         }
         let level = std::mem::take(&mut self.level);
         let mut pos = std::mem::take(&mut self.stress_pos);
-        pos.resize(W * H, u32::MAX);
+        pos.resize(W() * H(), u32::MAX);
         for (k, &i) in order.iter().enumerate() {
             pos[i] = k as u32;
         }
@@ -306,7 +306,7 @@ impl World {
             stack.push(k0);
             while let Some(k) = stack.pop() {
                 let i = order[k as usize];
-                let (x, y) = ((i % W) as i32, (i / W) as i32);
+                let (x, y) = ((i % W()) as i32, (i / W()) as i32);
                 for (nx, ny) in Self::neighbors(x, y) {
                     if !Self::inb(nx, ny) {
                         continue;
@@ -369,7 +369,7 @@ impl World {
                 for &k in members {
                     let (px, py) = push[k as usize];
                     let i = order[k as usize];
-                    let (x, y) = (i % W, i / W);
+                    let (x, y) = (i % W(), i / W());
                     if px != 0.0 {
                         wet.push((false, x * 2 + (px > 0.0) as usize, y, px));
                     }
@@ -413,7 +413,7 @@ impl World {
         // next pass (its load has changed).
         cracks.sort_by(|a, b| b.load.total_cmp(&a.load));
         // Which crack's part beyond each cell belongs to (0: none yet).
-        let mut taken = vec![0u32; if cracks.is_empty() { 0 } else { W * H }];
+        let mut taken = vec![0u32; if cracks.is_empty() { 0 } else { W() * H() }];
         let mut tips = 0;
         for (id, crack) in cracks.into_iter().enumerate() {
             if tips >= MAX_TIPS {
@@ -435,7 +435,7 @@ impl World {
                     ok = false;
                     break;
                 }
-                let (x, y) = ((i % W) as i32, (i / W) as i32);
+                let (x, y) = ((i % W()) as i32, (i / W()) as i32);
                 for (nx, ny) in Self::neighbors(x, y) {
                     if !Self::inb(nx, ny) {
                         continue;
@@ -459,7 +459,7 @@ impl World {
                 continue;
             }
             // It turns about the edge between the pivot fibre and the cell under it that held it.
-            let (px, py) = ((crack.pivot % W) as i32, (crack.pivot / W) as i32);
+            let (px, py) = ((crack.pivot % W()) as i32, (crack.pivot / W()) as i32);
             let held = Self::neighbors(px, py).into_iter().find(|&(nx, ny)| Self::inb(nx, ny) && level[Self::idx(nx, ny)] == crack.level - 1).unwrap_or((px, py + 1));
             let hinge = ((px + held.0) as f32 / 2.0 + 0.5, (py + held.1) as f32 / 2.0 + 0.5);
             for &i in &region {
@@ -510,13 +510,13 @@ impl World {
                 let (fx, fy) = push.get(members[k] as usize).copied().unwrap_or((0.0, 0.0));
                 let w = density(self.cells[i].m) as f64 + fy as f64;
                 mass[k] = w;
-                moment[k] = w * ((i % W) as f64 + 0.5);
+                moment[k] = w * ((i % W()) as f64 + 0.5);
                 side[k] = fx as f64;
-                side_moment[k] = fx as f64 * ((i / W) as f64 + 0.5);
+                side_moment[k] = fx as f64 * ((i / W()) as f64 + 0.5);
             }
             for k in lo..hi {
                 let i = cell(k);
-                let (x, y) = ((i % W) as i32, (i / W) as i32);
+                let (x, y) = ((i % W()) as i32, (i / W()) as i32);
                 for (nx, ny) in Self::neighbors(x, y) {
                     if !Self::inb(nx, ny) {
                         continue;
@@ -576,16 +576,16 @@ impl World {
         for &i in cells {
             let rho = density(self.cells[i].m);
             mass += rho;
-            mx += rho * ((i % W) as f32 + 0.5);
-            let t = i + W;
-            if t >= W * H || own(t) {
+            mx += rho * ((i % W()) as f32 + 0.5);
+            let t = i + W();
+            if t >= W() * H() || own(t) {
                 continue;
             }
             if self.mask[t] != 0 || matches!(self.cells[t].m.kind(), Kind::Static | Kind::Powder) {
-                let x = (i % W) as i32;
+                let x = (i % W()) as i32;
                 lo = lo.min(x);
                 hi = hi.max(x);
-                base = base.max(i / W + 1);
+                base = base.max(i / W() + 1);
             }
         }
         let cx = mx / mass.max(1e-6);
@@ -608,7 +608,7 @@ impl World {
         let edge = if side > 0.0 { hi as f32 + 1.0 } else { lo as f32 };
         let (mut over, mut hold) = (0.0f32, 0.0f32);
         for &(i, (fx, fy)) in &pushes {
-            let (x, y) = ((i % W) as f32 + 0.5, (i / W) as f32 + 0.5);
+            let (x, y) = ((i % W()) as f32 + 0.5, (i / W()) as f32 + 0.5);
             over += fx.abs() * (base as f32 - y) * if (fx > 0.0) == (side > 0.0) { 1.0 } else { -1.0 };
             hold += (density(self.cells[i].m) + fy) * (edge - x) * side.signum();
         }
@@ -624,7 +624,7 @@ impl World {
             return (0.0, cells[0]);
         }
         let sigma = strength(m) as f64 * 1.0e6;
-        let xy = |i: usize| ((i % W) as f64 + 0.5, (i / W) as f64 + 0.5);
+        let xy = |i: usize| ((i % W()) as f64 + 0.5, (i / W()) as f64 + 0.5);
         let (mut worst, mut pivot) = (0.0f64, cells[0]);
         for dir in [-1.0f64, 1.0] {
             // The edge fibre on that side, lowest first: the part beyond would turn about it.
@@ -674,8 +674,8 @@ impl World {
             let (mut lo, mut hi) = ((i32::MAX, 0), (i32::MIN, 0));
             let (mut loose, mut firm) = (false, false);
             for &i in &p.cells {
-                let t = i + W;
-                if t >= W * H || in_piece(t) {
+                let t = i + W();
+                if t >= W() * H() || in_piece(t) {
                     continue;
                 }
                 let under = self.cells[t].m;
@@ -694,7 +694,7 @@ impl World {
                 } else {
                     firm = true;
                 }
-                let (x, y) = ((i % W) as i32, (i / W) as i32);
+                let (x, y) = ((i % W()) as i32, (i / W()) as i32);
                 if x < lo.0 || (x == lo.0 && y > lo.1) {
                     lo = (x, y);
                 }
@@ -714,10 +714,10 @@ impl World {
             }
             let (mass, mx, my) = p.cells.iter().fold((0.0f32, 0.0f32, 0.0f32), |(m, mx, my), &i| {
                 let rho = density(self.cells[i].m);
-                (m + rho, mx + rho * ((i % W) as f32 + 0.5), my + rho * ((i / W) as f32 + 0.5))
+                (m + rho, mx + rho * ((i % W()) as f32 + 0.5), my + rho * ((i / W()) as f32 + 0.5))
             });
             let (cx, cy) = (mx / mass.max(1e-6), my / mass.max(1e-6));
-            let base = p.cells.iter().map(|&i| i / W + 1).max().unwrap_or(0);
+            let base = p.cells.iter().map(|&i| i / W() + 1).max().unwrap_or(0);
             let hinge = if let Some(edge) = self.pushed_over(&p.cells, (lo.0, hi.0), base) {
                 // Pushed over by the liquid against it (a wall of a dam that is too thin).
                 edge
@@ -748,8 +748,8 @@ impl World {
         }
         let in_piece = |i: usize| p.cells.binary_search_by(|q| i.cmp(q)).is_ok();
         p.cells.iter().all(|&i| {
-            let t = i + W;
-            t < W * H && (in_piece(t) || (self.mask[t] == 0 && free_for_slab(self.cells[t].m)))
+            let t = i + W();
+            t < W() * H() && (in_piece(t) || (self.mask[t] == 0 && free_for_slab(self.cells[t].m)))
         })
     }
 
@@ -761,7 +761,7 @@ impl World {
         let (mut mass, mut mx, mut my) = (0.0f32, 0.0f32, 0.0f32);
         let mut drawn = Vec::with_capacity(cells.len());
         for (k, &i) in cells.iter().enumerate() {
-            let (x, y) = ((i % W) as i32, (i / W) as i32);
+            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
             let rho = density(self.cells[i].m);
             mass += rho;
             mx += rho * (x as f32 + 0.5);
@@ -904,7 +904,7 @@ impl World {
         if worst * ms > 0.3 && s.parts.iter().any(|p| rubble(p.cell.m).is_some()) {
             let cells: Vec<usize> = s.drawn.iter().map(|d| d.0).collect();
             let vel: Vec<(f32, f32)> = cells.iter().map(|&i| {
-                let v = s.velocity_at(((i % W) as f32 + 0.5, (i / W) as f32 + 0.5));
+                let v = s.velocity_at(((i % W()) as f32 + 0.5, (i / W()) as f32 + 0.5));
                 let into = dot(v, n).min(0.0) * ms;
                 (into * n.0, into * n.1)
             }).collect();
@@ -974,12 +974,12 @@ impl World {
             let d = (p.x as f32 + 0.5 - s.c0.0, p.y as f32 + 0.5 - s.c0.1);
             let (x, y) = ((c.0 + d.0 * cs - d.1 * sn).floor() as i32, (c.1 + d.0 * sn + d.1 * cs).floor() as i32);
             // The base of the world is ground and its sides are walls (the sky is open).
-            if y >= H as i32 {
-                walls.push(((x as f32 + 0.5, H as f32), (0.0, -1.0)));
+            if y >= H() as i32 {
+                walls.push(((x as f32 + 0.5, H() as f32), (0.0, -1.0)));
             } else if x < 0 && y >= 0 {
                 walls.push(((0.0, y as f32 + 0.5), (1.0, 0.0)));
-            } else if x >= W as i32 && y >= 0 {
-                walls.push(((W as f32, y as f32 + 0.5), (-1.0, 0.0)));
+            } else if x >= W() as i32 && y >= 0 {
+                walls.push(((W() as f32, y as f32 + 0.5), (-1.0, 0.0)));
             }
             for (tx, ty) in [(x, y), (x + 1, y), (x, y + 1)] {
                 if Self::inb(tx, ty) {
@@ -996,7 +996,7 @@ impl World {
         let mut hits: Vec<usize> = vec![];
         for &t in &around {
             // Which part of the body covers the centre of this cell, if any.
-            let q = ((t % W) as f32 + 0.5 - c.0, (t / W) as f32 + 0.5 - c.1);
+            let q = ((t % W()) as f32 + 0.5 - c.0, (t / W()) as f32 + 0.5 - c.1);
             let home = ((s.c0.0 + q.0 * cs + q.1 * sn).floor() as i32, (s.c0.1 - q.0 * sn + q.1 * cs).floor() as i32);
             let Some(&k) = s.home.get(&home) else { continue };
             // Air gives way; while it turns slowly on its edge, so do water and loose grains
@@ -1009,7 +1009,7 @@ impl World {
             }
             // Against its own foot while it still turns on it: that corner is crushed, not stopped.
             if let Some(h) = s.hinge {
-                let p = ((t % W) as f32 + 0.5, (t / W) as f32 + 0.5);
+                let p = ((t % W()) as f32 + 0.5, (t / W()) as f32 + 0.5);
                 if (p.0 - h.0).powi(2) + (p.1 - h.1).powi(2) < 6.25 {
                     crushed.push((k, p));
                     continue;
@@ -1129,7 +1129,7 @@ impl World {
         let m = hits.iter().map(|&t| self.cells[t].m).find(|m| m.kind() == Kind::Static).unwrap_or(self.cells[hits[0]].m);
         let every = hits.len().div_ceil(MAX_POINTS);
         let points = hits.iter().step_by(every).map(|&t| {
-            let (x, y) = ((t % W) as i32, (t / W) as i32);
+            let (x, y) = ((t % W()) as i32, (t / W()) as i32);
             let (mut nx, mut ny) = (0.0f32, 0.0f32);
             for dy in -2..=2 {
                 for dx in -2..=2 {
@@ -1162,7 +1162,7 @@ impl World {
                 continue;
             }
             let k = piece.len() as f32;
-            let c = piece.iter().fold((0.0, 0.0), |a, &i| (a.0 + (i % W) as f32 + 0.5, a.1 + (i / W) as f32 + 0.5));
+            let c = piece.iter().fold((0.0, 0.0), |a, &i| (a.0 + (i % W()) as f32 + 0.5, a.1 + (i / W()) as f32 + 0.5));
             let v = s.velocity_at((c.0 / k, c.1 / k));
             let vn = (v.0 * n.0 + v.1 * n.1).min(0.0);
             // The part along the surface is braked, the part into it bounces back a little.
@@ -1178,8 +1178,8 @@ impl World {
         }
         let in_piece = |i: usize| piece.cells.binary_search_by(|q| i.cmp(q)).is_ok();
         let firm = piece.cells.iter().any(|&i| {
-            let t = i + W;
-            t < W * H && !in_piece(t) && (self.mask[t] != 0 || matches!(self.cells[t].m.kind(), Kind::Static | Kind::Powder))
+            let t = i + W();
+            t < W() * H() && !in_piece(t) && (self.mask[t] != 0 || matches!(self.cells[t].m.kind(), Kind::Static | Kind::Powder))
         });
         if !firm {
             return false;
@@ -1221,7 +1221,7 @@ impl World {
         // Each piece grows from its seed through the cells nearest to it.
         let next = |k: usize| {
             let i = cells[k];
-            let (x, y) = ((i % W) as i32, (i / W) as i32);
+            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
             Self::neighbors(x, y).into_iter().filter(|&(nx, ny)| Self::inb(nx, ny)).filter_map(|(nx, ny)| at.get(&Self::idx(nx, ny)).copied()).collect::<Vec<usize>>()
         };
         loop {
@@ -1255,7 +1255,7 @@ impl World {
             }
             let i = cells[k];
             let m = self.cells[i].m;
-            let (x, y) = ((i % W) as i32, (i / W) as i32);
+            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
             self.set(x, y, Mat::Empty);
             let Some(grain) = rubble(m) else { continue };
             // Thrown back up and aside a little, as the shards of a broken plate.
@@ -1290,8 +1290,8 @@ mod tests {
         w.day_cycle = false;
         w.climate_fixed = Some(-5.0);
         w.reset_temps();
-        for x in 0..W as i32 {
-            for y in ground..H as i32 {
+        for x in 0..W() as i32 {
+            for y in ground..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -1326,7 +1326,7 @@ mod tests {
             tipped |= w.slabs.iter().any(|s| s.angle > 0.3);
         }
         assert!(tipped, "it turned over its foot");
-        assert!((0..W * H).filter(|&i| w.cells[i].m == Mat::Ice).all(|i| i / W > 400), "nothing is left standing in the air");
+        assert!((0..W() * H()).filter(|&i| w.cells[i].m == Mat::Ice).all(|i| i / W() > 400), "nothing is left standing in the air");
         let hail = count(&w, Mat::Hail);
         assert!(hail > n / 10, "it shattered on the rock: {hail} hail of {n}");
         assert!(count(&w, Mat::Ice) + hail > n * 8 / 10, "the ice is still there");
@@ -1360,10 +1360,10 @@ mod tests {
         run(&mut w, 400);
         assert!((105..125).all(|x| w.raw(x, 425) == Mat::Ice), "the centred block stays");
         // (It may come to lean against the side of the pedestal, as a plank would.)
-        let fallen: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Ice && i % W > 200).collect();
-        let mean_y = fallen.iter().map(|i| i / W).sum::<usize>() / fallen.len();
+        let fallen: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Ice && i % W() > 200).collect();
+        let mean_y = fallen.iter().map(|i| i / W()).sum::<usize>() / fallen.len();
         assert!(mean_y > 428, "the overhanging block tipped off: its cells are at row {mean_y} on average");
-        assert!((0..W * H).any(|i| matches!(w.cells[i].m, Mat::Ice | Mat::Hail) && i % W > 320 && i / W > 440), "it fell beside the pedestal");
+        assert!((0..W() * H()).any(|i| matches!(w.cells[i].m, Mat::Ice | Mat::Hail) && i % W() > 320 && i / W() > 440), "it fell beside the pedestal");
     }
 
     #[test]
@@ -1413,7 +1413,7 @@ mod tests {
             }
         }
         run(&mut w, 1500);
-        let top = |x: i32| (0..H as i32).find(|&y| w.raw(x, y) == Mat::Dirt).unwrap_or(450);
+        let top = |x: i32| (0..H() as i32).find(|&y| w.raw(x, y) == Mat::Dirt).unwrap_or(450);
         assert!(top(405) > 420, "the wall slumped: top at {}", top(405));
         assert!(top(395) < 450 && top(415) < 450, "into a heap on both sides");
         assert_eq!(count(&w, Mat::Dirt), 400, "no earth is lost");
@@ -1429,7 +1429,7 @@ mod tests {
                 w.set(x, y, Mat::Ice);
             }
         }
-        let cells: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Ice).collect();
+        let cells: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Ice).collect();
         w.loosen(cells, Some((100.0, 104.0)), (0.0, 0.0), 0.0);
         let s = &w.slabs[0];
         assert!((s.mass - 40.0 * 0.92).abs() < 1e-3);
@@ -1446,7 +1446,7 @@ mod tests {
 
     /// Cells of matter `m` in the world.
     fn cells_of(w: &World, m: Mat) -> Vec<(i32, i32)> {
-        (0..W * H).filter(|&i| w.cells[i].m == m).map(|i| ((i % W) as i32, (i / W) as i32)).collect()
+        (0..W() * H()).filter(|&i| w.cells[i].m == m).map(|i| ((i % W()) as i32, (i / W()) as i32)).collect()
     }
 
     #[test]
@@ -1457,7 +1457,7 @@ mod tests {
                 w.set(x, y, Mat::Wood);
             }
         }
-        let cells: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Wood).collect();
+        let cells: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Wood).collect();
         w.loosen(cells, None, (0.0, 2.0), 0.0);
         let mut s = w.slabs.pop().unwrap();
         let before = energy(&s);
@@ -1468,7 +1468,7 @@ mod tests {
         assert!(s.spin < -0.01, "pushed up at its right end, it turns anticlockwise: {}", s.spin);
         assert!(energy(&s) <= before, "a hit loses energy, it never makes any: {} > {before}", energy(&s));
         // Straight under its centre, the same blow does not turn it.
-        let mut s2 = { let mut w = world(450); for x in 100..120 { for y in 300..306 { w.set(x, y, Mat::Wood); } } let cells: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Wood).collect(); w.loosen(cells, None, (0.0, 2.0), 0.0); w.slabs.pop().unwrap() };
+        let mut s2 = { let mut w = world(450); for x in 100..120 { for y in 300..306 { w.set(x, y, Mat::Wood); } } let cells: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Wood).collect(); w.loosen(cells, None, (0.0, 2.0), 0.0); w.slabs.pop().unwrap() };
         let mid = Hit { soft: false, points: vec![((s2.c.0, 306.0), (0.0, -1.0))], m: Mat::Stone };
         w.collide(&mut s2, &mid);
         assert!(s2.spin.abs() < 1e-4, "{}", s2.spin);
@@ -1514,7 +1514,7 @@ mod tests {
                 w.set(x, y, Mat::Wood);
             }
         }
-        let cells: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Wood).collect();
+        let cells: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Wood).collect();
         w.loosen(cells, None, (1.5, 0.0), 0.0);
         run(&mut w, 600);
         assert!(w.slabs.is_empty(), "it came to rest");
@@ -1535,7 +1535,7 @@ mod tests {
                 w.set(x, y, Mat::Wood);
             }
         }
-        let cells: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Wood).collect();
+        let cells: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Wood).collect();
         // Spinning as it falls: it lands on a corner.
         w.loosen(cells, None, (0.0, 0.0), 0.02);
         let mut spun = false;
@@ -1599,8 +1599,8 @@ mod snapshots {
         w.day_cycle = false;
         w.climate_fixed = Some(-5.0);
         w.reset_temps();
-        for x in 0..W as i32 {
-            for y in 450..H as i32 {
+        for x in 0..W() as i32 {
+            for y in 450..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -1621,7 +1621,7 @@ mod snapshots {
                 w.set(x, y, Mat::Wood);
             }
         }
-        let cells: Vec<usize> = (0..W * H).filter(|&i| w.cells[i].m == Mat::Wood && i % W >= 300 && i % W < 316).collect();
+        let cells: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Wood && i % W() >= 300 && i % W() < 316).collect();
         w.loosen(cells, None, (0.4, 0.0), 0.03);
         // A slope and a round boulder.
         for x in 420..700 {

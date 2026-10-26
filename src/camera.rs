@@ -83,7 +83,7 @@ impl Camera {
 /// Keeps the world covering the whole area (no empty band at the edges).
 fn clamp_origin(o: Vec2, s: f32, area: Rect) -> Vec2 {
     let (vw, vh) = (area.w / s, area.h / s);
-    vec2(o.x.clamp(0.0, (W as f32 - vw).max(0.0)), o.y.clamp(0.0, (H as f32 - vh).max(0.0)))
+    vec2(o.x.clamp(0.0, (W() as f32 - vw).max(0.0)), o.y.clamp(0.0, (H() as f32 - vh).max(0.0)))
 }
 
 #[cfg(test)]

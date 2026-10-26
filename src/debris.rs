@@ -239,7 +239,7 @@ impl Debris {
                 }
             }
         }
-        let gone = |p: &Piece| p.age >= LIFE || p.p.y > H as f32 + 30.0 || p.p.x < -30.0 || p.p.x > W as f32 + 30.0;
+        let gone = |p: &Piece| p.age >= LIFE || p.p.y > H() as f32 + 30.0 || p.p.x < -30.0 || p.p.x > W() as f32 + 30.0;
         self.pieces.retain(|p| !gone(p));
         (thud, smoke)
     }
@@ -299,7 +299,7 @@ mod tests {
     /// A flat stone floor at y = 300.
     fn floor() -> World {
         let mut w = World::new_static();
-        for x in 0..W as i32 {
+        for x in 0..W() as i32 {
             for y in 300..330 {
                 w.set(x, y, Mat::Stone);
             }

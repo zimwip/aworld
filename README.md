@@ -111,6 +111,12 @@ Q/E/T tourner · Tab onglet · [ ] pinceau · ↑/↓ vitesse · 1-0 matières �
 [--biome mer|montagne] [--hour 18.5] [--season hiver] [--view thermique|efforts|vent] [--palette] [--wreck]` enregistre une capture
 (`--wreck` fait exploser une voiture juste avant).
 
+**Taille du monde** : 960 × 540 cellules par défaut. Les curseurs Largeur / Hauteur du menu du climat (clic sur la
+pastille de l'heure) relancent le jeu avec un monde neuf d'une autre taille, de 384 × 216 à 1920 × 1080 (pas de 96
+colonnes et de 18 lignes) ; au lancement : `cargo run --release -- --grid 1440x810` (ou `AWORLD_GRID=1440x810`). Le
+relief et le ciel s'étirent avec le monde ; les objets (voitures, blocs, arbres, personnages) gardent leur taille en
+cellules. Une sauvegarde ne se charge que dans un monde de sa taille. Pas dans le navigateur pour l'instant.
+
 
 ## Son
 

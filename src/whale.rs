@@ -77,11 +77,11 @@ pub struct Whales {
 
 /// The water surface over a column, if the water there is at least `MIN_DEPTH` deep.
 pub fn surface_at(world: &World, x: i32) -> Option<i32> {
-    if !(0..W as i32).contains(&x) {
+    if !(0..W() as i32).contains(&x) {
         return None;
     }
     let mut y = 0;
-    while y < H as i32 && matches!(world.at(x, y).kind(), Kind::Empty | Kind::Gas) {
+    while y < H() as i32 && matches!(world.at(x, y).kind(), Kind::Empty | Kind::Gas) {
         y += 1;
     }
     let deep = (y..y + MIN_DEPTH).all(|d| world.at(x, d) == Mat::Water);
@@ -93,7 +93,7 @@ pub fn find_sea(world: &World) -> Option<(i32, i32, i32)> {
     let step = 3;
     let mut best: Option<(i32, i32, i32)> = None;
     let mut run: Option<(i32, i32, i32)> = None;
-    for x in (0..W as i32).step_by(step) {
+    for x in (0..W() as i32).step_by(step) {
         match (surface_at(world, x), run) {
             (Some(y), Some((x0, _, y0))) if (y - y0).abs() <= 3 => run = Some((x0, x, y0)),
             (Some(y), _) => run = Some((x, x, y)),
@@ -280,8 +280,8 @@ mod tests {
     /// A stone basin across the world filled with water to `level`, bottom at row 500.
     fn sea(width: i32, level: i32) -> World {
         let mut w = World::new_static();
-        for x in 0..W as i32 {
-            for y in 500..H as i32 {
+        for x in 0..W() as i32 {
+            for y in 500..H() as i32 {
                 w.set(x, y, Mat::Stone);
             }
         }
@@ -352,7 +352,7 @@ mod tests {
         let mut whales = Whales::new();
         assert!(whales.summon(&world));
         whales.update(1.0 / 60.0, &world);
-        for x in 0..W as i32 {
+        for x in 0..W() as i32 {
             for y in 380..500 {
                 world.set(x, y, Mat::Empty);
             }
