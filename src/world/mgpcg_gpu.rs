@@ -638,6 +638,8 @@ mod tests {
 
     /// The card's costs, to see what a resident solver could hope for on it:
     /// `AWORLD_GPU=1 cargo test --release --bin aworld bench_gpu -- --ignored --nocapture`.
+    /// `AWORLD_BENCH_GRID=1920x1080` measures a bigger world than the game's (the tank of the
+    /// last two lines is as wide, and as high in proportion).
     #[test]
     #[ignore]
     fn bench_gpu() {
@@ -646,11 +648,12 @@ mod tests {
             return;
         };
         eprintln!("carte : {}", g.name);
-        let (w, h) = (960, 540);
+        let (w, h) = std::env::var("AWORLD_BENCH_GRID").ok().and_then(|v| v.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))).unwrap_or((960, 540));
+        eprintln!("grille : {w}x{h}");
         let mut gpu = PressureGpu::new(w, h).unwrap();
         gpu.bench();
         // And a whole solve of the big tank, as the game would ask for it.
-        let (w, h) = (960, 200);
+        let (w, h) = (w, h * 200 / 540);
         let mut gpu = PressureGpu::new(w, h).unwrap();
         let mut sys = tank(w, h);
         gpu.solve(sys.fine(), 1.0, 0.0, 50);
