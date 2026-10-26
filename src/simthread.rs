@@ -138,7 +138,8 @@ impl SimThread {
         sim.sounds = Sounds::recorder();
         let (to, rx) = channel();
         let (tx, from) = channel();
-        let spare = Box::new(blank());
+        // Two spares: one is being filled while the screen gives the other back.
+        let spare = vec![Box::new(blank()), Box::new(blank())];
         std::thread::Builder::new()
             .name("simulation".into())
             .spawn(move || {
@@ -147,7 +148,7 @@ impl SimThread {
                 // behind the steps, and the images a second would drop with the steps.
                 let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
                 let pool = rayon::ThreadPoolBuilder::new().num_threads(cores.saturating_sub(1).max(1)).thread_name(|i| format!("simulation-{i}")).build().expect("simulation pool");
-                pool.install(move || Worker { game: Some(sim), spare: Some(spare), rx, tx, lends: 0, dirty: true, last: Instant::now(), busy: 0.016, lent_for: 0.0 }.run())
+                pool.install(move || Worker { game: Some(sim), spare, rx, tx, lends: 0, dirty: true, last: Instant::now(), busy: 0.016, lent_for: 0.0 }.run())
             })
             .expect("simulation thread");
         SimThread { to, from, lends: 0, shown: 0 }
@@ -218,7 +219,7 @@ fn blank() -> Game {
 /// The simulation thread's side.
 struct Worker {
     game: Option<Box<Game>>,
-    spare: Option<Box<Game>>,
+    spare: Vec<Box<Game>>,
     rx: Receiver<ToSim>,
     tx: Sender<ToScreen>,
     lends: u64,
@@ -270,7 +271,7 @@ impl Worker {
         if !self.dirty {
             return;
         }
-        let (Some(game), Some(mut pic)) = (self.game.as_mut(), self.spare.take()) else { return };
+        let (Some(game), Some(mut pic)) = (self.game.as_mut(), self.spare.pop()) else { return };
         copy_picture(game, &mut pic);
         let news = News::take(game);
         self.dirty = false;
@@ -301,6 +302,11 @@ impl Worker {
             let start = Instant::now();
             self.game.as_mut().expect("the world").sim_step();
             seconds += start.elapsed().as_secs_f64();
+            // A picture after every step, not every update: a world that lags behind the clock
+            // takes several steps an update, and the screen would show one in four (32 steps a
+            // second, but 8 different pictures, and the water jumps).
+            self.dirty = true;
+            self.publish();
         }
         self.game.as_mut().expect("the world").after_steps(dt, steps, seconds);
     }
@@ -323,7 +329,7 @@ impl Worker {
 
     fn handle(&mut self, m: ToSim) {
         match m {
-            ToSim::Recycle(pic) => self.spare = Some(pic),
+            ToSim::Recycle(pic) => self.spare.push(pic),
             ToSim::Back(_) => unreachable!("given back without being lent"),
             ToSim::Lend => {
                 let since = Instant::now();
@@ -433,6 +439,8 @@ mod frame_bench {
         let n = 300;
         let mut worst = 0.0f64;
         let paint = std::env::var_os("PAINT").is_some();
+        // How many different worlds the screen showed: one a step, or the water jumps.
+        let (mut pictures, mut clock) = (0, g.world.clock);
         for _ in 0..n {
             let f = Instant::now();
             // Painting: every frame borrows the world.
@@ -444,8 +452,11 @@ mod frame_bench {
                 crate::render::light_map(&g.world, &mut buf);
             }
             worst = worst.max(f.elapsed().as_secs_f64());
+            if g.world.clock != clock {
+                (pictures, clock) = (pictures + 1, g.world.clock);
+            }
         }
         let (secs, steps) = g.fps.take_steps();
-        println!("frame {:.2} ms (worst {:.1}), {steps} steps in {:.1} s ({secs:.1} s of steps)", t.elapsed().as_secs_f64() * 1000.0 / n as f64, worst * 1000.0, t.elapsed().as_secs_f64());
+        println!("{pictures} pictures, frame {:.2} ms (worst {:.1}), {steps} steps in {:.1} s ({secs:.1} s of steps)", t.elapsed().as_secs_f64() * 1000.0 / n as f64, worst * 1000.0, t.elapsed().as_secs_f64());
     }
 }
