@@ -1753,8 +1753,14 @@ impl World {
         if ticks > 0 {
             self.frame = self.frame.wrapping_add(1);
         }
+        // (The seep through thin matter runs on the cells the card gave back, before the step's
+        // cells go to it: a cell it changed after they went would be a cell the card has wrong,
+        // and what the card did to it would be lost at the next step.)
         if self.liquid_physics {
             self.take_liquids_from_card();
+            if self.liquids_on_card() {
+                self.seep_through_thin();
+            }
         }
         if audit {
             marks.push(("reprise de la carte", self.water_units_audit()));
@@ -1772,7 +1778,9 @@ impl World {
                 if last {
                     timed!(self, prof::LIQUIDS, self.step_liquids(self.dt));
                 }
-                self.seep_through_thin();
+                if !self.liquids_on_card() {
+                    self.seep_through_thin();
+                }
             }
             if audit {
                 marks.push(("liquides", self.water_units_audit()));
@@ -2934,7 +2942,8 @@ impl World {
         // Water with more water on top of it (the roof of a hole in a lake, a thick stream) just
         // sinks a cell at a time: only a free drop races down.
         let free_drop = if self.liquid_physics {
-            self.lone_liquid(x, y)
+            // (Water on a cloud too, alone or not: the cloud is a wall to the liquids.)
+            self.lone_liquid(x, y) || self.rain_over_gas(x, y)
         } else {
             self.at(x, y - 1).kind() != Kind::Liquid
         };
@@ -3649,6 +3658,13 @@ impl World {
                     piece.fallen += 1.0;
                 }
                 if !self.piece_can_move(piece, 1) {
+                    // Under water and lighter than it: it comes up (Archimedes), a row a step,
+                    // until its top is out (a log that dived in resurfaces).
+                    if self.buoyed(piece) {
+                        piece.vy = 0.0;
+                        self.piece_move(piece, -1);
+                        continue;
+                    }
                     // Touched down. It may break (see `statics.rs`); if not, a hard landing
                     // bounces right away and a soft one settles.
                     if self.landing_breaks(piece) {
@@ -3701,6 +3717,32 @@ impl World {
     }
 
     /// The upward part of a bounce.
+    /// Whether a piece is under a liquid it is lighter than and can come up a row through it:
+    /// every cell over it is air, gas or such a liquid, one of them liquid in a body of liquid
+    /// (not a stray drop), and one of the cells under it liquid too (immersed, not a puddle
+    /// lying on a block in the air).
+    fn buoyed(&self, piece: &Piece) -> bool {
+        let in_piece = |i: usize| piece.cells.binary_search_by(|p| i.cmp(p)).is_ok();
+        let lighter = |j: usize| self.mask[j] == 0 && self.cells[j].m.kind() == Kind::Liquid && piece.density < density(self.cells[j].m);
+        let body = |j: usize| lighter(j) && ((j >= W && lighter(j - W)) || (j % W > 0 && lighter(j - 1)) || (j % W + 1 < W && lighter(j + 1)));
+        let mut under_liquid = false;
+        for &i in &piece.cells {
+            if i < W {
+                return false;
+            }
+            let j = i - W;
+            if in_piece(j) {
+                continue;
+            }
+            if body(j) {
+                under_liquid = true;
+            } else if !(self.mask[j] == 0 && matches!(self.cells[j].m.kind(), Kind::Empty | Kind::Gas | Kind::Flame)) {
+                return false;
+            }
+        }
+        under_liquid && piece.cells.iter().any(|&i| i + W < W * H && !in_piece(i + W) && lighter(i + W))
+    }
+
     fn rise(&mut self, piece: &mut Piece) {
         let up = (-piece.vy).max(1.0) as i32;
         for _ in 0..up {
@@ -5312,9 +5354,12 @@ mod tests {
                 w.set(x, y, Mat::Stone);
             }
         }
+        // (Banks as wide as the world: a wall one cell thick gives way under 32 m of water and
+        // the splash of the rock, see `statics.rs`, and the lake would drain away.)
         for y in 300..H as i32 - 10 {
-            w.set(99, y, Mat::Stone);
-            w.set(300, y, Mat::Stone);
+            for x in (0..100).chain(300..W as i32) {
+                w.set(x, y, Mat::Stone);
+            }
         }
         for x in 100..300 {
             for y in 340..H as i32 - 10 {

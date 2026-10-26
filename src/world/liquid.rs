@@ -382,6 +382,12 @@ impl World {
         self.water_fill(i)
     }
 
+    /// Whether the water at (x, y) lies on a gas that is not open air at its pocket's pressure
+    /// (a cloud, smoke, the steam of a bubble): it falls through it as the cells' rain.
+    pub(super) fn rain_over_gas(&self, x: i32, y: i32) -> bool {
+        self.at(x, y + 1).kind() == Kind::Gas && !self.gas_open(x, y + 1)
+    }
+
     /// Whether the cell at (x, y) is a lone cell of liquid (nothing liquid beside or over it):
     /// with air under it, it is a drop of the cells' turn.
     pub(super) fn lone_liquid(&self, x: i32, y: i32) -> bool {
@@ -406,6 +412,11 @@ impl World {
     /// The drops' velocity, m/s (down positive).
     pub fn drop_velocity(d: &Drop) -> (f32, f32) {
         (d.vx, d.vy)
+    }
+
+    /// Whether the liquids run on a graphics card (one was opened and works).
+    pub fn liquids_on_card(&self) -> bool {
+        self.liq.card.as_ref().is_some_and(Option::is_some)
     }
 
     /// The rows the card works on (the band of the last step given to it), when the liquids
@@ -827,8 +838,11 @@ impl World {
                             // water of a boiler (unless the water presses harder: a bubble).
                             Kind::Gas if self.gas_open(x as i32, y as i32) => AIR,
                             Kind::Gas => SOLID,
-                            // A lone drop of water in the air is the cells' rain.
-                            Kind::Liquid if self.cells[i].m == Mat::Water && y + 1 < H && matches!(self.cells[i + W].m.kind(), Kind::Empty | Kind::Gas) && self.lone_liquid(x as i32, y as i32) => AIR,
+                            // A lone drop of water in the air is the cells' rain, and so is
+                            // water over a gas that is not open air at its pocket's pressure (a
+                            // cloud), alone or not: the gas is a wall to the liquids, and the
+                            // water would lie on the cloud (see `World::step_water`).
+                            Kind::Liquid if self.cells[i].m == Mat::Water && y + 1 < H && matches!(self.cells[i + W].m.kind(), Kind::Empty | Kind::Gas) && (self.lone_liquid(x as i32, y as i32) || self.rain_over_gas(x as i32, y as i32)) => AIR,
                             Kind::Liquid if self.liquid_fill(i) >= field::FULL / HOLDS => FULLISH,
                             Kind::Liquid => WET,
                             _ => SOLID,
@@ -1756,6 +1770,42 @@ mod tests {
         }
         let y = bottom(&w);
         assert!(y >= 440, "after 1.7 s the bottom is at {y}, not on the floor");
+    }
+
+    /// A pool on a hillside, held by the trunk of a tree on its downhill side: thin matter does
+    /// not hold a liquid back (`seep_through_thin`), the pool runs through the trunk and down
+    /// the hill until it is a film on the slope.
+    #[test]
+    fn a_pool_on_a_hillside_runs_through_a_tree() {
+        let mut w = world();
+        // The ground: a slope down to the left, from (300, 400) to (100, 460), flat beyond.
+        for x in 0..W as i32 {
+            let top = if x >= 300 { 400 } else if x >= 100 { 400 + (300 - x) * 60 / 200 } else { 460 };
+            for y in top..H as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        // A dam of stone uphill, a trunk downhill, the pool between them.
+        for y in 370..400 {
+            w.set(340, y, Mat::Stone);
+            w.set(341, y, Mat::Stone);
+        }
+        for y in 370..=403 {
+            w.set(290, y, Mat::Trunk);
+        }
+        for x in 291..340 {
+            for y in 385..400 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        w.temp.fill(15.0);
+        let before = w.liquid_units(Mat::Water);
+        for _ in 0..900 {
+            w.step();
+        }
+        let left = |w: &World| (0..290).flat_map(|x| (300..470).map(move |y| (x, y))).filter(|&(x, y)| w.at(x, y) == Mat::Water).map(|(x, y)| w.liquid_fill(World::idx(x, y)) as u64).sum::<u64>();
+        let pool = (291..340).flat_map(|x| (370..400).map(move |y| (x, y))).filter(|&(x, y)| w.at(x, y) == Mat::Water).count();
+        assert!(left(&w) > before as u64 / 2, "the trunk held the pool back: {} of {before} units got past it, {pool} cells left in the pool, {} units in all", left(&w), w.liquid_units(Mat::Water));
     }
 
     /// A bubble of gas shut in a pool rises to its surface (Archimedes), where the cells'
