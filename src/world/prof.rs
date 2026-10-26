@@ -19,9 +19,8 @@ pub const HEAT_WIND: usize = 17;
 pub const HEAT_AIR: usize = 18;
 pub const HEAT_SPACE: usize = 19;
 pub const HEAT_SUN: usize = 20;
-/// Not in the order of the step: the water field runs right after the cells.
-pub const FIELD: usize = 21;
-/// Not in the order of the step either: the liquids' physics runs after the cells too.
+/// Not in the order of the step: the liquids' physics runs right after the cells. (Index 21, the
+/// water field that is gone, is never timed, so the overlay leaves it out.)
 pub const LIQUIDS: usize = 22;
 /// The parts of the liquids' physics (already counted in `liquides physiques`), one run per
 /// sub-step; `LIQ_ITERATIONS` counts one run per iteration of the pressure solver.

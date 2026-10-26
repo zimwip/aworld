@@ -35,6 +35,7 @@ struct Vortex {
     life: u32,
 }
 
+#[derive(Clone)]
 pub struct Flow {
     vx: Vec<f32>,
     vy: Vec<f32>,
@@ -113,6 +114,7 @@ impl Flow {
 
     /// Which flow cells are mostly solid ground (cells that `solid` says are hard).
     pub fn refresh_solids(&mut self, cells: &[Cell], solid: impl Fn(&Cell) -> bool) {
+        let was = self.solid.clone();
         for j in 0..FH {
             for i in 0..FW {
                 let (mut n, mut hard) = (0, 0);
@@ -127,6 +129,28 @@ impl Flow {
                     }
                 }
                 self.solid[j * FW + i] = hard * 5 >= n * 2;
+            }
+        }
+        // A cell a solid has just left fills with the air around it, at its density: a body
+        // falling through the air must not leave a trail of air at the ambient pressure (the
+        // solver holds solid cells there), which would spread as waves of pressure.
+        for j in 0..FH as i32 {
+            for i in 0..FW as i32 {
+                let k = at(i, j);
+                if self.solid[k] || !was[k] {
+                    continue;
+                }
+                let (mut sum, mut cnt) = (0.0, 0.0);
+                for (di, dj) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let nj = j + dj;
+                    if nj >= 0 && nj < FH as i32 && !was[at(i + di, nj)] && !self.solid[at(i + di, nj)] {
+                        sum += self.rho[at(i + di, nj)];
+                        cnt += 1.0;
+                    }
+                }
+                if cnt > 0.0 {
+                    self.rho[k] = sum / cnt;
+                }
             }
         }
     }

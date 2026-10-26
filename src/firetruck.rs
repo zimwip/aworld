@@ -87,7 +87,7 @@ pub enum News {
     Blocked,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct FireTrucks {
     pub truck: Option<Truck>,
     pub drops: Vec<Drop>,

@@ -46,11 +46,23 @@ impl World {
                 solid[j * FW + i] = sol * 2 >= cnt && !liquid[j * FW + i];
             }
         }
+        // Air the wind solver still counts as solid has no pressure of its own: the solver re-reads
+        // the ground only every 16 steps, so its solids lag behind a body falling through the air,
+        // and it holds them at the ambient pressure. They are filled in from around like rock, or
+        // they would read as a jump of pressure that runs down with the body and blows the ground
+        // away before it lands.
+        let mut stale = vec![false; n];
+        for j in 0..FH {
+            for i in 0..FW {
+                let k = j * FW + i;
+                stale[k] = !liquid[k] && !solid[k] && self.flow.is_solid(i, j);
+            }
+        }
         // Air: the solver's pressure. Liquid: first the air just above it, then shared out.
         for j in 0..FH {
             for i in 0..FW {
                 let k = j * FW + i;
-                self.dp[k] = if liquid[k] || solid[k] { 0.0 } else { self.flow.excess_at_cell(i, j) };
+                self.dp[k] = if liquid[k] || solid[k] || stale[k] { 0.0 } else { self.flow.excess_at_cell(i, j) };
             }
         }
         for j in 0..FH as i32 {
@@ -64,7 +76,7 @@ impl World {
                     up -= 1;
                 }
                 let u = at(i, up);
-                self.dp[k] = if liquid[u] || solid[u] { 0.0 } else { self.dp[u] };
+                self.dp[k] = if liquid[u] || solid[u] || stale[u] { 0.0 } else { self.dp[u] };
             }
         }
         for _ in 0..24 {
@@ -92,22 +104,24 @@ impl World {
                 }
             }
         }
-        // Rock takes the pressure of what is around it, so the gradient has no hole in it.
+        // Rock (and air with no pressure of its own) takes the pressure of what is around it, so
+        // the gradient has no hole in it. With nothing around to go by, it keeps the pressure it
+        // had: a body that covers a cell does not change the pressure there.
         for j in 0..FH as i32 {
             for i in 0..FW as i32 {
                 let k = at(i, j);
-                if !solid[k] {
+                if !solid[k] && !stale[k] {
                     continue;
                 }
                 let (mut sum, mut cnt) = (0.0, 0.0);
                 for (di, dj) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                     let nj = j + dj;
-                    if nj >= 0 && nj < FH as i32 && !solid[at(i + di, nj)] {
+                    if nj >= 0 && nj < FH as i32 && !solid[at(i + di, nj)] && !stale[at(i + di, nj)] {
                         sum += self.dp[at(i + di, nj)];
                         cnt += 1.0;
                     }
                 }
-                self.dp[k] = if cnt > 0.0 { sum / cnt } else { 0.0 };
+                self.dp[k] = if cnt > 0.0 { sum / cnt } else { self.dp_slow[k] };
             }
         }
         // What pushes is the part that changes quickly (a blast wave, a surge): the slowly varying
@@ -395,6 +409,42 @@ mod boom {
                     eprintln!("t={t:3} water {total} splash>y330 {splash} highest water y={top} sand mean x {sand_x:.1} quick-dp max {maxdp:.2}");
                 }
             }
+        }
+    }
+
+    /// A body of stone dropped from high up must not blow the sand away before it lands: as it falls
+    /// it is ahead of the solids the wind solver knows about, and those cells must not read as a
+    /// jump of pressure.
+    #[test]
+    fn a_falling_body_does_not_blow_the_ground_away_before_it_lands() {
+        for (seed, x) in [(7, 300), (7, 520), (11, 420)] {
+            let mut w = World::new();
+            w.generate(seed);
+            // Long enough for the air to settle into its layers (low pressure near the ground).
+            for _ in 0..300 {
+                w.step();
+            }
+            let top = (0..H as i32).find(|&y| w.raw(x, y) != Mat::Empty).unwrap();
+            let ground = |w: &World| -> Vec<Mat> { (top..top + 12).flat_map(|y| (x - 40..x + 40).map(move |xx| w.raw(xx, y))).collect() };
+            let before = ground(&w);
+            for y in 40..60 {
+                for xx in x - 10..x + 10 {
+                    w.set(xx, y, Mat::Stone);
+                }
+            }
+            let mut steps = 0;
+            loop {
+                w.step();
+                steps += 1;
+                let lowest = (0..top).rev().find(|&y| (x - 10..x + 10).any(|xx| w.raw(xx, y) == Mat::Stone)).unwrap_or(0);
+                // It is still a few cells above the ground (it falls about three a step).
+                if lowest >= top - 5 || steps > 400 {
+                    break;
+                }
+            }
+            assert!(steps < 400, "the stone should have fallen (seed {seed}, x {x})");
+            let moved = before.iter().zip(&ground(&w)).filter(|(a, b)| a != b).count();
+            assert!(moved <= 2, "seed {seed}, x {x}: {moved} cells of ground moved before the stone touched it");
         }
     }
 }
