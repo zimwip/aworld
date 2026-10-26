@@ -386,14 +386,35 @@ mod native {
             self.gpu.device.create_command_encoder(&Default::default())
         }
 
-        /// One kernel over `n` threads, with the parameters of `colour`.
-        fn run(&self, pass: &mut wgpu::ComputePass, pipeline: &wgpu::ComputePipeline, colour: u32, n: usize) {
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &self.binds[0], &[colour * SLOT as u32]);
-            pass.set_bind_group(1, &self.binds[1], &[]);
-            pass.set_bind_group(2, &self.binds[2], &[]);
-            pass.set_bind_group(3, &self.binds[3], &[]);
-            pass.dispatch_workgroups(n.div_ceil(WG) as u32, 1, 1);
+        /// One kernel over `n` threads, with the parameters of `colour`. The bind groups are
+        /// set once a pass (and the parameters' slot once a colour): every kernel shares the
+        /// layout, and setting them again at each launch was most of the encoding's cost.
+        fn run(&self, pass: &mut Pass, pipeline: &wgpu::ComputePipeline, colour: u32, n: usize) {
+            pass.pass.set_pipeline(pipeline);
+            if pass.colour != Some(colour) {
+                pass.pass.set_bind_group(0, &self.binds[0], &[colour * SLOT as u32]);
+                pass.colour = Some(colour);
+            }
+            if !pass.bound {
+                pass.pass.set_bind_group(1, &self.binds[1], &[]);
+                pass.pass.set_bind_group(2, &self.binds[2], &[]);
+                pass.pass.set_bind_group(3, &self.binds[3], &[]);
+                pass.bound = true;
+            }
+            pass.pass.dispatch_workgroups(n.div_ceil(WG) as u32, 1, 1);
+        }
+    }
+
+    /// A compute pass of the liquids' step, remembering what is bound.
+    struct Pass<'a> {
+        pass: wgpu::ComputePass<'a>,
+        colour: Option<u32>,
+        bound: bool,
+    }
+
+    impl<'a> Pass<'a> {
+        fn new(enc: &'a mut wgpu::CommandEncoder) -> Self {
+            Pass { pass: enc.begin_compute_pass(&Default::default()), colour: None, bound: false }
         }
     }
 
@@ -657,7 +678,7 @@ mod native {
                             c |= AWAKE;
                         }
                         let pocket = world.pocket_at(x as i32, y as i32);
-                        if m.kind() == Kind::Gas && pocket.is_some() {
+                        if m.kind() == Kind::Gas && world.gas_open(x as i32, y as i32) {
                             c |= OPEN;
                         }
                         code[x] = c;
@@ -766,7 +787,7 @@ mod native {
             let stamp_at = |enc: &mut wgpu::CommandEncoder, stamps: &mut Stamper, what: &'static str| stamps.at(enc, what);
             stamp_at(&mut enc, &mut stamps, "début");
             {
-                let mut pass = enc.begin_compute_pass(&Default::default());
+                let mut pass = Pass::new(&mut enc);
                 if !sent.is_empty() {
                     card.run(&mut pass, &k.apply_cells, 0, sent.len());
                 }
@@ -777,7 +798,7 @@ mod native {
             stamp_at(&mut enc, &mut stamps, "envoi");
             for s in 0..sub {
                 {
-                    let mut pass = enc.begin_compute_pass(&Default::default());
+                    let mut pass = Pass::new(&mut enc);
                     card.run(&mut pass, &k.classify, 0, ncell);
                     card.run(&mut pass, &k.forward_u, 0, nu_);
                     card.run(&mut pass, &k.forward_v, 0, nv);
@@ -789,12 +810,12 @@ mod native {
                 stamp_at(&mut enc, &mut stamps, "forces");
                 if thick {
                     {
-                        let mut pass = enc.begin_compute_pass(&Default::default());
+                        let mut pass = Pass::new(&mut enc);
                         card.run(&mut pass, &k.thickness, 0, ncell);
                     }
                     enc.copy_buffer_to_buffer(&card.u, ubytes.start, &card.u2, ubytes.start, ubytes.end - ubytes.start);
                     enc.copy_buffer_to_buffer(&card.v, vbytes.start, &card.v2, vbytes.start, vbytes.end - vbytes.start);
-                    let mut pass = enc.begin_compute_pass(&Default::default());
+                    let mut pass = Pass::new(&mut enc);
                     for _ in 0..VISCOUS_SWEEPS {
                         for colour in 0..2 {
                             card.run(&mut pass, &k.viscous_u, colour, nu_);
@@ -810,20 +831,20 @@ mod native {
                 }
                 if s + 1 == sub {
                     {
-                        let mut pass = enc.begin_compute_pass(&Default::default());
+                        let mut pass = Pass::new(&mut enc);
                         card.run(&mut pass, &k.system_cells, 0, ncell);
                         card.run(&mut pass, &k.system_edges, 0, ncell);
                         card.run(&mut pass, &k.assemble, 0, ncell);
                     }
                     card.pressure.solve_fixed(&mut enc, y0, y1, fullish, SETTLED, RELATIVE, card.iters, &mut stamps);
-                    let mut pass = enc.begin_compute_pass(&Default::default());
+                    let mut pass = Pass::new(&mut enc);
                     card.run(&mut pass, &k.take_pressure, 0, ncell);
                     card.run(&mut pass, &k.push_u, 0, nu_);
                     card.run(&mut pass, &k.push_v, 0, nv);
                     drop(pass);
                     stamp_at(&mut enc, &mut stamps, "pression");
                 }
-                let mut pass = enc.begin_compute_pass(&Default::default());
+                let mut pass = Pass::new(&mut enc);
                 card.run(&mut pass, &k.throw_find, 0, ncell);
                 card.run(&mut pass, &k.throw_apply, 0, ncell);
                 card.run(&mut pass, &k.carry_flow, 0, ncell);
@@ -837,7 +858,7 @@ mod native {
                 stamp_at(&mut enc, &mut stamps, "transport");
             }
             {
-                let mut pass = enc.begin_compute_pass(&Default::default());
+                let mut pass = Pass::new(&mut enc);
                 card.run(&mut pass, &k.fastest, 0, ncell);
             }
             // Back: the band's class and pressure, the throws, the changed cells, the fastest

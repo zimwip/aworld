@@ -286,6 +286,24 @@ impl World {
         }
     }
 
+    /// Whether the gas at a cell is open air to the liquids: shut in a pocket that presses on the
+    /// liquid beside it at least as hard as the liquid presses back (a boiler). The carrying never
+    /// puts liquid into a gas, so a pocket the liquid presses harder (a bubble of steam deep in a
+    /// pool, at a bar when the water round it is at a bar and a half) is a wall to the liquid: as
+    /// open air it would draw the liquid in for ever and pile it up in the cell beside.
+    pub fn gas_open(&self, x: i32, y: i32) -> bool {
+        let Some(k) = self.pocket_at(x, y) else { return false };
+        let push = self.pockets[k].pressure;
+        [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)].into_iter().all(|(nx, ny)| {
+            if !Self::inb(nx, ny) {
+                return true;
+            }
+            let i = Self::idx(nx, ny);
+            // (The cell under a pocket is at the pocket's pressure plus its own weight.)
+            self.liq_w[i] <= 0.0 || self.liq_p[i] <= push + 1.5 * self.liq_w[i]
+        })
+    }
+
     /// Whether the gas at a cell is shut in a closed pocket (cut off from the open air).
     pub fn sealed(&self, x: i32, y: i32) -> bool {
         self.pocket_at(x, y).and_then(|k| self.pockets.get(k)).is_some_and(|p| !p.open)

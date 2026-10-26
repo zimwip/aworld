@@ -62,8 +62,9 @@ pub(super) const SPRAY: f32 = 9.0;
 pub(super) const THROW: f32 = 2.0;
 /// The most of a cell that comes off as drops in a sub-step, thrown sideways or up.
 pub(super) const THROW_SHARE: f32 = 0.5;
-/// What the drag of the air leaves of a drop's speed after a step.
-pub(super) const DROP_DRAG: f32 = 0.998;
+/// The terminal speed of a drop in the air, m/s (a large raindrop): the drag of the air grows
+/// with the square of the speed and balances gravity there.
+pub(super) const DROP_TERMINAL_MS: f32 = 9.0;
 /// A drop leaves the liquid at most this fast, m/s: the speed that rises 1 m (the grid packs
 /// the energy of a splash into a few cells, and drops thrown at the grid's speed would climb
 /// into the sky, which is logarithmic up there).
@@ -697,10 +698,14 @@ impl World {
         }
         let mut drops = std::mem::take(&mut liq.drops);
         let s = DT / CELL_M;
+        let drag = G * DT / (DROP_TERMINAL_MS * DROP_TERMINAL_MS);
         drops.retain_mut(|d| {
             d.vy += G * DT;
-            d.vx *= DROP_DRAG;
-            d.vy *= DROP_DRAG;
+            // Quadratic drag: g (v / v_t)², against the motion.
+            let speed = (d.vx * d.vx + d.vy * d.vy).sqrt();
+            let k = (1.0 - drag * speed).max(0.0);
+            d.vx *= k;
+            d.vy *= k;
             let (dx, dy) = (d.vx * s, d.vy * s);
             let n = dx.abs().max(dy.abs()).ceil().max(1.0) as usize;
             for _ in 0..n {
@@ -813,8 +818,8 @@ impl World {
                             // pressure that counted the gas as open air would push liquid at it
                             // for ever and pile it up in the cell beside. Shut in a pocket, the
                             // gas is open air at the pocket's pressure: that is what pushes the
-                            // water of a boiler.
-                            Kind::Gas if self.pocket_at(x as i32, y as i32).is_some() => AIR,
+                            // water of a boiler (unless the water presses harder: a bubble).
+                            Kind::Gas if self.gas_open(x as i32, y as i32) => AIR,
                             Kind::Gas => SOLID,
                             // A lone drop of water in the air is the cells' rain.
                             Kind::Liquid if self.cells[i].m == Mat::Water && y + 1 < H && matches!(self.cells[i + W].m.kind(), Kind::Empty | Kind::Gas) && self.lone_liquid(x as i32, y as i32) => AIR,
@@ -960,7 +965,10 @@ impl World {
                 let (xi, yi) = (x as i32, y as i32);
                 let (a, b) = (kind(xi, yi - 1), kind(xi, yi));
                 let was = (vf[vi(x, y)] + 0.5 * (v[vi(x, y)] - back)).clamp(lo, hi);
-                let fall = if a != b { was * calm } else { was } + G * dt;
+                // (Not a surface that falls: liquid over air, or liquid under air with air under
+                // it; calming those held a falling body at CALM-th of g, three metres a second.)
+                let falls = (a >= WET && b == AIR) || (a == AIR && b >= WET && kind(xi, yi + 1) == AIR);
+                let fall = if a != b && !falls { was * calm } else { was } + G * dt;
                 row[x] = if a != FULLISH && b != FULLISH {
                     // A film lying on liquid or on the ground goes no faster than what is under it
                     // (it has nowhere to fall); spray climbs no faster than a thrown drop.
@@ -1720,6 +1728,51 @@ mod tests {
         // (Half a minute of a cascade off the edge: the crumbs its drops leave, a thousandth.)
         let after = left + w.dried + w.gone;
         assert!(after <= before && before - after < before / 1_000, "{before} -> {after}");
+    }
+
+    /// A body of water let go in the air falls at g (the calming of the free surface must not
+    /// hold it back): 8 x 8 cells, 10 m over the floor, which a free fall reaches in 1.4 s.
+    #[test]
+    fn water_falls_at_g() {
+        let mut w = world();
+        tank(&mut w, 100, 300, 339, 449);
+        rect(&mut w, 216, 380, 223, 387, Mat::Water);
+        w.temp.fill(0.0);
+        let bottom = |w: &World| (380..450).rev().find(|&y| (216..224).any(|x| w.at(x, y) == Mat::Water)).unwrap_or(380);
+        for _ in 0..30 {
+            w.step();
+        }
+        // After half a second a free fall is 1.2 m (7 cells) down; held at 3 m/s it would be 5.
+        let y = bottom(&w);
+        assert!(y >= 393, "after 0.5 s the bottom is at {y} (started at 387)");
+        for _ in 30..100 {
+            w.step();
+        }
+        let y = bottom(&w);
+        assert!(y >= 440, "after 1.7 s the bottom is at {y}, not on the floor");
+    }
+
+    /// A bubble of gas shut in a pool rises to its surface (Archimedes), where the cells'
+    /// liquids let it out; the water it passed is still there.
+    #[test]
+    fn a_bubble_rises_through_a_pool() {
+        let mut w = world();
+        tank(&mut w, 100, 400, 339, 449);
+        rect(&mut w, 100, 420, 339, 449, Mat::Water);
+        // (Hot enough for the steam not to condense, not enough for the water to boil.)
+        w.temp.fill(96.0);
+        w.set(220, 448, Mat::Steam);
+        let before = w.liquid_units(Mat::Water);
+        let mut top = 448;
+        for _ in 0..600 {
+            w.step();
+            if let Some(y) = (400..450).find(|&y| (100..340).any(|x| w.at(x, y) == Mat::Steam)) {
+                top = top.min(y);
+            }
+        }
+        assert!(top < 420, "the bubble only rose to row {top} in 10 s (the surface is at 420)");
+        let after = w.liquid_units(Mat::Water) + w.dried;
+        assert!(after <= before && before - after < before / 10_000, "{before} -> {after}");
     }
 
     /// A block of water 16 x 16 let go 2.5 m over a pool 15 cells deep, in the same tank.
