@@ -617,7 +617,7 @@ const BUBBLE_RISE: u32 = 10;
 const DROP_DRIFT: f32 = 0.8;
 /// How many times faster a drop in mid-air evaporates than the same water lying in a puddle.
 const DROP_EVAPORATION: f32 = 30.0;
-/// A drop falling through a cloud sweeps up the cell under it once in this many steps.
+/// A drop falling through a cloud sweeps up the cell under it once in this many cells it falls.
 const DROP_SWEEP: u32 = 5;
 /// In a cloud, a cell turns into a raindrop once in this many steps where the cloud is thickest.
 const RAIN_EVERY: f32 = 8000.0;
@@ -2110,10 +2110,10 @@ impl World {
         if matches!(self.at(x, y + 1).kind(), Kind::Empty | Kind::Gas) && self.mask_free(x, y + 1) {
             return self.fall_on(x, y, terminal, true);
         }
-        // On a grain that is falling itself (the column it is part of hangs between two cells):
+        // On a cell that is falling itself (the column it is part of hangs between two cells):
         // it falls with it.
         let j = Self::idx(x, y + 1);
-        if Self::inb(x, y + 1) && self.cells[j].m.kind() == Kind::Powder && self.vel[j] > 0 {
+        if Self::inb(x, y + 1) && self.vel[j] > 0 && self.cells[j].m.kind() != Kind::Liquid && self.mask_free(x, y + 1) {
             return self.fall_on(x, y, terminal, false);
         }
         self.vel[i] = 0;
@@ -3059,8 +3059,10 @@ impl World {
         };
         if free_drop && matches!(self.at(x, y + 1).kind(), Kind::Empty | Kind::Gas) && self.mask_free(x, y + 1) {
             // Falling through a cloud, the drop sweeps up the droplets in its way and grows: the
-            // cloud's water becomes rain (`VAPOUR_PER_WATER` cells of cloud, one cell of rain).
-            if self.raw(x, y + 1) == Mat::Cloud && self.chance(DROP_SWEEP) && self.gather_vapour(x, y + 1) {
+            // cloud's water becomes rain (`VAPOUR_PER_WATER` cells of cloud, one cell of rain). It
+            // goes by the way it falls (the tick it would go into the cell), not by the time.
+            let into = self.fall_at[i] as u32 + self.vel[i].saturating_add(GRAIN_ACCEL).min(DROP_TERMINAL) as u32 >= FALL_UNIT;
+            if into && self.raw(x, y + 1) == Mat::Cloud && self.chance(DROP_SWEEP) && self.gather_vapour(x, y + 1) {
                 let j = Self::idx(x, y + 1);
                 let t = self.temp[j].max(self.temp[i]);
                 self.set(x, y + 1, Mat::Water);
@@ -3143,37 +3145,28 @@ impl World {
         let v = self.vel[i].saturating_add(GRAIN_ACCEL).min(DROP_TERMINAL);
         let way = self.fall_at[i] as u32 + v as u32;
         self.vel[i] = v;
-        if way < FALL_UNIT {
-            self.fall_at[i] = way as u8;
-            return;
-        }
-        self.fall_at[i] = (way - FALL_UNIT) as u8;
-        let fall = 1;
+        let down = way >= FALL_UNIT;
+        self.fall_at[i] = (if down { way - FALL_UNIT } else { way }) as u8;
+        // The wind carries it sideways every tick, whether it goes down a cell or not.
         let wind = (self.flow.wind_at(x, y).0 * DROP_DRIFT).clamp(-3.0, 3.0);
-        let mut side = wind.trunc() as i32 + if (self.rand() % 1000) as f32 / 1000.0 < wind.fract().abs() { wind.signum() as i32 } else { 0 };
+        let side = wind.trunc() as i32 + if (self.rand() % 1000) as f32 / 1000.0 < wind.fract().abs() { wind.signum() as i32 } else { 0 };
         let free = |w: &World, x: i32, y: i32| matches!(w.at(x, y).kind(), Kind::Empty | Kind::Gas) && w.mask_free(x, y);
-        let (mut cx, mut cy) = (x, y);
-        let mut k = 0;
-        while k < fall {
-            // The sideways part of the move is spread over the fall.
-            let sx = side.signum();
-            if sx != 0 && free(self, cx + sx, cy + 1) {
-                cx += sx;
-                side -= sx;
-            } else if free(self, cx, cy + 1) {
-                side = 0;
-            } else {
+        let mut cx = x;
+        for _ in 0..side.abs() {
+            if !(self.at(cx + side.signum(), y) == Mat::Empty && self.mask_free(cx + side.signum(), y)) {
                 break;
             }
-            cy += 1;
-            k += 1;
-            if !Self::inb(cx, cy) {
-                break;
-            }
+            cx += side.signum();
         }
-        // Stopped short by what is below: it lands.
-        self.vel[i] = if k < fall { 0 } else { v };
-        self.swap((x, y), (cx, cy));
+        let cy = if down && free(self, cx, y + 1) { y + 1 } else { y };
+        // Stopped by what is below: it lands.
+        if down && cy == y {
+            self.vel[i] = 0;
+            self.fall_at[i] = 0;
+        }
+        if (cx, cy) != (x, y) {
+            self.swap((x, y), (cx, cy));
+        }
     }
 
     fn step_steam(&mut self, x: i32, y: i32) {
@@ -5048,11 +5041,16 @@ mod tests {
         let mut w = World::new_static();
         w.flow.pin_uniform(0.0, 0.0);
         w.set(400, 20, Mat::Water);
-        for _ in 0..40 {
-            w.step();
+        let at = |w: &World| (0..H() as i32).find(|&y| (380..420).any(|x| w.raw(x, y) == Mat::Water)).unwrap_or(H() as i32) - 20;
+        let mut fell = vec![];
+        for _ in 0..3 {
+            for _ in 0..20 {
+                w.step();
+            }
+            fell.push(at(&w));
         }
-        let y = (0..H() as i32).find(|&y| (380..420).any(|x| w.raw(x, y) == Mat::Water)).unwrap_or(H() as i32);
-        assert!(y > 20 + 100, "in 40 steps a drop falls well over 40 cells: it is at {y}");
+        // From rest, ½ g t²: 3, 12 and 27 cells of 1/6 m after 1/3, 2/3 and 1 s.
+        assert!((2..=5).contains(&fell[0]) && (9..=15).contains(&fell[1]) && (22..=30).contains(&fell[2]), "a drop falls by gravity: {fell:?} cells");
     }
 
     #[test]
@@ -5068,7 +5066,8 @@ mod tests {
         // Night: the sown seed must wait in the soil, not sprout.
         w.set_phase(0.75);
         w.day_cycle = false;
-        for _ in 0..30 {
+        // (Ten cells of 1/6 m from rest: 0.6 s.)
+        for _ in 0..60 {
             w.step();
         }
         assert_eq!(w.raw(110, 300), Mat::Dirt, "the seed does not pile up: it goes into the earth");
@@ -5471,7 +5470,9 @@ mod tests {
                     w.set(x, y, Mat::Ice);
                 }
             }
-            for _ in 0..500 {
+            // (Snowflakes fall at under 1 m/s: a band of snow takes its time to fall away.)
+            let steps = if layer == Mat::Snow { 1500 } else { 500 };
+            for _ in 0..steps {
                 w.step();
             }
             let ice_rows: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Ice && (380..420).contains(&((i % W()) as i32))).map(|i| i / W()).collect();
