@@ -230,7 +230,7 @@ fn summary(w: &World) -> (f64, f64, f64, usize) {
 fn same_seconds_at_any_step() {
     let seconds = 3.0;
     for (name, make, _) in scenes() {
-        if !matches!(name, "liquides" | "incendie" | "démo") {
+        if !matches!(name, "liquides" | "incendie" | "démo") || std::env::var("AWORLD_BENCH_SCENE").is_ok_and(|o| o != name) {
             continue;
         }
         let w0 = make();
@@ -250,11 +250,30 @@ fn same_seconds_at_any_step() {
             }
             let (water, wy, temp, burning) = summary(&w);
             eprintln!(
-                "{name:>9} pas de 1/{:<3.0} s : eau {water:.0} (centre à y = {wy:.1}), {temp:.2} °C en moyenne, {burning} cases en feu, horloge {} ({:.1} s de calcul)",
+                "{name:>9} pas de 1/{:<3.0} s : eau {water:.0} (centre à y = {wy:.1}), {temp:.2} °C en moyenne, {burning} cases en feu, horloge {}, parti {} séché {} ({:.1} s de calcul)",
                 1.0 / dt,
                 w.clock,
+                w.gone,
+                w.dried,
                 t.elapsed().as_secs_f64()
             );
         }
+    }
+}
+
+#[test]
+#[ignore]
+fn water_over_time_probe() {
+    for ticks in [0.5f32, 1.0, 2.0] {
+        let mut w = liquids();
+        let dt = ticks * STEP;
+        let mut line = format!("1/{:.0}:", 1.0 / dt);
+        for k in 0..=(3.0 / dt) as u32 {
+            if k % ((0.5 / dt) as u32) == 0 {
+                line += &format!(" {:.4}", summary(&w).0 / 1e9);
+            }
+            w.step_dt(dt);
+        }
+        eprintln!("{line}");
     }
 }
