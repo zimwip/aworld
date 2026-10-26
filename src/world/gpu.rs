@@ -36,6 +36,16 @@ mod native {
         }
     }
 
+    /// The limits asked of the card: the defaults, but as many storage buffers a kernel as the
+    /// card has (the liquids bind some thirty grids at once; the web build will have to split
+    /// them by kernel).
+    fn limits(card: &wgpu::Limits) -> wgpu::Limits {
+        let mut l = wgpu::Limits::default().using_resolution(card.clone());
+        l.max_storage_buffers_per_shader_stage = card.max_storage_buffers_per_shader_stage.min(64);
+        l.max_storage_buffer_binding_size = card.max_storage_buffer_binding_size.min(1 << 30);
+        l
+    }
+
     /// The card, opened once; `None` where there is none, or where it is not asked for.
     pub fn gpu() -> Option<&'static Gpu> {
         static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
@@ -47,7 +57,7 @@ mod native {
             let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() }))?;
             let info = adapter.get_info();
             let (device, queue) = pollster::block_on(adapter.request_device(
-                &wgpu::DeviceDescriptor { label: Some("aworld"), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::default().using_resolution(adapter.limits()), memory_hints: wgpu::MemoryHints::Performance },
+                &wgpu::DeviceDescriptor { label: Some("aworld"), required_features: wgpu::Features::empty(), required_limits: limits(&adapter.limits()), memory_hints: wgpu::MemoryHints::Performance },
                 None,
             ))
             .ok()?;

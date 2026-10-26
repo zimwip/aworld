@@ -63,6 +63,7 @@ const SC_UNDO: u32 = 10u;
 
 const FLUID: u32 = 1u;
 const WG: u32 = 256u;
+const COARSEST_SWEEPS: u32 = 24u;
 
 var<workgroup> sh: array<f32, 256>;
 
@@ -104,20 +105,8 @@ fn apply_s(c: u32, xx: u32, y: u32) -> f32 {
 
 // One Gauss-Seidel sweep over the cells of one colour: each takes the pressure that balances
 // its right side against its neighbours (which the other colour holds still).
-@compute @workgroup_size(16, 16)
-fn sweep(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (sc[SC_DONE] != 0.0) {
-        return;
-    }
-    let xx = id.x;
-    let y = id.y + P.y0;
-    if (xx >= P.w || y >= P.h || y >= P.y0 + P.rows || (xx + y) % 2u != P.colour) {
-        return;
-    }
-    let c = y * P.w + xx;
-    if (kind[c] != FLUID) {
-        return;
-    }
+/// One Gauss-Seidel update of the fluid cell c = (xx, y).
+fn sweep_cell(c: u32, xx: u32, y: u32) {
     var v = b[c];
     if (xx > 0u && kind[c - 1u] == FLUID) {
         v += ax[y * (P.w + 1u) + xx] * x[c - 1u];
@@ -132,6 +121,47 @@ fn sweep(@builtin(global_invocation_id) id: vec3<u32>) {
         v += ay[c + P.w] * x[c + P.w];
     }
     x[c] = v / diag[c];
+}
+
+@compute @workgroup_size(16, 16)
+fn sweep(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (sc[SC_DONE] != 0.0) {
+        return;
+    }
+    let xx = id.x;
+    let y = id.y + P.y0;
+    if (xx >= P.w || y >= P.h || y >= P.y0 + P.rows || (xx + y) % 2u != P.colour) {
+        return;
+    }
+    let c = y * P.w + xx;
+    if (kind[c] != FLUID) {
+        return;
+    }
+    sweep_cell(c, xx, y);
+}
+
+/// The coarsest level's sweeps, all of them in one workgroup (one launch instead of
+/// forty-eight): each thread takes every 256th cell of the band, and the threads wait for
+/// each other between two colours.
+@compute @workgroup_size(256)
+fn sweep_coarsest(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let done = sc[SC_DONE] != 0.0;
+    let first = P.y0 * P.w;
+    let n = P.rows * P.w;
+    for (var s = 0u; s < COARSEST_SWEEPS * 2u; s += 1u) {
+        let colour = s % 2u;
+        if (!done) {
+            for (var i = lid.x; i < n; i += WG) {
+                let c = first + i;
+                let xx = c % P.w;
+                let y = c / P.w;
+                if (y < P.h && (xx + y) % 2u == colour && kind[c] == FLUID) {
+                    sweep_cell(c, xx, y);
+                }
+            }
+        }
+        workgroupBarrier();
+    }
 }
 
 // The residual b - A x of the four fine cells under each coarse one, summed: the coarse right
@@ -314,27 +344,47 @@ fn residual(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocat
 
 // The sum, or the largest, of the partials of the last reduction (one workgroup, in a fixed
 // order: the same answer every time).
-fn total_sum() -> f32 {
+/// The sum (or the largest) of the partials, by a whole workgroup: each thread takes every
+/// 256th, then the tree (a fixed order: the same from one run to the next).
+fn total_sum(local: u32) -> f32 {
     var v = 0.0;
-    for (var i = 0u; i < P.groups; i += 1u) {
+    for (var i = local; i < P.groups; i += WG) {
         v += partials[i];
     }
-    return v;
+    sh[local] = v;
+    workgroupBarrier();
+    for (var stride = WG / 2u; stride > 0u; stride /= 2u) {
+        if (local < stride) {
+            sh[local] += sh[local + stride];
+        }
+        workgroupBarrier();
+    }
+    return sh[0];
 }
 
-fn total_max() -> f32 {
+fn total_max(local: u32) -> f32 {
     var v = 0.0;
-    for (var i = 0u; i < P.groups; i += 1u) {
+    for (var i = local; i < P.groups; i += WG) {
         v = max(v, partials[i]);
     }
-    return v;
+    sh[local] = v;
+    workgroupBarrier();
+    for (var stride = WG / 2u; stride > 0u; stride /= 2u) {
+        if (local < stride) {
+            sh[local] = max(sh[local], sh[local + stride]);
+        }
+        workgroupBarrier();
+    }
+    return sh[0];
 }
 
-// After the first residual: the tolerance is settled (the absolute one, or the relative one
-// times the first step), and a pressure already settled is done.
-@compute @workgroup_size(1)
-fn start() {
-    let step0 = total_max();
+// The first step: the tolerance from it, and done if it is settled already.
+@compute @workgroup_size(256)
+fn start(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let step0 = total_max(lid.x);
+    if (lid.x != 0u) {
+        return;
+    }
     sc[SC_TOL] = max(sc[SC_TOL], sc[SC_REL] * step0);
     sc[SC_BEST] = step0;
     sc[SC_STEP] = step0;
@@ -344,7 +394,6 @@ fn start() {
     }
 }
 
-// q = A s, and s · q.
 @compute @workgroup_size(256)
 fn apply(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
     if (sc[SC_DONE] != 0.0) {
@@ -365,12 +414,12 @@ fn apply(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation
 }
 
 // alpha = rho / (s · q); a system that is not positive (or a rho that ran away) stops here.
-@compute @workgroup_size(1)
-fn alpha() {
-    if (sc[SC_DONE] != 0.0) {
+@compute @workgroup_size(256)
+fn alpha(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let sq = total_sum(lid.x);
+    if (lid.x != 0u || sc[SC_DONE] != 0.0) {
         return;
     }
-    let sq = total_sum();
     sc[SC_SQ] = sq;
     sc[SC_ITER] += 1.0;
     let rho = sc[SC_RHO];
@@ -401,12 +450,12 @@ fn advance(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocati
 
 // The step after the advance: settled under the tolerance, or running away (a singular system:
 // the step is undone and the solve stops there), or on to the next iteration.
-@compute @workgroup_size(1)
-fn step() {
-    if (sc[SC_DONE] != 0.0) {
+@compute @workgroup_size(256)
+fn step(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let st = total_max(lid.x);
+    if (lid.x != 0u || sc[SC_DONE] != 0.0) {
         return;
     }
-    let st = total_max();
     sc[SC_STEP] = st;
     if (st < sc[SC_TOL]) {
         sc[SC_DONE] = 1.0;
@@ -449,12 +498,12 @@ fn dot_rz(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocatio
 }
 
 // rho = r · z, and beta = rho / the last rho (0 at the start).
-@compute @workgroup_size(1)
-fn rho() {
-    if (sc[SC_DONE] != 0.0) {
+@compute @workgroup_size(256)
+fn rho(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let rho2 = total_sum(lid.x);
+    if (lid.x != 0u || sc[SC_DONE] != 0.0) {
         return;
     }
-    let rho2 = total_sum();
     let rho1 = sc[SC_RHO];
     sc[SC_BETA] = select(rho2 / rho1, 0.0, rho1 == 0.0);
     sc[SC_RHO] = rho2;

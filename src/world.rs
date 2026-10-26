@@ -5,6 +5,12 @@
 mod blast;
 pub mod matter;
 pub use blast::Ejecta;
+/// The classes of the liquids' cells, for the simulation view.
+pub mod liquid_class {
+    pub use super::liquid::{AIR, FULLISH, WET};
+    #[allow(unused_imports)]
+    pub use super::liquid::SOLID;
+}
 pub mod flow;
 mod pockets;
 mod pressure;
@@ -23,6 +29,7 @@ mod liquid;
 mod mgpcg;
 mod gpu;
 mod mgpcg_gpu;
+mod liquid_gpu;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]
@@ -639,6 +646,8 @@ pub struct World {
     pub climate: thermal::Climate,
     /// Bumped whenever the picture could have changed: lets the renderer skip work.
     pub revision: u64,
+    /// Water dried into the air since the start, in units of fill (the volume tests count it).
+    pub dried: u64,
     /// Wind, -1 (left) to 1 (right).
     pub wind: f32,
     /// The player's wind controls: strongest wind (0..1), how fast the direction keeps changing
@@ -792,6 +801,7 @@ impl World {
             climate_fixed: None,
             climate: thermal::Climate::default(),
             revision: 1,
+            dried: 0,
             wind: 0.0,
             wind_max: 1.0,
             wind_changes: 1.0,
@@ -902,8 +912,9 @@ impl World {
             structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, dp,
             dp_slow, dpd, pressure_forces, lod, parallel_cells, liquid_physics, liq, fill, pocket_of,
             pockets, latent, vel: _, moisture, fuel, growth, jet, liq_p, cls: _, liq_w: _, zones, bursts, charge, mcharge, magnet, polar,
-            bolts, storm_rng, pressure_cache: _, prof: _, air_rows, air_sky, later: _,
+            bolts, storm_rng, pressure_cache: _, prof: _, air_rows, air_sky, later: _, dried,
         } = from;
+        self.dried = *dried;
         self.cells.clone_from(cells);
         self.frame = *frame;
         self.rng = *rng;
@@ -1677,12 +1688,37 @@ impl World {
         self.revision += 1;
         self.frame = self.frame.wrapping_add(1);
         let clock = self.prof.start();
+        let audit = self.liquid_physics && std::env::var_os("AWORLD_DEBUG_MASS").is_some();
+        let mut marks: Vec<(&str, u64)> = Vec::new();
+        if audit {
+            marks.push(("début", self.water_units_audit()));
+        }
+        if self.liquid_physics {
+            self.take_liquids_from_card();
+        }
+        if audit {
+            marks.push(("reprise de la carte", self.water_units_audit()));
+        }
         timed!(self, 0, self.step_cells());
+        if audit {
+            marks.push(("tour des cellules", self.water_units_audit()));
+        }
         if self.liquid_physics {
             timed!(self, prof::LIQUIDS, self.step_liquids());
             self.seep_through_thin();
         }
+        if audit {
+            marks.push(("liquides", self.water_units_audit()));
+        }
         self.after_cells();
+        if audit {
+            marks.push(("après les cellules", self.water_units_audit()));
+            for k in 1..marks.len() {
+                if marks[k].1 != marks[k - 1].1 {
+                    eprintln!("pas {}: l'eau passe de {} à {} ({:+}) dans « {} »", self.frame, marks[k - 1].1, marks[k].1, marks[k].1 as i64 - marks[k - 1].1 as i64, marks[k].0);
+                }
+            }
+        }
         self.prof.stop(prof::TOTAL, clock);
         self.prof.end_step();
     }
@@ -2936,6 +2972,7 @@ impl World {
         // A cell of water that is not full makes less vapour (none at all from a thin film:
         // it just dries).
         let share = if self.liquid_physics { self.water_fill(i) as f32 / field::FULL as f32 } else { 1.0 };
+        self.dried += (share * field::FULL as f32) as u64;
         // (A part of a cell of steam is a whole one or none, by chance: on average the water is
         // all there.)
         let v = share * VAPOUR_PER_WATER as f32;
@@ -2995,6 +3032,7 @@ impl World {
         let part = field::FULL / VAPOUR_PER_WATER as u32;
         let fill = self.water_fill(i);
         let taken = fill.min(part);
+        self.dried += taken as u64;
         // Less than a quarter makes a whole cell of steam or none, by chance: on average the
         // water is all there.
         let steam = taken == part || (self.rand() % part) < taken;
@@ -3942,9 +3980,17 @@ impl World {
             Mat::Water => {
                 // Warm water shifts toward a pale, reddish tone just before it boils.
                 let warm = ((t - 30.0).max(0.0) * 1.3) as i32;
-                // A cell of water that is not full shows paler.
-                let a = if self.liquid_physics { 60 + (145 * self.water_fill(y * W + x).min(field::FULL) as u64 / field::FULL as u64) as i32 } else { 205 };
-                (44 + v / 2 + warm, 124 + v + flick / 4 + warm / 3, (224 + v - warm).max(0), a)
+                let (r, g, b) = (44 + v / 2 + warm, 124 + v + flick / 4 + warm / 3, (224 + v - warm).max(0));
+                if !self.liquid_physics {
+                    (r, g, b, 205)
+                } else {
+                    // A cell of the field that is not full is water mixed with air: the less water,
+                    // the clearer it shows, and the paler (spray and the froth of a splash are
+                    // whitish, not a deeper blue).
+                    let q = self.water_fill(y * W + x).min(field::FULL) as i32 * 256 / field::FULL as i32;
+                    let pale = |c: i32, to: i32| c + (to - c) * (256 - q) / 256;
+                    (pale(r, 200), pale(g, 222), pale(b, 240), 205 * q / 256)
+                }
             }
             Mat::Fire => (255, (80 + self.fuel[y * W + x].left as i32 * 3).min(235), 30, 235),
             Mat::Steam | Mat::Cloud => (0, 0, 0, 0),
