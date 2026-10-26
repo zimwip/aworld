@@ -297,6 +297,7 @@ void main() {
 }";
 
 /// A bolt of lightning being shown: its shape and how long ago it struck (seconds).
+#[derive(Clone)]
 pub struct LiveBolt {
     pub bolt: crate::world::Bolt,
     pub age: f32,
@@ -1158,6 +1159,7 @@ pub fn draw_flag(v: View, at: (i32, i32), col: Color, checkered: bool) {
     draw_circle(top.x, top.y, v.s * 1.2, Color::from_rgba(255, 220, 90, 255));
 }
 
+#[derive(Clone)]
 pub struct Boom {
     pub pos: Vec2,
     pub t: f32,

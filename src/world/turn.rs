@@ -3,7 +3,7 @@
 //!
 //! It can also run on every core (`World::parallel_cells`: on with the physics of the liquids,
 //! else off unless `AWORLD_CELLS_PAR=1`). The
-//! world is then cut into strips one sleeping zone wide, from the top of the world to the bottom;
+//! world is then cut into strips `STRIP_W` columns wide (a sleeping zone, two of 16), from the top of the world to the bottom;
 //! every third strip runs at once (three rounds, side by side), each in a view of the world of its
 //! own, and in a strip the cells take their turn in the usual order. This is about twice as fast
 //! on four cores when much is moving, but it is not the same turn: the rules of liquids depend on
@@ -24,12 +24,17 @@ use rayon::prelude::*;
 use std::mem::{take, ManuallyDrop};
 
 /// Columns a rule may reach either side of its strip.
-pub const REACH: i32 = sleep::CS as i32;
+pub const REACH: i32 = 32;
+/// Sleeping zones across a strip: enough for the strip to be as wide as the reach.
+const STRIP_ZONES: usize = (REACH as usize).div_ceil(sleep::CS);
+/// Columns across a strip, and strips across the world.
+const STRIP_W: usize = STRIP_ZONES * sleep::CS;
+const STRIPS: usize = sleep::CW / STRIP_ZONES;
 /// Strips of a round are this many strips from one another. Between two of them lie
 /// `ROUNDS - 1` strips, which their reach shares out; the world wraps round at the sides, so the
 /// number of strips is a multiple of it.
 const ROUNDS: usize = 3;
-const _: () = assert!(sleep::CW % ROUNDS == 0 && 2 * REACH as usize <= (ROUNDS - 1) * sleep::CS);
+const _: () = assert!(sleep::CW % STRIP_ZONES == 0 && STRIPS % ROUNDS == 0 && 2 * REACH as usize <= (ROUNDS - 1) * STRIP_W);
 
 /// A rule put off to the end of the turn: it reaches too far to run beside other strips.
 #[derive(Clone, Copy, Debug)]
@@ -142,7 +147,10 @@ impl World {
         let mut later = Vec::new();
         for k in 0..ROUNDS {
             let round = if ltr { k } else { ROUNDS - 1 - k };
-            let strips: Vec<usize> = (round..sleep::CW).step_by(ROUNDS).filter(|&zx| (0..sleep::CH).any(|zy| self.zones.awake[zy * sleep::CW + zx])).collect();
+            let strips: Vec<usize> = (round..STRIPS)
+                .step_by(ROUNDS)
+                .filter(|&s| (0..sleep::CH).any(|zy| (s * STRIP_ZONES..(s + 1) * STRIP_ZONES).any(|zx| self.zones.awake[zy * sleep::CW + zx])))
+                .collect();
             let views: Vec<ManuallyDrop<World>> = match strips.len() {
                 0 => continue,
                 // One strip alone runs here, in the same kind of view.
@@ -174,20 +182,24 @@ impl World {
         }
     }
 
-    /// The turn of the cells of strip `zx`, bottom row first, in a view of the world of its own.
-    fn strip_turn(&self, zx: usize, ltr: bool, seed: u32) -> ManuallyDrop<World> {
-        let mut v = ManuallyDrop::new(self.view(mix(seed, zx as u32)));
-        let (x0, x1) = ((zx * sleep::CS) as i32, ((zx + 1) * sleep::CS).min(W) as i32);
+    /// The turn of the cells of strip `s`, bottom row first, in a view of the world of its own.
+    fn strip_turn(&self, s: usize, ltr: bool, seed: u32) -> ManuallyDrop<World> {
+        let mut v = ManuallyDrop::new(self.view(mix(seed, s as u32)));
         #[cfg(debug_assertions)]
-        STRIP.with(|t| t.set(Some((x0, x1))));
+        STRIP.with(|t| t.set(Some(((s * STRIP_W) as i32, ((s + 1) * STRIP_W).min(W) as i32))));
         for y in (0..H as i32).rev() {
-            let zone = y as usize / sleep::CS * sleep::CW + zx;
-            if !v.zones.awake[zone] {
-                continue;
-            }
-            for i in 0..x1 - x0 {
-                let x = if ltr { x0 + i } else { x1 - 1 - i };
-                v.cell_turn(x, y, zone);
+            let zrow = y as usize / sleep::CS * sleep::CW;
+            for j in 0..STRIP_ZONES {
+                let zx = s * STRIP_ZONES + if ltr { j } else { STRIP_ZONES - 1 - j };
+                let zone = zrow + zx;
+                if !v.zones.awake[zone] {
+                    continue;
+                }
+                let (x0, x1) = ((zx * sleep::CS) as i32, ((zx + 1) * sleep::CS).min(W) as i32);
+                for i in 0..x1 - x0 {
+                    let x = if ltr { x0 + i } else { x1 - 1 - i };
+                    v.cell_turn(x, y, zone);
+                }
             }
         }
         #[cfg(debug_assertions)]
@@ -281,12 +293,9 @@ impl World {
                 pressure_forces: self.pressure_forces,
                 lod: self.lod,
                 parallel_cells: true,
-                water_field: self.water_field,
                 liquid_physics: self.liquid_physics,
                 liq: Default::default(),
                 fill: share(&self.fill),
-                gifts: Vec::new(),
-                flux: Vec::new(),
                 pocket_of: share(&self.pocket_of),
                 pockets: share(&self.pockets),
                 latent: share(&self.latent),

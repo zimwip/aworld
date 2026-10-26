@@ -1,4 +1,4 @@
-//! The metrics panel (F4): where the time of a step goes, part by part of the simulation, so
+//! The metrics panel (Ctrl+D): where the time of a step goes, part by part of the simulation, so
 //! that an optimisation can aim at what costs. Each part of `Game::sim_step` is timed (the world
 //! itself in detail, through `world/prof.rs`), gathered over about a second, and shown as
 //! milliseconds a step, share of the step and the dearest single step, with the zones that are
@@ -81,7 +81,7 @@ impl Window {
 
 #[derive(Clone)]
 pub struct Metrics {
-    /// The panel is on the screen (F4).
+    /// The panel is on the screen (Ctrl+D).
     pub shown: bool,
     /// `AWORLD_PROFILE=1`: a report on the terminal every 600 steps.
     log: bool,
@@ -225,7 +225,7 @@ impl Metrics {
         rrect(r, 10.0, Color::new(0.05, 0.06, 0.1, 0.86));
         let (x, mut y) = (r.x + 12.0, r.y + 22.0);
         ui.text("Métriques de la simulation", x, y, 16, TEXT);
-        let hint = "F4";
+        let hint = "Ctrl+D";
         ui.text(hint, r.x + pw - 12.0 - ui.text_w(hint, 13), y, 13, DIM);
         y += 20.0;
 
@@ -247,7 +247,15 @@ impl Metrics {
         }
         y += 18.0;
         ui.text(
-            &format!("zones éveillées {}/{} ({:.0} %) · simplification {}/3 · x{}", info.awake, info.zones, 100.0 * info.awake as f32 / info.zones.max(1) as f32, info.lod, info.speed),
+            &format!(
+                "zones {s}×{s} éveillées {}/{} ({:.0} %) · simplification {}/3 · x{}",
+                info.awake,
+                info.zones,
+                100.0 * info.awake as f32 / info.zones.max(1) as f32,
+                info.lod,
+                info.speed,
+                s = crate::world::sleep::CS
+            ),
             x,
             y,
             13,

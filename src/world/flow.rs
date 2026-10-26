@@ -35,6 +35,7 @@ struct Vortex {
     life: u32,
 }
 
+#[derive(Clone)]
 pub struct Flow {
     vx: Vec<f32>,
     vy: Vec<f32>,

@@ -192,7 +192,7 @@ impl Kid {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Kids {
     pub kid: Option<Kid>,
     cooldown: f32,

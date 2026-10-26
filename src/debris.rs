@@ -63,7 +63,7 @@ impl Piece {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Debris {
     pub pieces: Vec<Piece>,
     seed: u32,
