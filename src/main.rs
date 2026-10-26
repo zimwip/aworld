@@ -4830,6 +4830,17 @@ async fn main() {
                 game.world.paint(x + 14, y - 46, 9, Mat::Water);
             }
         }
+        // `--steam x`: a layer of steam on the ground at x, under a layer of water.
+        if shot.is_some() && frame == 300 {
+            if let Some(x) = arg("--steam").and_then(|v| v.parse::<i32>().ok()) {
+                let y = ground_y(&game.world, x);
+                for dy in 1..=24 {
+                    for dx in -24..=24 {
+                        game.world.set(x + dx, y - dy, if dy <= 10 { Mat::Steam } else { Mat::Water });
+                    }
+                }
+            }
+        }
         // `--sim-steps n`: the simulation view's step by step, n steps just before the shot.
         if shot.is_some() && frame == 352 {
             if let Some(n) = arg("--sim-steps").and_then(|v| v.parse::<usize>().ok()) {
