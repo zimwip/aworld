@@ -11,7 +11,7 @@
 
 use super::*;
 use rayon::prelude::*;
-use super::num::{ceil_i, floor_f, round_i};
+use super::num::{ceil_i, floor_f, round_i, wrap_i};
 
 /// Simulation steps in one full day.
 pub const DAY_STEPS: u32 = 21_600;
@@ -1301,7 +1301,7 @@ impl World {
                             };
                             Self::carry_fine(cells, old_t, i, x, y, -lerp(0) * reach, -lerp(1) * reach)
                         } else {
-                            let sx0 = (x as i32 + ix).rem_euclid(W() as i32 - 1) as usize;
+                            let sx0 = wrap_i(x as i32 + ix, W() as i32 - 1) as usize;
                             // Free air is read as it is; anything else counts as the cell's own temperature.
                             let air = |j: usize| if cells[j].m == Mat::Empty { old_t[j] } else { old_t[i] };
                             let top = air(sy0 * W() + sx0) * (1.0 - tx) + air(sy0 * W() + sx0 + 1) * tx;
@@ -1363,7 +1363,7 @@ impl World {
         let (px, py) = (x as f32 + ox, y as f32 + oy);
         let (fx, fy) = (floor_f(px), floor_f(py));
         let (tx, ty) = (px - fx, py - fy);
-        let sx0 = (fx as i32).rem_euclid(W() as i32 - 1) as usize;
+        let sx0 = wrap_i(fx as i32, W() as i32 - 1) as usize;
         let sy0 = (fy as i32).clamp(0, H() as i32 - 2) as usize;
         let corners = [sy0 * W() + sx0, sy0 * W() + sx0 + 1, (sy0 + 1) * W() + sx0, (sy0 + 1) * W() + sx0 + 1];
         let open = corners.iter().all(|&j| cells[j].m == Mat::Empty);
@@ -1383,7 +1383,7 @@ impl World {
         let (mut sum, mut count) = (0.0, 0.0);
         for k in 1..n {
             let f = k as f32 / n as f32;
-            let j = round_i(y as f32 + oy * f).clamp(0, H() as i32 - 1) as usize * W() + round_i(x as f32 + ox * f).rem_euclid(W() as i32) as usize;
+            let j = round_i(y as f32 + oy * f).clamp(0, H() as i32 - 1) as usize * W() + wrap_i(round_i(x as f32 + ox * f), W() as i32) as usize;
             if cells[j].m != Mat::Empty {
                 return if count > 0.0 { sum / count } else { old[i] };
             }

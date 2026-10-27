@@ -50,6 +50,22 @@ pub fn round_i(v: f32) -> i32 {
     }
 }
 
+/// `v.rem_euclid(n)` without a division when `v` is at most one `n` out of `0..n`, as a
+/// column one step past either edge of the world is: `n` (the width) is only known at run time,
+/// so the remainder is a real division, and the heat carried by the wind wraps every cell it reads.
+#[inline]
+pub fn wrap_i(v: i32, n: i32) -> i32 {
+    if v >= 0 && v < n {
+        v
+    } else if v < 0 && v >= -n {
+        v + n
+    } else if v >= n && v < 2 * n {
+        v - n
+    } else {
+        v.rem_euclid(n)
+    }
+}
+
 #[cfg(test)]
 mod rounding {
     use super::*;
@@ -70,6 +86,18 @@ mod rounding {
             assert_eq!(floor_f(x).to_bits(), x.floor().to_bits(), "floor {x}");
             assert_eq!(round_i(x), x.round() as i32, "round {x}");
             assert_eq!(ceil_i(x), x.ceil() as i32, "ceil {x}");
+        }
+    }
+
+    #[test]
+    fn the_quick_wrap_matches_the_remainder() {
+        for n in [1, 2, 7, 239, 959, 960] {
+            for v in (-3 * n - 5)..(3 * n + 5) {
+                assert_eq!(wrap_i(v, n), v.rem_euclid(n), "{v} mod {n}");
+            }
+            for v in [i32::MIN, i32::MIN + 1, i32::MAX, i32::MAX - 1] {
+                assert_eq!(wrap_i(v, n), v.rem_euclid(n), "{v} mod {n}");
+            }
         }
     }
 }
