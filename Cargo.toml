@@ -37,3 +37,7 @@ sound = []
 
 [profile.dev]
 opt-level = 2
+
+[dev-dependencies]
+pprof = { version = "0.14", features = ["flamegraph"] }
+rustc-demangle = "0.1"

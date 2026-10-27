@@ -24,7 +24,7 @@
 //! meadow, a hole in a brick wall or a dent in an iron plate.
 
 use super::num::round_i;
-use super::{density, Kind, Mat, World, H, W};
+use super::{density, xy_i32, Kind, Mat, World, H, W};
 use rayon::prelude::*;
 
 /// Side of a cell, in metres.
@@ -458,7 +458,7 @@ impl World {
         if m.is_wooden() && !self.chance(3) {
             return;
         }
-        let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+        let (x, y) = xy_i32(i);
         if p >= CRUSH * sigma {
             self.set(x, y, into);
             return;
@@ -701,7 +701,7 @@ impl World {
         // A fixed order, so that the same blast always gives the same crater.
         cells.sort_unstable_by_key(|c| c.0);
         for (i, f) in cells {
-            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+            let (x, y) = xy_i32(i);
             let m = self.cells[i].m;
             if passable(m) {
                 continue;
@@ -738,7 +738,7 @@ impl World {
         fire.sort_unstable();
         fire.dedup();
         for i in fire {
-            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+            let (x, y) = xy_i32(i);
             let m = self.cells[i].m;
             if self.mask[i] != 0 || !(passable(m) || m.kind() == Kind::Liquid) {
                 continue;

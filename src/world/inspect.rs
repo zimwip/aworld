@@ -91,7 +91,7 @@ impl World {
         }
         for s in &self.slabs {
             for &i in s.cells() {
-                let (vx, vy) = s.velocity_at(((i % W()) as f32 + 0.5, (i / W()) as f32 + 0.5));
+                let (vx, vy) = s.velocity_at({ let (x, y) = xy(i); (x as f32 + 0.5, y as f32 + 0.5) });
                 out.insert(i, Motion { vx: vx * CELL_STEP_MS, vy: vy * CELL_STEP_MS, source: Source::Slab });
             }
         }

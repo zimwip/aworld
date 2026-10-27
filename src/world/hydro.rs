@@ -111,7 +111,7 @@ impl World {
         seen[start] = true;
         stack.push(start);
         while let Some(i) = stack.pop() {
-            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+            let (x, y) = xy_i32(i);
             top = top.min(y);
             let (above, below) = (self.at(x, y - 1), self.at(x, y + 1));
             if free(above) && below == m {
@@ -171,7 +171,7 @@ impl World {
     fn closed_runs(&self, list: &[usize], m: Mat, width: i32, mut keep: impl FnMut(i32, i32)) {
         let mut run: Option<(i32, i32, i32, bool)> = None;
         for &i in list {
-            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+            let (x, y) = xy_i32(i);
             let closed = match run {
                 Some((ry, _, r, c)) if ry == y && x < r => c,
                 _ => {
@@ -200,7 +200,7 @@ impl World {
         self.closed_runs(surf, m, W() as i32, |x, y| from.push(Spot { head: (H() as i32 - y) as f32 + gas(self, x, y - 1, -1), x, y }));
         let mut to: Vec<Spot> = surf
             .iter()
-            .map(|&i| ((i % W()) as i32, (i / W()) as i32))
+            .map(|&i| xy_i32(i))
             .filter(|&(x, y)| self.at(x, y - 1) == Mat::Empty)
             .map(|(x, y)| Spot { head: (H() as i32 - y + 1) as f32 + gas(self, x, y - 1, -1), x, y: y - 1 })
             .collect();

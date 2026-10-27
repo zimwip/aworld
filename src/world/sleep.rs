@@ -6,6 +6,7 @@
 //! affected: they keep running everywhere.
 
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 /// Side of a sleeping zone, in cells: 32, or 16 or 64 when the game is built with
 /// `AWORLD_ZONE=16` (or 64) to compare (smaller zones sleep more often but cost more to watch; see
@@ -23,14 +24,22 @@ const fn zone_side(v: &[u8]) -> usize {
         _ => panic!("AWORLD_ZONE : 16, 32 ou 64"),
     }
 }
-/// Zones across and down.
-#[allow(non_snake_case)]
-pub fn CW() -> usize {
-    W().div_ceil(CS)
+/// Zones across and down (kept, rather than worked out from `W()` and `H()` each time: `wake`
+/// asks for them for most cells the turn touches).
+static ZONES: [AtomicUsize; 2] = [AtomicUsize::new(960usize.div_ceil(CS)), AtomicUsize::new(540usize.div_ceil(CS))];
+pub(super) fn set_zones(w: usize, h: usize) {
+    ZONES[0].store(w.div_ceil(CS), Relaxed);
+    ZONES[1].store(h.div_ceil(CS), Relaxed);
 }
 #[allow(non_snake_case)]
+#[inline(always)]
+pub fn CW() -> usize {
+    ZONES[0].load(Relaxed)
+}
+#[allow(non_snake_case)]
+#[inline(always)]
 pub fn CH() -> usize {
-    H().div_ceil(CS)
+    ZONES[1].load(Relaxed)
 }
 
 /// The state of the zones: which run this step, which were woken for the next one, and which
@@ -84,24 +93,30 @@ impl Zones {
     /// Wakes the zone of cell `i`, and the zone next door when the cell is on its edge.
     #[inline]
     pub fn wake(&mut self, i: usize) {
-        let (x, y) = (i % W(), i / W());
+        let (x, y) = xy(i);
+        let (cw, ch) = (CW(), CH());
         let (cx, cy) = (x / CS, y / CS);
         let (lx, ly) = (x % CS, y % CS);
-        let x0 = if lx == 0 && cx > 0 { cx - 1 } else { cx };
-        let x1 = if lx == CS - 1 && cx + 1 < CW() { cx + 1 } else { cx };
-        let y0 = if ly == 0 && cy > 0 { cy - 1 } else { cy };
-        let y1 = if ly == CS - 1 && cy + 1 < CH() { cy + 1 } else { cy };
-        for zy in y0..=y1 {
-            for zx in x0..=x1 {
-                self.woke[zy * CW() + zx] = true;
+        let k = cy * cw + cx;
+        self.changed[k] = self.stamp;
+        self.woke[k] = true;
+        // The cell on the edge of its zone wakes the zone next door too (and gas wraps round
+        // the sides of the world). Most cells are inside their zone: one test, then done.
+        if lx == 0 || lx == CS - 1 || ly == 0 || ly == CS - 1 {
+            let x0 = if lx == 0 && cx > 0 { cx - 1 } else { cx };
+            let x1 = if lx == CS - 1 && cx + 1 < cw { cx + 1 } else { cx };
+            let y0 = if ly == 0 && cy > 0 { cy - 1 } else { cy };
+            let y1 = if ly == CS - 1 && cy + 1 < ch { cy + 1 } else { cy };
+            for zy in y0..=y1 {
+                for zx in x0..=x1 {
+                    self.woke[zy * cw + zx] = true;
+                }
             }
-        }
-        self.changed[cy * CW() + cx] = self.stamp;
-        // Gas wraps round the sides of the world.
-        if x == 0 {
-            self.woke[cy * CW() + CW() - 1] = true;
-        } else if x == W() - 1 {
-            self.woke[cy * CW()] = true;
+            if x == 0 {
+                self.woke[cy * cw + cw - 1] = true;
+            } else if x == W() - 1 {
+                self.woke[cy * cw] = true;
+            }
         }
     }
 
