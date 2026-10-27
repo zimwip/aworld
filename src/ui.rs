@@ -1,7 +1,7 @@
 //! Immediate-mode widgets: big friendly buttons with drawn icons.
 
-use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation, PipelineParams};
-use macroquad::prelude::*;
+use crate::gfx::{BlendFactor, BlendState, BlendValue, Equation, PipelineParams};
+use crate::gfx::*;
 
 pub const BG: Color = Color::new(0.075, 0.085, 0.13, 1.0);
 pub const PANEL: Color = Color::new(0.115, 0.13, 0.20, 1.0);
@@ -726,7 +726,7 @@ impl Drawer {
 #[cfg(test)]
 mod tests {
     use super::{Drawer, Layers};
-    use macroquad::prelude::{vec2, Rect};
+    use crate::gfx::{vec2, Rect};
 
     /// The palette (at the left) is drawn after the day pill, which it overlaps when it is out.
     fn pill_under_palette() -> Layers {

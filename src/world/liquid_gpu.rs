@@ -13,7 +13,9 @@
 pub use native::LiquidGpu;
 
 #[cfg(target_arch = "wasm32")]
-pub struct LiquidGpu;
+pub struct LiquidGpu {
+    pub patches_up: Vec<Patch>,
+}
 
 #[cfg(target_arch = "wasm32")]
 impl LiquidGpu {

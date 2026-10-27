@@ -3,7 +3,7 @@
 //! Units are grid cells and simulation steps.
 
 use crate::world::{Mat, World, H, W};
-use macroquad::prelude::{vec2, Vec2};
+use crate::gfx::{vec2, Vec2};
 
 /// Everything below is tuned in "design units"; this shrinks the car to fit the finer grid.
 pub const S: f32 = 0.67;

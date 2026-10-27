@@ -4,7 +4,7 @@
 //! Nothing here touches the world: it is all light in the sky.
 
 use crate::render::View;
-use macroquad::prelude::*;
+use crate::gfx::*;
 
 /// Downward pull on rockets and sparks, in world cells per second squared.
 const GRAVITY: f32 = 90.0;

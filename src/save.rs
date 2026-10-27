@@ -4,7 +4,7 @@ use crate::pipes::{Driver, Pipe, Valve};
 use crate::mech::{Axle, End, Gear, GearSize, Mechanism, Motor, Pivot, Rod, Slider};
 use crate::blocks::{Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, MemberRole, Spring, SpringKind};
 use crate::world::{Biome, Mat, World, DAY_STEPS, H, W};
-use macroquad::prelude::{vec2, Vec2};
+use crate::gfx::{vec2, Vec2};
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 use std::io::{self, Error, ErrorKind};

@@ -4,8 +4,8 @@ use crate::blocks::{Block, BlockKind, Member, MemberMat, Spring, SpringKind, STU
 use crate::car::{Car, ModelKind};
 use crate::world::sleep::{CH, CS, CW};
 use crate::world::{Kind, Mat, World, H, W};
-use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation, PipelineParams};
-use macroquad::prelude::*;
+use crate::gfx::{BlendFactor, BlendState, BlendValue, Equation, PipelineParams};
+use crate::gfx::*;
 use rayon::prelude::*;
 
 /// Where the world sits on screen.

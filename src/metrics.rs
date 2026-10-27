@@ -5,7 +5,7 @@
 //! awake and the last steps drawn as a little graph. Off (panel hidden and no
 //! `AWORLD_PROFILE`), it costs one test per part.
 
-use macroquad::prelude::*;
+use crate::gfx::*;
 
 use crate::ui::{rrect, Ui, ACCENT, DIM, GREEN, RED, TEXT};
 use crate::world::prof::{self, Profile, PHASES};

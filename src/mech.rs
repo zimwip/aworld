@@ -17,7 +17,7 @@
 
 use crate::blocks::Anchor;
 use crate::pipes::Plumbing;
-use macroquad::prelude::{vec2, Vec2};
+use crate::gfx::{vec2, Vec2};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 static NEXT_MECH_UID: AtomicU32 = AtomicU32::new(1);

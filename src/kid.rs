@@ -7,7 +7,7 @@
 use crate::render::View;
 use crate::ui::{rrect, rrect_lines, Ui};
 use crate::world::{Kind, Mat, World, H, W};
-use macroquad::prelude::*;
+use crate::gfx::*;
 use std::f32::consts::TAU;
 
 /// The sprite grid, and the size of one of its pixels in world cells.

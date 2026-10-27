@@ -4,6 +4,7 @@ mod camera;
 mod car;
 mod fireworks;
 mod fps;
+mod gfx;
 mod firetruck;
 mod kid;
 mod debris;
@@ -31,7 +32,7 @@ mod world;
 
 use blocks::{anchor_world, block_at, magnet, node_at, placement_ok, stamp_all, Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, MemberRole, Physics, Spring, SpringKind, MEMBER_MAX_LEN, SPRING_MAX_LEN};
 use car::{collide_cars, Car, Fate, ModelKind, Tuning};
-use macroquad::prelude::*;
+use crate::gfx::*;
 use render::{RenderMode, cable_preview, draw_block, draw_block_shape, draw_guides, draw_booms, draw_cable, draw_car, draw_flag, draw_member, draw_spring, draw_spring_between, Boom, LiveBolt, Renderer, View, BOLT_LIFE};
 use science::{info, mat_color, palette_info, MATTERS, RECIPES};
 use mech::{GearSize, Mechanism};
@@ -792,7 +793,7 @@ impl Game {
         std::process::exit(0);
         // A page cannot close itself: the web version just goes back to the game.
         #[cfg(target_arch = "wasm32")]
-        macroquad::miniquad::window::request_quit();
+        gfx::request_quit();
     }
 
     fn toggle_fullscreen(&mut self) {
@@ -2796,12 +2797,12 @@ impl Game {
         let edge = PANEL_W + shift;
         if self.panel.visible() {
             let outer = (ui.mouse, ui.pressed);
-            unsafe { get_internal_gl() }.quad_gl.push_model_matrix(Mat4::from_translation(vec3(shift, 0.0, 0.0)));
+            push_shift(shift);
             ui.mouse.x -= shift;
             draw_rectangle(0.0, TOP_H, PANEL_W, sh - TOP_H, PANEL);
             self.draw_panel(ui, sh);
             self.draw_info_box(ui, sh);
-            unsafe { get_internal_gl() }.quad_gl.pop_model_matrix();
+            pop_shift();
             ui.mouse = outer.0;
         }
         // The handle that stays in sight: click it to pin the palette out (or to unpin it).
@@ -4974,7 +4975,7 @@ async fn main() {
         if let Some(path) = &shot {
             if frame == arg("--frames").and_then(|v| v.parse().ok()).unwrap_or(360) {
                 eprintln!("average frame time: {:.1} ms", frame_time * 1000.0 / frame as f32);
-                get_screen_data().export_png(path);
+                save_screenshot(path);
                 std::process::exit(0);
             }
         }
