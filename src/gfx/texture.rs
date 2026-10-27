@@ -95,6 +95,21 @@ impl Texture2D {
         self.update_part(0, 0, image.width as u32, image.height as u32, &image.bytes);
     }
 
+    /// Replaces the `w` × `h` pixels at (`x`, `y`) with the same pixels of `image` (of the same
+    /// size as the texture): only that part goes to the card.
+    pub fn update_rect(&self, image: &Image, x: u32, y: u32, w: u32, h: u32) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let row = 4 * image.width as u32;
+        kit().gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &self.0.texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+            &image.bytes,
+            wgpu::TexelCopyBufferLayout { offset: (y * row + 4 * x) as u64, bytes_per_row: Some(row), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+    }
+
     /// Replaces the `w` × `h` pixels at (`x`, `y`) with `bytes` (RGBA, row by row).
     pub fn update_part(&self, x: u32, y: u32, w: u32, h: u32, bytes: &[u8]) {
         self.write(kit().gpu, x, y, w, h, bytes);

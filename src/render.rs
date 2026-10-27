@@ -676,6 +676,25 @@ impl Renderer {
         visible
     }
 
+    /// Sends the zones `zones` of `image` to `texture`: on each row of zones, the stretch from the
+    /// first changed zone to the last (a world of 1920 × 1080 is 8 MB a picture, and a frame
+    /// usually changes a few zones of it).
+    fn upload_zones(texture: &Texture2D, image: &Image, zones: &[usize]) {
+        let mut span = vec![(usize::MAX, 0usize); CH()];
+        for &k in zones {
+            let s = &mut span[k / CW()];
+            *s = (s.0.min(k % CW()), s.1.max(k % CW() + 1));
+        }
+        for (row, &(a, b)) in span.iter().enumerate() {
+            if a >= b {
+                continue;
+            }
+            let (x0, y0) = (a * CS, row * CS);
+            let (x1, y1) = ((b * CS).min(W()), ((row + 1) * CS).min(H()));
+            texture.update_rect(image, x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32);
+        }
+    }
+
     /// The zones whose cells may have changed since step count `since`.
     fn changed_zones(world: &World, since: u64) -> Vec<usize> {
         (0..CW() * CH()).filter(|&k| world.zones.changed_since(k, since)).collect()
@@ -737,14 +756,16 @@ impl Renderer {
                             self.veg_zones[k] = Self::veg_of_zone(world, k);
                         }
                         self.full = false;
+                        self.texture.update(&self.image);
                     } else {
                         let mut zones = Self::changed_zones(world, self.drawn_stamp);
                         self.band = (self.band + 1) % CH();
                         zones.extend((0..CW()).map(|i| self.band * CW() + i));
-                        for k in zones {
+                        for &k in &zones {
                             Self::fill_zone(&mut self.image, k, |x, y| landscape_color(world, x, y));
                             self.veg_zones[k] = Self::veg_of_zone(world, k);
                         }
+                        Self::upload_zones(&self.texture, &self.image, &zones);
                     }
                     self.veg_tick = -1;
                     self.drawn_stamp = world.zones.stamp();
@@ -752,8 +773,8 @@ impl Renderer {
             }
             if mode != RenderMode::Normal {
                 self.full = true;
+                self.texture.update(&self.image);
             }
-            self.texture.update(&self.image);
             self.rev_world = world.revision;
             self.last_mode = id;
         }
@@ -992,14 +1013,20 @@ impl Renderer {
     pub fn draw_gas(&mut self, world: &World, v: View) {
         if self.rev_gas != world.revision {
             // The gas picture depends only on the cells: recolour the zones that changed.
-            let zones = if self.rev_gas == u64::MAX || world.zones.stamp() < self.gas_stamp { (0..CW() * CH()).collect() } else { Self::changed_zones(world, self.gas_stamp) };
+            let all = self.rev_gas == u64::MAX || world.zones.stamp() < self.gas_stamp;
+            let zones = if all { (0..CW() * CH()).collect() } else { Self::changed_zones(world, self.gas_stamp) };
             let was = self.has_gas;
-            for k in zones {
+            for &k in &zones {
                 self.gas_zones[k] = Self::fill_zone(&mut self.gas_image, k, |x, y| world.gas_color(x, y));
             }
             self.has_gas = self.gas_zones.iter().any(|&n| n > 0);
+            // Without gas before or after, the zones were clear on the card and still are.
             if self.has_gas || was {
-                self.gas_texture.update(&self.gas_image);
+                if all {
+                    self.gas_texture.update(&self.gas_image);
+                } else {
+                    Self::upload_zones(&self.gas_texture, &self.gas_image, &zones);
+                }
                 self.blur_gas();
             }
             self.rev_gas = world.revision;
