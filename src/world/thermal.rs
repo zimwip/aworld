@@ -936,7 +936,7 @@ impl World {
             }
             for &i in &busy[y] {
                 let i = i as usize;
-                let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+                let (x, y) = xy_i32(i);
                 let m = self.cells[i].m;
                 let t = self.temp[i];
                 match m {
@@ -1346,7 +1346,8 @@ impl World {
                 // part of the heat pass runs on its own step, after the reactions: a cell must not
                 // be left past its change point until the next one).
                 if flux > 0.0 && super::matter::fusion(m).is_some() {
-                    self.latent_heat(j, (j % W()) as i32, (j / W()) as i32, m, self.temp[j]);
+                    let (jx, jy) = xy_i32(j);
+                    self.latent_heat(j, jx, jy, m, self.temp[j]);
                 }
             }
         }
@@ -1837,7 +1838,8 @@ mod latent_tests {
         let (before, sky) = (w.total_heat(), w.climate.sky_dev);
         for k in 0..W() * H() {
             if w.cells[k].m == Mat::Steam {
-                w.condense((k % W()) as i32, (k / W()) as i32);
+                let (kx, ky) = xy_i32(k);
+                w.condense(kx, ky);
             }
         }
         assert!(close(w.total_heat(), before));

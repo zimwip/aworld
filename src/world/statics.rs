@@ -355,7 +355,7 @@ impl World {
             stack.push(k0);
             while let Some(k) = stack.pop() {
                 let i = order[k as usize];
-                let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+                let (x, y) = xy_i32(i);
                 for (nx, ny) in Self::neighbors(x, y) {
                     if !Self::inb(nx, ny) {
                         continue;
@@ -418,7 +418,7 @@ impl World {
                 for &k in members {
                     let (px, py) = push[k as usize];
                     let i = order[k as usize];
-                    let (x, y) = (i % W(), i / W());
+                    let (x, y) = xy(i);
                     if px != 0.0 {
                         wet.push((false, x * 2 + (px > 0.0) as usize, y, px));
                     }
@@ -484,7 +484,7 @@ impl World {
                     ok = false;
                     break;
                 }
-                let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+                let (x, y) = xy_i32(i);
                 for (nx, ny) in Self::neighbors(x, y) {
                     if !Self::inb(nx, ny) {
                         continue;
@@ -565,7 +565,7 @@ impl World {
             }
             for k in lo..hi {
                 let i = cell(k);
-                let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+                let (x, y) = xy_i32(i);
                 for (nx, ny) in Self::neighbors(x, y) {
                     if !Self::inb(nx, ny) {
                         continue;
@@ -657,7 +657,7 @@ impl World {
         let edge = if side > 0.0 { hi as f32 + 1.0 } else { lo as f32 };
         let (mut over, mut hold) = (0.0f32, 0.0f32);
         for &(i, (fx, fy)) in &pushes {
-            let (x, y) = ((i % W()) as f32 + 0.5, (i / W()) as f32 + 0.5);
+            let (x, y) = { let (x, y) = xy(i); (x as f32 + 0.5, y as f32 + 0.5) };
             over += fx.abs() * (base as f32 - y) * if (fx > 0.0) == (side > 0.0) { 1.0 } else { -1.0 };
             hold += (density(self.cells[i].m) + fy) * (edge - x) * side.signum();
         }
@@ -751,7 +751,7 @@ impl World {
                 } else {
                     firm = true;
                 }
-                let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+                let (x, y) = xy_i32(i);
                 if x < lo.0 || (x == lo.0 && y > lo.1) {
                     lo = (x, y);
                 }
@@ -850,7 +850,7 @@ impl World {
         let (mut mass, mut mx, mut my) = (0.0f32, 0.0f32, 0.0f32);
         let mut drawn = Vec::with_capacity(cells.len());
         for (k, &i) in cells.iter().enumerate() {
-            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+            let (x, y) = xy_i32(i);
             let rho = density(self.cells[i].m);
             mass += rho;
             mx += rho * (x as f32 + 0.5);
@@ -1142,7 +1142,7 @@ impl World {
             }
             // Against its own foot while it still turns on it: that corner is crushed, not stopped.
             if let Some(h) = s.hinge {
-                let p = ((t % W()) as f32 + 0.5, (t / W()) as f32 + 0.5);
+                let p = { let (x, y) = xy(t); (x as f32 + 0.5, y as f32 + 0.5) };
                 if (p.0 - h.0).powi(2) + (p.1 - h.1).powi(2) < 6.25 {
                     crushed.push((k, p));
                     continue;
@@ -1267,7 +1267,7 @@ impl World {
         let m = hits.iter().map(|&t| self.cells[t].m).find(|m| m.kind() == Kind::Static).unwrap_or(self.cells[hits[0]].m);
         let every = hits.len().div_ceil(MAX_POINTS);
         let points = hits.iter().step_by(every).map(|&t| {
-            let (x, y) = ((t % W()) as i32, (t / W()) as i32);
+            let (x, y) = xy_i32(t);
             let (mut nx, mut ny) = (0.0f32, 0.0f32);
             for dy in -2..=2 {
                 for dx in -2..=2 {
@@ -1360,7 +1360,7 @@ impl World {
         // Each piece grows from its seed through the cells nearest to it.
         let next = |k: usize| {
             let i = cells[k];
-            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+            let (x, y) = xy_i32(i);
             Self::neighbors(x, y).into_iter().filter(|&(nx, ny)| Self::inb(nx, ny)).filter_map(|(nx, ny)| at.get(&Self::idx(nx, ny)).copied()).collect::<Vec<usize>>()
         };
         loop {
@@ -1394,7 +1394,7 @@ impl World {
             }
             let i = cells[k];
             let m = self.cells[i].m;
-            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+            let (x, y) = xy_i32(i);
             self.set(x, y, Mat::Empty);
             let Some(grain) = rubble(m) else { continue };
             // Thrown back up and aside a little, as the shards of a broken plate.
@@ -1585,7 +1585,7 @@ mod tests {
 
     /// Cells of matter `m` in the world.
     fn cells_of(w: &World, m: Mat) -> Vec<(i32, i32)> {
-        (0..W() * H()).filter(|&i| w.cells[i].m == m).map(|i| ((i % W()) as i32, (i / W()) as i32)).collect()
+        (0..W() * H()).filter(|&i| w.cells[i].m == m).map(|i| xy_i32(i)).collect()
     }
 
     #[test]

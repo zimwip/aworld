@@ -47,7 +47,6 @@ pub const STEP: f32 = 1.0 / 60.0;
 /// speed) is several steps: past it the heat and the liquids would need sub-steps of their own.
 pub const MAX_DT: f32 = 3.0 * STEP;
 use thermal::adiabatic_cooling_c;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 /// How the brush treats what is already there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -98,18 +97,48 @@ pub const NMAT: usize = Mat::ALL.len();
 /// The size of the world, in cells: 960 x 540 unless the game is started with another one
 /// (`--grid`, see `set_grid`). Set once, before the first world is made: every field of the
 /// world, of the renderer and of the card is sized from it.
-static GRID: [AtomicUsize; 2] = [AtomicUsize::new(960), AtomicUsize::new(540)];
+static mut GRID: [usize; 2] = [960, 540];
 /// Columns across the world.
+///
+/// (A plain read of `GRID`, not an atomic one: the compiler may then keep the width in a
+/// register through a loop over the cells, and work out the index of a neighbour by an add; an
+/// atomic read it reloads at every turn of the loop, worth a tenth of a step. Sound because
+/// `set_grid` is the only write, made once from the main thread before any world, renderer or
+/// card exists and before any other thread reads it.)
 #[allow(non_snake_case)]
 #[inline(always)]
 pub fn W() -> usize {
-    GRID[0].load(Relaxed)
+    unsafe { GRID[0] }
 }
 /// Rows down the world.
 #[allow(non_snake_case)]
 #[inline(always)]
 pub fn H() -> usize {
-    GRID[1].load(Relaxed)
+    unsafe { GRID[1] }
+}
+/// The row of cell `i` by a multiplication: `W()` is only known at run time, so `i / W()` is a
+/// real division, and the cells' turn works one out for most cells it touches (a tenth of a step
+/// on a busy scene, measured). `DIV` is `(m, s)` with `i / W() == i * m >> s` for every `i` below
+/// 2^31 (Granlund and Montgomery, "Division by invariant integers using multiplication", theorem
+/// 4.2: `s = 31 + ceil(log2 W)`, `m = ceil(2^s / W)`; the product stays under 2^63).
+static mut DIV: (usize, usize) = div_magic(960);
+const fn div_magic(w: usize) -> (usize, usize) {
+    let l = (usize::BITS - (w - 1).leading_zeros()) as usize;
+    let s = 31 + l;
+    (((1u128 << s) + w as u128 - 1).div_euclid(w as u128) as usize, s)
+}
+/// `xy(i)`, without the divisions (see `DIV`).
+#[inline(always)]
+pub fn xy(i: usize) -> (usize, usize) {
+    let (m, s) = unsafe { DIV };
+    let y = ((i as u64 * m as u64) >> s) as usize;
+    (i - y * W(), y)
+}
+/// `xy` in `i32`.
+#[inline(always)]
+pub fn xy_i32(i: usize) -> (i32, i32) {
+    let (x, y) = xy(i);
+    (x as i32, y as i32)
 }
 /// The design size, which the terrain and the sky are drawn for (see `sx`, `sy`).
 pub const BASE_W: usize = 960;
@@ -130,8 +159,12 @@ pub fn snap_grid(w: usize, h: usize) -> (usize, usize) {
 /// a world, a renderer or a card already made keep the size they were made at.
 pub fn set_grid(w: usize, h: usize) -> (usize, usize) {
     let (w, h) = snap_grid(w, h);
-    GRID[0].store(w, Relaxed);
-    GRID[1].store(h, Relaxed);
+    // SAFETY: see `W`. The first world of the game, of a test or of a bench is made after this.
+    unsafe {
+        GRID = [w, h];
+        DIV = div_magic(w);
+    }
+    sleep::set_zones(w, h);
     turn::check_strips();
     (w, h)
 }
@@ -1173,7 +1206,7 @@ impl World {
         taken.sort_unstable();
         let mut columns = vec![];
         for i in taken {
-            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+            let (x, y) = xy_i32(i);
             let mut top = y;
             while top > 0 && matches!(self.cells[Self::idx(x, top - 1)].m, Mat::Dirt | Mat::Grass) {
                 top -= 1;
@@ -1519,7 +1552,7 @@ impl World {
             if !matches!(c.m.kind(), Kind::Powder | Kind::Liquid | Kind::Gas | Kind::Flame) {
                 continue;
             }
-            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+            let (x, y) = xy_i32(i);
             let mut moved = false;
             for dy in 1..=30 {
                 if y - dy < 0 {
@@ -3396,10 +3429,12 @@ impl World {
         // `VAPOUR_PER_WATER` cells of the cloud's water, so a cloud that rains thins out and the rain eases off by itself until
         // fresh vapour feeds it again. A cloud warmed by the sun keeps its water and does not rain.
         let t = self.temp[i];
-        if near >= 2 && t < 12.0 && matches!(self.at(x, y + 1), Mat::Empty | Mat::Cloud) {
+        // (The one-in-`RAIN_EVERY` draw comes first: it spares the look at the 24 cells around
+        // on nearly every tick. The odds are the same, one draw times the other.)
+        if near >= 2 && t < 12.0 && self.chance_f(1.0 / RAIN_EVERY) && matches!(self.at(x, y + 1), Mat::Empty | Mat::Cloud) {
             let water = self.cloud_water(x, y);
             let thick = ((water - RAIN_MIN_WATER) / (24.0 - RAIN_MIN_WATER)).max(0.0);
-            if self.chance_f(thick * thick / RAIN_EVERY) && self.gather_vapour(x, y) {
+            if self.chance_f(thick * thick) && self.gather_vapour(x, y) {
                 // The drop holds the cloud's water; freezing into snow or hail, it gives off
                 // the heat of freezing (counted by `heat_of`).
                 let own = thermal::heat_of(Mat::Cloud, t) + self.packed(i) as f32 * thermal::latent0(Mat::Cloud);
@@ -3703,7 +3738,7 @@ impl World {
         while head < order.len() {
             let i = order[head];
             head += 1;
-            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+            let (x, y) = xy_i32(i);
             let from = self.cells[i].m;
             for (nx, ny) in Self::neighbors(x, y) {
                 if Self::inb(nx, ny) {
@@ -3741,7 +3776,7 @@ impl World {
             stack.push(start);
             while let Some(i) = stack.pop() {
                 cells.push(i);
-                let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+                let (x, y) = xy_i32(i);
                 for (nx, ny) in Self::neighbors(x, y) {
                     if Self::inb(nx, ny) {
                         let j = Self::idx(nx, ny);
@@ -3824,7 +3859,7 @@ impl World {
         }
         if matches!(m, Mat::Trunk | Mat::Sapling) {
             // Roots: a tree holds to the ground it stands on.
-            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+            let (x, y) = xy_i32(i);
             let held = |(x, y): (i32, i32)| Self::inb(x, y) && self.ground[Self::idx(x, y)];
             let ground = |m: Mat| m.is_hard() && !m.is_vegetation();
             return (ground(self.raw(x, y + 1)) && held((x, y + 1)))
@@ -4472,6 +4507,22 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_row_by_multiplication_is_the_row_by_division_for_every_width() {
+        // Every width `--grid` takes, and every cell of the tallest world (and past it).
+        let mut w = GRID_W.0;
+        while w <= GRID_W.1 {
+            let (m, s) = div_magic(w);
+            let top = w * GRID_H.1 + w;
+            for i in (0..top).step_by(7).chain(top - w..top) {
+                assert_eq!(((i as u64 * m as u64) >> s) as usize, i / w, "width {w}, cell {i}");
+            }
+            w += GRID_W.2;
+        }
+        let (x, y) = xy(5 * W() + 3);
+        assert_eq!((x, y), (3, 5));
+    }
 
     #[test]
     fn a_simplified_simulation_still_melts_sand_and_cools_a_hot_stone() {
@@ -5545,7 +5596,7 @@ mod tests {
                     w.cells[i].m == Mat::Ice
                         && i / W() < 330
                         && (0..4).all(|k| {
-                            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+                            let (x, y) = xy_i32(i);
                             let (nx, ny) = [(x, y + 1), (x + 1, y), (x - 1, y), (x, y - 1)][k];
                             // Ice floating on a lake is not hanging in the air either.
                             !matches!(w.raw(nx, ny), Mat::Stone | Mat::Dirt | Mat::Grass | Mat::Ice | Mat::Trunk | Mat::Leaf | Mat::Branch | Mat::Water)

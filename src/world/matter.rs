@@ -19,7 +19,7 @@
 //! (it peaks at a few thousand atmospheres): it neither packs the soil nor makes diamond.
 
 use super::thermal::{cap, heat_of, latent0, GLASS_C, KILN_C, LATENT_FUSION, LATENT_METAL, LATENT_ROCK, MELT_C, METAL_MELT_C, ROCK_MELT_C, WOOD_IGNITE_C};
-use super::{density, Kind, Mat, World, H, W};
+use super::{density, xy_i32, Kind, Mat, World, H, W};
 
 /// A condition a change needs; all the conditions of a change must hold.
 #[derive(Clone, Copy, Debug)]
@@ -231,7 +231,7 @@ impl World {
     pub(super) fn change_state(&mut self, i: usize, to: Mat, latent: f32) {
         let (from, t, kept) = (self.cells[i].m, self.temp[i], self.states(i));
         let heat = heat_of(from, t) - latent;
-        let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+        let (x, y) = xy_i32(i);
         self.set(x, y, to);
         self.temp[i] = (heat - latent0(to)) / cap(to);
         self.keep_states(i, kept, from);

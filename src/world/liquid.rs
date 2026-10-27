@@ -384,7 +384,7 @@ impl World {
         if !self.liquid_physics || self.liq.p.len() != W() * H() {
             return (0.0, 0.0);
         }
-        let (x, y) = (i % W(), i / W());
+        let (x, y) = xy(i);
         let head = |j: usize| -> f32 {
             if self.liq.class[j] & 3 == FULLISH && self.cells[j].m.kind() == Kind::Liquid {
                 (self.liq.p[j] / (1000.0 * G * CELL_M)).max(0.0)
@@ -809,7 +809,7 @@ impl World {
         self.fill[j] = if q == field::FULL { 0 } else { q };
         // Its speed goes to the edges of the cell, in proportion to what it brings.
         let w = d.q as f32 / q as f32;
-        let (x, y) = (j % W(), j / W());
+        let (x, y) = xy(j);
         if let Some(Some(card)) = liq.card.as_mut() {
             for e in [ui(x, y), ui(x + 1, y)] {
                 card.patches_up.push(liquid_gpu::Patch { edge: e as u32, mode: 1, value: d.vx, weight: w });
@@ -1340,7 +1340,7 @@ impl World {
                     if kind(j) == mgpcg::FIXED {
                         // The fixed pressure beside: the gas over the liquid (or over its film),
                         // or the liquid that sleeps.
-                        let pj = if class[j] & 3 == FULLISH { p_old[j] } else { self.gas_pa_over((j % W()) as i32, (j / W()) as i32) };
+                        let pj = if class[j] & 3 == FULLISH { p_old[j] } else { { let (jx, jy) = xy_i32(j); self.gas_pa_over(jx, jy) } };
                         rhs_i += a * pj;
                     }
                 }
@@ -1636,7 +1636,7 @@ impl World {
                 // broke into drops, a third of the body in a second. Only from above: done on
                 // the side edges too, it pumped the waves the wind raises, on the card.)
                 if let Some((2, speed)) = feed.filter(|_| q as u32 >= field::FULL / 4) {
-                    let (x, y) = (i % W(), i / W());
+                    let (x, y) = xy(i);
                     if y + 1 < H() && self.cells[i + W()].m == Mat::Empty && self.mask[i + W()] == 0 {
                         let slot = &mut liq.v[vi(x, y + 1)];
                         if slot.abs() < speed.abs() {
@@ -1656,11 +1656,18 @@ impl World {
     /// A cell holding more than full pushes the extra up, into air or the same liquid.
     fn overflow(&mut self, liq: &Liquids) {
         let full = field::FULL;
+        // (Both passes look for the few cells that move with a tight scan of the fills of the
+        // row, the cells, their matter and the rest read only there: the passes are serial and
+        // visited every cell of every body a cell at a time, a tenth of the step on a big tank.)
         for y in (1..H()).rev() {
             let Some((x0, x1)) = liq.span(y) else { continue };
-            for x in x0..=x1 {
-                let i = y * W() + x;
-                if self.cells[i].m.kind() != Kind::Liquid || self.fill[i] <= full + CRUMB {
+            let base = y * W();
+            let mut x = x0;
+            while let Some(k) = self.fill[base + x..=base + x1].iter().position(|&f| f > full + CRUMB) {
+                x += k;
+                let i = base + x;
+                x += 1;
+                if self.cells[i].m.kind() != Kind::Liquid {
                     continue;
                 }
                 let j = i - W();
@@ -1693,13 +1700,30 @@ impl World {
         // joins the liquid under or over it, or goes if there is none.
         for y in 0..H() {
             let Some((x0, x1)) = liq.span(y) else { continue };
-            for x in x0..=x1 {
-                let i = y * W() + x;
+            let base = y * W();
+            // Only a crumb, or a cell over one short of full (its fill not 0: a full cell's is),
+            // can move: a cell over a full cell, or over the floor, has nowhere to sink, and
+            // that is most of a body and of its surface, seen off by the fills alone. (A crumb
+            // is a fill of `CRUMB` or less that is not 0.)
+            let next = |fill: &[u32], x: usize| -> Option<usize> {
+                let row = &fill[base + x..=base + x1];
+                let crumb = |a: u32| a != 0 && a <= CRUMB;
+                if y + 1 < H() {
+                    row.iter().zip(&fill[base + W() + x..=base + W() + x1]).position(|(&a, &b)| b != 0 || crumb(a))
+                } else {
+                    row.iter().position(|&a| crumb(a))
+                }
+            };
+            let mut x = x0;
+            while let Some(k) = next(&self.fill, x) {
+                x += k;
+                let (i, xc) = (base + x, x);
+                x += 1;
                 let m = self.cells[i].m;
                 if m.kind() != Kind::Liquid || self.mask[i] != 0 {
                     continue;
                 }
-                let runs = |yy: usize| self.zones.awake[yy / sleep::CS * sleep::CW() + x / sleep::CS];
+                let runs = |yy: usize| self.zones.awake[yy / sleep::CS * sleep::CW() + xc / sleep::CS];
                 let have = self.liquid_fill(i);
                 let same = |j: usize| self.cells[j].m == m && self.mask[j] == 0;
                 let below = (y + 1 < H() && same(i + W())).then_some(i + W());
