@@ -7,7 +7,7 @@
 use crate::render::View;
 use crate::ui::Ui;
 use crate::world::{Kind, Mat, World, H, W};
-use macroquad::prelude::*;
+use crate::gfx::*;
 
 /// The timeline of a visit (seconds): the pack comes, howls three times, the moon winks, they go.
 const COME: f32 = 2.0;

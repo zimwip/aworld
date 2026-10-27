@@ -14,20 +14,16 @@
 <body>
   <canvas id="glcanvas" tabindex="1"></canvas>
   <div id="loading">Chargement d'AWorld…</div>
-  <!-- macroquad's JS glue (WebGL, audio, input), from the same version as the game -->
-  <script>
-    // The bundle's networking plugin looks for this helper, which this version of the glue lacks:
-    // a harmless stub keeps the console clean.
-    window.register_plugin = window.register_plugin || function () {};
-  </script>
-  <script src="mq_js_bundle.js"></script>
-  <script>
+  <script type="module">
+    // The game (aworld_bg.wasm) and its glue (aworld.js), made by wasm-bindgen: it draws with
+    // WebGPU, or WebGL 2 where the browser has no WebGPU.
+    import init from "./aworld.js";
     // Keys (Esc, Space...) only reach the game when the canvas has the focus.
-    var cv = document.getElementById("glcanvas");
+    const cv = document.getElementById("glcanvas");
     cv.focus();
-    window.addEventListener("pointerdown", function () { cv.focus(); });
+    window.addEventListener("pointerdown", () => cv.focus());
     // The canvas is opaque once the game draws, which hides the loading text behind it.
-    load("aworld.wasm");
+    init();
   </script>
 </body>
 </html>

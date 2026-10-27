@@ -11,7 +11,7 @@
 
 use crate::render::View;
 use crate::world::{Kind, World, H, W};
-use macroquad::prelude::*;
+use crate::gfx::*;
 
 /// Size of a stick lying down, cells (5 cm each: a fat stick, so that it can be seen).
 pub const LEN: i32 = 10;

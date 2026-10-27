@@ -28,7 +28,7 @@ mod turn;
 mod field;
 mod liquid;
 mod mgpcg;
-mod gpu;
+pub mod gpu;
 mod mgpcg_gpu;
 mod liquid_gpu;
 pub mod inspect;

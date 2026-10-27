@@ -3,7 +3,7 @@
 //! they become rapier bodies, welded to the blocks they touch.
 
 use crate::world::{Mat, World, H, W};
-use macroquad::prelude::{vec2, Vec2};
+use crate::gfx::{vec2, Vec2};
 use rapier2d::prelude::*;
 use std::collections::{HashMap, HashSet};
 

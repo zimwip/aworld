@@ -36,13 +36,22 @@ if errorlevel 1 (
   echo Installation de la cible wasm32-unknown-unknown...
   rustup target add wasm32-unknown-unknown || exit /b 1
 )
+rem The glue between the page and the game: the same version as the wasm-bindgen of Cargo.toml.
+rem The line reads: wasm-bindgen = "=0.2.x" (its third piece between the "=" is 0.2.x").
+for /f "tokens=3 delims==" %%v in ('findstr /b /c:"wasm-bindgen = " Cargo.toml') do set WBG=%%v
+set WBG=%WBG:"=%
+set HAVE=
+for /f "tokens=2" %%v in ('wasm-bindgen --version 2^>nul') do set HAVE=%%v
+if not "%HAVE%"=="%WBG%" (
+  echo Installation de wasm-bindgen %WBG% ^(une seule fois^)...
+  cargo install wasm-bindgen-cli --version %WBG% --locked || exit /b 1
+)
 cargo build --release --target wasm32-unknown-unknown --bin aworld || exit /b 1
 cargo build --release --bin aworld-serve || exit /b 1
 if exist dist\web rmdir /s /q dist\web
 mkdir dist\web\site || exit /b 1
 copy /y web\index.html dist\web\site\ >nul || exit /b 1
-copy /y web\mq_js_bundle.js dist\web\site\ >nul || exit /b 1
-copy /y target\wasm32-unknown-unknown\release\aworld.wasm dist\web\site\ >nul || exit /b 1
+wasm-bindgen --target web --no-typescript --out-dir dist\web\site target\wasm32-unknown-unknown\release\aworld.wasm || exit /b 1
 copy /y target\release\aworld-serve.exe dist\web\ >nul || exit /b 1
 copy /y web\serve.bat dist\web\ >nul || exit /b 1
 echo OK : dist\web

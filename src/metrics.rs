@@ -5,7 +5,7 @@
 //! awake and the last steps drawn as a little graph. Off (panel hidden and no
 //! `AWORLD_PROFILE`), it costs one test per part.
 
-use macroquad::prelude::*;
+use crate::gfx::*;
 
 use crate::ui::{rrect, Ui, ACCENT, DIM, GREEN, RED, TEXT};
 use crate::world::prof::{self, Profile, PHASES};
@@ -38,7 +38,7 @@ const HISTORY: usize = 240;
 /// The time of one step at x1 (60 steps a second): above it, the world cannot keep up.
 const BUDGET_MS: f32 = 1000.0 / 60.0;
 
-/// Seconds on a steady clock. Not macroquad's `get_time`: the steps may run away from the main
+/// Seconds on a steady clock. Not the window's `get_time`: the steps may run away from the main
 /// thread, where it cannot be read.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn now() -> f64 {

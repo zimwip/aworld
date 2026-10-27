@@ -4,7 +4,7 @@
 
 use crate::render::View;
 use crate::world::{Kind, World, H, W};
-use macroquad::prelude::*;
+use crate::gfx::*;
 
 /// Length of the plane, in world cells.
 const LENGTH: f32 = 70.0;

@@ -1,7 +1,7 @@
 //! The educational side: what each material is, and the recipes that link them.
 
 use crate::world::Mat;
-use macroquad::prelude::Color;
+use crate::gfx::Color;
 
 pub struct Info {
     pub name: &'static str,

@@ -3,7 +3,7 @@
 
 use crate::render::View;
 use crate::world::{Biome, Season};
-use macroquad::prelude::*;
+use crate::gfx::*;
 
 fn mix(a: Color, b: Color, t: f32) -> Color {
     let t = t.clamp(0.0, 1.0);

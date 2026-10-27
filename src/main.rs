@@ -4,6 +4,7 @@ mod camera;
 mod car;
 mod fireworks;
 mod fps;
+mod gfx;
 mod firetruck;
 mod kid;
 mod debris;
@@ -31,7 +32,7 @@ mod world;
 
 use blocks::{anchor_world, block_at, magnet, node_at, placement_ok, stamp_all, Anchor, Block, BlockKind, Cable, CableMat, Member, MemberMat, MemberRole, Physics, Spring, SpringKind, MEMBER_MAX_LEN, SPRING_MAX_LEN};
 use car::{collide_cars, Car, Fate, ModelKind, Tuning};
-use macroquad::prelude::*;
+use crate::gfx::*;
 use render::{RenderMode, cable_preview, draw_block, draw_block_shape, draw_guides, draw_booms, draw_cable, draw_car, draw_flag, draw_member, draw_spring, draw_spring_between, Boom, LiveBolt, Renderer, View, BOLT_LIFE};
 use science::{info, mat_color, palette_info, MATTERS, RECIPES};
 use mech::{GearSize, Mechanism};
@@ -126,8 +127,6 @@ fn window_conf() -> Conf {
         window_width: (PANEL_W + 1280.0) as i32,
         window_height: (TOP_H + 768.0) as i32,
         window_resizable: true,
-        sample_count: 4,
-        ..Default::default()
     }
 }
 
@@ -792,7 +791,7 @@ impl Game {
         std::process::exit(0);
         // A page cannot close itself: the web version just goes back to the game.
         #[cfg(target_arch = "wasm32")]
-        macroquad::miniquad::window::request_quit();
+        gfx::request_quit();
     }
 
     fn toggle_fullscreen(&mut self) {
@@ -1604,7 +1603,7 @@ impl Game {
     fn update(&mut self, dt: f32) {
         self.tick_toast(dt);
         if let Some((steps, step)) = self.update_world(dt, dt) {
-            // std's clock, macroquad's in the browser (std has none there; macroquad's needs a
+            // std's clock, the window's in the browser (std has none there; the window's needs a
             // window, which the tests have not).
             let start = metrics::now();
             for _ in 0..steps {
@@ -2897,12 +2896,12 @@ impl Game {
         let edge = PANEL_W + shift;
         if self.panel.visible() {
             let outer = (ui.mouse, ui.pressed);
-            unsafe { get_internal_gl() }.quad_gl.push_model_matrix(Mat4::from_translation(vec3(shift, 0.0, 0.0)));
+            push_shift(shift);
             ui.mouse.x -= shift;
             draw_rectangle(0.0, TOP_H, PANEL_W, sh - TOP_H, PANEL);
             self.draw_panel(ui, sh);
             self.draw_info_box(ui, sh);
-            unsafe { get_internal_gl() }.quad_gl.pop_model_matrix();
+            pop_shift();
             ui.mouse = outer.0;
         }
         // The handle that stays in sight: click it to pin the palette out (or to unpin it).
@@ -4685,8 +4684,11 @@ fn draw_car_icon(c: Vec2, col: Color, s: f32) {
     draw_circle(c.x + 10.0 * s, c.y + 9.0 * s, 5.0 * s, Color::from_rgba(26, 26, 32, 255));
 }
 
-#[macroquad::main(window_conf)]
-async fn main() {
+fn main() {
+    gfx::run(window_conf(), game());
+}
+
+async fn game() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let shot = arg("--demo");
@@ -5106,7 +5108,10 @@ async fn main() {
         if let Some(path) = &shot {
             if frame == arg("--frames").and_then(|v| v.parse().ok()).unwrap_or(360) {
                 eprintln!("average frame time: {:.1} ms", frame_time * 1000.0 / frame as f32);
-                get_screen_data().export_png(path);
+                #[cfg(not(target_arch = "wasm32"))]
+                save_screenshot(path);
+                #[cfg(target_arch = "wasm32")]
+                let _ = path;
                 std::process::exit(0);
             }
         }

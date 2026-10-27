@@ -7,7 +7,7 @@ use crate::car::{Car, S};
 use crate::firetruck::{self, Truck};
 use crate::render::View;
 use crate::world::{Mat, World, H, W};
-use macroquad::prelude::*;
+use crate::gfx::*;
 
 /// Same pull as the cars feel, cells per step².
 const GRAVITY: f32 = 0.12 * S;

@@ -3,7 +3,7 @@
 
 use crate::render::View;
 use crate::world::{H, W};
-use macroquad::prelude::*;
+use crate::gfx::*;
 
 /// The furthest one can zoom in, from the standard view.
 pub const MAX_ZOOM: f32 = 8.0;

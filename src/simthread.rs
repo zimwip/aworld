@@ -19,7 +19,7 @@
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
 
-use macroquad::prelude::*;
+use crate::gfx::*;
 
 use crate::sound::{Ev, Sounds};
 use crate::ui::Ui;

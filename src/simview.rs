@@ -8,7 +8,7 @@
 //! state of every cell is kept, and the step's diff is what changed since.
 
 
-use macroquad::prelude::*;
+use crate::gfx::*;
 use rayon::prelude::*;
 
 use crate::render::View;

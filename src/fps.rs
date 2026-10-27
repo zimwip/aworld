@@ -2,7 +2,7 @@
 //! picture, at the pace of the screen), steps a second (the world, 60 a second at x1 whatever the
 //! screen), and how long one step takes, all averaged over half a second so they can be read.
 
-use macroquad::prelude::*;
+use crate::gfx::*;
 
 use crate::ui::{rrect, Ui, DIM, GREEN, RED};
 

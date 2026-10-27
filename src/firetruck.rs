@@ -6,7 +6,7 @@
 
 use crate::render::View;
 use crate::world::{Kind, Mat, World, H, W};
-use macroquad::prelude::*;
+use crate::gfx::*;
 
 /// Length and height of the engine, in world cells.
 pub const LENGTH: f32 = 36.0;
