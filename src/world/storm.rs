@@ -121,39 +121,45 @@ impl World {
         // Cloud in each square, and how cold it is.
         // Also, for the charge in the ground: whether a square holds matter, how well the best of
         // it conducts, and whether it has air in it.
-        let mut cloud = vec![0.0f32; QW() * QH()];
-        let mut cold = vec![0.0f32; QW() * QH()];
-        let mut cond = vec![-1.0f32; QW() * QH()];
-        let mut open = vec![false; QW() * QH()];
-        // And whether it holds loose grains (which a field can pull), and iron filings (rust).
-        let mut grains = vec![false; QW() * QH()];
-        let mut rusty = vec![false; QW() * QH()];
-        for qy in 0..QH() {
-            for qx in 0..QW() {
-                let (mut n, mut t) = (0u32, 0.0f32);
-                let k = qy * QW() + qx;
-                for y in qy * QS..(qy + 1) * QS {
-                    for x in qx * QS..(qx + 1) * QS {
-                        let i = y * W() + x;
-                        let m = self.cells[i].m;
-                        if m == Mat::Cloud {
-                            n += 1;
-                            t += self.temp[i];
-                        }
-                        match m.kind() {
-                            Kind::Empty | Kind::Gas | Kind::Flame => open[k] = true,
-                            kind => {
-                                cond[k] = cond[k].max(conductivity(m));
-                                grains[k] |= kind == Kind::Powder;
-                                rusty[k] |= m == Mat::Rust;
+        // (Each row of squares on its own, on every core: a look at every cell of the world.)
+        use rayon::prelude::*;
+        let (cells, temp) = (&self.cells, &self.temp);
+        let squares: Vec<(f32, f32, f32, bool, bool, bool)> = (0..QH())
+            .into_par_iter()
+            .flat_map_iter(|qy| {
+                (0..QW()).map(move |qx| {
+                    let (mut n, mut t) = (0u32, 0.0f32);
+                    let (mut cond, mut open, mut grains, mut rusty) = (-1.0f32, false, false, false);
+                    for y in qy * QS..(qy + 1) * QS {
+                        for x in qx * QS..(qx + 1) * QS {
+                            let i = y * W() + x;
+                            let m = cells[i].m;
+                            if m == Mat::Cloud {
+                                n += 1;
+                                t += temp[i];
+                            }
+                            match m.kind() {
+                                Kind::Empty | Kind::Gas | Kind::Flame => open = true,
+                                kind => {
+                                    cond = cond.max(conductivity(m));
+                                    grains |= kind == Kind::Powder;
+                                    rusty |= m == Mat::Rust;
+                                }
                             }
                         }
                     }
-                }
-                cloud[k] = n as f32 / (QS * QS) as f32;
-                cold[k] = if n > 0 && t / (n as f32) < ICE_C { 1.0 } else { 0.0 };
-            }
-        }
+                    let cloud = n as f32 / (QS * QS) as f32;
+                    let cold = if n > 0 && t / (n as f32) < ICE_C { 1.0 } else { 0.0 };
+                    (cloud, cold, cond, open, grains, rusty)
+                })
+            })
+            .collect();
+        let cloud: Vec<f32> = squares.iter().map(|s| s.0).collect();
+        let cold: Vec<f32> = squares.iter().map(|s| s.1).collect();
+        let cond: Vec<f32> = squares.iter().map(|s| s.2).collect();
+        let open: Vec<bool> = squares.iter().map(|s| s.3).collect();
+        let grains: Vec<bool> = squares.iter().map(|s| s.4).collect();
+        let rusty: Vec<bool> = squares.iter().map(|s| s.5).collect();
         self.magnet_step(&rusty);
         let any_charge = self.charge.iter().chain(&self.mcharge).any(|q| q.abs() > 1e-4);
         if !any_charge && !cloud.iter().zip(&cold).any(|(c, k)| *c > 0.5 && *k > 0.0) {

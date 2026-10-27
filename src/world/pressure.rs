@@ -5,6 +5,7 @@
 //! the buoyancy of the liquid already balance it.
 
 use super::flow::{CELL, FH, FW};
+use super::num::wrap_i;
 use super::{density, Kind, World, H, W};
 
 /// Excess pressure gradient (atmospheres per world cell) below which a liquid is not pushed.
@@ -16,7 +17,7 @@ const PUSH: f32 = 40.0;
 
 #[inline]
 fn at(i: i32, j: i32) -> usize {
-    j as usize * FW() + i.rem_euclid(FW() as i32) as usize
+    j as usize * FW() + wrap_i(i, FW() as i32) as usize
 }
 
 impl World {

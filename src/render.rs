@@ -661,19 +661,37 @@ impl Renderer {
         }
     }
 
-    /// Recolours one sleeping zone of the picture. Returns how many pixels are not fully transparent.
-    fn fill_zone(image: &mut Image, k: usize, color: impl Fn(usize, usize) -> [u8; 4]) -> u32 {
-        let px = image.get_image_data_mut();
-        let (x0, y0) = ((k % CW()) * CS, (k / CW()) * CS);
-        let mut visible = 0;
-        for y in y0..(y0 + CS).min(H()) {
-            for x in x0..(x0 + CS).min(W()) {
-                let c = color(x, y);
-                visible += (c[3] != 0) as u32;
-                px[y * W() + x] = c;
-            }
+    /// Recolours the sleeping zones `zones` of the picture, each row of zones on its own core.
+    /// Returns, for each zone, how many of its pixels are not fully transparent.
+    fn fill_zones(image: &mut Image, zones: &[usize], color: impl Fn(usize, usize) -> [u8; 4] + Sync) -> Vec<(usize, u32)> {
+        let mut rows = vec![vec![]; CH()];
+        for &k in zones {
+            rows[k / CW()].push(k);
         }
-        visible
+        image
+            .get_image_data_mut()
+            .par_chunks_mut(CS * W())
+            .zip(rows.par_iter())
+            .enumerate()
+            .flat_map_iter(|(row, (px, ks))| {
+                let filled: Vec<(usize, u32)> = ks
+                    .iter()
+                    .map(|&k| {
+                        let x0 = (k % CW()) * CS;
+                        let mut visible = 0;
+                        for (dy, line) in px.chunks_mut(W()).enumerate() {
+                            for x in x0..(x0 + CS).min(W()) {
+                                let c = color(x, row * CS + dy);
+                                visible += (c[3] != 0) as u32;
+                                line[x] = c;
+                            }
+                        }
+                        (k, visible)
+                    })
+                    .collect();
+                filled
+            })
+            .collect()
     }
 
     /// Sends the zones `zones` of `image` to `texture`: on each row of zones, the stretch from the
@@ -752,18 +770,17 @@ impl Renderer {
                     // A fresh world (a new game, a loaded one) counts its steps from the start again.
                     if self.full || self.last_mode != id || world.zones.stamp() < self.drawn_stamp {
                         Self::fill(&mut self.image, |x, y| landscape_color(world, x, y));
-                        for k in 0..CW() * CH() {
-                            self.veg_zones[k] = Self::veg_of_zone(world, k);
-                        }
+                        self.veg_zones = (0..CW() * CH()).into_par_iter().map(|k| Self::veg_of_zone(world, k)).collect();
                         self.full = false;
                         self.texture.update(&self.image);
                     } else {
                         let mut zones = Self::changed_zones(world, self.drawn_stamp);
                         self.band = (self.band + 1) % CH();
                         zones.extend((0..CW()).map(|i| self.band * CW() + i));
-                        for &k in &zones {
-                            Self::fill_zone(&mut self.image, k, |x, y| landscape_color(world, x, y));
-                            self.veg_zones[k] = Self::veg_of_zone(world, k);
+                        Self::fill_zones(&mut self.image, &zones, |x, y| landscape_color(world, x, y));
+                        let veg: Vec<_> = zones.par_iter().map(|&k| (k, Self::veg_of_zone(world, k))).collect();
+                        for (k, v) in veg {
+                            self.veg_zones[k] = v;
                         }
                         Self::upload_zones(&self.texture, &self.image, &zones);
                     }
@@ -1016,8 +1033,8 @@ impl Renderer {
             let all = self.rev_gas == u64::MAX || world.zones.stamp() < self.gas_stamp;
             let zones = if all { (0..CW() * CH()).collect() } else { Self::changed_zones(world, self.gas_stamp) };
             let was = self.has_gas;
-            for &k in &zones {
-                self.gas_zones[k] = Self::fill_zone(&mut self.gas_image, k, |x, y| world.gas_color(x, y));
+            for (k, n) in Self::fill_zones(&mut self.gas_image, &zones, |x, y| world.gas_color(x, y)) {
+                self.gas_zones[k] = n;
             }
             self.has_gas = self.gas_zones.iter().any(|&n| n > 0);
             // Without gas before or after, the zones were clear on the card and still are.
@@ -1084,9 +1101,14 @@ fn rain_drop(world: &World, x: usize, y: usize) -> Option<usize> {
     (n <= DROP_CELLS && y >= n && world.cells[i - n * W()].m.kind() != Kind::Liquid).then_some(n)
 }
 
-/// Whether cell (x, y) is part of a falling drop.
+/// Whether cell (x, y) is part of a falling drop. (Only the lowest cell of the water from (x, y)
+/// down can be a drop's lowest cell: a drop has air under it.)
+#[inline]
 fn in_drop(world: &World, x: usize, y: usize) -> bool {
-    (y..(y + DROP_CELLS).min(H())).take_while(|&yy| world.cells[yy * W() + x].m == Mat::Water).any(|yy| rain_drop(world, x, yy).is_some())
+    if world.cells[y * W() + x].m != Mat::Water {
+        return false;
+    }
+    (y..(y + DROP_CELLS).min(H())).take_while(|&yy| world.cells[yy * W() + x].m == Mat::Water).last().is_some_and(|yy| rain_drop(world, x, yy).is_some())
 }
 
 /// The landscape's colour of cell (x, y): the world's, but none for a falling raindrop.

@@ -4,7 +4,7 @@
 //!
 //! Velocities are kept in coarse cells per step (a coarse cell is `CELL` world cells wide).
 
-use super::num::floor_f;
+use super::num::{floor_f, wrap_i};
 use super::{Cell, Kind, World, H, W};
 use rayon::prelude::*;
 
@@ -56,8 +56,8 @@ pub fn skim_at(skim: &[f32], sky: &[f32], x: usize, y: usize) -> f32 {
     let t = fx - i0;
     let i0 = i0 as i32;
     let row = (y / CELL).min(FH() - 1) * FW();
-    let a = skim[row + i0.rem_euclid(FW() as i32) as usize];
-    let b = skim[row + (i0 + 1).rem_euclid(FW() as i32) as usize];
+    let a = skim[row + wrap_i(i0, FW() as i32) as usize];
+    let b = skim[row + wrap_i(i0 + 1, FW() as i32) as usize];
     a + (b - a) * t
 }
 
@@ -118,7 +118,7 @@ pub struct Flow {
 
 #[inline]
 fn at(i: i32, j: i32) -> usize {
-    (j as usize) * FW() + i.rem_euclid(FW() as i32) as usize
+    (j as usize) * FW() + wrap_i(i, FW() as i32) as usize
 }
 
 impl Flow {
@@ -630,7 +630,7 @@ impl Flow {
         // The four cells round it, wrapped (a plane flying in from off the screen, a drop on
         // its way out of the world, ask for the wind beyond the edges).
         let (i0, j0) = (i0 as i32, j0 as usize);
-        let (ia, ib) = (i0.rem_euclid(FW() as i32) as usize, (i0 + 1).rem_euclid(FW() as i32) as usize);
+        let (ia, ib) = (wrap_i(i0, FW() as i32) as usize, wrap_i(i0 + 1, FW() as i32) as usize);
         let (k0, k1) = (j0 * FW(), (j0 + 1) * FW());
         let s = |a: &[f32]| (a[k0 + ia] * (1.0 - tx) + a[k0 + ib] * tx) * (1.0 - ty) + (a[k1 + ia] * (1.0 - tx) + a[k1 + ib] * tx) * ty;
         (s(&self.vx) * CELL as f32, s(&self.vy) * CELL as f32)
