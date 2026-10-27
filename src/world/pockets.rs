@@ -439,7 +439,7 @@ impl World {
             if excess <= strength || excess * (p.cells as f32) < BURST_ENERGY {
                 continue;
             }
-            let (x, y) = ((wall % W()) as i32, (wall / W()) as i32);
+            let (x, y) = xy_i32(wall);
             self.burst(x, y, excess, p.cells);
             self.bursts.push((x, y, p.pressure));
             // Opened: the pocket is part of the open air until the next count.

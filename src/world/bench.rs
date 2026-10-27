@@ -144,6 +144,99 @@ fn slab_probe() {
     }
 }
 
+/// A flame graph of each bench scene (`pprof`, 500 samples a second, every thread), for the hot
+/// spots: `flame-<scène>.svg` in `AWORLD_FLAME_DIR` (the current directory by default).
+///
+/// ```text
+/// CARGO_PROFILE_RELEASE_DEBUG=1 cargo test --release --bin aworld flame_probe -- --ignored --nocapture
+/// ```
+///
+/// Takes `AWORLD_BENCH_STEPS`, `AWORLD_BENCH_SCENE` and `AWORLD_BENCH_DT` as `bench_scenes` does.
+#[test]
+#[ignore]
+fn flame_probe() {
+    let steps: u32 = std::env::var("AWORLD_BENCH_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+    let only = std::env::var("AWORLD_BENCH_SCENE").ok();
+    let ticks: f32 = std::env::var("AWORLD_BENCH_DT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    let dir = std::env::var("AWORLD_FLAME_DIR").unwrap_or_else(|_| ".".into());
+    let dt = ticks * super::STEP;
+    for (name, make, each) in scenes() {
+        if only.as_deref().is_some_and(|o| o != name) {
+            continue;
+        }
+        let mut w = make();
+        for i in 0..30 {
+            if let Some(f) = each {
+                f(&mut w, i);
+            }
+            w.step();
+        }
+        w.prof.on = true;
+        w.prof.reset();
+        let guard = pprof::ProfilerGuardBuilder::default().frequency(500).blocklist(&["libc", "libgcc", "pthread", "vdso"]).build().unwrap();
+        let t = Instant::now();
+        for i in 0..steps {
+            if let Some(f) = each {
+                f(&mut w, i);
+            }
+            w.step_dt(dt);
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / steps as f64;
+        let file = format!("{dir}/flame-{}.svg", name.replace(['é', 'è'], "e"));
+        let report = guard.report().build().unwrap();
+        let mut out = std::fs::File::create(&file).unwrap();
+        report.flamegraph(&mut out).unwrap();
+        // The hot spots as text too: the functions where the samples land (self), and the
+        // ones they land under (inclusive, each counted once a stack).
+        let (mut own, mut under) = (std::collections::HashMap::<String, isize>::new(), std::collections::HashMap::<String, isize>::new());
+        let total: isize = report.data.values().sum();
+        let mut folded = String::new();
+        for (frames, n) in &report.data {
+            let names: Vec<String> = frames
+                .frames
+                .iter()
+                .flat_map(|f| f.iter().map(|s| format!("{:#}", rustc_demangle::demangle(&String::from_utf8_lossy(&s.name.clone().unwrap_or_default())))))
+                .collect();
+            if let Some(leaf) = names.first() {
+                *own.entry(leaf.clone()).or_default() += n;
+            }
+            let mut seen = std::collections::HashSet::new();
+            for name in &names {
+                if seen.insert(name.clone()) {
+                    *under.entry(name.clone()).or_default() += n;
+                }
+            }
+            folded += &format!("{} {n}\n", names.iter().rev().map(String::as_str).collect::<Vec<_>>().join(";"));
+        }
+        std::fs::write(file.replace(".svg", ".folded"), &folded).unwrap();
+        let top = |m: &std::collections::HashMap<String, isize>, k: usize| {
+            let mut v: Vec<_> = m.iter().collect();
+            v.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+            v.into_iter().take(k).map(|(f, n)| format!("{:5.1} %  {f}\n", 100.0 * *n as f64 / total.max(1) as f64)).collect::<String>()
+        };
+        let text = format!("{name}: {ms:.2} ms/pas, {total} échantillons\n\n--- où tombent les échantillons (temps propre)\n{}\n--- sous quelles fonctions (temps inclus)\n{}", top(&own, 45), top(&under, 60));
+        std::fs::write(file.replace(".svg", ".txt"), &text).unwrap();
+        eprintln!("\n=== {name}: {ms:.2} ms/pas, flame graph dans {file}\n{}", w.prof.report());
+    }
+}
+
+/// Water painted over a big cloud, as `cloud_probe` has it.
+fn cloud() -> World {
+    let mut w = countryside();
+    w.set_liquid_physics(true);
+    for y in 120..400 {
+        for x in 300..900 {
+            w.set(x, y, Mat::Cloud);
+        }
+    }
+    for y in 100..120 {
+        for x in 350..850 {
+            w.set(x, y, Mat::Water);
+        }
+    }
+    w
+}
+
 /// A big charged storm cloud over the valley, and a bolt every few steps.
 fn storm() -> World {
     let mut w = countryside();
@@ -186,6 +279,7 @@ pub(super) fn scenes() -> Vec<(&'static str, fn() -> World, Option<fn(&mut World
             }
         })),
         ("incendie", fire, None),
+        ("nuage", cloud, None),
     ]
 }
 
