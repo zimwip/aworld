@@ -732,6 +732,9 @@ pub struct World {
     /// The sections of each anchored body by a fingerprint of its cells, and a scratch map of
     /// cells to their place in the order of the supports (see `statics::stress_pass`).
     stress_cache: std::collections::HashMap<u64, std::sync::Arc<statics::BodyStress>>,
+    /// The plan of each anchored body by a fingerprint of its shape, with what it gave last (see
+    /// `statics::StressPlan`).
+    stress_plans: std::collections::HashMap<u64, statics::Worked>,
     stress_pos: Vec<u32>,
     /// Where each place of the order comes in its body's list (the same reuse).
     stress_local: Vec<u32>,
@@ -914,6 +917,7 @@ impl World {
             bodies: Vec::new(),
             strain_key: 0,
             stress_cache: std::collections::HashMap::new(),
+            stress_plans: std::collections::HashMap::new(),
             stress_pos: Vec::new(),
             stress_local: Vec::new(),
             ticks: 0,
@@ -1042,7 +1046,7 @@ impl World {
     /// copy is never stepped. Every field is named, so that a new one has to be sorted here.
     pub fn copy_picture(&mut self, from: &World) {
         let World {
-            cells, frame, rng, seen: _, ground: _, stack: _, released: _, released_list: _, falling, slabs, level: _, strain, pushes, bodies, strain_key, stress_cache: _,
+            cells, frame, rng, seen: _, ground: _, stack: _, released: _, released_list: _, falling, slabs, level: _, strain, pushes, bodies, strain_key, stress_cache: _, stress_plans: _,
             stress_pos: _, stress_local: _, ticks, log, paint_log, temp, clock, dt, tick_time, heat_stage, day_cycle, thermal_flip, heat_carry, temp_old: _, heat_took: _,
             climate_fixed, climate, revision, wind, wind_max, wind_changes, windiness, wind_clock, biome, leaf_rgb, autumn, grass_rgb,
             structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, dp,

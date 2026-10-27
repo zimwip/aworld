@@ -88,6 +88,62 @@ pub(super) struct BodyStress {
     cracks: Vec<Crack>,
 }
 
+/// How far a share of the load (see `section_load`) may be off in the stress view when a body's
+/// loads have barely changed since it was last worked out: under it, the old figures stand.
+const SHARE_SLACK: f64 = 0.01;
+
+/// In the tests: every run of a plan is checked against the body worked out from scratch.
+#[cfg(test)]
+pub(super) static CHECK_PLANS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The sections of an anchored body, worked out from its shape alone (see `stress_plan`): run
+/// again with the weights and the liquids' push of the moment (see `replay_stress`), it gives
+/// what working the body out from scratch gives, to the bit, without looking for its sections
+/// again. The liquids lapping at a bank change the push on it every pass, not its shape.
+pub(super) struct StressPlan {
+    /// Each place's density and centre (x, y), read once.
+    rho: Vec<f64>,
+    at: Vec<(f64, f64)>,
+    steps: Vec<PlanStep>,
+    /// The cells of the sections, one after the other, and their places.
+    fibre_cells: Vec<usize>,
+    fibre_places: Vec<u32>,
+    /// The least that the bonds of any section hold (see `section_load`), and the span of the
+    /// body (cells across, cells down): how far a change of the loads can move a share.
+    weakest: f64,
+    span: (f64, f64),
+}
+
+enum PlanStep {
+    /// The places `lo..hi` (all at one distance from the anchors) take their loads.
+    Load(u32, u32),
+    /// What place `a` carries goes to place `b`: the parts they head join.
+    Join(u32, u32),
+    /// A section to check.
+    Section(Section),
+}
+
+/// A section of a plan: the place that heads what it carries, its distance from the anchors,
+/// its fibres (`fibre_cells[a..b]`), and, unless it is vegetation (which never cracks), its two
+/// edge fibres: where (x, y), which cell, and what its bonds hold about it.
+struct Section {
+    root: u32,
+    level: u32,
+    fibres: (u32, u32),
+    veg: bool,
+    edges: [(f64, f64, usize, f64); 2],
+}
+
+/// A body worked out: its plan, the push of the liquids on each of its places when it was last
+/// worked out, the result, and the least margin of any section to cracking or holding again
+/// (the gap of its share to 1, times what its bonds hold).
+pub(super) struct Worked {
+    plan: std::sync::Arc<StressPlan>,
+    push: Vec<(f32, f32)>,
+    done: std::sync::Arc<BodyStress>,
+    margin: f64,
+}
+
 /// Speed in m/s of one cell per step.
 fn ms_per_cell_step() -> f32 {
     CELL_M / (CELL_M * FALL / G).sqrt()
@@ -332,6 +388,7 @@ impl World {
         let n = order.len();
         if n == 0 {
             self.stress_cache.clear();
+            self.stress_plans.clear();
             return;
         }
         let level = std::mem::take(&mut self.level);
@@ -374,13 +431,18 @@ impl World {
         // its body's list.
         let mut bodies: Vec<Vec<u32>> = vec![vec![]; count as usize];
         let mut keys: Vec<u64> = vec![0; count as usize];
+        // (And a fingerprint of the shape alone: the plan of the body, see `StressPlan`.)
+        let mut shapes: Vec<u64> = vec![0; count as usize];
         for (k, &b) in body_of.iter().enumerate() {
             let i = order[k];
-            keys[b as usize] = (keys[b as usize] ^ ((i as u64) << 8 | self.cells[i].m as u64) ^ quarters(k).rotate_left(29)).wrapping_mul(0x100_0000_01b3);
+            let cell = (i as u64) << 8 | self.cells[i].m as u64;
+            keys[b as usize] = (keys[b as usize] ^ cell ^ quarters(k).rotate_left(29)).wrapping_mul(0x100_0000_01b3);
+            shapes[b as usize] = (shapes[b as usize] ^ cell).wrapping_mul(0x100_0000_01b3);
             bodies[b as usize].push(k as u32);
         }
-        for (key, b) in keys.iter_mut().zip(&bodies) {
+        for ((key, shape), b) in keys.iter_mut().zip(shapes.iter_mut()).zip(&bodies) {
             *key ^= b.len() as u64;
+            *shape ^= b.len() as u64;
         }
         // (Only the bodies that have to be worked out again.)
         let mut local = std::mem::take(&mut self.stress_local);
@@ -392,17 +454,51 @@ impl World {
                 }
             }
         }
-        let results: Vec<std::sync::Arc<BodyStress>> = {
+        // A body seen before keeps its result; one whose shape was seen before is run again on
+        // its plan, or not even that while its loads have moved too little to change anything.
+        let worked: Vec<(std::sync::Arc<BodyStress>, Option<Worked>)> = {
             let (this, level, pos, local, push) = (&*self, &level, &pos, &local, &push);
             bodies
                 .par_iter()
-                .zip(keys.par_iter())
-                .map(|(members, key)| match this.stress_cache.get(key) {
-                    Some(done) => done.clone(),
-                    None => std::sync::Arc::new(this.body_stress(order, members, local, level, pos, push)),
+                .zip(keys.par_iter().zip(shapes.par_iter()))
+                .map(|(members, (key, shape))| {
+                    if let Some(done) = this.stress_cache.get(key) {
+                        return (done.clone(), None);
+                    }
+                    let now: Vec<(f32, f32)> = members.iter().map(|&k| push.get(k as usize).copied().unwrap_or((0.0, 0.0))).collect();
+                    let plan = match this.stress_plans.get(shape) {
+                        Some(w) => {
+                            if this.barely_moved(w, &now) {
+                                return (w.done.clone(), None);
+                            }
+                            w.plan.clone()
+                        }
+                        None => std::sync::Arc::new(this.stress_plan(order, members, local, level, pos)),
+                    };
+                    let (done, margin) = Self::replay_stress(&plan, &now);
+                    // (In the tests, every run of a plan is checked against the body worked out from scratch.)
+                    #[cfg(test)]
+                    if CHECK_PLANS.load(std::sync::atomic::Ordering::Relaxed) {
+                        let fresh = this.body_stress(order, members, local, level, pos, push);
+                        assert_eq!(done.strain, fresh.strain, "a plan gives other strains than the body worked out");
+                        let crack = |c: &Crack| (c.load.to_bits(), c.level, c.fibres.clone(), c.pivot);
+                        assert_eq!(done.cracks.iter().map(crack).collect::<Vec<_>>(), fresh.cracks.iter().map(crack).collect::<Vec<_>>());
+                    }
+                    let done = std::sync::Arc::new(done);
+                    (done.clone(), Some(Worked { plan, push: now, done, margin }))
                 })
                 .collect()
         };
+        let mut plans = std::mem::take(&mut self.stress_plans);
+        let mut results = Vec::with_capacity(worked.len());
+        let mut kept = std::collections::HashMap::new();
+        for ((done, fresh), shape) in worked.into_iter().zip(&shapes) {
+            if let Some(w) = fresh.or_else(|| plans.remove(shape)) {
+                kept.insert(*shape, w);
+            }
+            results.push(done);
+        }
+        self.stress_plans = kept;
         let mut cracks: Vec<Crack> = vec![];
         self.pushes.clear();
         for (members, done) in bodies.iter().zip(&results) {
@@ -520,9 +616,201 @@ impl World {
         self.level = level;
     }
 
+    /// The plan of one anchored body (`members`: its places in `order`, rising; `local`: where
+    /// each place of `order` comes in its body's list): what `body_stress` does that hangs on the
+    /// shape alone, the joining of the parts from the farthest cells inwards and the edges and
+    /// bonds of each section, written down to be run again on any loads (see `replay_stress`).
+    fn stress_plan(&self, order: &[usize], members: &[u32], local: &[u32], level: &[u32], pos: &[u32]) -> StressPlan {
+        let n = members.len();
+        let local = |k: u32| local[k as usize];
+        let mut up: Vec<u32> = (0..n as u32).collect();
+        fn find(up: &mut [u32], mut k: u32) -> u32 {
+            while up[k as usize] != k {
+                let next = up[up[k as usize] as usize];
+                up[k as usize] = next;
+                k = next;
+            }
+            k
+        }
+        let cell: Vec<usize> = members.iter().map(|&k| order[k as usize]).collect();
+        let (mut steps, mut fibre_cells, mut fibre_places) = (vec![], vec![], vec![]);
+        let mut fibres: Vec<(u32, u32)> = vec![];
+        let mut weakest = f64::INFINITY;
+        let xy = |i: usize| ((i % W()) as f64 + 0.5, (i / W()) as f64 + 0.5);
+        let mut hi = n;
+        while hi > 0 {
+            let d = level[cell[hi - 1]];
+            let mut lo = hi;
+            while lo > 0 && level[cell[lo - 1]] == d {
+                lo -= 1;
+            }
+            steps.push(PlanStep::Load(lo as u32, hi as u32));
+            for k in lo..hi {
+                let i = cell[k];
+                let (x, y) = xy_i32(i);
+                for (nx, ny) in Self::neighbors(x, y) {
+                    if !Self::inb(nx, ny) {
+                        continue;
+                    }
+                    let j = Self::idx(nx, ny);
+                    if pos[j] == u32::MAX || level[j] < d || !self.same_body(i, j) {
+                        continue;
+                    }
+                    let (a, b) = (find(&mut up, k as u32), find(&mut up, local(pos[j])));
+                    if a != b {
+                        up[a as usize] = b;
+                        steps.push(PlanStep::Join(a, b));
+                    }
+                }
+            }
+            if d == 0 {
+                break;
+            }
+            fibres.clear();
+            for k in lo..hi {
+                fibres.push((find(&mut up, k as u32), k as u32));
+            }
+            fibres.sort_unstable();
+            let mut a = 0;
+            while a < fibres.len() {
+                let root = fibres[a].0;
+                let mut b = a;
+                while b < fibres.len() && fibres[b].0 == root {
+                    b += 1;
+                }
+                let from = fibre_cells.len() as u32;
+                fibre_cells.extend(fibres[a..b].iter().map(|&(_, k)| cell[k as usize]));
+                fibre_places.extend(fibres[a..b].iter().map(|&(_, k)| k));
+                let cells = &fibre_cells[from as usize..];
+                // As `section_load` finds them.
+                let m = self.cells[cells[0]].m;
+                let sigma = strength(m) as f64 * 1.0e6;
+                let mut edges = [(0.0, 0.0, cells[0], 0.0); 2];
+                if !m.is_vegetation() {
+                    for (e, dir) in [-1.0f64, 1.0].into_iter().enumerate() {
+                        let p = *cells.iter().max_by(|&&a, &&b| {
+                            let (ax, ay) = xy(a);
+                            let (bx, by) = xy(b);
+                            (dir * ax + ay).total_cmp(&(dir * bx + by))
+                        }).unwrap();
+                        let (px, py) = xy(p);
+                        let lever: f64 = cells.iter().map(|&i| {
+                            let (x, y) = xy(i);
+                            ((x - px).powi(2) + (y - py).powi(2)).sqrt() + 0.5
+                        }).sum();
+                        let holding = sigma / 3.0 * lever;
+                        weakest = weakest.min(holding);
+                        edges[e] = (px, py, p, holding);
+                    }
+                }
+                steps.push(PlanStep::Section(Section { root, level: d, fibres: (from, fibre_cells.len() as u32), veg: m.is_vegetation(), edges }));
+                a = b;
+            }
+            hi = lo;
+        }
+        let (mut x0, mut x1, mut y0, mut y1) = (usize::MAX, 0, usize::MAX, 0);
+        for &i in &cell {
+            let (x, y) = (i % W(), i / W());
+            (x0, x1, y0, y1) = (x0.min(x), x1.max(x), y0.min(y), y1.max(y));
+        }
+        let span = if cell.is_empty() { (0.0, 0.0) } else { ((x1 - x0 + 1) as f64, (y1 - y0 + 1) as f64) };
+        let rho = cell.iter().map(|&i| density(self.cells[i].m) as f64).collect();
+        let at = cell.iter().map(|&i| ((i % W()) as f64 + 0.5, (i / W()) as f64 + 0.5)).collect();
+        StressPlan { rho, at, steps, fibre_cells, fibre_places, weakest, span }
+    }
+
+    /// The load on every section of a body by its plan, with `push` the push of the liquids on
+    /// each of its places: what `body_stress` finds, to the bit (the same sums in the same order,
+    /// the same shares). Also the least margin of any section, as `Worked` keeps it.
+    fn replay_stress(plan: &StressPlan, push: &[(f32, f32)]) -> (BodyStress, f64) {
+        let n = plan.rho.len();
+        let mut mass = vec![0.0f64; n];
+        let mut moment = vec![0.0f64; n];
+        let mut side = vec![0.0f64; n];
+        let mut side_moment = vec![0.0f64; n];
+        let mut strain = vec![0u8; n];
+        let mut cracks: Vec<Crack> = vec![];
+        let mut margin = f64::INFINITY;
+        for step in &plan.steps {
+            match *step {
+                PlanStep::Load(lo, hi) => {
+                    for k in lo as usize..hi as usize {
+                        let (fx, fy) = push[k];
+                        let (x, y) = plan.at[k];
+                        let w = plan.rho[k] + fy as f64;
+                        mass[k] = w;
+                        moment[k] = w * x;
+                        side[k] = fx as f64;
+                        side_moment[k] = fx as f64 * y;
+                    }
+                }
+                PlanStep::Join(a, b) => {
+                    let (a, b) = (a as usize, b as usize);
+                    mass[b] += mass[a];
+                    moment[b] += moment[a];
+                    side[b] += side[a];
+                    side_moment[b] += side_moment[a];
+                }
+                PlanStep::Section(ref s) => {
+                    let r = s.root as usize;
+                    let cells = &plan.fibre_cells[s.fibres.0 as usize..s.fibres.1 as usize];
+                    let (load, pivot) = Self::section_share(s, cells[0], (mass[r], moment[r]), (side[r], side_moment[r]));
+                    if !s.veg {
+                        margin = margin.min((1.0 - load as f64).abs() * s.edges[0].3.min(s.edges[1].3));
+                    }
+                    let shown = (load.clamp(0.0, 2.0) * 127.5) as u8;
+                    for &k in &plan.fibre_places[s.fibres.0 as usize..s.fibres.1 as usize] {
+                        strain[k as usize] = shown;
+                    }
+                    if load > 1.0 {
+                        cracks.push(Crack { load, level: s.level, fibres: cells.to_vec(), pivot });
+                    }
+                }
+            }
+        }
+        (BodyStress { strain, cracks }, margin)
+    }
+
+    /// `section_load` on a section of a plan, whose edges and bonds are already known.
+    fn section_share(s: &Section, first: usize, (mass, moment): (f64, f64), (side, side_moment): (f64, f64)) -> (f32, usize) {
+        if s.veg || (mass <= 0.0 && side == 0.0) {
+            return (0.0, first);
+        }
+        let (mut worst, mut pivot) = (0.0f64, first);
+        for (e, dir) in [-1.0f64, 1.0].into_iter().enumerate() {
+            let (px, py, p, holding) = s.edges[e];
+            let turning = G as f64 * CELL_M as f64 * 1000.0 * dir * ((moment - mass * px) - (side_moment - side * py));
+            if turning <= 0.0 {
+                continue;
+            }
+            let load = if holding > 0.0 { turning / holding } else { 10.0 };
+            if load > worst {
+                worst = load;
+                pivot = p;
+            }
+        }
+        (worst as f32, pivot)
+    }
+
+    /// Whether the push of the liquids on a body (`now`, by place) has moved so little since it
+    /// was last worked out that no section can have changed: the turning moment about an edge
+    /// moves by at most the change of each push times its lever, which the span of the body
+    /// bounds; that cannot carry any section across its breaking point (the least margin) nor
+    /// move any share by more than `SHARE_SLACK`. Far from breaking, the sums are not done again.
+    fn barely_moved(&self, w: &Worked, now: &[(f32, f32)]) -> bool {
+        if w.push.len() != now.len() || !(w.plan.weakest > 0.0) {
+            return false;
+        }
+        let (across, down) = w.plan.span;
+        let turn: f64 = w.push.iter().zip(now).map(|(a, b)| (b.1 - a.1).abs() as f64 * across + (b.0 - a.0).abs() as f64 * down).sum::<f64>()
+            * G as f64 * CELL_M as f64 * 1000.0;
+        turn < w.margin && turn < SHARE_SLACK * w.plan.weakest
+    }
+
     /// The load on every section of one anchored body (`members`: its places in `order`, rising;
     /// `local`: where each place of `order` comes in its body's list), and the sections that
     /// cannot carry it, as `stress_pass` reads them.
+    #[cfg(test)]
     fn body_stress(&self, order: &[usize], members: &[u32], local: &[u32], level: &[u32], pos: &[u32], push: &[(f32, f32)]) -> BodyStress {
         let n = members.len();
         let local = |k: u32| local[k as usize];
@@ -667,6 +955,7 @@ impl World {
     /// How loaded the section through `cells` is, as a share of what it can bear (over 1: it
     /// cracks), given what all it carries weighs down, Σ w and Σ w·x (its mass, and the push of
     /// liquids on it), and pushes sideways, Σ f and Σ f·y. Also the fibre it would turn about.
+    #[cfg(test)]
     fn section_load(&self, cells: &[usize], (mass, moment): (f64, f64), (side, side_moment): (f64, f64)) -> (f32, usize) {
         let m = self.cells[cells[0]].m;
         if m.is_vegetation() || (mass <= 0.0 && side == 0.0) {
@@ -1422,6 +1711,26 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plan run on the loads of the moment gives what the body worked out from scratch gives,
+    /// to the bit: water lapping at its banks, blasts that change its shape.
+    #[test]
+    fn a_plan_gives_what_the_body_worked_out_gives() {
+        CHECK_PLANS.store(true, std::sync::atomic::Ordering::Relaxed);
+        for (name, make, each) in super::super::bench::scenes() {
+            if !matches!(name, "liquides" | "explosions") {
+                continue;
+            }
+            let mut w = make();
+            for i in 0..100 {
+                if let Some(f) = each {
+                    f(&mut w, i);
+                }
+                w.step();
+            }
+            assert!(!w.stress_plans.is_empty(), "{name}: the anchored bodies have plans");
+        }
+    }
 
     /// Cold, still, a slab of bedrock from row `ground` down.
     fn world(ground: i32) -> World {

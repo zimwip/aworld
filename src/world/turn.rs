@@ -337,6 +337,7 @@ impl World {
                 bodies: Vec::new(),
                 strain_key: self.strain_key,
                 stress_cache: Default::default(),
+                stress_plans: Default::default(),
                 stress_pos: Vec::new(),
                 stress_local: Vec::new(),
                 ticks: self.ticks,
