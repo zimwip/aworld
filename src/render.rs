@@ -1084,9 +1084,14 @@ fn rain_drop(world: &World, x: usize, y: usize) -> Option<usize> {
     (n <= DROP_CELLS && y >= n && world.cells[i - n * W()].m.kind() != Kind::Liquid).then_some(n)
 }
 
-/// Whether cell (x, y) is part of a falling drop.
+/// Whether cell (x, y) is part of a falling drop. (Only the lowest cell of the water from (x, y)
+/// down can be a drop's lowest cell: a drop has air under it.)
+#[inline]
 fn in_drop(world: &World, x: usize, y: usize) -> bool {
-    (y..(y + DROP_CELLS).min(H())).take_while(|&yy| world.cells[yy * W() + x].m == Mat::Water).any(|yy| rain_drop(world, x, yy).is_some())
+    if world.cells[y * W() + x].m != Mat::Water {
+        return false;
+    }
+    (y..(y + DROP_CELLS).min(H())).take_while(|&yy| world.cells[yy * W() + x].m == Mat::Water).last().is_some_and(|yy| rain_drop(world, x, yy).is_some())
 }
 
 /// The landscape's colour of cell (x, y): the world's, but none for a falling raindrop.

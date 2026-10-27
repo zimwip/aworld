@@ -856,13 +856,16 @@ impl World {
             .map(|(y, row)| {
                 let (mut first, mut last) = (usize::MAX, 0);
                 let (a, b) = range(y);
+                // (The row's cells, blocks and zones taken once: the loop reads each by its column.)
+                let (cells, mask) = (&self.cells[y * W()..(y + 1) * W()], &self.mask[y * W()..(y + 1) * W()]);
+                let zones = &awake[y / sleep::CS * sleep::CW()..(y / sleep::CS + 1) * sleep::CW()];
                 for (x, c) in row.iter_mut().enumerate().take(b + 1).skip(a) {
                     let i = y * W() + x;
-                    let run = awake[y / sleep::CS * sleep::CW() + x / sleep::CS];
-                    let what = if self.mask[i] != 0 {
+                    let run = zones[x / sleep::CS];
+                    let what = if mask[x] != 0 {
                         SOLID
                     } else {
-                        match self.cells[i].m.kind() {
+                        match cells[x].m.kind() {
                             Kind::Empty => AIR,
                             // A gas in the open (a cloud lying on a lake, steam over a bath) is a
                             // wall to the liquid: the carrying never puts liquid into a gas, so a

@@ -3726,13 +3726,15 @@ impl World {
             }
         }
         // Breadth first from the fixed things, so that each cell learns how far it is from them.
-        let mut order: Vec<usize> = Vec::new();
-        for i in 0..W() * H() {
-            if !seen[i] && self.anchors(i) {
-                seen[i] = true;
-                level[i] = 0;
-                order.push(i);
-            }
+        // (The anchors looked for row by row on every core, then taken in order.)
+        let mut order: Vec<usize> = {
+            use rayon::prelude::*;
+            let (seen, this) = (&seen, &*self);
+            (0..H()).into_par_iter().flat_map_iter(|y| (y * W()..(y + 1) * W()).filter(move |&i| !seen[i] && this.anchors(i))).collect()
+        };
+        for &i in &order {
+            seen[i] = true;
+            level[i] = 0;
         }
         let mut head = 0;
         while head < order.len() {
@@ -3754,7 +3756,7 @@ impl World {
         }
         self.level = level;
         // Now without the free bodies: what they can rest on (see `tip_pass`).
-        self.spread_ground(false, &[]);
+        self.spread_ground_without_free_bodies();
         self.stress_pass(&order, &mut seen);
         // A piece that was already falling keeps its speed (sampled cells are enough).
         let mut speeds: std::collections::HashMap<usize, (f32, f32)> = std::collections::HashMap::new();
@@ -3815,29 +3817,77 @@ impl World {
     pub(super) fn spread_ground(&mut self, free: bool, from: &[usize]) {
         let mut ground = std::mem::take(&mut self.ground);
         ground.resize(W() * H(), false);
-        let mut stack: Vec<usize> = Vec::new();
         if from.is_empty() {
+            // The whole world: which cells carry, worked out first on every core (the fill then
+            // reads one byte a cell instead of the cell, its block and its level).
+            use rayon::prelude::*;
+            let mut carry = vec![false; W() * H()];
+            carry.par_chunks_mut(W()).enumerate().for_each(|(y, row)| {
+                for (x, c) in row.iter_mut().enumerate() {
+                    *c = self.carries(y * W() + x, free);
+                }
+            });
             ground.fill(false);
-            stack.extend((W() * (H() - 1)..W() * H()).filter(|&i| self.carries(i, free)));
+            let y = H() - 1;
+            let seeds: Vec<(usize, usize)> = (0..W()).filter(|&x| carry[y * W() + x]).map(|x| (x, y)).collect();
+            Self::fill_runs(&mut ground, seeds, |i| carry[i]);
         } else {
-            stack.extend(from.iter().copied());
+            let mut seeds = Vec::new();
+            for &i in from {
+                ground[i] = true;
+            }
+            for &i in from {
+                let (x, y) = ((i % W()) as i32, (i / W()) as i32);
+                seeds.extend(Self::neighbors(x, y).into_iter().filter(|&(nx, ny)| Self::inb(nx, ny)).map(|(nx, ny)| (nx as usize, ny as usize)));
+            }
+            Self::fill_runs(&mut ground, seeds, |i| self.carries(i, free));
         }
-        for &i in &stack {
-            ground[i] = true;
+        self.ground = ground;
+    }
+
+    /// `ground` for the free bodies to rest on (see `tip_pass`): what `spread_ground(false, ..)`
+    /// finds. Mostly that is what `spread_ground(true, ..)` has just found, which holds no free
+    /// body: then it stands as it is (the ground without the cells that are not in it is the same).
+    fn spread_ground_without_free_bodies(&mut self) {
+        use rayon::prelude::*;
+        let leans = self.ground.par_iter().enumerate().any(|(i, &g)| g && self.mask[i] == 0 && Self::structural(self.cells[i].m) && self.level[i] == u32::MAX);
+        if leans {
+            self.spread_ground(false, &[]);
         }
-        while let Some(i) = stack.pop() {
-            let (x, y) = ((i % W()) as i32, (i / W()) as i32);
-            for (nx, ny) in Self::neighbors(x, y) {
-                if Self::inb(nx, ny) {
-                    let j = Self::idx(nx, ny);
-                    if !ground[j] && self.carries(j, free) {
-                        ground[j] = true;
-                        stack.push(j);
+    }
+
+    /// Marks in `ground` every cell joined (side by side or one over the other) to a cell of
+    /// `seeds` through cells that `can`, a run of a row at a time: each run is marked whole, and
+    /// the runs of the rows over and under it that are not marked yet are the next to fill.
+    fn fill_runs(ground: &mut [bool], mut seeds: Vec<(usize, usize)>, can: impl Fn(usize) -> bool) {
+        let open = |ground: &[bool], i: usize| !ground[i] && can(i);
+        while let Some((x, y)) = seeds.pop() {
+            let row = y * W();
+            if !open(ground, row + x) {
+                continue;
+            }
+            let (mut a, mut b) = (x, x);
+            while a > 0 && open(ground, row + a - 1) {
+                a -= 1;
+            }
+            while b + 1 < W() && open(ground, row + b + 1) {
+                b += 1;
+            }
+            ground[row + a..=row + b].fill(true);
+            for ny in [y.wrapping_sub(1), y + 1] {
+                if ny >= H() {
+                    continue;
+                }
+                let mut inside = false;
+                for nx in a..=b {
+                    let o = open(ground, ny * W() + nx);
+                    if o && !inside {
+                        seeds.push((nx, ny));
                     }
+                    inside = o;
                 }
             }
         }
-        self.ground = ground;
     }
 
     /// Whether cell `i` is solid and held by something fixed: the base of the world, a tunnel's
