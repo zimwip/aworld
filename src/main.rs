@@ -5060,6 +5060,17 @@ async fn game() {
                 game.world.paint(x + 14, y - 46, 9, Mat::Water);
             }
         }
+        // `--deluge`: a great mass of water let fall over the valley (as the bench's scene
+        // « déluge »), well before the shot.
+        if shot.is_some() && frame == 120 && args.iter().any(|a| a == "--deluge") {
+            for y in 40..230 {
+                for x in 150..760 {
+                    if game.world.at(x, y) == Mat::Empty {
+                        game.world.set(x, y, Mat::Water);
+                    }
+                }
+            }
+        }
         // `--steam x`: a layer of steam on the ground at x, under a layer of water.
         if shot.is_some() && frame == 300 {
             if let Some(x) = arg("--steam").and_then(|v| v.parse::<i32>().ok()) {

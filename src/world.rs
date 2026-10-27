@@ -1917,7 +1917,7 @@ impl World {
             if k > 0 {
                 self.frame = self.frame.wrapping_add(1);
             }
-            timed!(self, 0, self.step_cells());
+            timed!(self, 0, self.step_cells(k > 0));
             if audit {
                 marks.push(("tour des cellules", self.water_units_audit()));
             }
@@ -4659,7 +4659,7 @@ mod tests {
                 t.elapsed() / n
             };
             let whole = time(&mut || w.step());
-            let cells = time(&mut || w.step_cells());
+            let cells = time(&mut || w.step_cells(false));
             let flow = time(&mut || w.update_flow());
             let press = time(&mut || w.update_pressure());
             let push = time(&mut || w.pressure_push());

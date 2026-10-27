@@ -120,11 +120,18 @@ impl Zones {
         }
     }
 
-    /// Starts a step: the zones woken during the last one, or holding a restless cell, run.
-    pub(super) fn begin(&mut self) {
+    /// Starts a tick: the zones woken during the last one, or holding a restless cell, run.
+    /// With `again` (a tick after the first of a step of several), the zones that ran at an
+    /// earlier tick of the step run too: the liquids take their turn once a step, after the last
+    /// tick, and wake the zones they move for the next step only. Without it, a body of water
+    /// moving through zones that nothing else wakes (full water under full water is not
+    /// restless) found them asleep at the last tick whenever the game took steps of several
+    /// ticks (when it falls behind): it stood still there in squares of `CS` cells, a wall to
+    /// the water round it.
+    pub(super) fn begin(&mut self, again: bool) {
         self.stamp += 1;
         for k in 0..CW() * CH() {
-            self.awake[k] = !self.enabled || self.woke[k] || self.restless[k];
+            self.awake[k] = !self.enabled || self.woke[k] || self.restless[k] || (again && self.awake[k]);
             if self.awake[k] {
                 self.changed[k] = self.stamp;
             }
@@ -245,11 +252,11 @@ mod tests {
         for _ in 0..150 {
             w.step();
         }
-        w.zones.begin();
+        w.zones.begin(false);
         assert_eq!(w.zones.awake_count(), 0, "nothing can move: everything sleeps");
         // A grain dropped from above wakes its zone, which runs again.
         w.set(300, 100, Mat::Sand);
-        w.zones.begin();
+        w.zones.begin(false);
         assert!(w.zones.awake[(100 / CS) * CW() + 300 / CS]);
         assert!(w.zones.awake_count() <= 4);
     }
@@ -272,6 +279,29 @@ mod tests {
         let k = (100 / CS) * CW() + 300 / CS;
         assert!(w.zones.changed_since(k, drawn), "a painted cell marks its zone");
         assert_eq!((0..CW() * CH()).filter(|&k| w.zones.changed_since(k, drawn)).count(), 1);
+    }
+
+    #[test]
+    fn a_body_of_water_falling_in_steps_of_several_ticks_keeps_its_zones_running() {
+        // The game takes steps of three ticks when it falls behind; the liquids run once a step.
+        let mut w = World::new_static();
+        w.set_liquid_physics(true);
+        for y in 64..224 {
+            for x in 192..352 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        for k in 0..8 {
+            w.step_dt(MAX_DT);
+            let asleep = (0..CW() * CH())
+                .filter(|&z| {
+                    let (x0, y0) = ((z % CW()) * CS, (z / CW()) * CS);
+                    (y0..y0 + CS).all(|y| (x0..x0 + CS).all(|x| w.raw(x as i32, y as i32) == Mat::Water))
+                })
+                .filter(|&z| !w.zones.runs(z))
+                .count();
+            assert_eq!(asleep, 0, "step {k}: zones of the falling water asleep (it stands still there in squares)");
+        }
     }
 
     #[test]

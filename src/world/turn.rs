@@ -164,11 +164,12 @@ pub(super) fn guard(x: i32) {
 }
 
 impl World {
-    /// Every cell of matter takes its turn, bottom row first.
-    pub(super) fn step_cells(&mut self) {
+    /// Every cell of matter takes its turn, bottom row first (`again`: a tick after the first of
+    /// the step, see `Zones::begin`).
+    pub(super) fn step_cells(&mut self, again: bool) {
         self.air_rows = (0..H() as i32).map(|y| self.ambient_c(y)).collect();
         self.air_sky = self.climate.sky_dev;
-        self.zones.begin();
+        self.zones.begin(again);
         if self.parallel_cells {
             self.cells_on_every_core();
         } else {
