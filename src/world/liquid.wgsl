@@ -110,6 +110,7 @@ const G: f32 = 9.81;
 const REST: f32 = 0.01;
 const REFILL: f32 = 0.1;
 const SPRAY: f32 = 9.0;
+const SURGE: f32 = 25.0;
 const CALM: f32 = 3.0;
 const LAUNCH: f32 = 4.43;
 const CRUMB: u32 = 8u;
@@ -869,6 +870,8 @@ fn push_u(@builtin(global_invocation_id) id: vec3<u32>) {
     var val = u[e] - s / r * (pa_at(i32(xx), i32(yy)) - pa_at(i32(xx) - 1, i32(yy)));
     // (The surface the wind stirs is pushed a little at a time: it is let move.)
     let stirred = yy > 0u && ((cls[a - P.w] & 3u) == AIR || (cls[bb - P.w] & 3u) == AIR) && abs(skim_at(xx, yy)) > STIR;
+    // (The free surface no faster than `SURGE`, see the CPU.)
+    if ((ca & 3u) == FULLISH) != ((cb & 3u) == FULLISH) { val = clamp(val, -SURGE, SURGE); }
     if (ca & 3u) == FULLISH && (cb & 3u) == FULLISH && abs(val) < REST && !stirred { val = 0.0; }
     u[e] = val;
 }
@@ -889,6 +892,7 @@ fn push_v(@builtin(global_invocation_id) id: vec3<u32>) {
     if (ca & 3u) >= WET && (cb & 3u) >= WET { r = 0.5 * (rho(a) + rho(bb)); } else if (ca & 3u) >= WET { r = rho(a); } else { r = rho(bb); }
     let s = P.dt / CELL_M;
     var val = v[e] - s / r * (pa_at(i32(xx), i32(yy)) - pa_at(i32(xx), i32(yy) - 1));
+    if ((ca & 3u) == FULLISH) != ((cb & 3u) == FULLISH) { val = clamp(val, -SURGE, SURGE); }
     if (ca & 3u) == FULLISH && (cb & 3u) == FULLISH && abs(val) < REST { val = 0.0; }
     v[e] = val;
 }
@@ -1164,15 +1168,15 @@ fn carry_commit(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 /// A cell holding more than full pushes the extra up, into air or the same liquid: one thread
-/// a column, src the bottom of the band up.
+/// a column, from the top of the band down, a cell a sub-step (see the CPU).
 @compute @workgroup_size(256)
 fn overflow(@builtin(global_invocation_id) id: vec3<u32>) {
     let xx = id.x;
     if xx >= P.w { return; }
-    var yy = P.y0 + P.rows;
-    while yy > max(P.y0, 1u) {
-        yy -= 1u;
+    var yy = max(P.y0, 1u);
+    while yy < P.y0 + P.rows {
         let c = yy * P.w + xx;
+        yy += 1u;
         if raw_kind(c) != K_LIQUID || fill[c] <= FULL + CRUMB { continue; }
         let j = c - P.w;
         let m = mat_of(c);

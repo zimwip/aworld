@@ -69,6 +69,12 @@ pub(super) const DROP_TERMINAL_MS: f32 = 9.0;
 /// the energy of a splash into a few cells, and drops thrown at the grid's speed would climb
 /// into the sky, which is logarithmic up there).
 pub(super) const LAUNCH: f32 = 4.43;
+/// The free surface (an edge between a full cell and the air or a film) goes no faster than
+/// this, m/s: the speed of water fallen 32 m, or of the front of a flood 16 m deep. The air
+/// beyond the edge is not solved, so the edge takes the whole jump of the pressure of an impact
+/// alone and shot off at two or three times the speed of the body behind it (a block of water
+/// dropped on the fields threw sheets at 60 m/s, which held the step at its most sub-steps).
+pub(super) const SURGE: f32 = 25.0;
 /// At most this many sub-steps in a step of `DT` (fast flows take smaller ones), and as many more
 /// in a longer step.
 pub(super) const MAX_SUB: usize = 4;
@@ -1462,6 +1468,9 @@ impl World {
                 }
                 let r = if ca & 3 >= WET && cb & 3 >= WET { 0.5 * (rho(a) + rho(b)) } else if ca & 3 >= WET { rho(a) } else { rho(b) };
                 row[x] -= s / r * (pa(x as i32, y as i32) - pa(x as i32 - 1, y as i32));
+                if (ca & 3 == FULLISH) != (cb & 3 == FULLISH) {
+                    row[x] = row[x].clamp(-SURGE, SURGE);
+                }
                 // (The surface the wind stirs is pushed a little at a time: it is let move.)
                 let stirred = y > 0 && (class[a - W()] & 3 == AIR || class[b - W()] & 3 == AIR) && flow::skim_at(skim, sky, x, y).abs() > flow::STIR;
                 if ca & 3 == FULLISH && cb & 3 == FULLISH && row[x].abs() < REST && !stirred {
@@ -1482,6 +1491,9 @@ impl World {
                 }
                 let r = if ca & 3 >= WET && cb & 3 >= WET { 0.5 * (rho(a) + rho(b)) } else if ca & 3 >= WET { rho(a) } else { rho(b) };
                 row[x] -= s / r * (pa(x as i32, y as i32) - pa(x as i32, y as i32 - 1));
+                if (ca & 3 == FULLISH) != (cb & 3 == FULLISH) {
+                    row[x] = row[x].clamp(-SURGE, SURGE);
+                }
                 if ca & 3 == FULLISH && cb & 3 == FULLISH && row[x].abs() < REST {
                     row[x] = 0.0;
                 }
@@ -1729,7 +1741,11 @@ impl World {
         self.prof.stop(prof::LIQ_OVERFLOW, clock);
     }
 
-    /// A cell holding more than full pushes the extra up, into air or the same liquid.
+    /// A cell holding more than full pushes the extra up, into air or the same liquid: a cell a
+    /// sub-step, from the top down (the cell over has had its turn). From the bottom up, the
+    /// extra climbed the whole column in one pass, and a body of water squeezed where it lands
+    /// (as much as the sub-steps between two solves of the pressure let it) threw its surplus to
+    /// the top of each column at once, in needles of water a cell wide that shot to the sky.
     ///
     /// Everything here moves up or down a column (a cell gives to the one over or under it), so
     /// the columns are independent: bands of them run side by side, each in the order of the
@@ -1771,7 +1787,7 @@ impl World {
                 // the row, the cells, their matter and the rest read only there: the passes
                 // visited every cell of every body a cell at a time, a tenth of the step on a big
                 // tank.)
-                for y in (1..H()).rev() {
+                for y in 1..H() {
                     let Some((x0, x1)) = liq.span(y) else { continue };
                     let (x0, x1) = (x0.max(b0), x1.min(b1));
                     let base = y * W();

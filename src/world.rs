@@ -5576,7 +5576,8 @@ mod tests {
         for _ in 0..800 {
             w.step();
         }
-        let ice_y = (0..H() as i32).find(|&y| w.raw(190, y) == Mat::Ice).unwrap_or(-1);
+        // (The top of the block wherever it drifted: the lake rocks it a few cells to a side.)
+        let ice_y = (0..H() as i32).find(|&y| (100..300).any(|x| w.raw(x, y) == Mat::Ice)).unwrap_or(-1);
         assert!(ice_y > 0 && ice_y < 500, "ice should float near the surface, y = {ice_y}");
     }
 
