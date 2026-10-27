@@ -1605,9 +1605,12 @@ impl World {
         // a cell that was empty, which edge fed it most and how fast: see `feed` below).
         let world: &World = self;
         let (u, v) = (&liq.u, &liq.v);
-        let changes: Vec<(usize, i64, f32, Option<Mat>, Option<(usize, f32)>)> = (0..H())
+        // (By row: each row's changes are its own, and go back on every core. Whether the cell
+        // under has air is read here, before any change, as one pass in order read it: the row
+        // under had not had its changes yet.)
+        let changes: Vec<Vec<(usize, i64, f32, Option<Mat>, Option<(usize, f32)>)>> = (0..H())
             .into_par_iter()
-            .flat_map_iter(|y| {
+            .map(|y| {
                 let (x0, x1) = rows[y].unwrap_or((1, 0));
                 let (fu, fv) = (&fu, &fv);
                 (x0..=x1).filter_map(move |x| {
@@ -1632,8 +1635,11 @@ impl World {
                         }
                     }
                     let t = if q > 0 { (heat / q as f64) as f32 } else { world.temp[i] };
-                    Some((i, q, t, if had == 0 { new } else { None }, feed))
+                    // (The feed only matters over air.)
+                    let air_under = y + 1 < H() && world.cells[i + W()].m == Mat::Empty && world.mask[i + W()] == 0;
+                    Some((i, q, t, if had == 0 { new } else { None }, feed.filter(|_| air_under)))
                 })
+                .collect()
             })
             .collect();
         // The scratch back to blank where it was used, for the next sub-step.
@@ -1646,174 +1652,272 @@ impl World {
             }
         });
         (liq.fu, liq.fv, liq.want, liq.scale) = (fu, fv, want, scale);
-        for (i, q, t, new, feed) in changes {
-            if q <= 0 {
-                if self.cells[i].m.kind() == Kind::Liquid {
-                    self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
-                    self.clear_states(i);
-                    self.vel[i] = 0;
-                }
-            } else {
-                if let Some(nm) = new {
-                    self.cells[i] = Cell { m: nm, stamp: self.frame };
-                    self.clear_states(i);
-                    self.latent[i] = 0.0;
-                    self.vel[i] = 0;
-                }
-                // A cell fed most from above, with air under it, once it holds a quarter: its
-                // bottom edge takes the speed of the liquid that comes in. An edge in the air
-                // is at rest, and the front of a body falling through the air was slowed by
-                // every cell it wetted (the fresh edge under it read its own rest), which the
-                // pressure passed on to the whole body: it fell at four fifths of g and
-                // slowing. (Not before the quarter: a wisp wetting the next cell at the body's
-                // speed, and that one the next, ran ahead of the body as a trail of films that
-                // broke into drops, a third of the body in a second. Only from above: done on
-                // the side edges too, it pumped the waves the wind raises, on the card.)
-                if let Some((2, speed)) = feed.filter(|_| q as u32 >= field::FULL / 4) {
-                    let (x, y) = xy(i);
-                    if y + 1 < H() && self.cells[i + W()].m == Mat::Empty && self.mask[i + W()] == 0 {
-                        let slot = &mut liq.v[vi(x, y + 1)];
-                        if slot.abs() < speed.abs() {
-                            *slot = speed;
+        let frame = self.frame;
+        let (cells, fill, temp, vel, latent, slots) =
+            (Shared::new(&mut self.cells), Shared::new(&mut self.fill), Shared::new(&mut self.temp), Shared::new(&mut self.vel), Shared::new(&mut self.latent), Shared::new(&mut liq.v));
+        // The cells that change matter (their other states go after), and the zones to wake (one
+        // for a run of cells inside the same zone, see `overflow`).
+        let applied: Vec<(Vec<usize>, Vec<usize>)> = changes
+            .into_par_iter()
+            .map(|row| {
+                let (mut cleared, mut woken) = (Vec::new(), Vec::new());
+                let mut last_zone = usize::MAX;
+                for (i, q, t, new, feed) in row {
+                    // SAFETY: the cells of the row, and the edges under them, are the row's own.
+                    unsafe {
+                        if q <= 0 {
+                            if cells.get(i).m.kind() == Kind::Liquid {
+                                *cells.at(i) = Cell { m: Mat::Empty, stamp: frame };
+                                *fill.at(i) = 0;
+                                *vel.at(i) = 0;
+                                cleared.push(i);
+                            }
+                        } else {
+                            if let Some(nm) = new {
+                                *cells.at(i) = Cell { m: nm, stamp: frame };
+                                *latent.at(i) = 0.0;
+                                *vel.at(i) = 0;
+                                cleared.push(i);
+                            }
+                            // A cell fed most from above, with air under it, once it holds a
+                            // quarter: its bottom edge takes the speed of the liquid that comes
+                            // in. An edge in the air is at rest, and the front of a body falling
+                            // through the air was slowed by every cell it wetted (the fresh edge
+                            // under it read its own rest), which the pressure passed on to the
+                            // whole body: it fell at four fifths of g and slowing. (Not before
+                            // the quarter: a wisp wetting the next cell at the body's speed, and
+                            // that one the next, ran ahead of the body as a trail of films that
+                            // broke into drops, a third of the body in a second. Only from above:
+                            // done on the side edges too, it pumped the waves the wind raises, on
+                            // the card.)
+                            if let Some((2, speed)) = feed.filter(|_| q as u32 >= field::FULL / 4) {
+                                let (x, y) = xy(i);
+                                let slot = slots.at(vi(x, y + 1));
+                                if slot.abs() < speed.abs() {
+                                    *slot = speed;
+                                }
+                            }
+                            *temp.at(i) = t;
+                            *fill.at(i) = if q as u32 == field::FULL { 0 } else { q as u32 };
                         }
                     }
+                    let (x, y) = xy(i);
+                    let zone = y / sleep::CS * sleep::CW() + x / sleep::CS;
+                    if zone != last_zone || x % sleep::CS == 0 || x % sleep::CS == sleep::CS - 1 || y % sleep::CS == 0 || y % sleep::CS == sleep::CS - 1 {
+                        woken.push(i);
+                        last_zone = zone;
+                    }
                 }
-                self.temp[i] = t;
-                self.fill[i] = if q as u32 == field::FULL { 0 } else { q as u32 };
+                (cleared, woken)
+            })
+            .collect();
+        for (cleared, woken) in applied {
+            for i in cleared {
+                let f = self.fill[i];
+                self.clear_states(i);
+                self.fill[i] = f;
             }
-            self.revision += 1;
-            self.zones.wake(i);
+            if !woken.is_empty() {
+                self.revision += 1;
+            }
+            for i in woken {
+                self.zones.wake(i);
+            }
         }
+        let clock = self.prof.start();
         self.overflow(liq);
+        self.prof.stop(prof::LIQ_OVERFLOW, clock);
     }
 
     /// A cell holding more than full pushes the extra up, into air or the same liquid.
+    ///
+    /// Everything here moves up or down a column (a cell gives to the one over or under it), so
+    /// the columns are independent: bands of them run side by side, each in the order of the
+    /// rows (the same result as one pass over the whole world). The zones woken and the cells
+    /// whose states go are gathered and seen to after.
     fn overflow(&mut self, liq: &Liquids) {
         let full = field::FULL;
-        // (Both passes look for the few cells that move with a tight scan of the fills of the
-        // row, the cells, their matter and the rest read only there: the passes are serial and
-        // visited every cell of every body a cell at a time, a tenth of the step on a big tank.)
-        for y in (1..H()).rev() {
-            let Some((x0, x1)) = liq.span(y) else { continue };
-            let base = y * W();
-            let mut x = x0;
-            while let Some(k) = self.fill[base + x..=base + x1].iter().position(|&f| f > full + CRUMB) {
-                x += k;
-                let i = base + x;
-                x += 1;
-                if self.cells[i].m.kind() != Kind::Liquid {
-                    continue;
-                }
-                let j = i - W();
-                let m = self.cells[i].m;
-                let up = match self.cells[j].m {
-                    Mat::Empty if self.mask[j] == 0 => 0,
-                    n if n == m => self.liquid_fill(j),
-                    _ => continue,
+        let frame = self.frame;
+        let (cells, fill, temp, vel) = (Shared::new(&mut self.cells), Shared::new(&mut self.fill), Shared::new(&mut self.temp), Shared::new(&mut self.vel));
+        let (mask, awake) = (&self.mask, &self.zones.awake);
+        // SAFETY (every `cells`, `fill`, `temp` and `vel` below): a band only reaches the cells
+        // of its own columns.
+        let cell = |i: usize| unsafe { cells.get(i) };
+        let fill_at = |i: usize| unsafe { fill.get(i) };
+        let liquid_fill = |i: usize| match fill_at(i) {
+            0 => full,
+            f => f,
+        };
+        let set_fill = |i: usize, q: u32| unsafe { *fill.at(i) = if q == full { 0 } else { q } };
+        let bands: Vec<(Vec<usize>, Vec<usize>)> = (0..W().div_ceil(super::par::COLUMN_BAND))
+            .into_par_iter()
+            .map(|band| {
+                let (b0, b1) = (band * super::par::COLUMN_BAND, ((band + 1) * super::par::COLUMN_BAND).min(W()) - 1);
+                // The zones to wake, and the cells that change matter (their other states go).
+                // A cell inside its zone wakes only that zone: one is kept for a run of them (a
+                // body sinks and overflows by tens of thousands of cells a sub-step).
+                let (mut woken, mut cleared) = (Vec::new(), Vec::new());
+                let mut last_zone = usize::MAX;
+                let mut wake = |i: usize| {
+                    let (x, y) = xy(i);
+                    let zone = y / sleep::CS * sleep::CW() + x / sleep::CS;
+                    let (lx, ly) = (x % sleep::CS, y % sleep::CS);
+                    if zone != last_zone || lx == 0 || lx == sleep::CS - 1 || ly == 0 || ly == sleep::CS - 1 {
+                        woken.push(i);
+                        last_zone = zone;
+                    }
                 };
-                let extra = self.fill[i] - full;
-                if up == 0 {
-                    self.cells[j] = Cell { m, stamp: self.frame };
-                    self.clear_states(j);
-                    self.temp[j] = self.temp[i];
-                }
-                let q = up + extra;
-                self.fill[j] = if q == full { 0 } else { q };
-                self.fill[i] = 0;
-                self.revision += 1;
-                self.zones.wake(j);
-            }
-        }
-        // Liquid lying on a cell of the same liquid that is short of full sinks into it (from
-        // the top down, so that a film on the surface sinks through to the first gap): the
-        // pressure alone never fills a cell under a film, since the film holds no pressure and
-        // the surface edge under it comes to rest, and the film would lie there for ever. Not
-        // into a short cell that is not held up (see below). What would
-        // leave a crumb behind goes whole (a cell may hold a crumb over full). A crumb (`CRUMB`
-        // units or less: so little moves no more, what an edge passes rounding to nothing)
-        // joins the liquid under or over it, or goes if there is none.
-        for y in 0..H() {
-            let Some((x0, x1)) = liq.span(y) else { continue };
-            let base = y * W();
-            // Only a crumb, or a cell over one short of full (its fill not 0: a full cell's is),
-            // can move: a cell over a full cell, or over the floor, has nowhere to sink, and
-            // that is most of a body and of its surface, seen off by the fills alone. (A crumb
-            // is a fill of `CRUMB` or less that is not 0.)
-            let next = |fill: &[u32], x: usize| -> Option<usize> {
-                let row = &fill[base + x..=base + x1];
-                let crumb = |a: u32| a != 0 && a <= CRUMB;
-                if y + 1 < H() {
-                    row.iter().zip(&fill[base + W() + x..=base + W() + x1]).position(|(&a, &b)| b != 0 || crumb(a))
-                } else {
-                    row.iter().position(|&a| crumb(a))
-                }
-            };
-            let mut x = x0;
-            while let Some(k) = next(&self.fill, x) {
-                x += k;
-                let (i, xc) = (base + x, x);
-                x += 1;
-                let m = self.cells[i].m;
-                if m.kind() != Kind::Liquid || self.mask[i] != 0 {
-                    continue;
-                }
-                let runs = |yy: usize| self.zones.awake[yy / sleep::CS * sleep::CW() + xc / sleep::CS];
-                let have = self.liquid_fill(i);
-                let same = |j: usize| self.cells[j].m == m && self.mask[j] == 0;
-                let below = (y + 1 < H() && same(i + W())).then_some(i + W());
-                let to = if have <= CRUMB {
-                    match below.or((y > 0 && same(i - W())).then_some(i - W())) {
-                        Some(j) => j,
-                        None => {
-                            self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
-                            self.clear_states(i);
-                            self.vel[i] = 0;
-                            self.revision += 1;
-                            self.zones.wake(i);
+                // (Both passes look for the few cells that move with a tight scan of the fills of
+                // the row, the cells, their matter and the rest read only there: the passes
+                // visited every cell of every body a cell at a time, a tenth of the step on a big
+                // tank.)
+                for y in (1..H()).rev() {
+                    let Some((x0, x1)) = liq.span(y) else { continue };
+                    let (x0, x1) = (x0.max(b0), x1.min(b1));
+                    let base = y * W();
+                    let mut x = x0;
+                    while x <= x1 {
+                        // SAFETY: the band's own columns of the row.
+                        let Some(k) = (x..=x1).position(|xx| fill_at(base + xx) > full + CRUMB) else { break };
+                        x += k;
+                        let i = base + x;
+                        x += 1;
+                        if cell(i).m.kind() != Kind::Liquid {
                             continue;
                         }
-                    }
-                } else {
-                    let Some(j) = below else { continue };
-                    // (Held: on a wall, on other matter, or on the same liquid at least half
-                    // full; not on air, nor on a film of the fall's own wetting: the front of a
-                    // body falling through the air sank into the cell its bottom had just
-                    // wetted, a whole cell a sub-step, ten metres a second, and the hole
-                    // climbed through the body, which fell at a metre a second as a stack of
-                    // films, shedding half of itself as drops. A wisp, under a quarter, sinks
-                    // into the wisp under it anyway: two wisps hanging in the air join, where
-                    // each alone would hang for ever, too thin to move, and the fuller cell
-                    // falls or is thrown as a drop.)
-                    let held = j + W() >= W() * H()
-                        || match self.cells[j + W()].m {
-                            Mat::Empty => false,
-                            n if n == m => self.liquid_fill(j + W()) >= full / HOLDS,
-                            _ => true,
+                        let j = i - W();
+                        let m = cell(i).m;
+                        let up = match cell(j).m {
+                            Mat::Empty if mask[j] == 0 => 0,
+                            n if n == m => liquid_fill(j),
+                            _ => continue,
                         };
-                    if !held && have >= full / 4 {
-                        continue;
+                        let extra = fill_at(i) - full;
+                        unsafe {
+                            if up == 0 {
+                                *cells.at(j) = Cell { m, stamp: frame };
+                                cleared.push(j);
+                                *temp.at(j) = temp.get(i);
+                            }
+                            set_fill(j, up + extra);
+                            *fill.at(i) = 0;
+                        }
+                        wake(j);
                     }
-                    j
-                };
-                let there = self.liquid_fill(to);
-                let gap = full.saturating_sub(there);
-                if gap == 0 && have > CRUMB || !(runs(y) || runs(to / W())) {
-                    continue;
                 }
-                let moved = if have.min(gap) + CRUMB >= have { have } else { gap };
-                self.temp[to] = ((self.temp[to] as f64 * there as f64 + self.temp[i] as f64 * moved as f64) / (there + moved) as f64) as f32;
-                let q = there + moved;
-                self.fill[to] = if q == full { 0 } else { q };
-                if moved == have {
-                    self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
-                    self.clear_states(i);
-                    self.vel[i] = 0;
-                } else {
-                    self.fill[i] = have - moved;
+                // Liquid lying on a cell of the same liquid that is short of full sinks into it
+                // (from the top down, so that a film on the surface sinks through to the first
+                // gap): the pressure alone never fills a cell under a film, since the film holds
+                // no pressure and the surface edge under it comes to rest, and the film would lie
+                // there for ever. Not into a short cell that is not held up (see below). What
+                // would leave a crumb behind goes whole (a cell may hold a crumb over full). A
+                // crumb (`CRUMB` units or less: so little moves no more, what an edge passes
+                // rounding to nothing) joins the liquid under or over it, or goes if there is
+                // none.
+                for y in 0..H() {
+                    let Some((x0, x1)) = liq.span(y) else { continue };
+                    let (x0, x1) = (x0.max(b0), x1.min(b1));
+                    let base = y * W();
+                    // Only a crumb, or a cell over one short of full (its fill not 0: a full
+                    // cell's is), can move: a cell over a full cell, or over the floor, has
+                    // nowhere to sink, and that is most of a body and of its surface, seen off by
+                    // the fills alone. (A crumb is a fill of `CRUMB` or less that is not 0.)
+                    let crumb = |a: u32| a != 0 && a <= CRUMB;
+                    let next = |x: usize| -> Option<usize> {
+                        if y + 1 < H() {
+                            (x..=x1).position(|xx| fill_at(base + W() + xx) != 0 || crumb(fill_at(base + xx)))
+                        } else {
+                            (x..=x1).position(|xx| crumb(fill_at(base + xx)))
+                        }
+                    };
+                    let mut x = x0;
+                    while x <= x1 {
+                        let Some(k) = next(x) else { break };
+                        x += k;
+                        let (i, xc) = (base + x, x);
+                        x += 1;
+                        let m = cell(i).m;
+                        if m.kind() != Kind::Liquid || mask[i] != 0 {
+                            continue;
+                        }
+                        let runs = |yy: usize| awake[yy / sleep::CS * sleep::CW() + xc / sleep::CS];
+                        let have = liquid_fill(i);
+                        let same = |j: usize| cell(j).m == m && mask[j] == 0;
+                        let below = (y + 1 < H() && same(i + W())).then_some(i + W());
+                        let to = if have <= CRUMB {
+                            match below.or((y > 0 && same(i - W())).then_some(i - W())) {
+                                Some(j) => j,
+                                None => {
+                                    unsafe {
+                                        *cells.at(i) = Cell { m: Mat::Empty, stamp: frame };
+                                        *fill.at(i) = 0;
+                                        *vel.at(i) = 0;
+                                    }
+                                    cleared.push(i);
+                                    wake(i);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            let Some(j) = below else { continue };
+                            // (Held: on a wall, on other matter, or on the same liquid at least
+                            // half full; not on air, nor on a film of the fall's own wetting: the
+                            // front of a body falling through the air sank into the cell its
+                            // bottom had just wetted, a whole cell a sub-step, ten metres a
+                            // second, and the hole climbed through the body, which fell at a metre
+                            // a second as a stack of films, shedding half of itself as drops. A
+                            // wisp, under a quarter, sinks into the wisp under it anyway: two
+                            // wisps hanging in the air join, where each alone would hang for
+                            // ever, too thin to move, and the fuller cell falls or is thrown as a
+                            // drop.)
+                            let held = j + W() >= W() * H()
+                                || match cell(j + W()).m {
+                                    Mat::Empty => false,
+                                    n if n == m => liquid_fill(j + W()) >= full / HOLDS,
+                                    _ => true,
+                                };
+                            if !held && have >= full / 4 {
+                                continue;
+                            }
+                            j
+                        };
+                        let there = liquid_fill(to);
+                        let gap = full.saturating_sub(there);
+                        if gap == 0 && have > CRUMB || !(runs(y) || runs(to / W())) {
+                            continue;
+                        }
+                        let moved = if have.min(gap) + CRUMB >= have { have } else { gap };
+                        unsafe {
+                            *temp.at(to) = ((temp.get(to) as f64 * there as f64 + temp.get(i) as f64 * moved as f64) / (there + moved) as f64) as f32;
+                            set_fill(to, there + moved);
+                            if moved == have {
+                                *cells.at(i) = Cell { m: Mat::Empty, stamp: frame };
+                                *fill.at(i) = 0;
+                                *vel.at(i) = 0;
+                                cleared.push(i);
+                            } else {
+                                *fill.at(i) = have - moved;
+                            }
+                        }
+                        wake(i);
+                        wake(to);
+                    }
                 }
+                (woken, cleared)
+            })
+            .collect();
+        // The other states of the cells that changed matter go (their fill is the one left).
+        for (woken, cleared) in bands {
+            for i in cleared {
+                let f = self.fill[i];
+                self.clear_states(i);
+                self.fill[i] = f;
+            }
+            if !woken.is_empty() {
                 self.revision += 1;
+            }
+            for i in woken {
                 self.zones.wake(i);
-                self.zones.wake(to);
             }
         }
     }

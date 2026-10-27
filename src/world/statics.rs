@@ -1456,16 +1456,21 @@ impl World {
         }
         // What the body leaves is filled with the air (or smoke, or flames) it pushes aside.
         let now: HashSet<usize> = drawn.iter().map(|d| d.0).collect();
-        let mut pushed: Vec<(Cell, f32, (States, u16))> = drawn.iter().filter(|d| !own.contains(&d.0) && self.cells[d.0].m != Mat::Empty).map(|d| (self.cells[d.0], self.temp[d.0], self.take_states(d.0))).collect();
+        let mut pushed: Vec<(Cell, f32, (States, u16), usize)> = drawn.iter().filter(|d| !own.contains(&d.0) && self.cells[d.0].m != Mat::Empty).map(|d| (self.cells[d.0], self.temp[d.0], self.take_states(d.0), d.0)).collect();
         pushed.sort_by_key(|p| matches!(p.0.m.kind(), Kind::Liquid | Kind::Powder | Kind::Static));
         let frame = self.frame;
+        // The liquid moved into the room the body leaves: where it is now, where it was.
+        let mut wet = vec![];
         for &(i, _) in &s.drawn {
             if now.contains(&i) {
                 continue;
             }
             // Pushed aside into the room the body leaves (grains and water first: they matter).
             match pushed.pop() {
-                Some((cell, t, st)) => {
+                Some((cell, t, st, from)) => {
+                    if cell.m.kind() == Kind::Liquid {
+                        wet.push((i, from));
+                    }
                     self.cells[i] = Cell { stamp: frame, ..cell };
                     self.temp[i] = t;
                     self.put_states(i, st);
@@ -1480,7 +1485,7 @@ impl World {
             self.zones.wake(i);
         }
         // What found no room is thrown up beside it.
-        for (cell, _, _) in pushed {
+        for (cell, _, _, _) in pushed {
             if cell.m.kind() != Kind::Gas && cell.m.kind() != Kind::Flame && self.ejecta.len() < 14_000 {
                 let h = s.hinge.unwrap_or(c);
                 let vx = (self.rand() % 100) as f32 / 100.0 - 0.5;
@@ -1499,6 +1504,13 @@ impl World {
         s.drawn = drawn;
         s.crushed = crushed;
         self.revision += 1;
+        // The room it left is above the liquid where it comes out of it: the liquid it drove
+        // aside goes to the surface round it instead (see `wade`).
+        if !wet.is_empty() {
+            let v = s.velocity_at(c);
+            let speed = (v.0 * v.0 + v.1 * v.1).sqrt() * ms_per_cell_step();
+            self.wade(&|j| now.contains(&j), &wet, c.0, speed);
+        }
         Ok(())
     }
 

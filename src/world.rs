@@ -525,6 +525,13 @@ const EMPTY: Cell = Cell { m: Mat::Empty, stamp: 0 };
 /// few cells and no more.
 const PLOUGH: f32 = 1.0;
 const PLOUGH_BRAKE: f32 = 0.6;
+/// A piece that comes down a row with its whole foot in a liquid loses this much of its speed
+/// (cells per drop): the drag of the liquid it drives aside. A rock dropped from high up slows to
+/// a few metres a second in the water instead of going through it as through the air.
+const WADE_BRAKE: f32 = 0.25;
+/// The liquid a falling piece drives aside is looked for this many cells of liquid around it at
+/// most, on its way to the free surface.
+const WADE_REACH: usize = 40_000;
 
 /// What a cell of matter carries besides what it is made of: one state per aspect, each in its
 /// own array of `World`, each with one meaning and one unit. When the matter moves its states go
@@ -674,6 +681,14 @@ struct Piece {
     fallen: f32,
     /// Mean density relative to water: lighter than a liquid, it floats on it (ice, wood).
     density: f32,
+}
+
+impl Piece {
+    /// The cells of its foot: those with no cell of it under them.
+    fn foot(&self) -> usize {
+        let in_piece = |i: usize| self.cells.binary_search_by(|p| i.cmp(p)).is_ok();
+        self.cells.iter().filter(|&&i| !in_piece(i + W())).count()
+    }
 }
 
 /// A copy of everything that changes while the world runs (for undo).
@@ -1917,7 +1932,7 @@ impl World {
             if k > 0 {
                 self.frame = self.frame.wrapping_add(1);
             }
-            timed!(self, 0, self.step_cells());
+            timed!(self, 0, self.step_cells(k > 0));
             if audit {
                 marks.push(("tour des cellules", self.water_units_audit()));
             }
@@ -3949,7 +3964,11 @@ impl World {
                     if self.ploughs(piece) {
                         piece.vy -= PLOUGH_BRAKE;
                     }
-                    self.piece_move(piece, 1);
+                    let wet = self.piece_move(piece, 1);
+                    // Driving the liquid aside brakes it too, the more of its foot is in it.
+                    if wet > 0 {
+                        piece.vy -= WADE_BRAKE * wet as f32 / piece.foot().max(1) as f32;
+                    }
                     piece.fallen += 1.0;
                 }
                 if !self.piece_can_move(piece, 1) {
@@ -4105,7 +4124,17 @@ impl World {
         })
     }
 
-    fn piece_move(&mut self, piece: &mut Piece, dir: i32) {
+    /// Moves `piece` a row down (`dir` 1) or up (-1). Coming down into a liquid it is heavier
+    /// than, it drives it aside (see `wade_piece`): returns how many cells of that liquid were
+    /// under its foot.
+    fn piece_move(&mut self, piece: &mut Piece, dir: i32) -> usize {
+        let wet: Vec<usize> = if dir > 0 {
+            let in_piece = |i: usize| piece.cells.binary_search_by(|p| i.cmp(p)).is_ok();
+            piece.cells.iter().map(|&i| i + W()).filter(|&t| t < W() * H() && !in_piece(t) && self.mask[t] == 0 && self.cells[t].m.kind() == Kind::Liquid).collect()
+        } else {
+            vec![]
+        };
+        let heavier = wet.iter().all(|&t| piece.density >= density(self.cells[t].m));
         // Cells are processed leading edge first so nothing overwrites itself.
         let order: Vec<usize> = if dir > 0 { (0..piece.cells.len()).collect() } else { (0..piece.cells.len()).rev().collect() };
         let mut gone = vec![];
@@ -4130,6 +4159,149 @@ impl World {
             piece.cells.remove(k);
         }
         piece.cells.sort_unstable_by(|a, b| b.cmp(a));
+        // (Not one lighter than the liquid: it bobs on it, and the liquid swapped over it as it
+        // comes down goes back under it as it comes up, where the liquid driven aside would
+        // leave a bubble under it.)
+        if wet.is_empty() || !heavier {
+            return 0;
+        }
+        self.wade_piece(piece, &wet);
+        wet.len()
+    }
+
+    /// `piece` has just come down a row into the liquid of the cells `wet` (where its foot is
+    /// now). Moving each cell of it down a row swapped that liquid up the column of the piece, to
+    /// the cell its top left: right where the piece is under the liquid (the liquid flows round
+    /// it and fills in behind), but where its top stands out of the liquid that put the liquid on
+    /// it, and the water ran over a rock dropped into a pond instead of being driven aside (see
+    /// `wade`).
+    fn wade_piece(&mut self, piece: &Piece, wet: &[usize]) {
+        let in_piece = |i: usize| piece.cells.binary_search_by(|p| i.cmp(p)).is_ok();
+        let moved: Vec<(usize, usize)> = wet
+            .iter()
+            .map(|&t| {
+                let mut p = t;
+                while p >= W() && in_piece(p) {
+                    p -= W();
+                }
+                (p, t)
+            })
+            .collect();
+        let cx = piece.cells.iter().map(|&i| (i % W()) as f32).sum::<f32>() / piece.cells.len().max(1) as f32;
+        // (Its speed as it was: a piece settling slowly onto a liquid, a block of ice coming to float,
+        // moves a row at a time all the same, but throws nothing up.)
+        let speed = piece.vy.max(0.0) * liquid::CELL_M / (2.0 * STEP);
+        self.wade(&in_piece, &moved, cx, speed);
+    }
+
+    /// A solid body (its cells: `body`) has moved into liquid, which went to the cells it left
+    /// (`moved`: where each cell of liquid is now, where it was). That liquid stays there if it
+    /// is under liquid still; if not (the body stands out of the liquid there, and the liquid was
+    /// put on it), it goes instead to the free surface it can reach through the liquid from where
+    /// it was, the nearest first, no higher than where it is: the pond rises round the body, the
+    /// liquid thrown up and out (from `cx`, the column of the body's middle) at the body's
+    /// `speed` (m/s), a splash.
+    fn wade(&mut self, body: &dyn Fn(usize) -> bool, moved: &[(usize, usize)], cx: f32, speed: f32) {
+        let liquid = |w: &World, i: usize| w.mask[i] == 0 && w.cells[i].m.kind() == Kind::Liquid;
+        let mut out: Vec<(usize, usize)> = moved.iter().copied().filter(|&(p, _)| !body(p) && liquid(self, p) && (p < W() || !liquid(self, p - W()))).collect();
+        if out.is_empty() {
+            return;
+        }
+        let tops: std::collections::HashSet<usize> = out.iter().map(|o| o.0).collect();
+        // Through the liquid from where it was (not through the body, nor through what is to
+        // move) to the free cells over or beside it, lying on something.
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::with_capacity(4096);
+        let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        for &(_, t) in &out {
+            for (nx, ny) in Self::neighbors((t % W()) as i32, (t / W()) as i32) {
+                if Self::inb(nx, ny) {
+                    let j = Self::idx(nx, ny);
+                    if !body(j) && !tops.contains(&j) && liquid(self, j) && seen.insert(j) {
+                        queue.push_back(j);
+                    }
+                }
+            }
+        }
+        let free = |w: &World, j: usize| w.mask[j] == 0 && matches!(w.cells[j].m.kind(), Kind::Empty | Kind::Gas) && !body(j);
+        let lying = |w: &World, j: usize| j + W() >= W() * H() || !(free(w, j + W()) || tops.contains(&(j + W())));
+        // The free surface round the body, a few times as much as there is liquid to put on it,
+        // the nearest first.
+        let want = out.len() * 4 + 64;
+        let mut slots: Vec<usize> = vec![];
+        while let Some(i) = queue.pop_front() {
+            if slots.len() >= want || seen.len() > WADE_REACH {
+                break;
+            }
+            let (x, y) = xy_i32(i);
+            for (nx, ny) in [(x, y - 1), (x - 1, y), (x + 1, y), (x, y + 1)] {
+                if !Self::inb(nx, ny) {
+                    continue;
+                }
+                let j = Self::idx(nx, ny);
+                if seen.contains(&j) || tops.contains(&j) || body(j) {
+                    continue;
+                }
+                if liquid(self, j) {
+                    seen.insert(j);
+                    queue.push_back(j);
+                } else if free(self, j) && lying(self, j) {
+                    seen.insert(j);
+                    slots.push(j);
+                }
+            }
+        }
+        // The lowest of it first, and of the liquid to go there the highest (what stands out
+        // most of the liquid): the level rises evenly round the body, it does not pile up in a
+        // wall beside it (which climbed the body's side and the waves washed over it). Never up:
+        // liquid lower than the surface it could go to stays where it is.
+        slots.sort_by_key(|&j| std::cmp::Reverse(j / W()));
+        out.sort_unstable_by_key(|o| o.0);
+        let speed = speed.min(liquid::LAUNCH);
+        let frame = self.frame;
+        let mut next = 0;
+        for (&j, &(p, _)) in slots.iter().zip(&out) {
+            if j / W() < p / W() {
+                break;
+            }
+            next += 1;
+            self.carry(p, j);
+            for c in [p, j] {
+                self.cells[c].stamp = frame;
+                self.zones.wake(c);
+            }
+            self.vel[j] = 0;
+            // Thrown up, and out away from the body.
+            let side = if ((j % W()) as f32) < cx { -1.0 } else { 1.0 };
+            self.push_liquid(j, (side * speed * 0.5, -speed));
+        }
+        if next > 0 {
+            self.revision += 1;
+        }
+    }
+
+    /// Sets the velocity (m/s, down positive) of the edges of cell `i` that the liquids carry
+    /// (on the card if they run there).
+    fn push_liquid(&mut self, i: usize, (vx, vy): (f32, f32)) {
+        if !self.liquid_physics {
+            return;
+        }
+        let (x, y) = xy(i);
+        let liq = &mut self.liq;
+        if let Some(Some(card)) = liq.card.as_mut() {
+            for e in [liquid::ui(x, y), liquid::ui(x + 1, y)] {
+                card.patches_up.push(liquid_gpu::Patch { edge: e as u32, mode: 1, value: vx, weight: 1.0 });
+            }
+            for e in [liquid::vi(x, y), liquid::vi(x, y + 1)] {
+                card.patches_up.push(liquid_gpu::Patch { edge: e as u32 | 0x8000_0000, mode: 1, value: vy, weight: 1.0 });
+            }
+        } else if liq.u.len() == (W() + 1) * H() {
+            for e in [liquid::ui(x, y), liquid::ui(x + 1, y)] {
+                liq.u[e] = vx;
+            }
+            for e in [liquid::vi(x, y), liquid::vi(x, y + 1)] {
+                liq.v[e] = vy;
+            }
+        }
     }
 
     /// Premultiplied RGBA of a cell; empty cells are fully transparent so the
@@ -4659,7 +4831,7 @@ mod tests {
                 t.elapsed() / n
             };
             let whole = time(&mut || w.step());
-            let cells = time(&mut || w.step_cells());
+            let cells = time(&mut || w.step_cells(false));
             let flow = time(&mut || w.update_flow());
             let press = time(&mut || w.update_pressure());
             let push = time(&mut || w.pressure_push());
@@ -5559,9 +5731,13 @@ mod tests {
                 w.set(x, y, Mat::Stone);
             }
         }
+        // (Walls of rock three cells thick: one cell thick, the water pushes it over, see
+        // `statics.rs`, and the lake drains away under the ice.)
         for y in 440..520 {
-            w.set(99, y, Mat::Stone);
-            w.set(300, y, Mat::Stone);
+            for k in 0..3 {
+                w.set(97 + k, y, Mat::Stone);
+                w.set(300 + k, y, Mat::Stone);
+            }
         }
         for x in 100..300 {
             for y in 480..520 {
@@ -5701,6 +5877,70 @@ mod tests {
             let top = ice_rows.iter().min().copied().unwrap_or(0);
             eprintln!("LAYER {layer:?}: {} ice cells left, highest row {top}", ice_rows.len());
             assert!(ice_rows.is_empty() || top > 190, "ice stayed up in a layer of {layer:?}: top row {top}");
+        }
+    }
+
+    /// A pond 90 cells deep between banks of rock, and a block of rock 60 x 120 over it: it
+    /// falls in and comes to rest on the bottom, its top out of the water.
+    /// A pond 90 cells deep and 360 wide between banks of rock, and a block of rock `wide` x
+    /// `tall` over the middle of it.
+    fn rock_into_pond(wide: i32, tall: i32) -> World {
+        let mut w = World::new();
+        w.day_cycle = false;
+        w.set_phase(0.75);
+        for x in 0..W() as i32 {
+            for y in H() as i32 - 10..H() as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for y in 300..H() as i32 - 10 {
+            for x in (0..300).chain(660..W() as i32) {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for x in 300..660 {
+            for y in 440..H() as i32 - 10 {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        for x in 480 - wide / 2..480 + wide / 2 {
+            for y in 420 - tall..420 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        w
+    }
+
+    #[test]
+    fn a_rock_falling_into_a_pond_drives_the_water_aside_and_raises_it() {
+        // Taller than the pond is deep: it comes to rest on the bottom, its top well out of the
+        // water (the waves it raises do not wash over it).
+        for (wide, tall) in [(40, 150), (60, 160)] {
+            let mut w = rock_into_pond(wide, tall);
+            let water = |w: &World| (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Water).map(|i| w.liquid_fill(i) as u64).sum::<u64>() + w.liq.drops.iter().map(|d| d.q as u64).sum::<u64>();
+            let before = water(&w);
+            // Cells of water lying on the rock, at worst while it goes in and at the end.
+            let on_top = |w: &World| (480 - wide / 2..480 + wide / 2).map(|x| (0..H() as i32).take_while(|&y| w.raw(x, y) != Mat::Stone).filter(|&y| w.raw(x, y) == Mat::Water).count()).sum::<usize>();
+            let (mut wet, mut drops) = (0, 0);
+            for _ in 0..900 {
+                w.step();
+                wet = wet.max(on_top(&w));
+                drops = drops.max(w.liq.drops.len());
+            }
+            let top = (0..H() as i32).find(|&y| (470..490).any(|x| w.raw(x, y) == Mat::Stone)).unwrap();
+            let level = |x: i32| (0..H() as i32).find(|&y| w.raw(x, y) == Mat::Water).unwrap_or(H() as i32);
+            let (left, right) = (level(330), level(630));
+            let after = water(&w);
+            eprintln!("ROCK {wide}x{tall}: top {top}, water on it at worst {wet}, at the end {}, level {left} / {right} (was 440), drops {drops}, water {before} -> {after}", on_top(&w));
+            assert!(top >= 530 - tall - 1, "the rock sank to the bottom: top row {top}");
+            assert!(wet < wide as usize / 2, "the water went over the rock: {wet} cells on it");
+            // Its volume under the water, spread over the rest of the pond: 90·wide / (360 - wide).
+            let rise = 90.0 * wide as f32 / (360 - wide) as f32;
+            for l in [left, right] {
+                assert!((440.0 - l as f32 - rise).abs() < 5.0, "the pond rose by {} cells, {rise} expected", 440 - l);
+            }
+            assert!(drops > 50, "it splashed: {drops} drops at most");
+            assert!(after.abs_diff(before) * 1000 < before, "no water made or lost: {before} -> {after}");
         }
     }
 
