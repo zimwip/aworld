@@ -291,8 +291,15 @@ impl World {
     /// puts liquid into a gas, so a pocket the liquid presses harder (a bubble of steam deep in a
     /// pool, at a bar when the water round it is at a bar and a half) is a wall to the liquid: as
     /// open air it would draw the liquid in for ever and pile it up in the cell beside.
+    /// A gas in the open sky (a cloud, the steam over a bath) is never open air to them: it is
+    /// at the air's pressure, which held up a body of water painted over a cloud for as long as
+    /// its weight did not press harder (the liquids cannot push it into the cloud, and it is the
+    /// cells' rain only over a gas that is a wall to them, see `World::rain_over_gas`).
     pub fn gas_open(&self, x: i32, y: i32) -> bool {
         let Some(k) = self.pocket_at(x, y) else { return false };
+        if self.pockets[k].open {
+            return false;
+        }
         let push = self.pockets[k].pressure;
         [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)].into_iter().all(|(nx, ny)| {
             if !Self::inb(nx, ny) {
