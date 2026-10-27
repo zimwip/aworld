@@ -11,6 +11,7 @@
 
 use super::*;
 use std::time::Instant;
+use super::sleep::{CH, CS, CW};
 
 /// The ground of a countryside world, `n` cells below the top of the land at `x`.
 fn ground(w: &World, x: i32) -> i32 {
@@ -51,6 +52,20 @@ fn liquids() -> World {
     w.generate_biome(3, Biome::Sea);
     for (x, y) in [(200, 120), (300, 110), (420, 130), (560, 120)] {
         w.paint(x, y, 40, Mat::Water);
+    }
+    w
+}
+
+/// A great mass of water let fall on the countryside, 600 cells by 190 (Thomas's flood of 27
+/// October): it lands, splashes and spreads over the whole valley.
+fn deluge() -> World {
+    let mut w = countryside();
+    for y in 40..230 {
+        for x in 150..760 {
+            if w.raw(x, y) == Mat::Empty {
+                w.set(x, y, Mat::Water);
+            }
+        }
     }
     w
 }
@@ -273,6 +288,7 @@ pub(super) fn scenes() -> Vec<(&'static str, fn() -> World, Option<fn(&mut World
         ("démo", demo as fn() -> World, None),
         ("explosions", explosions, None),
         ("liquides", liquids, None),
+        ("déluge", deluge, None),
         ("orage", storm, Some(|w: &mut World, i: u32| {
             if i % 40 == 0 {
                 w.strike(300 + (i as i32 * 37) % 360, 0);
@@ -520,4 +536,76 @@ fn a_block_of_sand_falls_by_gravity_at_any_step() {
         assert!((24..=31).contains(&(low - 49)), "steps of 1/{:.0} s: the bottom fell {} cells in a second", 1.0 / dt, low - 49);
         assert!(low - high <= 12, "steps of 1/{:.0} s: the block spread over {} rows", 1.0 / dt, low - high + 1);
     }
+}
+
+/// The scene « déluge » in pictures (Thomas's flood of 27 October): every second of the world,
+/// the world as drawn with the zones that run outlined in red (`flood-*.png`), and the fill of
+/// the water, white when full (`fill-*.png`), in `AWORLD_FLOOD_DIR`; and the time of a step.
+/// `AWORLD_BENCH_DT=3` takes steps of three ticks, as the game does when it falls behind.
+///
+/// ```text
+/// AWORLD_FLOOD_DIR=/tmp/flood cargo test --release --bin aworld flood_probe -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn flood_probe() {
+    let mut w = deluge();
+    let ticks: f32 = std::env::var("AWORLD_BENCH_DT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    let steps: usize = std::env::var("AWORLD_PROBE_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+    let every = (60.0 / ticks).round() as usize;
+    let dir = std::env::var("AWORLD_FLOOD_DIR").ok();
+    w.prof.on = true;
+    let mut spent = 0.0;
+    for k in 0..=steps {
+        if k % every == 0 {
+            let water = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Water).count();
+            eprintln!(
+                "{:.1} s : {water} cellules d'eau, {} gouttes, {}/{} zones éveillées, {:.1} ms/pas",
+                k as f32 * STEP * ticks,
+                w.liq.drops.len(),
+                w.zones.awake_count(),
+                CW() * CH(),
+                spent * 1000.0 / every as f64
+            );
+            spent = 0.0;
+            if let Some(dir) = &dir {
+                let (mut picture, mut fill) = (vec![0u8; 4 * W() * H()], vec![0u8; 4 * W() * H()]);
+                for i in 0..W() * H() {
+                    let (x, y) = (i % W(), i / W());
+                    let c = w.color(x, y);
+                    let a = c[3] as u32;
+                    let sky = [150u32, 190, 235];
+                    let mut p = [0u8, 0, 0, 255];
+                    for j in 0..3 {
+                        p[j] = ((c[j] as u32 * a + sky[j] * (255 - a)) / 255) as u8;
+                    }
+                    if (x % CS == 0 || y % CS == 0) && w.zones.runs(y / CS * CW() + x / CS) {
+                        p = [255, p[1] / 2, p[2] / 2, 255];
+                    }
+                    picture[4 * i..4 * i + 4].copy_from_slice(&p);
+                    let f = match w.cells[i].m {
+                        Mat::Water => {
+                            let q = (w.liquid_fill(i).min(field::FULL) as u64 * 255 / field::FULL as u64) as u8;
+                            [q, q, q, 255]
+                        }
+                        Mat::Empty => [0, 0, 60, 255],
+                        _ => [90, 70, 50, 255],
+                    };
+                    fill[4 * i..4 * i + 4].copy_from_slice(&f);
+                }
+                std::fs::create_dir_all(dir).unwrap();
+                for (name, px) in [("flood", &picture), ("fill", &fill)] {
+                    let file = std::fs::File::create(format!("{dir}/{name}-{k:04}.png")).unwrap();
+                    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), W() as u32, H() as u32);
+                    enc.set_color(png::ColorType::Rgba);
+                    enc.set_depth(png::BitDepth::Eight);
+                    enc.write_header().unwrap().write_image_data(px).unwrap();
+                }
+            }
+        }
+        let t = Instant::now();
+        w.step_dt(ticks * STEP);
+        spent += t.elapsed().as_secs_f64();
+    }
+    eprint!("{}", w.prof.report().lines().take(16).map(|l| format!("{l}\n")).collect::<String>());
 }
