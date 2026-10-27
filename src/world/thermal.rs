@@ -1584,10 +1584,12 @@ impl World {
                 }
             }
             Mat::Glass => {
-                // Thermal shock: neighbours at very different temperatures crack it.
+                // Thermal shock: neighbours at very different temperatures crack it. Loose
+                // grains touch it at a few points and insulate: the tube of glass lightning fuses
+                // in sand (a fulgurite) cools in it whole.
                 let mut worst = 0.0f32;
                 for (nx, ny) in Self::neighbors(x, y) {
-                    if Self::inb(nx, ny) {
+                    if Self::inb(nx, ny) && self.raw(nx, ny).kind() != Kind::Powder {
                         worst = worst.max((self.temp[Self::idx(nx, ny)] - t).abs());
                     }
                 }

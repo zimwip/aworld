@@ -1029,6 +1029,32 @@ mod tests {
     }
 
     #[test]
+    fn a_fulgurite_stays_where_lightning_fused_it_in_the_sand() {
+        let mut w = World::new();
+        w.day_cycle = false;
+        w.set_phase(0.75);
+        ground(&mut w, 450);
+        for x in 300..700 {
+            for y in 300..450 {
+                w.set(x, y, Mat::Sand);
+            }
+        }
+        w.strike(500, 200);
+        let glass = |w: &World| (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Glass).collect::<std::collections::HashSet<_>>();
+        let fused = glass(&w);
+        assert!(fused.len() > 20, "lightning fused only {} cells of sand", fused.len());
+        for _ in 0..600 {
+            w.step();
+        }
+        let now = glass(&w);
+        // A few cells at the very top may crack against the cold air; the tube in the sand stays.
+        let kept = fused.intersection(&now).count();
+        assert!(kept * 10 >= fused.len() * 8, "only {kept} of {} cells of glass are still where they were", fused.len());
+        let deepest = |s: &std::collections::HashSet<usize>| s.iter().map(|i| i / W()).max().unwrap();
+        assert!(deepest(&now) <= deepest(&fused) + 1, "the glass sank from row {} to {}", deepest(&fused), deepest(&now));
+    }
+
+    #[test]
     fn lightning_goes_for_the_iron_mast() {
         let mut w = World::new_static();
         ground(&mut w, 400);

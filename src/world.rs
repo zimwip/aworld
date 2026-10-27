@@ -486,6 +486,12 @@ pub struct Cell {
 }
 
 const EMPTY: Cell = Cell { m: Mat::Empty, stamp: 0 };
+/// A heavy piece ploughs into sand or earth only coming down at this speed or more (cells per
+/// drop): a piece resting on grains, or set down gently, stays on them. Each row of grains it
+/// pushes aside costs it `PLOUGH_BRAKE` of its speed, so a body dropped from high up sinks in a
+/// few cells and no more.
+const PLOUGH: f32 = 1.0;
+const PLOUGH_BRAKE: f32 = 0.6;
 
 /// What a cell of matter carries besides what it is made of: one state per aspect, each in its
 /// own array of `World`, each with one meaning and one unit. When the matter moves its states go
@@ -1413,6 +1419,9 @@ impl World {
         }
         self.cells[ia].stamp = self.frame;
         self.cells[ib].stamp = self.frame;
+        if self.later.is_some() && self.cells[ib].m.kind() == Kind::Powder && matches!(self.cells[ia].m.kind(), Kind::Empty | Kind::Gas) {
+            self.left_hole(a.0, a.1);
+        }
     }
 
     /// Swaps the matter of cells `i` and `j` with every state it carries (see `Aspect`).
@@ -3780,6 +3789,10 @@ impl World {
                     if !self.piece_can_move(piece, 1) && !self.crush_foliage(piece) {
                         break;
                     }
+                    // Ploughing into loose grains: pushing them aside takes its speed.
+                    if self.ploughs(piece) {
+                        piece.vy -= PLOUGH_BRAKE;
+                    }
                     self.piece_move(piece, 1);
                     piece.fallen += 1.0;
                 }
@@ -3882,6 +3895,15 @@ impl World {
         piece.vy += 0.5;
     }
 
+    /// Whether moving `piece` down a row pushes packed grains (sand, shards) aside.
+    fn ploughs(&self, piece: &Piece) -> bool {
+        let in_piece = |i: usize| piece.cells.binary_search_by(|p| i.cmp(p)).is_ok();
+        piece.cells.iter().any(|&i| {
+            let t = i + W();
+            t < W() * H() && !in_piece(t) && self.mask[t] == 0 && self.cells[t].m.kind() == Kind::Powder && density(self.cells[t].m) >= 1.0
+        })
+    }
+
     fn piece_can_move(&self, piece: &Piece, dir: i32) -> bool {
         let in_piece = |i: usize| piece.cells.binary_search_by(|p| i.cmp(p)).is_ok();
         piece.cells.iter().all(|&i| {
@@ -3901,15 +3923,24 @@ impl World {
                         // Archimedes: a piece heavier than the liquid (rock, iron) sinks through
                         // it, pushing it aside; a lighter one (ice, wood) floats on a body of it,
                         // but a stray drop or a puff of liquid in mid-air does not hold it up.
-                        // Settled sand or earth holds up a log the same way.
+                        // Settled sand or earth holds up a log the same way. Packed grains are
+                        // no liquid, though: they hold up even a heavy piece (rock, glass) resting
+                        // on them; only one that comes down fast ploughs into them (see `PLOUGH`).
+                        // Light flakes (dead leaves, snow, ash) are crushed under it all the same.
                         Kind::Liquid | Kind::Powder => {
+                            let m = self.cells[target].m;
+                            let heavier = piece.density >= density(m);
+                            let bears = m.kind() == Kind::Powder && density(m) >= 1.0;
                             // (A film of liquid, under half a cell, never holds a piece up: one
                             // caught in a notch of a block of ice held the block up in the sky.)
-                            if piece.density >= density(self.cells[target].m) || (self.cells[target].m.kind() == Kind::Liquid && self.liquid_fill(target) < field::FULL / liquid::HOLDS) {
+                            let film = m.kind() == Kind::Liquid && self.liquid_fill(target) < field::FULL / liquid::HOLDS;
+                            if (heavier && (!bears || piece.vy >= PLOUGH)) || film {
                                 true
                             } else {
+                                // (A drop caught in a notch of the piece rests on the piece
+                                // itself: it comes down with it.)
                                 let under = target + W();
-                                let settled = under >= W() * H() || matches!(self.cells[under].m.kind(), Kind::Liquid | Kind::Static | Kind::Powder);
+                                let settled = under >= W() * H() || (!in_piece(under) && matches!(self.cells[under].m.kind(), Kind::Liquid | Kind::Static | Kind::Powder));
                                 !settled
                             }
                         }
@@ -5543,6 +5574,49 @@ mod tests {
         eprintln!("LAKE rock rows {:?}..{:?}, log rows {:?}..{:?}", rock.first(), rock.last(), wood.first(), wood.last());
         assert!(rock.iter().min().is_some_and(|&y| y > 400), "the rock sank: rows {:?}", rock.first());
         assert!(wood.iter().max().is_some_and(|&y| y < 350), "the log floats: rows {:?}", wood.last());
+    }
+
+    #[test]
+    fn heavy_solids_rest_on_sand_instead_of_sinking_through_it() {
+        let mut w = World::new();
+        w.day_cycle = false;
+        w.set_phase(0.75);
+        // A bed of sand in a tank of rock (at the edges of the world it would run out).
+        for x in 0..W() as i32 {
+            for y in 450..H() as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+            for y in 300..450 {
+                w.set(x, y, if (50..W() as i32 - 50).contains(&x) { Mat::Sand } else { Mat::Stone });
+            }
+        }
+        // Glass and rock (both heavier than sand) laid on it and buried in it, a crumb of glass
+        // (it falls straight down, not as a tumbling body) dropped onto it from high up.
+        for x in 100..120 {
+            for y in 296..300 {
+                w.set(x, y, Mat::Glass);
+            }
+        }
+        for x in 200..210 {
+            for y in 320..330 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for x in 300..302 {
+            for y in 200..202 {
+                w.set(x, y, Mat::Glass);
+            }
+        }
+        for _ in 0..400 {
+            w.step();
+        }
+        let rows = |m: Mat, x0: i32, x1: i32| (0..H() as i32).filter(|&y| (x0..x1).any(|x| w.raw(x, y) == m)).collect::<Vec<_>>();
+        let slab = rows(Mat::Glass, 100, 120);
+        assert_eq!((slab.first(), slab.last()), (Some(&296), Some(&299)), "the glass slab stays on the sand");
+        let rock: Vec<i32> = rows(Mat::Stone, 195, 215).into_iter().filter(|&y| y < 450).collect();
+        assert_eq!((rock.first(), rock.last()), (Some(&320), Some(&329)), "the rock stays where it is buried");
+        let crumb = rows(Mat::Glass, 290, 312);
+        assert!(crumb.last().is_some_and(|&y| (300..=306).contains(&y)), "the crumb dents the sand, no more: rows {crumb:?}");
     }
 
     /// A floor of rock on the base of the world, `top` rows thick.
