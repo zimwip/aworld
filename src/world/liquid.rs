@@ -219,6 +219,9 @@ pub struct Liquids {
     pub(super) card: Option<Option<liquid_gpu::LiquidGpu>>,
     /// In a picture of the world (see `World::copy_picture`), the rows the card worked on.
     pub(super) card_rows: Option<(usize, usize)>,
+    /// The step count (`Zones::stamp`) when each zone was last classed: a zone that has not
+    /// changed since, asleep with its neighbours, keeps its classes (see `classify`).
+    pub(super) classed: Vec<u64>,
 }
 
 /// A drop of liquid thrown off a body (spray, a splash): it flies off the grid, under gravity
@@ -832,6 +835,30 @@ impl World {
     /// What each cell is to the liquids this sub-step, and the span of each row to work on.
     fn classify(&self, liq: &mut Liquids, again: bool) {
         let awake = &self.zones.awake;
+        // A zone asleep, with its eight neighbours asleep, that has not changed since it was
+        // last classed keeps its classes: no liquid that runs is near enough to read them, and
+        // its cells are as they were (what reads them from afar, the push on a solid and the
+        // pressure under a cell, only looks at full liquid, which a zone at rest keeps).
+        let (cw, ch, stamp) = (sleep::CW(), sleep::CH(), self.zones.stamp());
+        liq.classed.resize(cw * ch, 0);
+        let keep: Vec<bool> = (0..cw * ch)
+            .map(|k| {
+                let (zx, zy) = ((k % cw) as i32, (k / cw) as i32);
+                let near = (-1..=1).any(|dy| (-1..=1).any(|dx| {
+                    let (nx, ny) = (zx + dx, zy + dy);
+                    nx >= 0 && ny >= 0 && (nx as usize) < cw && (ny as usize) < ch && awake[ny as usize * cw + nx as usize]
+                }));
+                let at = liq.classed[k];
+                !again && !near && at != 0 && at <= stamp && !self.zones.changed_since(k, at)
+            })
+            .collect();
+        if !again {
+            for (at, &kept) in liq.classed.iter_mut().zip(&keep) {
+                if !kept {
+                    *at = stamp;
+                }
+            }
+        }
         // Between two sub-steps, only the spans change (the liquid runs there and nowhere else),
         // and a class reads at most the cells beside: the cells a cell further are looked at
         // again, the rest keep their class.
@@ -859,7 +886,11 @@ impl World {
                 // (The row's cells, blocks and zones taken once: the loop reads each by its column.)
                 let (cells, mask) = (&self.cells[y * W()..(y + 1) * W()], &self.mask[y * W()..(y + 1) * W()]);
                 let zones = &awake[y / sleep::CS * sleep::CW()..(y / sleep::CS + 1) * sleep::CW()];
+                let kept = &keep[y / sleep::CS * cw..(y / sleep::CS + 1) * cw];
                 for (x, c) in row.iter_mut().enumerate().take(b + 1).skip(a) {
+                    if kept[x / sleep::CS] {
+                        continue;
+                    }
                     let i = y * W() + x;
                     let run = zones[x / sleep::CS];
                     let what = if mask[x] != 0 {

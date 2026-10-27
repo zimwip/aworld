@@ -3414,14 +3414,20 @@ impl World {
 
     fn step_cloud(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
-        let mut near = 0;
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                if (dx != 0 || dy != 0) && self.raw(x + dx, y + dy) == Mat::Cloud {
-                    near += 1;
+        // Whether at least `n` of the eight cells around are cloud (the look stops there: in a
+        // cloud, the first few cells answer).
+        let near = |w: &World, n: u32| {
+            let mut seen = 0;
+            for (dx, dy) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+                if w.raw(x + dx, y + dy) == Mat::Cloud {
+                    seen += 1;
+                    if seen >= n {
+                        return true;
+                    }
                 }
             }
-        }
+            false
+        };
         // A cloud is water: countless droplets too small to fall. Where the cloud is thick they
         // bump into each other and merge until some are heavy enough to fall: rain when it is
         // mild, snow when it freezes, hail when it is very cold. A drop can start anywhere in the
@@ -3431,7 +3437,7 @@ impl World {
         let t = self.temp[i];
         // (The one-in-`RAIN_EVERY` draw comes first: it spares the look at the 24 cells around
         // on nearly every tick. The odds are the same, one draw times the other.)
-        if near >= 2 && t < 12.0 && self.chance_f(1.0 / RAIN_EVERY) && matches!(self.at(x, y + 1), Mat::Empty | Mat::Cloud) {
+        if near(self, 2) && t < 12.0 && self.chance_f(1.0 / RAIN_EVERY) && matches!(self.at(x, y + 1), Mat::Empty | Mat::Cloud) {
             let water = self.cloud_water(x, y);
             let thick = ((water - RAIN_MIN_WATER) / (24.0 - RAIN_MIN_WATER)).max(0.0);
             if self.chance_f(thick * thick) && self.gather_vapour(x, y) {
@@ -3447,7 +3453,7 @@ impl World {
         }
         // Warmed above its dew point (by the sun, by warm air), or left alone in dry air, a cloud
         // evaporates again.
-        if (self.chance(600) && self.above_dew_point(x, y)) || (near == 0 && self.chance(3000)) {
+        if (self.chance(600) && self.above_dew_point(x, y)) || (!near(self, 1) && self.chance(3000)) {
             self.evaporate_cloud(x, y);
             return;
         }
