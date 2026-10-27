@@ -868,6 +868,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_splash_in_one_tank_leaves_the_tank_beside_it_alone_on_the_card() {
+        if super::super::gpu::gpu().is_none() {
+            eprintln!("no GPU here: skipped");
+            return;
+        }
+        for (w, h, wall) in [(512, 128, 1), (960, 200, 7), (256, 64, 2)] {
+            let (mut sys, still) = super::super::mgpcg::tests::two_tanks(w, h, wall);
+            let mut gpu = PressureGpu::new(w, h).unwrap();
+            gpu.solve(sys.fine(), 1.0, 1e-3, 12);
+            let moved = super::super::mgpcg::tests::right_tank_moved(&sys.levels[0].x, &still, w, h, wall);
+            assert!(moved < 10.0, "{w}x{h}, wall {wall}: the right tank moved by {moved} Pa on the card");
+        }
+    }
+
     /// The card's costs, to see what a resident solver could hope for on it:
     /// `AWORLD_GPU=1 cargo test --release --bin aworld bench_gpu -- --ignored --nocapture`.
     /// `AWORLD_BENCH_GRID=1920x1080` measures a bigger world than the game's (the tank of the
