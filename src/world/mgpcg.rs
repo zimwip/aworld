@@ -19,7 +19,9 @@
 //! the mean of the two fine edges that cross its face (in two dimensions the conductance of a
 //! square does not depend on its size), the residual is summed into the coarse cell and the
 //! correction copied back to its four cells: the coarse operator is then the fine one seen from
-//! afar.
+//! afar. A coarse cell only stands for fine cells that hang together inside it (`Level::parts`):
+//! one laid across a thin ridge would join the pools on each side, and a splash in one would
+//! throw the other about (the solve stops at a tolerance, well before what leaked has gone).
 //!
 //! The cost is in the passes over the fine grid, so there are as few as can be: each level packs
 //! its fluid cells into two lists by colour, with their coefficients, that a sweep streams
@@ -101,6 +103,15 @@ pub struct Level {
     /// finest one).
     pub b: Vec<f32>,
     pub x: Vec<f32>,
+    /// Below the finest level, the fine cells each cell stands for: bit 2 dy + dx for the fine
+    /// fluid cell (2 i + dx, 2 j + dy). The fine fluid cells of a coarse one must hang together
+    /// through the edges inside it, or the coarse cell would join what does not touch (two pools
+    /// on each side of a thin ridge, cut by the same coarse cell): the largest group that hangs
+    /// together is taken, and the others are left out of the coarse grid (their residual is not
+    /// passed down, no correction comes back up to them; the sweeps alone see to them).
+    parts: Vec<u8>,
+    /// Whether some fine fluid cell was left out (see `parts`).
+    split: bool,
 }
 
 impl Level {
@@ -116,6 +127,8 @@ impl Level {
             rows: vec![None; h],
             b: vec![0.0; w * h],
             x: vec![0.0; w * h],
+            parts: vec![0; w * h],
+            split: false,
         }
     }
 
@@ -174,8 +187,61 @@ impl Level {
                 row[i] = kind;
             }
         });
-        let kind = &self.kind;
+        // The fine fluid cells of each coarse one that hang together (see `parts`).
+        let split = std::sync::atomic::AtomicBool::new(false);
+        rows_mut!(self.parts, w, big, |(j, row): (usize, &mut [u8])| {
+            let Some((i0, i1)) = rows[j] else { return };
+            for i in i0..=i1 {
+                let (x, y) = (2 * i, 2 * j);
+                let fluid = |dx: usize, dy: usize| x + dx < fw && y + dy < f.h && f.kind[(y + dy) * fw + x + dx] == FLUID;
+                let mut cells = 0u8;
+                for k in 0..4 {
+                    if fluid(k & 1, k >> 1) {
+                        cells |= 1 << k;
+                    }
+                }
+                // The four edges inside: top, bottom, left, right.
+                let links = [
+                    (0, 1, cells & 3 == 3 && f.ax[f.axi(x + 1, y)] > 0.0),
+                    (2, 3, cells >> 2 == 3 && f.ax[f.axi(x + 1, y + 1)] > 0.0),
+                    (0, 2, cells & 5 == 5 && f.ay[(y + 1) * fw + x] > 0.0),
+                    (1, 3, cells & 10 == 10 && f.ay[(y + 1) * fw + x + 1] > 0.0),
+                ];
+                let (mut best, mut seen) = (0u8, 0u8);
+                for k in 0..4 {
+                    if cells >> k & 1 == 0 || seen >> k & 1 != 0 {
+                        continue;
+                    }
+                    let mut group = 1u8 << k;
+                    loop {
+                        let mut more = group;
+                        for &(a, b, on) in &links {
+                            if on && (group >> a & 1 != 0 || group >> b & 1 != 0) {
+                                more |= 1 << a | 1 << b;
+                            }
+                        }
+                        if more == group {
+                            break;
+                        }
+                        group = more;
+                    }
+                    seen |= group;
+                    if group.count_ones() > best.count_ones() {
+                        best = group;
+                    }
+                }
+                if best != cells {
+                    split.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                row[i] = best;
+            }
+        });
+        self.split = split.into_inner();
+        let (kind, parts) = (&self.kind, &self.parts);
         let any_fluid = |a: usize, b: usize| kind[a] != NONE && kind[b] != NONE && (kind[a] == FLUID || kind[b] == FLUID);
+        // Whether the fine cell `k` (bit 2 dy + dx) of coarse cell `c` is in it: a fine edge
+        // counts in a coarse one only between cells in their coarse cells.
+        let within = |c: usize, k: usize| kind[c] != FLUID || parts[c] >> k & 1 != 0;
         rows_mut!(self.ax, w + 1, big, |(j, row): (usize, &mut [f32])| {
             let Some((i0, i1)) = rows[j] else { return };
             for i in i0.max(1)..=(i1 + 1).min(w - 1) {
@@ -184,7 +250,7 @@ impl Level {
                     let mut s = 0.0;
                     for dy in 0..2 {
                         let y = 2 * j + dy;
-                        if y < f.h && 2 * i < fw {
+                        if y < f.h && 2 * i < fw && within(a, 2 * dy + 1) && within(b, 2 * dy) {
                             s += f.ax[f.axi(2 * i, y)];
                         }
                     }
@@ -205,7 +271,7 @@ impl Level {
                     let mut s = 0.0;
                     for dx in 0..2 {
                         let x = 2 * i + dx;
-                        if x < fw && 2 * j < f.h + 1 {
+                        if x < fw && 2 * j < f.h + 1 && within(a, 2 + dx) && within(b, dx) {
                             s += f.ay[2 * j * fw + x];
                         }
                     }
@@ -302,6 +368,28 @@ impl Level {
             (0..h).into_par_iter().for_each(fill);
         } else {
             (0..h).for_each(fill);
+        }
+    }
+
+    /// Takes the coarse correction away from the fine cells the coarse level below left out
+    /// (`parts` of that level, `cw` wide): a sweep that folds the correction in must not read
+    /// one into them.
+    fn unlink(&mut self, parts: &[u8], cw: usize) {
+        let w = self.w;
+        for list in &mut self.nodes {
+            list.par_chunks_mut(CHUNK).for_each(|chunk| {
+                for n in chunk {
+                    if n.bits & 15 == 0 {
+                        continue;
+                    }
+                    let (x, y) = (n.i as usize % w, n.i as usize / w);
+                    for (k, (jx, jy)) in [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)].into_iter().enumerate() {
+                        if n.bits >> k & 1 != 0 && parts[(jy / 2) * cw + jx / 2] >> ((jy & 1) * 2 + (jx & 1)) & 1 == 0 {
+                            n.bits &= !(1 << k);
+                        }
+                    }
+                }
+            });
         }
     }
 
@@ -581,6 +669,9 @@ impl Solver {
         for l in 1..self.used {
             let (fine, coarse) = self.levels.split_at_mut(l);
             coarse[0].coarsen_from(&fine[l - 1]);
+            if coarse[0].split {
+                fine[l - 1].unlink(&coarse[0].parts, coarse[0].w);
+            }
         }
     }
 
@@ -599,7 +690,7 @@ impl Solver {
             let (fine, coarse) = self.levels.split_at_mut(l + 1);
             let (f, c) = (&fine[l], &mut coarse[0]);
             let (fw, fh, cw, par) = (f.w, f.h, c.w, f.par());
-            let (fx, fkind, crows) = (&f.x, &f.kind, &c.rows);
+            let (fx, fkind, crows, cparts) = (&f.x, &f.kind, &c.rows, &c.parts);
             rows_mut!(c.b, cw, par, |(j, row): (usize, &mut [f32])| {
                 let Some((i0, i1)) = crows[j] else { return };
                 for i in i0..=i1 {
@@ -607,7 +698,7 @@ impl Solver {
                     for dy in 0..2 {
                         for dx in 0..2 {
                             let (x, y) = (2 * i + dx, 2 * j + dy);
-                            if x < fw && y < fh && (x + y) % 2 != LAST_COLOUR && fkind[y * fw + x] == FLUID {
+                            if x < fw && y < fh && (x + y) % 2 != LAST_COLOUR && fkind[y * fw + x] == FLUID && cparts[j * cw + i] >> (2 * dy + dx) & 1 != 0 {
                                 s += f.residual_at(fx, x, y);
                             }
                         }
@@ -772,12 +863,17 @@ impl Level {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::world) mod tests {
     use super::*;
 
     /// A tank of water w x h with the air over its top row: the pressure comes out hydrostatic,
     /// and in a handful of iterations whatever the width.
     fn tank(w: usize, h: usize) -> (Solver, f32) {
+        tank_to(w, h, 1.0)
+    }
+
+    /// The same, solved until no pressure would move by more than `tol`.
+    fn tank_to(w: usize, h: usize, tol: f32) -> (Solver, f32) {
         let mut s = Solver::default();
         s.ready(w, h);
         let rho = 1000.0f32;
@@ -811,7 +907,7 @@ mod tests {
             }
         }
         s.coarsen();
-        let it = s.solve(1.0, 0.0, 50) as f32;
+        let it = s.solve(tol, 0.0, 50) as f32;
         (s, it)
     }
 
@@ -831,5 +927,76 @@ mod tests {
             assert!(it <= 8.0, "{w}x{h} took {it} iterations");
         }
     }
-}
 
+    /// Two tanks side by side, the wall between them `wall` cells thick and across the cells of
+    /// the coarse grids (it starts at an odd column), the right one solved already and a splash
+    /// (a strong divergence in a patch) in the left one: the system, ready to solve, and the
+    /// pressure of the right tank before it.
+    pub(in crate::world) fn two_tanks(w: usize, h: usize, wall: usize) -> (Solver, Vec<f32>) {
+        let (mut s, _) = tank_to(w, h, 0.01);
+        let rho = 1000.0f32;
+        let still: Vec<f32> = s.levels[0].x.clone();
+        s.clear();
+        let mid = w / 2;
+        let wall_at = |x: usize| x > mid && x <= mid + wall;
+        {
+            let f = s.fine();
+            for y in 0..h {
+                for x in 0..w {
+                    f.kind[y * w + x] = if wall_at(x) { NONE } else if y == 0 { FIXED } else { FLUID };
+                }
+                f.rows[y] = Some((0, w - 1));
+            }
+            for y in 0..h {
+                for x in 1..w {
+                    f.ax[y * (w + 1) + x] = if wall_at(x - 1) || wall_at(x) || y == 0 { 0.0 } else { 1.0 / rho };
+                }
+            }
+            for y in 1..h {
+                for x in 0..w {
+                    f.ay[y * w + x] = if wall_at(x) { 0.0 } else { 1.0 / rho };
+                }
+            }
+            for y in 1..h {
+                for x in 0..w {
+                    let c = y * w + x;
+                    if wall_at(x) {
+                        continue;
+                    }
+                    f.diag[c] = f.ax[y * (w + 1) + x] + f.ax[y * (w + 1) + x + 1] + f.ay[c] + f.ay[c + w];
+                    f.b[c] = if y + 1 == h { 9.81 / 6.0 } else { 0.0 };
+                    if x > mid / 4 && x < mid / 2 && y > h / 4 && y < h / 2 {
+                        f.b[c] += 4000.0;
+                    }
+                    f.x[c] = still[c];
+                }
+            }
+        }
+        (s, still)
+    }
+
+    /// The most the right tank's pressure in `x` moved from `still`, Pa.
+    pub(in crate::world) fn right_tank_moved(x: &[f32], still: &[f32], w: usize, h: usize, wall: usize) -> f32 {
+        let mut moved = 0.0f32;
+        for y in 1..h {
+            for i in w / 2 + wall + 1..w {
+                moved = moved.max((x[y * w + i] - still[y * w + i]).abs());
+            }
+        }
+        moved
+    }
+
+    /// The splash in the left tank must leave the right one as it was: they share no edge, so
+    /// nothing of one may reach the other through the coarse grids (it moved by 3 MPa when a
+    /// coarse cell joined them).
+    #[test]
+    fn a_splash_in_one_tank_leaves_the_tank_beside_it_alone() {
+        for (w, h, wall) in [(512, 128, 1), (960, 200, 7), (256, 64, 2)] {
+            let (mut s, still) = two_tanks(w, h, wall);
+            s.coarsen();
+            s.solve(1.0, 1e-3, 12);
+            let moved = right_tank_moved(&s.levels[0].x, &still, w, h, wall);
+            assert!(moved < 10.0, "{w}x{h}, wall {wall}: the right tank moved by {moved} Pa");
+        }
+    }
+}

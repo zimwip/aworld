@@ -3,7 +3,11 @@
 //
 // Group 1 is the level a kernel works on, group 2 the level under it (half as fine), group 3 the
 // vectors of the conjugate gradients on the finest level. A cell is FLUID (1) when it holds an
-// unknown pressure, FIXED (2) when its pressure is known (in the right side), NONE (0) otherwise.
+// unknown pressure, FIXED (2) when its pressure is known (in the right side), NONE (0) otherwise,
+// in the low four bits of its kind; below the finest level, bits 4 to 7 are the fine fluid cells
+// the coarse cell stands for (`parts` in mgpcg.rs: bit 4 + 2 dy + dx for the fine cell
+// (2 i + dx, 2 j + dy)), those that hang together inside it, so that no coarse cell joins two
+// bodies of liquid that do not touch.
 
 // A level's grid, the one under it, the colour of the sweep, and the band of rows the kernels
 // work on (the rows that hold the system, with what was sent last time): y0 and rows on this
@@ -97,16 +101,16 @@ var<workgroup> sh: array<f32, 256>;
 // A x at the fluid cell c = (xx, y): diag x_c minus the edges to the fluid cells beside.
 fn apply_x(c: u32, xx: u32, y: u32) -> f32 {
     var v = diag[c] * x[c];
-    if (xx > 0u && kind[c - 1u] == FLUID) {
+    if (xx > 0u && (kind[c - 1u] & 15u) == FLUID) {
         v -= ax[y * (P.w + 1u) + xx] * x[c - 1u];
     }
-    if (xx + 1u < P.w && kind[c + 1u] == FLUID) {
+    if (xx + 1u < P.w && (kind[c + 1u] & 15u) == FLUID) {
         v -= ax[y * (P.w + 1u) + xx + 1u] * x[c + 1u];
     }
-    if (y > 0u && kind[c - P.w] == FLUID) {
+    if (y > 0u && (kind[c - P.w] & 15u) == FLUID) {
         v -= ay[c] * x[c - P.w];
     }
-    if (y + 1u < P.h && kind[c + P.w] == FLUID) {
+    if (y + 1u < P.h && (kind[c + P.w] & 15u) == FLUID) {
         v -= ay[c + P.w] * x[c + P.w];
     }
     return v;
@@ -115,16 +119,16 @@ fn apply_x(c: u32, xx: u32, y: u32) -> f32 {
 // The same on the search direction s.
 fn apply_s(c: u32, xx: u32, y: u32) -> f32 {
     var v = diag[c] * s[c];
-    if (xx > 0u && kind[c - 1u] == FLUID) {
+    if (xx > 0u && (kind[c - 1u] & 15u) == FLUID) {
         v -= ax[y * (P.w + 1u) + xx] * s[c - 1u];
     }
-    if (xx + 1u < P.w && kind[c + 1u] == FLUID) {
+    if (xx + 1u < P.w && (kind[c + 1u] & 15u) == FLUID) {
         v -= ax[y * (P.w + 1u) + xx + 1u] * s[c + 1u];
     }
-    if (y > 0u && kind[c - P.w] == FLUID) {
+    if (y > 0u && (kind[c - P.w] & 15u) == FLUID) {
         v -= ay[c] * s[c - P.w];
     }
-    if (y + 1u < P.h && kind[c + P.w] == FLUID) {
+    if (y + 1u < P.h && (kind[c + P.w] & 15u) == FLUID) {
         v -= ay[c + P.w] * s[c + P.w];
     }
     return v;
@@ -135,16 +139,16 @@ fn apply_s(c: u32, xx: u32, y: u32) -> f32 {
 /// One Gauss-Seidel update of the fluid cell c = (xx, y).
 fn sweep_cell(c: u32, xx: u32, y: u32) {
     var v = b[c];
-    if (xx > 0u && kind[c - 1u] == FLUID) {
+    if (xx > 0u && (kind[c - 1u] & 15u) == FLUID) {
         v += ax[y * (P.w + 1u) + xx] * x[c - 1u];
     }
-    if (xx + 1u < P.w && kind[c + 1u] == FLUID) {
+    if (xx + 1u < P.w && (kind[c + 1u] & 15u) == FLUID) {
         v += ax[y * (P.w + 1u) + xx + 1u] * x[c + 1u];
     }
-    if (y > 0u && kind[c - P.w] == FLUID) {
+    if (y > 0u && (kind[c - P.w] & 15u) == FLUID) {
         v += ay[c] * x[c - P.w];
     }
-    if (y + 1u < P.h && kind[c + P.w] == FLUID) {
+    if (y + 1u < P.h && (kind[c + P.w] & 15u) == FLUID) {
         v += ay[c + P.w] * x[c + P.w];
     }
     x[c] = v / diag[c];
@@ -161,7 +165,7 @@ fn sweep(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let c = y * P.w + xx;
-    if (kind[c] != FLUID) {
+    if ((kind[c] & 15u) != FLUID) {
         return;
     }
     sweep_cell(c, xx, y);
@@ -182,7 +186,7 @@ fn sweep_coarsest(@builtin(local_invocation_id) lid: vec3<u32>) {
                 let c = first + i;
                 let xx = c % P.w;
                 let y = c / P.w;
-                if (y < P.h && (xx + y) % 2u == colour && kind[c] == FLUID) {
+                if (y < P.h && (xx + y) % 2u == colour && (kind[c] & 15u) == FLUID) {
                     sweep_cell(c, xx, y);
                 }
             }
@@ -210,7 +214,7 @@ fn restrict_residual(@builtin(global_invocation_id) id: vec3<u32>) {
             let y = 2u * j + dy;
             if (xx < P.w && y < P.h) {
                 let c = y * P.w + xx;
-                if (kind[c] == FLUID) {
+                if ((kind[c] & 15u) == FLUID && part(ckind[j * P.cw + i], dx, dy)) {
                     sum += b[c] - apply_x(c, xx, y);
                 }
             }
@@ -232,12 +236,25 @@ fn prolong(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let c = y * P.w + xx;
-    if (kind[c] == FLUID) {
-        x[c] += cx[(y / 2u) * P.cw + xx / 2u];
+    let cc = (y / 2u) * P.cw + xx / 2u;
+    if ((kind[c] & 15u) == FLUID && part(ckind[cc], xx & 1u, y & 1u)) {
+        x[c] += cx[cc];
     }
 }
 
-// The coarse grid's cells: fixed if a cell under it is fixed, else fluid if one is.
+// Whether the coarse cell of kind `k` stands for its fine cell (dx, dy).
+fn part(k: u32, dx: u32, dy: u32) -> bool {
+    return ((k >> (4u + 2u * dy + dx)) & 1u) != 0u;
+}
+
+// Whether the fine cell (dx, dy) of a coarse cell of kind `k` is in it, for an edge: always
+// when the coarse cell is not an unknown.
+fn within(k: u32, dx: u32, dy: u32) -> bool {
+    return (k & 15u) != FLUID || part(k, dx, dy);
+}
+
+// The coarse grid's cells: fixed if a cell under it is fixed, else fluid if one is; and the
+// largest group of its fine fluid cells that hang together through the edges inside it.
 @compute @workgroup_size(16, 16)
 fn coarsen_kind(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = id.x;
@@ -246,20 +263,63 @@ fn coarsen_kind(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     var k = 0u;
+    var cells = 0u;
     for (var dy = 0u; dy < 2u; dy++) {
         for (var dx = 0u; dx < 2u; dx++) {
             let xx = 2u * i + dx;
             let y = 2u * j + dy;
             if (xx < P.w && y < P.h) {
-                k = max(k, kind[y * P.w + xx]);
+                let f = kind[y * P.w + xx] & 15u;
+                k = max(k, f);
+                if (f == FLUID) {
+                    cells |= 1u << (2u * dy + dx);
+                }
             }
         }
     }
-    ckind[j * P.cw + i] = k;
+    // The four edges inside (top, bottom, left, right): the two cells, and whether it links them.
+    let x0 = 2u * i;
+    let y0 = 2u * j;
+    var links = array<vec3<u32>, 4>(vec3<u32>(0u, 1u, 0u), vec3<u32>(2u, 3u, 0u), vec3<u32>(0u, 2u, 0u), vec3<u32>(1u, 3u, 0u));
+    if ((cells & 3u) == 3u && ax[y0 * (P.w + 1u) + x0 + 1u] > 0.0) {
+        links[0].z = 1u;
+    }
+    if ((cells & 12u) == 12u && ax[(y0 + 1u) * (P.w + 1u) + x0 + 1u] > 0.0) {
+        links[1].z = 1u;
+    }
+    if ((cells & 5u) == 5u && ay[(y0 + 1u) * P.w + x0] > 0.0) {
+        links[2].z = 1u;
+    }
+    if ((cells & 10u) == 10u && ay[(y0 + 1u) * P.w + x0 + 1u] > 0.0) {
+        links[3].z = 1u;
+    }
+    var best = 0u;
+    var seen = 0u;
+    for (var c0 = 0u; c0 < 4u; c0++) {
+        if (((cells >> c0) & 1u) == 0u || ((seen >> c0) & 1u) != 0u) {
+            continue;
+        }
+        var group = 1u << c0;
+        for (var round = 0u; round < 3u; round++) {
+            for (var e = 0u; e < 4u; e++) {
+                let l = links[e];
+                if (l.z != 0u && (((group >> l.x) & 1u) != 0u || ((group >> l.y) & 1u) != 0u)) {
+                    group |= (1u << l.x) | (1u << l.y);
+                }
+            }
+        }
+        seen |= group;
+        if (countOneBits(group) > countOneBits(best)) {
+            best = group;
+        }
+    }
+    ckind[j * P.cw + i] = k | (best << 4u);
 }
 
 fn any_fluid(a: u32, bb: u32) -> bool {
-    return a != 0u && bb != 0u && (a == FLUID || bb == FLUID);
+    let ka = a & 15u;
+    let kb = bb & 15u;
+    return ka != 0u && kb != 0u && (ka == FLUID || kb == FLUID);
 }
 
 // The coarse edges: the mean of the two fine edges that cross each face (nothing at the border
@@ -276,9 +336,11 @@ fn coarsen_edges(@builtin(global_invocation_id) id: vec3<u32>) {
     if (i <= P.cw && j < P.ch) {
         var v = 0.0;
         if (i >= 1u && i + 1u <= P.cw && any_fluid(ckind[j * P.cw + i - 1u], ckind[j * P.cw + i])) {
+            let ka = ckind[j * P.cw + i - 1u];
+            let kb = ckind[j * P.cw + i];
             for (var dy = 0u; dy < 2u; dy++) {
                 let y = 2u * j + dy;
-                if (y < P.h && 2u * i < P.w) {
+                if (y < P.h && 2u * i < P.w && within(ka, 1u, dy) && within(kb, 0u, dy)) {
                     v += ax[y * (P.w + 1u) + 2u * i];
                 }
             }
@@ -289,9 +351,11 @@ fn coarsen_edges(@builtin(global_invocation_id) id: vec3<u32>) {
     if (i < P.cw && j <= P.ch) {
         var v = 0.0;
         if (j >= 1u && j + 1u <= P.ch && any_fluid(ckind[(j - 1u) * P.cw + i], ckind[j * P.cw + i])) {
+            let ka = ckind[(j - 1u) * P.cw + i];
+            let kb = ckind[j * P.cw + i];
             for (var dx = 0u; dx < 2u; dx++) {
                 let xx = 2u * i + dx;
-                if (xx < P.w && 2u * j < P.h + 1u) {
+                if (xx < P.w && 2u * j < P.h + 1u && within(ka, dx, 1u) && within(kb, dx, 0u)) {
                     v += ay[2u * j * P.w + xx];
                 }
             }
@@ -311,7 +375,7 @@ fn coarsen_diag(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let c = j * P.cw + i;
-    if (ckind[c] != FLUID) {
+    if ((ckind[c] & 15u) != FLUID) {
         cdiag[c] = 0.0;
         return;
     }
@@ -358,7 +422,7 @@ fn residual(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocat
     let c = id.x + P.y0 * P.w;
     var m = 0.0;
     if (c < (P.y0 + P.rows) * P.w) {
-        if (kind[c] == FLUID) {
+        if ((kind[c] & 15u) == FLUID) {
             let v = b[c] - apply_x(c, c % P.w, c / P.w);
             r[c] = v;
             m = abs(v / diag[c]);
@@ -429,7 +493,7 @@ fn apply(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation
     let c = id.x + P.y0 * P.w;
     var d = 0.0;
     if (c < (P.y0 + P.rows) * P.w) {
-        if (kind[c] == FLUID) {
+        if ((kind[c] & 15u) == FLUID) {
             let v = apply_s(c, c % P.w, c / P.w);
             q[c] = v;
             d = s[c] * v;
@@ -465,7 +529,7 @@ fn advance(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocati
     }
     let c = id.x + P.y0 * P.w;
     var m = 0.0;
-    if (c < (P.y0 + P.rows) * P.w && kind[c] == FLUID) {
+    if (c < (P.y0 + P.rows) * P.w && (kind[c] & 15u) == FLUID) {
         let a = sc[SC_ALPHA];
         x[c] += a * s[c];
         let v = r[c] - a * q[c];
@@ -500,7 +564,7 @@ fn undo(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let c = id.x + P.y0 * P.w;
-    if (c < (P.y0 + P.rows) * P.w && kind[c] == FLUID) {
+    if (c < (P.y0 + P.rows) * P.w && (kind[c] & 15u) == FLUID) {
         let a = sc[SC_ALPHA];
         x[c] -= a * s[c];
         r[c] += a * q[c];
@@ -518,7 +582,7 @@ fn dot_rz(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocatio
     }
     let c = id.x + P.y0 * P.w;
     var d = 0.0;
-    if (c < (P.y0 + P.rows) * P.w && kind[c] == FLUID) {
+    if (c < (P.y0 + P.rows) * P.w && (kind[c] & 15u) == FLUID) {
         d = r[c] * z[c];
     }
     reduce_sum(lid.x, wid.x, d);
@@ -544,7 +608,7 @@ fn direction(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let c = id.x + P.y0 * P.w;
     if (c < (P.y0 + P.rows) * P.w) {
-        if (kind[c] == FLUID) {
+        if ((kind[c] & 15u) == FLUID) {
             s[c] = z[c] + sc[SC_BETA] * s[c];
         } else {
             s[c] = 0.0;
@@ -561,16 +625,16 @@ fn direction(@builtin(global_invocation_id) id: vec3<u32>) {
 
 fn f_apply_x(v: Lv, c: u32, xx: u32, y: u32) -> f32 {
     var r = diag[v.oc + c] * x[v.oc + c];
-    if (xx > 0u && kind[v.oc + c - 1u] == FLUID) {
+    if (xx > 0u && (kind[v.oc + c - 1u] & 15u) == FLUID) {
         r -= ax[v.oax + y * (v.w + 1u) + xx] * x[v.oc + c - 1u];
     }
-    if (xx + 1u < v.w && kind[v.oc + c + 1u] == FLUID) {
+    if (xx + 1u < v.w && (kind[v.oc + c + 1u] & 15u) == FLUID) {
         r -= ax[v.oax + y * (v.w + 1u) + xx + 1u] * x[v.oc + c + 1u];
     }
-    if (y > 0u && kind[v.oc + c - v.w] == FLUID) {
+    if (y > 0u && (kind[v.oc + c - v.w] & 15u) == FLUID) {
         r -= ay[v.oay + c] * x[v.oc + c - v.w];
     }
-    if (y + 1u < v.h && kind[v.oc + c + v.w] == FLUID) {
+    if (y + 1u < v.h && (kind[v.oc + c + v.w] & 15u) == FLUID) {
         r -= ay[v.oay + c + v.w] * x[v.oc + c + v.w];
     }
     return r;
@@ -578,16 +642,16 @@ fn f_apply_x(v: Lv, c: u32, xx: u32, y: u32) -> f32 {
 
 fn f_sweep_cell(v: Lv, c: u32, xx: u32, y: u32) {
     var r = b[v.oc + c];
-    if (xx > 0u && kind[v.oc + c - 1u] == FLUID) {
+    if (xx > 0u && (kind[v.oc + c - 1u] & 15u) == FLUID) {
         r += ax[v.oax + y * (v.w + 1u) + xx] * x[v.oc + c - 1u];
     }
-    if (xx + 1u < v.w && kind[v.oc + c + 1u] == FLUID) {
+    if (xx + 1u < v.w && (kind[v.oc + c + 1u] & 15u) == FLUID) {
         r += ax[v.oax + y * (v.w + 1u) + xx + 1u] * x[v.oc + c + 1u];
     }
-    if (y > 0u && kind[v.oc + c - v.w] == FLUID) {
+    if (y > 0u && (kind[v.oc + c - v.w] & 15u) == FLUID) {
         r += ay[v.oay + c] * x[v.oc + c - v.w];
     }
-    if (y + 1u < v.h && kind[v.oc + c + v.w] == FLUID) {
+    if (y + 1u < v.h && (kind[v.oc + c + v.w] & 15u) == FLUID) {
         r += ay[v.oay + c + v.w] * x[v.oc + c + v.w];
     }
     x[v.oc + c] = r / diag[v.oc + c];
@@ -601,7 +665,7 @@ fn f_sweep(v: Lv, colour: u32, lid: u32) {
         let c = first + i;
         let xx = c % v.w;
         let y = c / v.w;
-        if (y < v.h && (xx + y) % 2u == colour && kind[v.oc + c] == FLUID) {
+        if (y < v.h && (xx + y) % 2u == colour && (kind[v.oc + c] & 15u) == FLUID) {
             f_sweep_cell(v, c, xx, y);
         }
     }
@@ -642,7 +706,7 @@ fn vcycle_small(@builtin(local_invocation_id) lid: vec3<u32>) {
                             let y = 2u * j + dy;
                             if (xx < v.w && y < v.h) {
                                 let c = y * v.w + xx;
-                                if (kind[v.oc + c] == FLUID) {
+                                if ((kind[v.oc + c] & 15u) == FLUID && part(kind[u.oc + cc], dx, dy)) {
                                     sum += b[v.oc + c] - f_apply_x(v, c, xx, y);
                                 }
                             }
@@ -675,8 +739,9 @@ fn vcycle_small(@builtin(local_invocation_id) lid: vec3<u32>) {
                 let c = first + i;
                 let xx = c % v.w;
                 let y = c / v.w;
-                if (y < v.h && kind[v.oc + c] == FLUID) {
-                    x[v.oc + c] += x[u.oc + (y / 2u) * u.w + xx / 2u];
+                let cc = u.oc + (y / 2u) * u.w + xx / 2u;
+                if (y < v.h && (kind[v.oc + c] & 15u) == FLUID && part(kind[cc], xx & 1u, y & 1u)) {
+                    x[v.oc + c] += x[cc];
                 }
             }
         }
