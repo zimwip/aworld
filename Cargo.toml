@@ -14,21 +14,34 @@ name = "aworld-serve"
 path = "src/bin/serve.rs"
 
 [dependencies]
-macroquad = { version = "0.4", default-features = false }
 rapier2d = "0.36"
 rayon = "1.12.0"
 
-# Sound (src/sound/out.rs): macroquad's audio everywhere but Linux, where macroquad would link
-# ALSA at build time. Linux has its own mixer and loads ALSA when the game starts instead.
-[target.'cfg(not(target_os = "linux"))'.dependencies]
-macroquad = { version = "0.4", default-features = false, features = ["audio"] }
-
-# The pressure of the liquids on the GPU (src/world/mgpcg_gpu.rs): wgpu reaches Vulkan, Metal and
-# DirectX 12 on the desktop. (In the browser it will come with WebGPU, once the game draws with
-# wgpu as well; until then the web build solves on the CPU.)
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-wgpu = "24"
+# The window and its events (src/gfx): winit. Every pixel, and the liquids' computations
+# (src/world/mgpcg_gpu.rs), on one wgpu device: Vulkan, Metal and DirectX 12 on the desktop.
+winit = "0.30"
+wgpu = { version = "24", features = ["webgl", "fragile-send-sync-non-atomic-wasm"] }
 pollster = "0.4"
+web-time = "1"
+glam = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+# The letters of the font, rasterized into the text atlas.
+fontdue = "0.9"
+# Screenshots (--demo).
+png = "0.17"
+
+# Sound (src/sound/out.rs): one mixer everywhere. cpal plays it on Windows, macOS and the web;
+# on Linux cpal would link ALSA at build time, so Linux loads ALSA when the game starts instead.
+[target.'cfg(not(any(target_os = "linux", target_arch = "wasm32")))'.dependencies]
+cpal = "0.15"
+
+# The web build: the page's canvas, its event loop and WebAudio. `wasm-bindgen` is pinned: the
+# `wasm-bindgen` command that build.sh runs must be the same version.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+cpal = { version = "0.15", features = ["wasm-bindgen"] }
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Document", "Element", "HtmlCanvasElement", "Window", "EventTarget"] }
 
 [features]
 default = ["sound"]

@@ -1,6 +1,5 @@
 //! Immediate-mode widgets: big friendly buttons with drawn icons.
 
-use crate::gfx::{BlendFactor, BlendState, BlendValue, Equation, PipelineParams};
 use crate::gfx::*;
 
 pub const BG: Color = Color::new(0.075, 0.085, 0.13, 1.0);
@@ -79,65 +78,30 @@ pub struct Ui {
 const FADED: f32 = 0.28;
 
 /// The windows drawn off screen first, so that the one under a stroke can be laid down
-/// see-through. The target keeps premultiplied colours: windows are themselves see-through
-/// in places, and blending them over nothing must not darken them.
+/// see-through. The target keeps premultiplied colours (the alpha of what is drawn into it adds
+/// up as coverage, see `Blend::Alpha`): windows are themselves see-through in places, and blending
+/// them over nothing must not darken them.
 struct Veil {
     target: RenderTarget,
     size: (u32, u32),
-    draw: Material,
     show: Material,
 }
 
-const VEIL_VERT: &str = "#version 100
-attribute vec3 position;
-attribute vec2 texcoord;
-attribute vec4 color0;
-varying lowp vec2 uv;
-varying lowp vec4 color;
-uniform mat4 Model;
-uniform mat4 Projection;
-void main() {
-    gl_Position = Projection * Model * vec4(position, 1.0);
-    color = color0 / 255.0;
-    uv = texcoord;
-}";
-
-// Drawing a window: straight colours, written premultiplied.
-const VEIL_DRAW: &str = "#version 100
-precision mediump float;
-varying lowp vec2 uv;
-varying lowp vec4 color;
-uniform sampler2D Texture;
-void main() {
-    gl_FragColor = texture2D(Texture, uv) * color;
-}";
-
 // Laying the target down: already premultiplied, so the fade scales all four channels.
-const VEIL_SHOW: &str = "#version 100
-precision mediump float;
-varying lowp vec2 uv;
-varying lowp vec4 color;
-uniform sampler2D Texture;
-void main() {
-    gl_FragColor = texture2D(Texture, uv) * color.a;
+const VEIL_SHOW: &str = "
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return tex(in.uv) * in.color.a;
 }";
 
 impl Veil {
     fn new(w: u32, h: u32) -> Veil {
-        let straight = BlendState::new(Equation::Add, BlendFactor::Value(BlendValue::SourceAlpha), BlendFactor::OneMinusValue(BlendValue::SourceAlpha));
-        let premul = BlendState::new(Equation::Add, BlendFactor::One, BlendFactor::OneMinusValue(BlendValue::SourceAlpha));
-        let material = |frag: &str, color: BlendState| {
-            load_material(
-                ShaderSource::Glsl { vertex: VEIL_VERT, fragment: frag },
-                MaterialParams { pipeline_params: PipelineParams { color_blend: Some(color), alpha_blend: Some(premul), ..Default::default() }, ..Default::default() },
-            )
-            .expect("veil shader")
-        };
-        Veil { target: Veil::target(w, h), size: (w, h), draw: material(VEIL_DRAW, straight), show: material(VEIL_SHOW, premul) }
+        let show = load_material(VEIL_SHOW, MaterialParams { blend: Blend::Premultiplied, ..Default::default() }).expect("veil shader");
+        Veil { target: Veil::target(w, h), size: (w, h), show }
     }
 
     fn target(w: u32, h: u32) -> RenderTarget {
-        let t = render_target(w.max(1), h.max(1));
+        let t = render_target_scaled(w.max(1) as f32, h.max(1) as f32, dpi_scale());
         t.texture.set_filter(FilterMode::Nearest);
         t
     }
@@ -482,13 +446,8 @@ impl Ui {
             veil.target = Veil::target(size.0, size.1);
             veil.size = size;
         }
-        let mut camera = Camera2D::from_display_rect(Rect::new(0.0, 0.0, w, h));
-        // Upside down, so that the target reads the right way up once laid on the screen.
-        camera.zoom.y = -camera.zoom.y;
-        camera.render_target = Some(veil.target.clone());
-        set_camera(&camera);
+        set_target(Some(&veil.target));
         clear_background(Color::new(0.0, 0.0, 0.0, 0.0));
-        gl_use_material(&veil.draw);
     }
 
     /// Call after drawing the windows: lays them on the screen, the one under the stroke faded.
@@ -496,13 +455,14 @@ impl Ui {
         let Some(veil) = self.veil.as_ref().filter(|_| self.fade > 0.0) else {
             return;
         };
-        set_default_camera();
+        set_target(None);
         gl_use_material(&veil.show);
         let (w, h) = (screen_width(), screen_height());
         let f = self.fade_rect;
         let (x0, y0) = (f.x.clamp(0.0, w), f.y.clamp(0.0, h));
         let (x1, y1) = ((f.x + f.w).clamp(0.0, w), (f.y + f.h).clamp(0.0, h));
         let faded = 1.0 - (1.0 - FADED) * self.fade;
+        let k = veil.target.scale;
         // Around the faded window (as four bands), then the window itself.
         let pieces = [
             (Rect::new(0.0, 0.0, w, y0), 1.0),
@@ -515,7 +475,7 @@ impl Ui {
             if r.w <= 0.0 || r.h <= 0.0 {
                 continue;
             }
-            draw_texture_ex(&veil.target.texture, r.x, r.y, Color::new(1.0, 1.0, 1.0, a), DrawTextureParams { dest_size: Some(r.size()), source: Some(r), ..Default::default() });
+            draw_texture_ex(&veil.target.texture, r.x, r.y, Color::new(1.0, 1.0, 1.0, a), DrawTextureParams { dest_size: Some(r.size()), source: Some(Rect::new(r.x * k, r.y * k, r.w * k, r.h * k)), ..Default::default() });
         }
         gl_use_default_material();
     }

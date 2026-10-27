@@ -27,13 +27,19 @@ case "$mode" in
       echo "Installation de la cible wasm32-unknown-unknown..."
       rustup target add wasm32-unknown-unknown || { echo "Échec : lance « rustup target add wasm32-unknown-unknown »." >&2; exit 1; }
     fi
+    # The glue between the page and the game: the same version as the wasm-bindgen of Cargo.toml.
+    wbg=$(sed -n 's/^wasm-bindgen = "=\(.*\)"$/\1/p' Cargo.toml)
+    if [ "$(wasm-bindgen --version 2>/dev/null | cut -d' ' -f2)" != "$wbg" ]; then
+      echo "Installation de wasm-bindgen $wbg (une seule fois)..."
+      cargo install wasm-bindgen-cli --version "$wbg" --locked || { echo "Échec : lance « cargo install wasm-bindgen-cli --version $wbg »." >&2; exit 1; }
+    fi
     cargo build --release --target wasm32-unknown-unknown --bin aworld
     cargo build --release --bin aworld-serve
     out=dist/web
     rm -rf "$out"
     mkdir -p "$out/site"
-    cp web/index.html web/mq_js_bundle.js "$out/site/"
-    cp target/wasm32-unknown-unknown/release/aworld.wasm "$out/site/"
+    cp web/index.html "$out/site/"
+    wasm-bindgen --target web --no-typescript --out-dir "$out/site" target/wasm32-unknown-unknown/release/aworld.wasm
     cp target/release/aworld-serve "$out/"
     cp web/serve.sh web/serve.bat "$out/"
     chmod +x "$out/serve.sh" "$out/aworld-serve"

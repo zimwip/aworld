@@ -4,7 +4,6 @@ use crate::blocks::{Block, BlockKind, Member, MemberMat, Spring, SpringKind, STU
 use crate::car::{Car, ModelKind};
 use crate::world::sleep::{CH, CS, CW};
 use crate::world::{Kind, Mat, World, H, W};
-use crate::gfx::{BlendFactor, BlendState, BlendValue, Equation, PipelineParams};
 use crate::gfx::*;
 use rayon::prelude::*;
 
@@ -44,159 +43,150 @@ impl View {
     }
 }
 
-const VERT: &str = "#version 100
-attribute vec3 position;
-attribute vec2 texcoord;
-attribute vec4 color0;
-varying lowp vec2 uv;
-uniform mat4 Model;
-uniform mat4 Projection;
-void main() {
-    gl_Position = Projection * Model * vec4(position, 1.0);
-    uv = texcoord;
-}";
-
 // The texture is premultiplied RGBA. Bright orange cells (fire, lava, embers)
 // bloom into their surroundings; every solid gets a light top edge.
 // `Light` is the light map (see `light_map`): its green channel is the hot air, which bends the
 // light passing through it, so everything seen through it wobbles (heat haze); its blue channel
 // is the shadow of the clouds, which dims the sunlit world under them.
 // `sky` is (sun x, sun strength, moon x, moon strength), x from 0 to 1 across the world.
-const FRAG: &str = "#version 100
-precision highp float;
-varying vec2 uv;
-uniform sampler2D Texture;
-uniform sampler2D Light;
-uniform vec2 texel;
-uniform float time;
-uniform vec4 sky;
-float hash(vec2 p) {
-    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+const FRAG: &str = "
+struct Params { texel: vec2<f32>, time: f32, sky: vec4<f32> }
+@group(2) @binding(0) var<uniform> params: Params;
+@group(2) @binding(1) var Light: texture_2d<f32>;
+@group(2) @binding(2) var Light_sampler: sampler;
+fn light(uv: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(Light, Light_sampler, uv, 0.0);
+}
+fn hash(p: vec2<f32>) -> f32 {
+    return fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
 }
 // Smooth value noise and two octaves of it: soft blobs with no grid in them.
-float vnoise(vec2 p) {
-    vec2 i = floor(p);
-    vec2 f = fract(p);
+fn vnoise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    var f = fract(p);
     f = f * f * (3.0 - 2.0 * f);
-    return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+    return mix(mix(hash(i), hash(i + vec2<f32>(1.0, 0.0)), f.x), mix(hash(i + vec2<f32>(0.0, 1.0)), hash(i + vec2<f32>(1.0, 1.0)), f.x), f.y);
 }
-float fbm(vec2 p) {
-    return 0.65 * vnoise(p) + 0.35 * vnoise(p * 2.3 + vec2(17.0, 9.0));
+fn fbm(p: vec2<f32>) -> f32 {
+    return 0.65 * vnoise(p) + 0.35 * vnoise(p * 2.3 + vec2<f32>(17.0, 9.0));
 }
-void main() {
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let uv = in.uv;
+    let texel = params.texel;
+    let time = params.time;
+    let sky = params.sky;
     // Heat haze: hot air shifts what is seen through it. The light map is coarse (a texel per six
     // cells), so it is blurred into a soft mask first, a little more from below so the haze sits
     // over the source. The shift itself is turbulence: smooth noise that rises with the warm air
     // and is itself bent by slower noise (domain warping), so it swirls and wavers instead of
     // marching in straight rows.
-    vec2 lt = texel * 6.0;
-    float heat = 0.3 * texture2D(Light, uv).g
-        + 0.2 * texture2D(Light, uv + vec2(0.0, lt.y)).g
-        + 0.15 * (texture2D(Light, uv + vec2(lt.x, 0.0)).g + texture2D(Light, uv - vec2(lt.x, 0.0)).g)
-        + 0.1 * (texture2D(Light, uv - vec2(0.0, lt.y)).g + texture2D(Light, uv + vec2(0.0, 2.0 * lt.y)).g);
+    let lt = texel * 6.0;
+    var heat = 0.3 * light(uv).g
+        + 0.2 * light(uv + vec2<f32>(0.0, lt.y)).g
+        + 0.15 * (light(uv + vec2<f32>(lt.x, 0.0)).g + light(uv - vec2<f32>(lt.x, 0.0)).g)
+        + 0.1 * (light(uv - vec2<f32>(0.0, lt.y)).g + light(uv + vec2<f32>(0.0, 2.0 * lt.y)).g);
     heat = smoothstep(0.05, 0.9, heat);
-    vec2 cellf = uv / texel;
-    vec2 p = uv;
-    float shim = 0.0;
+    let cellf = uv / texel;
+    var p = uv;
+    var shim = 0.0;
     if (heat > 0.0) {
-        vec2 q = cellf * vec2(0.09, 0.07) + vec2(0.0, time * 1.4);
-        vec2 w = vec2(fbm(q * 0.45 + vec2(time * 0.35, 0.0)), fbm(q * 0.45 + vec2(5.2, 1.3 - time * 0.25)));
-        vec2 r = q + (w - 0.5) * 2.6;
-        vec2 d = vec2(fbm(r), fbm(r + vec2(8.3, 2.8))) - 0.5;
-        p = uv + d * vec2(1.6, 0.9) * texel * heat;
-        shim = fbm(r * 1.8 + vec2(3.1, 0.0)) - 0.5;
+        let q = cellf * vec2<f32>(0.09, 0.07) + vec2<f32>(0.0, time * 1.4);
+        let w = vec2<f32>(fbm(q * 0.45 + vec2<f32>(time * 0.35, 0.0)), fbm(q * 0.45 + vec2<f32>(5.2, 1.3 - time * 0.25)));
+        let r = q + (w - 0.5) * 2.6;
+        let d = vec2<f32>(fbm(r), fbm(r + vec2<f32>(8.3, 2.8))) - 0.5;
+        p = uv + d * vec2<f32>(1.6, 0.9) * texel * heat;
+        shim = fbm(r * 1.8 + vec2<f32>(3.1, 0.0)) - 0.5;
     }
-    vec4 c = texture2D(Texture, p);
-    vec3 glow = vec3(0.0);
-    float wsum = 0.0;
-    for (int i = -3; i <= 3; i++) {
-        for (int j = -3; j <= 3; j++) {
-            vec4 s = texture2D(Texture, p + vec2(float(i), float(j)) * texel * 1.6);
-            float e = step(0.93, s.r) * step(s.b, 0.3) * step(0.5, s.a);
-            float w = 1.0 / (1.0 + float(i * i + j * j));
+    var c = tex(p);
+    var glow = vec3<f32>(0.0);
+    var wsum = 0.0;
+    for (var i: i32 = -3; i <= 3; i++) {
+        for (var j: i32 = -3; j <= 3; j++) {
+            let s = tex(p + vec2<f32>(f32(i), f32(j)) * texel * 1.6);
+            let e = step(0.93, s.r) * step(s.b, 0.3) * step(0.5, s.a);
+            let w = 1.0 / (1.0 + f32(i * i + j * j));
             glow += s.rgb * e * w;
             wsum += w;
         }
     }
     glow = glow / wsum;
-    vec4 up = texture2D(Texture, p - vec2(0.0, texel.y));
-    float edge = c.a * (1.0 - up.a);
+    let up = tex(p - vec2<f32>(0.0, texel.y));
+    let edge = c.a * (1.0 - up.a);
     // Water shimmers and embers, lava and flames flicker: a noise per cell that changes twenty
     // times a second, so the texture itself only changes where the cells do.
-    vec2 cell = floor(p / texel);
-    float n = fract(sin(dot(cell, vec2(12.9898, 78.233)) + floor(time * 20.0) * 3.7) * 43758.5453) - 0.5;
-    float water = step(0.78, c.a) * step(c.a, 0.83) * step(c.r, c.b);
-    float hot = step(0.93, c.r) * step(c.b, 0.3) * step(0.5, c.a);
+    let cell = floor(p / texel);
+    let n = fract(sin(dot(cell, vec2<f32>(12.9898, 78.233)) + floor(time * 20.0) * 3.7) * 43758.5453) - 0.5;
+    let water = step(0.78, c.a) * step(c.a, 0.83) * step(c.r, c.b);
+    let hot = step(0.93, c.r) * step(c.b, 0.3) * step(0.5, c.a);
     c.g += n * (0.06 * water + 0.36 * hot) * c.a;
-    vec3 rgb = c.rgb + vec3(0.18) * edge * c.a + glow * 2.2;
+    var rgb = c.rgb + vec3<f32>(0.18) * edge * c.a + glow * 2.2;
     // Cloud shadow: by day, what lies under a cloud (seen from the sun) is in the shade.
-    float shade = texture2D(Light, uv).b * sky.y;
+    let shade = light(uv).b * sky.y;
     rgb *= 1.0 - 0.45 * shade;
     // Glints: the little waves of the top few rows of water catch the sun (or the moon) and flash,
     // most of all under the sun, the way a lake sparkles.
-    float a1 = texture2D(Texture, p - vec2(0.0, texel.y)).a;
-    float a2 = texture2D(Texture, p - vec2(0.0, texel.y * 3.0)).a;
-    float a3 = texture2D(Texture, p - vec2(0.0, texel.y * 6.0)).a;
-    float surf = water * max(max(step(a1, 0.05), 0.75 * step(a2, 0.05)), 0.4 * step(a3, 0.05));
+    let a1 = tex(p - vec2<f32>(0.0, texel.y)).a;
+    let a2 = tex(p - vec2<f32>(0.0, texel.y * 3.0)).a;
+    let a3 = tex(p - vec2<f32>(0.0, texel.y * 6.0)).a;
+    let surf = water * max(max(step(a1, 0.05), 0.75 * step(a2, 0.05)), 0.4 * step(a3, 0.05));
     if (surf > 0.0) {
-        float lit = sky.y * (1.0 - shade) * (0.35 + 0.65 * exp(-abs(uv.x - sky.x) * 4.0)) + 0.6 * sky.w * exp(-abs(uv.x - sky.z) * 6.0);
+        let lit = sky.y * (1.0 - shade) * (0.35 + 0.65 * exp(-abs(uv.x - sky.x) * 4.0)) + 0.6 * sky.w * exp(-abs(uv.x - sky.z) * 6.0);
         // A glint is a short horizontal streak: a wave face a few cells wide catching the light.
-        vec2 facet = vec2(floor(cell.x / 3.0), cell.y);
-        float t = time * 3.0 + hash(facet) * 9.0;
-        float g = hash(facet + floor(t) * vec2(7.13, 3.71));
-        float flash = smoothstep(0.86, 1.0, g) * (1.0 - fract(t));
-        float wave = 0.5 + 0.5 * sin(cell.x * 0.5 + time * 3.0 + sin(cell.x * 0.13 - time));
-        rgb += vec3(1.0, 0.97, 0.86) * surf * lit * (flash * 2.4 + wave * 0.16);
+        let facet = vec2<f32>(floor(cell.x / 3.0), cell.y);
+        let t = time * 3.0 + hash(facet) * 9.0;
+        let g = hash(facet + floor(t) * vec2<f32>(7.13, 3.71));
+        let flash = smoothstep(0.86, 1.0, g) * (1.0 - fract(t));
+        let wave = 0.5 + 0.5 * sin(cell.x * 0.5 + time * 3.0 + sin(cell.x * 0.13 - time));
+        rgb += vec3<f32>(1.0, 0.97, 0.86) * surf * lit * (flash * 2.4 + wave * 0.16);
     }
-    float a = max(c.a, clamp(length(glow) * 2.0, 0.0, 1.0));
+    var a = max(c.a, clamp(length(glow) * 2.0, 0.0, 1.0));
     // Flames: tongues of fire dance above the burning cells. The light map's red is how much fire
     // each square holds; read a little below this point, through a column that sways with slow
     // noise, it fades smoothly upwards from the top of the fire. Turbulent noise rising through it
     // tears it into licks that flare and die, taller in some places than others. Yellow-white at
     // the foot, orange, then red at the tips.
     if (c.a < 0.5) {
-        float sway = (fbm(vec2(cellf.y * 0.1 - time * 2.0, cellf.x * 0.05)) - 0.5) * 7.0 * texel.x;
-        vec2 b = uv + vec2(sway, lt.y * 1.1);
-        float fire = 0.5 * texture2D(Light, b).r + 0.25 * (texture2D(Light, b + vec2(lt.x * 0.5, 0.0)).r + texture2D(Light, b - vec2(lt.x * 0.5, 0.0)).r);
+        let sway = (fbm(vec2<f32>(cellf.y * 0.1 - time * 2.0, cellf.x * 0.05)) - 0.5) * 7.0 * texel.x;
+        let b = uv + vec2<f32>(sway, lt.y * 1.1);
+        let fire = 0.5 * light(b).r + 0.25 * (light(b + vec2<f32>(lt.x * 0.5, 0.0)).r + light(b - vec2<f32>(lt.x * 0.5, 0.0)).r);
         if (fire > 0.02) {
-            float n = fbm(vec2(cellf.x * 0.3 + sway / texel.x * 0.1, cellf.y * 0.2 + time * 4.5));
-            float tall = fbm(vec2(cellf.x * 0.12 - time * 0.4, time * 1.3));
-            float v = fire * (0.9 + 0.9 * tall) - 0.35 + (n - 0.5) * 1.0;
+            let n = fbm(vec2<f32>(cellf.x * 0.3 + sway / texel.x * 0.1, cellf.y * 0.2 + time * 4.5));
+            let tall = fbm(vec2<f32>(cellf.x * 0.12 - time * 0.4, time * 1.3));
+            let v = fire * (0.9 + 0.9 * tall) - 0.35 + (n - 0.5) * 1.0;
             // Flames give off light: their colours run past white into the glow, and a soft
             // orange halo spills round each tongue.
-            float fa = smoothstep(0.0, 0.2, v) * 0.95;
-            vec3 col = mix(vec3(1.0, 0.42, 0.08), vec3(1.0, 0.72, 0.18), smoothstep(0.05, 0.35, v));
-            col = mix(col, vec3(1.0, 0.97, 0.7), smoothstep(0.4, 0.8, v)) * (1.15 + 0.5 * smoothstep(0.3, 0.9, v));
-            float halo = smoothstep(-0.35, 0.05, v) * (1.0 - fa) * 0.45 * smoothstep(0.1, 0.5, fire);
-            rgb = rgb * (1.0 - fa) + col * min(fa * 1.6, 1.0) + vec3(1.0, 0.55, 0.15) * halo;
+            let fa = smoothstep(0.0, 0.2, v) * 0.95;
+            var col = mix(vec3<f32>(1.0, 0.42, 0.08), vec3<f32>(1.0, 0.72, 0.18), smoothstep(0.05, 0.35, v));
+            col = mix(col, vec3<f32>(1.0, 0.97, 0.7), smoothstep(0.4, 0.8, v)) * (1.15 + 0.5 * smoothstep(0.3, 0.9, v));
+            let halo = smoothstep(-0.35, 0.05, v) * (1.0 - fa) * 0.45 * smoothstep(0.1, 0.5, fire);
+            rgb = rgb * (1.0 - fa) + col * min(fa * 1.6, 1.0) + vec3<f32>(1.0, 0.55, 0.15) * halo;
             a = a + (fa + halo * 0.6) * (1.0 - a);
         }
     }
     // In clear air the haze shows itself as faint bright and dark swirls.
-    float rip = shim * heat * 0.05 * (1.0 - a);
-    gl_FragColor = vec4(rgb + vec3(max(rip, 0.0)), a + max(-rip, 0.0));
+    let rip = shim * heat * 0.05 * (1.0 - a);
+    return vec4<f32>(rgb + vec3<f32>(max(rip, 0.0)), a + max(-rip, 0.0));
 }";
 
 // At night a bluish veil covers the picture, except where fire, embers and lava light it: the light
 // map's alpha (one texel per `LS` cells, already blurred, see `night_pool`) is a wide, flickering
 // warm pool of light.
-const NIGHT_FRAG: &str = "#version 100
-precision highp float;
-varying vec2 uv;
-uniform sampler2D Texture;
-uniform vec2 texel;
-uniform float time;
-uniform float night;
-void main() {
-    float l = texture2D(Texture, uv).a;
+const NIGHT_FRAG: &str = "
+struct Params { texel: vec2<f32>, time: f32, night: f32 }
+@group(2) @binding(0) var<uniform> params: Params;
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let uv = in.uv;
+    var l = tex(uv).a;
     // The flames dancing above a fire are lights themselves: no veil over them.
-    float flames = max(texture2D(Texture, uv + vec2(0.0, texel.y)).r, texture2D(Texture, uv + vec2(0.0, 2.0 * texel.y)).r * 0.8);
+    let flames = max(tex(uv + vec2<f32>(0.0, params.texel.y)).r, tex(uv + vec2<f32>(0.0, 2.0 * params.texel.y)).r * 0.8);
     l = max(l, flames);
-    l *= 0.88 + 0.08 * sin(time * 13.0 + uv.x * 40.0) + 0.06 * sin(time * 23.0 - uv.y * 30.0);
+    l *= 0.88 + 0.08 * sin(params.time * 13.0 + uv.x * 40.0) + 0.06 * sin(params.time * 23.0 - uv.y * 30.0);
     l = clamp(l, 0.0, 1.0);
-    float a = 0.46 * night * (1.0 - 0.9 * l);
-    vec3 warm = vec3(1.0, 0.56, 0.22) * l * 0.4 * night;
-    gl_FragColor = vec4(vec3(0.02, 0.05, 0.2) * a + warm, a);
+    let a = 0.46 * params.night * (1.0 - 0.9 * l);
+    let warm = vec3<f32>(1.0, 0.56, 0.22) * l * 0.4 * params.night;
+    return vec4<f32>(vec3<f32>(0.02, 0.05, 0.2) * a + warm, a);
 }";
 
 // Clouds and steam are drawn from a density layer, blurred once per change into a smooth field
@@ -206,111 +196,95 @@ void main() {
 // `dusk` is (twilight strength, x of the low sun from 0 to 1): at sunrise and sunset the sun shines
 // from below the clouds, so their undersides and the edges facing it glow gold and rose while
 // their tops fall into a lavender shade.
-const GAS_FRAG: &str = "#version 100
-precision highp float;
-varying vec2 uv;
-uniform sampler2D Texture;
-uniform vec2 texel;
-uniform vec2 dusk;
-float dens(vec2 p) {
-    return texture2D(Texture, p).a;
+const GAS_FRAG: &str = "
+struct Params { texel: vec2<f32>, dusk: vec2<f32> }
+@group(2) @binding(0) var<uniform> params: Params;
+fn dens(p: vec2<f32>) -> f32 {
+    return tex(p).a;
 }
-void main() {
-    float d = dens(uv);
-    float a = smoothstep(0.16, 0.52, d);
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let uv = in.uv;
+    let texel = params.texel;
+    let dusk = params.dusk;
+    let d = dens(uv);
+    let a = smoothstep(0.16, 0.52, d);
     if (a <= 0.003) {
-        gl_FragColor = vec4(0.0);
-        return;
+        return vec4<f32>(0.0);
     }
-    float up = dens(uv - vec2(0.0, texel.y * 6.0));
-    float dn = dens(uv + vec2(0.0, texel.y * 6.0));
-    float lightness = clamp(0.88 + (up - dn) * 0.9, 0.7, 1.08);
-    vec3 col = vec3(0.97, 0.98, 1.0) * lightness;
+    let up = dens(uv - vec2<f32>(0.0, texel.y * 6.0));
+    let dn = dens(uv + vec2<f32>(0.0, texel.y * 6.0));
+    let lightness = clamp(0.88 + (up - dn) * 0.9, 0.7, 1.08);
+    var col = vec3<f32>(0.97, 0.98, 1.0) * lightness;
     if (dusk.x > 0.01) {
-        float under = clamp((d - dn) * 4.0, 0.0, 1.0);
-        float toward = uv.x < dusk.y ? 1.0 : -1.0;
-        float side = dens(uv + vec2(toward * texel.x * 8.0, 0.0));
-        float facing = clamp((d - side) * 2.5, 0.0, 1.0);
-        float near = exp(-abs(uv.x - dusk.y) * 2.5);
-        vec3 warm = mix(vec3(0.98, 0.46, 0.5), vec3(1.0, 0.72, 0.36), near);
-        col = mix(col, vec3(0.56, 0.5, 0.7) * lightness, dusk.x * 0.75);
+        let under = clamp((d - dn) * 4.0, 0.0, 1.0);
+        let toward = select(-1.0, 1.0, uv.x < dusk.y);
+        let side = dens(uv + vec2<f32>(toward * texel.x * 8.0, 0.0));
+        let facing = clamp((d - side) * 2.5, 0.0, 1.0);
+        let near = exp(-abs(uv.x - dusk.y) * 2.5);
+        let warm = mix(vec3<f32>(0.98, 0.46, 0.5), vec3<f32>(1.0, 0.72, 0.36), near);
+        col = mix(col, vec3<f32>(0.56, 0.5, 0.7) * lightness, dusk.x * 0.75);
         col = mix(col, warm * 1.05, clamp(0.35 * near + 1.1 * under + 0.7 * facing, 0.0, 0.9) * dusk.x);
     }
-    float alpha = a * 0.86;
-    gl_FragColor = vec4(col * alpha, alpha);
+    let alpha = a * 0.86;
+    return vec4<f32>(col * alpha, alpha);
 }";
 
 // One pass of the gas blur: a Gaussian along `dir` (one texel across, or one down), σ ≈ 3.7
 // cells, the two passes together the same bell as the blur the clouds always had. The density
 // is the alpha; the result is written as is (no blending) into the field.
-const GAS_BLUR: &str = "#version 100
-precision highp float;
-varying vec2 uv;
-uniform sampler2D Texture;
-uniform vec2 dir;
-void main() {
-    float d = 0.0;
-    float ws = 0.0;
-    for (int i = -9; i <= 9; i++) {
-        float w = exp(-float(i * i) / 28.0);
-        d += texture2D(Texture, uv + dir * float(i)).a * w;
+const GAS_BLUR: &str = "
+struct Params { dir: vec2<f32> }
+@group(2) @binding(0) var<uniform> params: Params;
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    var d = 0.0;
+    var ws = 0.0;
+    for (var i: i32 = -9; i <= 9; i++) {
+        let w = exp(-f32(i * i) / 28.0);
+        d += tex(in.uv + params.dir * f32(i)).a * w;
         ws += w;
     }
-    gl_FragColor = vec4(d / ws);
+    return vec4<f32>(d / ws);
 }";
 
-// Drops of water: each is a quad along its flight, texcoord in units of the drop's radius: x from
-// the middle of the round head back along the tail, y across. The vertex colour's red is the
-// tail's length (in radii, over 16), its green the size of a pixel (in radii), its alpha the
-// drop's opacity.
-const RAIN_VERT: &str = "#version 100
-attribute vec3 position;
-attribute vec2 texcoord;
-attribute vec4 color0;
-varying highp vec2 uv;
-varying mediump vec4 col;
-uniform mat4 Model;
-uniform mat4 Projection;
-void main() {
-    gl_Position = Projection * Model * vec4(position, 1.0);
-    uv = texcoord;
-    col = color0 / 255.0;
-}";
-
-// A cartoon drop: a round head, a tail tapering to a point behind it, a darker rim, a glint.
-const RAIN_FRAG: &str = "#version 100
-precision highp float;
-varying highp vec2 uv;
-varying mediump vec4 col;
-void main() {
-    float px = col.g;
-    float len = col.r * 16.0;
-    float a = uv.x;
-    float b = abs(uv.y);
+// Drops of water: each is a quad along its flight, `uv` in units of the drop's radius: x from the
+// middle of the round head back along the tail, y across. The vertex colour's red is the tail's
+// length (in radii, over 16), its green the size of a pixel (in radii), its alpha the drop's
+// opacity. A cartoon drop: a round head, a tail tapering to a point behind it, a darker rim, a
+// glint.
+const RAIN_FRAG: &str = "
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let uv = in.uv;
+    let px = in.color.g;
+    let len = in.color.r * 16.0;
+    let a = uv.x;
+    let b = abs(uv.y);
     // Signed distance to the outline, in radii (negative inside).
-    float dist;
+    var dist: f32;
     if (a <= 0.0) {
         dist = length(uv) - 1.0;
     } else {
-        float t = clamp(a / len, 0.0, 1.0);
-        float hw = pow(1.0 - t, 1.4);
+        let t = clamp(a / len, 0.0, 1.0);
+        let hw = pow(1.0 - t, 1.4);
         dist = (b - hw) * 0.85;
     }
-    float r = 1.0 / px;
-    float cover = clamp(0.5 - dist * r, 0.0, 1.0);
+    let r = 1.0 / px;
+    let cover = clamp(0.5 - dist * r, 0.0, 1.0);
     if (cover <= 0.0) {
         discard;
     }
-    vec3 body = vec3(0.42, 0.66, 0.98);
-    vec3 rim = vec3(0.16, 0.36, 0.78);
-    vec3 c = mix(body, rim, smoothstep(-0.38, -0.12, dist));
+    let body = vec3<f32>(0.42, 0.66, 0.98);
+    let rim = vec3<f32>(0.16, 0.36, 0.78);
+    var c = mix(body, rim, smoothstep(-0.38, -0.12, dist));
     // The glint, on the head, a little to one side.
-    float g = 1.0 - smoothstep(0.12, 0.32, length(uv - vec2(-0.25, -0.35)));
-    c = mix(c, vec3(0.95, 0.98, 1.0), g * 0.9);
+    let g = 1.0 - smoothstep(0.12, 0.32, length(uv - vec2<f32>(-0.25, -0.35)));
+    c = mix(c, vec3<f32>(0.95, 0.98, 1.0), g * 0.9);
     // The tail fades out toward its tip.
-    float fade = a > 0.0 ? 1.0 - 0.55 * clamp(a / len, 0.0, 1.0) : 1.0;
-    float alpha = cover * fade * col.a;
-    gl_FragColor = vec4(c * alpha, alpha);
+    let fade = select(1.0, 1.0 - 0.55 * clamp(a / len, 0.0, 1.0), a > 0.0);
+    let alpha = cover * fade * in.color.a;
+    return vec4<f32>(c * alpha, alpha);
 }";
 
 /// What the world picture shows.
@@ -327,38 +301,22 @@ pub enum RenderMode {
 // Lightning: each segment of a bolt is a quad whose texcoord y runs from -1 to 1 across it. A thin
 // white-hot core, a violet-blue glow round it and a wide faint halo; the vertex colour's alpha is
 // the brightness, and the wide halo quads (texcoord x = 1) light up the air and the clouds.
-const BOLT_VERT: &str = "#version 100
-attribute vec3 position;
-attribute vec2 texcoord;
-attribute vec4 color0;
-varying lowp vec2 uv;
-varying lowp vec4 col;
-uniform mat4 Model;
-uniform mat4 Projection;
-void main() {
-    gl_Position = Projection * Model * vec4(position, 1.0);
-    uv = texcoord;
-    col = color0 / 255.0;
-}";
-
-const BOLT_FRAG: &str = "#version 100
-precision mediump float;
-varying lowp vec2 uv;
-varying lowp vec4 col;
-void main() {
-    float d = abs(uv.y);
-    vec3 c;
-    if (uv.x > 0.5) {
+const BOLT_FRAG: &str = "
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let d = abs(in.uv.y);
+    var c: vec3<f32>;
+    if (in.uv.x > 0.5) {
         // Halo: the air and the clouds round the channel lit up.
-        float h = exp(-d * d * 3.5) * (1.0 - d);
-        c = vec3(0.45, 0.5, 0.95) * h * 0.5;
+        let h = exp(-d * d * 3.5) * (1.0 - d);
+        c = vec3<f32>(0.45, 0.5, 0.95) * h * 0.5;
     } else {
-        float core = exp(-d * d * 120.0);
-        float glow = exp(-d * d * 9.0) * 0.6 + exp(-d * 3.5) * 0.3;
-        c = vec3(1.0, 0.98, 1.0) * core * 1.6 + vec3(0.62, 0.55, 1.0) * glow;
+        let core = exp(-d * d * 120.0);
+        let glow = exp(-d * d * 9.0) * 0.6 + exp(-d * 3.5) * 0.3;
+        c = vec3<f32>(1.0, 0.98, 1.0) * core * 1.6 + vec3<f32>(0.62, 0.55, 1.0) * glow;
     }
-    c *= col.a * col.rgb;
-    gl_FragColor = vec4(c, 0.0);
+    c *= in.color.a * in.color.rgb;
+    return vec4<f32>(c, 0.0);
 }";
 
 /// A bolt of lightning being shown: its shape and how long ago it struck (seconds).
@@ -576,11 +534,11 @@ impl Renderer {
         let image = Image::gen_image_color(W() as u16, H() as u16, Color::new(0.0, 0.0, 0.0, 0.0));
         let texture = Texture2D::from_image(&image);
         texture.set_filter(FilterMode::Linear);
-        let blend = BlendState::new(Equation::Add, BlendFactor::One, BlendFactor::OneMinusValue(BlendValue::SourceAlpha));
+        let blend = Blend::Premultiplied;
         let material = load_material(
-            ShaderSource::Glsl { vertex: VERT, fragment: FRAG },
+            FRAG,
             MaterialParams {
-                pipeline_params: PipelineParams { color_blend: Some(blend), alpha_blend: Some(blend), ..Default::default() },
+                blend,
                 uniforms: vec![UniformDesc::new("texel", UniformType::Float2), UniformDesc::new("time", UniformType::Float1), UniformDesc::new("sky", UniformType::Float4)],
                 textures: vec!["Light".to_string()],
                 ..Default::default()
@@ -591,17 +549,17 @@ impl Renderer {
         let gas_texture = Texture2D::from_image(&gas_image);
         gas_texture.set_filter(FilterMode::Linear);
         let gas_material = load_material(
-            ShaderSource::Glsl { vertex: VERT, fragment: GAS_FRAG },
+            GAS_FRAG,
             MaterialParams {
-                pipeline_params: PipelineParams { color_blend: Some(blend), alpha_blend: Some(blend), ..Default::default() },
+                blend,
                 uniforms: vec![UniformDesc::new("texel", UniformType::Float2), UniformDesc::new("dusk", UniformType::Float2)],
                 ..Default::default()
             },
         )
         .expect("gas shader");
         let gas_blur = load_material(
-            ShaderSource::Glsl { vertex: VERT, fragment: GAS_BLUR },
-            MaterialParams { uniforms: vec![UniformDesc::new("dir", UniformType::Float2)], ..Default::default() },
+            GAS_BLUR,
+            MaterialParams { uniforms: vec![UniformDesc::new("dir", UniformType::Float2)], blend: Blend::Replace, ..Default::default() },
         )
         .expect("gas blur shader");
         let gas_field = [(); 2].map(|_| {
@@ -609,18 +567,12 @@ impl Renderer {
             t.texture.set_filter(FilterMode::Linear);
             t
         });
-        let rain_material = load_material(
-            ShaderSource::Glsl { vertex: RAIN_VERT, fragment: RAIN_FRAG },
-            MaterialParams {
-                pipeline_params: PipelineParams { color_blend: Some(blend), alpha_blend: Some(blend), ..Default::default() },
-                ..Default::default()
-            },
-        )
+        let rain_material = load_material(RAIN_FRAG, MaterialParams { blend, ..Default::default() })
         .expect("rain shader");
         let night_material = load_material(
-            ShaderSource::Glsl { vertex: VERT, fragment: NIGHT_FRAG },
+            NIGHT_FRAG,
             MaterialParams {
-                pipeline_params: PipelineParams { color_blend: Some(blend), alpha_blend: Some(blend), ..Default::default() },
+                blend,
                 uniforms: vec![UniformDesc::new("texel", UniformType::Float2), UniformDesc::new("time", UniformType::Float1), UniformDesc::new("night", UniformType::Float1)],
                 ..Default::default()
             },
@@ -630,11 +582,7 @@ impl Renderer {
         let light_texture = Texture2D::from_image(&light_image);
         light_texture.set_filter(FilterMode::Linear);
         // Lightning adds its light to what is under it.
-        let add = BlendState::new(Equation::Add, BlendFactor::One, BlendFactor::One);
-        let bolt_material = load_material(
-            ShaderSource::Glsl { vertex: BOLT_VERT, fragment: BOLT_FRAG },
-            MaterialParams { pipeline_params: PipelineParams { color_blend: Some(add), alpha_blend: Some(add), ..Default::default() }, ..Default::default() },
-        )
+        let bolt_material = load_material(BOLT_FRAG, MaterialParams { blend: Blend::Additive, ..Default::default() })
         .expect("bolt shader");
         let veg_image = Image::gen_image_color(W() as u16, H() as u16, Color::new(0.0, 0.0, 0.0, 0.0));
         let veg_texture = Texture2D::from_image(&veg_image);
@@ -880,7 +828,7 @@ impl Renderer {
         let mut idx: Vec<u16> = vec![];
         for [x, y, dx, dy, len, size] in drops {
             if idx.len() + 6 > BOLT_MESH_INDICES {
-                draw_mesh(&Mesh { vertices: std::mem::take(&mut verts), indices: std::mem::take(&mut idx), texture: None });
+                draw_mesh(&Mesh { vertices: std::mem::take(&mut verts), indices: std::mem::take(&mut idx) });
             }
             // The head's radius on screen: a little more than half a cell for a cell's worth of
             // water, never under a pixel.
@@ -899,7 +847,7 @@ impl Renderer {
             }
             idx.extend_from_slice(&[k, k + 1, k + 2, k, k + 2, k + 3]);
         }
-        draw_mesh(&Mesh { vertices: verts, indices: idx, texture: None });
+        draw_mesh(&Mesh { vertices: verts, indices: idx });
         gl_use_default_material();
     }
 
@@ -987,11 +935,10 @@ impl Renderer {
             let s = v.s.max(0.6);
             let mut line = |pts: &[(f32, f32)], w: f32, a: f32, halo: bool| {
                 for seg in pts.windows(2) {
-                    // A draw call holds at most `BOLT_MESH_INDICES` indices (macroquad cuts the
-                    // rest off, and the triangles left pointing past the cut come out as shards):
-                    // a long bolt zigzagging through rock goes out in several meshes.
+                    // A mesh numbers its vertices on 16 bits: a long bolt zigzagging through
+                    // rock goes out in several meshes.
                     if idx.len() + 6 > BOLT_MESH_INDICES {
-                        draw_mesh(&Mesh { vertices: std::mem::take(&mut verts), indices: std::mem::take(&mut idx), texture: None });
+                        draw_mesh(&Mesh { vertices: std::mem::take(&mut verts), indices: std::mem::take(&mut idx) });
                     }
                     let (p, q) = (px(seg[0]), px(seg[1]));
                     let d = q - p;
@@ -1015,7 +962,7 @@ impl Renderer {
             for br in &b.bolt.branches {
                 line(br, 1.8 * s, light * 0.6, false);
             }
-            draw_mesh(&Mesh { vertices: verts, indices: idx, texture: None });
+            draw_mesh(&Mesh { vertices: verts, indices: idx });
         }
         gl_use_default_material();
     }
@@ -1082,11 +1029,7 @@ impl Renderer {
     fn blur_gas(&self) {
         let (w, h) = (W() as f32, H() as f32);
         let pass = |src: &Texture2D, dst: &RenderTarget, dir: Vec2| {
-            let mut camera = Camera2D::from_display_rect(Rect::new(0.0, 0.0, w, h));
-            // Upside down, so that the target reads the right way up when drawn (as `ui.rs` does).
-            camera.zoom.y = -camera.zoom.y;
-            camera.render_target = Some(dst.clone());
-            set_camera(&camera);
+            set_target(Some(dst));
             clear_background(Color::new(0.0, 0.0, 0.0, 0.0));
             self.gas_blur.set_uniform("dir", dir);
             gl_use_material(&self.gas_blur);
@@ -1095,7 +1038,7 @@ impl Renderer {
         };
         pass(&self.gas_texture, &self.gas_field[0], vec2(1.0 / w, 0.0));
         pass(&self.gas_field[0].texture, &self.gas_field[1], vec2(0.0, 1.0 / h));
-        set_default_camera();
+        set_target(None);
     }
 }
 
@@ -1128,9 +1071,9 @@ fn landscape_color(world: &World, x: usize, y: usize) -> [u8; 4] {
     }
 }
 
-/// The most indices one mesh of a bolt holds: under macroquad's capacity for a draw call (5000
-/// indices, 10 000 vertices by default), and a whole number of quads.
-const BOLT_MESH_INDICES: usize = 4998;
+/// The most indices one mesh of quads holds: its vertices (four a quad, six indices) must be
+/// numbered on 16 bits.
+const BOLT_MESH_INDICES: usize = 6 * 16_000;
 
 fn quad(a: Vec2, b: Vec2, c: Vec2, d: Vec2, col: Color) {
     draw_triangle(a, b, c, col);

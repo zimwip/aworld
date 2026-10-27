@@ -399,29 +399,6 @@ pub fn howl(hz: f32, len: f32, off_key: f32) -> Vec<f32> {
     v
 }
 
-/// 16-bit mono PCM WAV, for macroquad's audio (Linux plays the samples directly).
-#[cfg_attr(target_os = "linux", allow(dead_code))]
-pub fn wav(samples: &[f32]) -> Vec<u8> {
-    let data = samples.len() as u32 * 2;
-    let mut out = Vec::with_capacity(44 + data as usize);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36 + data).to_le_bytes());
-    out.extend_from_slice(b"WAVEfmt ");
-    out.extend_from_slice(&16u32.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    out.extend_from_slice(&1u16.to_le_bytes()); // mono
-    out.extend_from_slice(&RATE.to_le_bytes());
-    out.extend_from_slice(&(RATE * 2).to_le_bytes());
-    out.extend_from_slice(&2u16.to_le_bytes());
-    out.extend_from_slice(&16u16.to_le_bytes());
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data.to_le_bytes());
-    for s in samples {
-        out.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32000.0) as i16).to_le_bytes());
-    }
-    out
-}
-
 // ---------------------------------------------------------------- playback
 
 #[cfg(feature = "sound")]
@@ -638,16 +615,6 @@ mod tests {
             let typical = v.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
             assert!(jump <= typical * 1.5 + 0.02, "seam jump {jump} vs max step {typical}");
         }
-    }
-
-    #[test]
-    fn wav_header_is_valid() {
-        let w = wav(&[0.0, 0.5, -0.5, 1.0]);
-        assert_eq!(&w[..4], b"RIFF");
-        assert_eq!(&w[8..16], b"WAVEfmt ");
-        assert_eq!(u32::from_le_bytes(w[4..8].try_into().unwrap()) as usize, w.len() - 8);
-        assert_eq!(u32::from_le_bytes(w[40..44].try_into().unwrap()), 8);
-        assert_eq!(w.len(), 44 + 8);
     }
 
     #[test]

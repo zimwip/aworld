@@ -127,8 +127,6 @@ fn window_conf() -> Conf {
         window_width: (PANEL_W + 1280.0) as i32,
         window_height: (TOP_H + 768.0) as i32,
         window_resizable: true,
-        sample_count: 4,
-        ..Default::default()
     }
 }
 
@@ -1605,7 +1603,7 @@ impl Game {
     fn update(&mut self, dt: f32) {
         self.tick_toast(dt);
         if let Some((steps, step)) = self.update_world(dt, dt) {
-            // std's clock, macroquad's in the browser (std has none there; macroquad's needs a
+            // std's clock, the window's in the browser (std has none there; the window's needs a
             // window, which the tests have not).
             let start = metrics::now();
             for _ in 0..steps {
@@ -4686,8 +4684,11 @@ fn draw_car_icon(c: Vec2, col: Color, s: f32) {
     draw_circle(c.x + 10.0 * s, c.y + 9.0 * s, 5.0 * s, Color::from_rgba(26, 26, 32, 255));
 }
 
-#[macroquad::main(window_conf)]
-async fn main() {
+fn main() {
+    gfx::run(window_conf(), game());
+}
+
+async fn game() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let shot = arg("--demo");
@@ -5107,7 +5108,10 @@ async fn main() {
         if let Some(path) = &shot {
             if frame == arg("--frames").and_then(|v| v.parse().ok()).unwrap_or(360) {
                 eprintln!("average frame time: {:.1} ms", frame_time * 1000.0 / frame as f32);
+                #[cfg(not(target_arch = "wasm32"))]
                 save_screenshot(path);
+                #[cfg(target_arch = "wasm32")]
+                let _ = path;
                 std::process::exit(0);
             }
         }
