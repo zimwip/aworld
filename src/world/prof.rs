@@ -4,7 +4,7 @@
 
 /// The phases of a step, in the order they run.
 /// After `total`, the parts of the heat pass (already counted in `chaleur`), then the water field.
-pub const PHASES: [&str; 33] = [
+pub const PHASES: [&str; 34] = [
     "cellules", "structures", "chutes", "corps rigides", "poches", "éjectas", "tassement", "vent",
     "écoulement air", "pression", "poussée", "saisons", "chaleur", "orage", "niveaux liquides", "total",
     "  chaleur/conduction", "  chaleur/vent", "  chaleur/air+réactions", "  chaleur/vers l'espace", "  chaleur/soleil",
@@ -12,6 +12,7 @@ pub const PHASES: [&str; 33] = [
     "  liquides/classement", "  liquides/forces", "  liquides/viscosité", "  liquides/pression", "  liquides/itérations",
     "  liquides/gouttes", "  liquides/transport",
     "  liquides/carte: envoi", "  liquides/carte: noyaux", "  liquides/carte: retour",
+    "  liquides/débordement",
 ];
 pub const TOTAL: usize = 15;
 pub const HEAT_CONDUCTION: usize = 16;
@@ -35,6 +36,8 @@ pub const LIQ_CARRY: usize = 29;
 pub const LIQ_UP: usize = 30;
 pub const LIQ_CARD: usize = 31;
 pub const LIQ_DOWN: usize = 32;
+/// The overflow and the sinking of films after the transport (part of `LIQ_CARRY`).
+pub const LIQ_OVERFLOW: usize = 33;
 
 #[derive(Clone)]
 pub struct Profile {
