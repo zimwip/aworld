@@ -66,7 +66,8 @@ mod tests {
         for _ in 0..60 * 20 {
             pull(&mut vx, &mut vy, g, 9.0);
         }
-        assert!((vy - 9.0).abs() < 0.05 && vy <= 9.0, "{vy}");
+        // (It reaches the terminal speed as it gains a step's gravity, and loses that to the air.)
+        assert!((vy + g - 9.0).abs() < 0.01, "{vy}");
         let (mut vx, mut vy) = (0.0, 0.0);
         for _ in 0..60 {
             pull(&mut vx, &mut vy, g, f32::INFINITY);

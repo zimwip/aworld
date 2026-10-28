@@ -11,8 +11,8 @@ use crate::gfx::*;
 
 /// Steps a piece lasts before it is gone (it fades during the last second).
 const LIFE: u32 = 60 * 9;
-/// The fastest a piece falls through the air, m/s: a wheel, a panel of steel.
-const TERMINAL_MS: f32 = 50.0;
+/// The fastest a piece falls through the air, m/s: a thin panel tumbling catches the air.
+const TERMINAL_MS: f32 = 15.0;
 /// No more pieces than this at once: the oldest go first.
 const MAX_PIECES: usize = 90;
 
