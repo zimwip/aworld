@@ -33,14 +33,14 @@ impl World {
         for j in 0..FH() {
             for i in 0..FW() {
                 let (mut cnt, mut liq, mut sol) = (0, 0, 0);
-                for dy in (0..CELL).step_by(2) {
-                    let y = j * CELL + dy;
+                for dy in (0..CELL()).step_by(2) {
+                    let y = j * CELL() + dy;
                     if y >= H() {
                         break;
                     }
-                    for dx in (0..CELL).step_by(2) {
+                    for dx in (0..CELL()).step_by(2) {
                         cnt += 1;
-                        match self.cells[y * W() + i * CELL + dx].m.kind() {
+                        match self.cells[y * W() + i * CELL() + dx].m.kind() {
                             Kind::Liquid => liq += 1,
                             Kind::Static | Kind::Powder => sol += 1,
                             _ => {}
@@ -143,8 +143,8 @@ impl World {
     }
 
     fn bilinear(field: &[f32], x: f32, y: f32) -> f32 {
-        let fx = x / CELL as f32 - 0.5;
-        let fy = (y / CELL as f32 - 0.5).clamp(0.0, FH() as f32 - 1.001);
+        let fx = x / CELL() as f32 - 0.5;
+        let fy = (y / CELL() as f32 - 0.5).clamp(0.0, FH() as f32 - 1.001);
         let (i0, j0) = (fx.floor(), fy.floor());
         let (tx, ty) = (fx - i0, fy - j0);
         let (i0, j0) = (i0 as i32, j0 as i32);
@@ -171,7 +171,7 @@ impl World {
     /// Gradient of the quickly changing excess pressure at a world position, in atmospheres per
     /// world cell: the part that pushes.
     pub fn pressure_gradient(&self, x: f32, y: f32) -> (f32, f32) {
-        let h = CELL as f32;
+        let h = CELL() as f32;
         let gx = (Self::bilinear(&self.dpd, x + h, y) - Self::bilinear(&self.dpd, x - h, y)) / (2.0 * h);
         let gy = (Self::bilinear(&self.dpd, x, y + h) - Self::bilinear(&self.dpd, x, y - h)) / (2.0 * h);
         (gx, gy)
@@ -185,16 +185,16 @@ impl World {
         }
         for j in 1..FH() as i32 - 1 {
             for i in 0..FW() as i32 {
-                let gx = (self.dpd[at(i + 1, j)] - self.dpd[at(i - 1, j)]) / (2.0 * CELL as f32);
-                let gy = (self.dpd[at(i, j + 1)] - self.dpd[at(i, j - 1)]) / (2.0 * CELL as f32);
+                let gx = (self.dpd[at(i + 1, j)] - self.dpd[at(i - 1, j)]) / (2.0 * CELL() as f32);
+                let gy = (self.dpd[at(i, j + 1)] - self.dpd[at(i, j - 1)]) / (2.0 * CELL() as f32);
                 let g = (gx * gx + gy * gy).sqrt();
                 if g < QUIET {
                     continue;
                 }
                 let (ux, uy) = (-gx / g, -gy / g);
-                let (x0, y0) = (i * CELL as i32, j * CELL as i32);
-                for dy in 0..CELL as i32 {
-                    for dx in 0..CELL as i32 {
+                let (x0, y0) = (i * CELL() as i32, j * CELL() as i32);
+                for dy in 0..CELL() as i32 {
+                    for dx in 0..CELL() as i32 {
                         let (x, y) = (x0 + dx, y0 + dy);
                         let m = self.at(x, y);
                         // (Only loose matter: the liquids are pushed by the gas pressure in their

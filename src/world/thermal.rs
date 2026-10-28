@@ -1258,7 +1258,7 @@ impl World {
         let blend = if exact { 0.7 } else { 1.0 - 0.3f32.powf(k) };
         let stride = if self.lod >= 1 { 2 } else { 1 };
         let tb = tables();
-        let cell = super::flow::CELL;
+        let cell = super::flow::CELL();
         let fw = super::flow::FW();
         // First the air is carried: each cell only reads the grid as it was (`old`), so the rows
         // of flow blocks are carried side by side.

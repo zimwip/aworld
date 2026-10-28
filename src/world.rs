@@ -166,7 +166,7 @@ pub fn set_grid(w: usize, h: usize) -> (usize, usize) {
         GRID = [w, h];
         DIV = div_magic(w);
     }
-    units::set_cell(w);
+    units::set_cell(w, h);
     sleep::set_zones(w, h);
     turn::check_strips();
     (w, h)
@@ -594,8 +594,13 @@ pub const WATER_UNITS: u16 = 64;
 /// Units of `moisture` in one cell of vapour (steam or cloud).
 pub const VAPOUR_UNITS: u16 = WATER_UNITS / VAPOUR_PER_WATER as u16;
 
-/// Steps for a cell of water at 40 °C under perfectly dry, still air to evaporate, on average.
+/// Steps for a cell of water at 40 °C under perfectly dry, still air to evaporate, on average,
+/// on the design grid: 5 cm of water in two and a half minutes.
 const EVAPORATE_40C: f32 = 9_000.0;
+/// The same on this grid: a surface dries by so many millimetres a second, a thinner cell sooner.
+fn evaporate_40c() -> f32 {
+    EVAPORATE_40C / units::finer()
+}
 /// A trunk cell standing on soil tries to transpire once in this many steps.
 const TRANSPIRE_EVERY: u32 = 200;
 
@@ -667,7 +672,8 @@ const SNOW_CREEP: u32 = 8;
 pub const VAPOUR_PER_WATER: usize = 4;
 /// The fastest a raindrop falls, m/s: that of the liquids' drops.
 const DROP_TERMINAL_MS: f32 = 9.1;
-/// A bubble of gas in a liquid climbs a cell one step in this many (a metre a second).
+/// A bubble of gas in a liquid climbs a cell one step in this many on the design grid (30 cm a
+/// second; see `chance_per_cell`).
 const BUBBLE_RISE: u32 = 10;
 /// How much of the wind's speed a falling drop takes on sideways.
 const DROP_DRIFT: f32 = 0.8;
@@ -1286,6 +1292,20 @@ impl World {
 
     fn chance(&mut self, n: u32) -> bool {
         self.rand() % n == 0
+    }
+
+    /// A rate tuned per cell of the design grid that moves something by a distance (a fire
+    /// catching the next cell, grass creeping, a bubble rising): once in `n` steps there, and as
+    /// many times more often as the grid is finer, so that it goes as many metres a second on any
+    /// grid (`power` 1). `power` 2 for a rate that spreads (moisture through the soil): a
+    /// diffusion. (On the design grid, `chance` itself.)
+    fn chance_per_cell(&mut self, n: u32, power: i32) -> bool {
+        let f = units::finer();
+        if f == 1.0 {
+            self.chance(n)
+        } else {
+            self.chance_f(f.powi(power) / n as f32)
+        }
     }
 
     /// True with probability `p` (0..1).
@@ -2100,7 +2120,7 @@ impl World {
     /// A flame touches a neighbour that can burn: a loose wood cell becomes
     /// an ember, a wooden block heats up.
     fn ignite(&mut self, nx: i32, ny: i32, one_in: u32) {
-        if !Self::inb(nx, ny) || !self.chance(one_in) {
+        if !Self::inb(nx, ny) || !self.chance_per_cell(one_in, 1) {
             return;
         }
         let b = self.mask[Self::idx(nx, ny)];
@@ -2341,7 +2361,8 @@ impl World {
         if self.moisture[i] >= GRASS_GROW && self.temp[i] > 5.0 && matches!(self.at(x, y - 1), Mat::Empty | Mat::Grass) && self.turf_open(x, y) {
             // Grass creeps sideways along the ground, and its roots thicken the turf downwards.
             let near = self.raw(x, y - 1) == Mat::Grass || (-1..=1).any(|dy| self.raw(x - 1, y + dy) == Mat::Grass || self.raw(x + 1, y + dy) == Mat::Grass);
-            if self.chance(if near { GRASS_SPREAD } else { GRASS_SPROUT }) && self.lit(x, y) {
+            let grows = if near { self.chance_per_cell(GRASS_SPREAD, 1) } else { self.chance(GRASS_SPROUT) };
+            if grows && self.lit(x, y) {
                 self.retype(x, y, Mat::Grass);
                 return;
             }
@@ -2374,7 +2395,7 @@ impl World {
         if self.moisture[i] == 0 {
             return;
         }
-        if self.chance(SOIL_SEEP) {
+        if self.chance_per_cell(SOIL_SEEP, 2) {
             let n = Self::neighbors(x, y)[(self.rand() % 4) as usize];
             let k = self.soil_seep(x, y, n);
             if k > 0 {
@@ -2384,7 +2405,7 @@ impl World {
                 self.zones.wake(j);
             }
         }
-        if self.moisture[i] >= SOIL_FULL && self.at(x, y + 1) == Mat::Empty && self.mask_free(x, y + 1) && self.chance(SOIL_DRIP) {
+        if self.moisture[i] >= SOIL_FULL && self.at(x, y + 1) == Mat::Empty && self.mask_free(x, y + 1) && self.chance_per_cell(SOIL_DRIP, 1) {
             // On the bottom row the drop falls out of the world.
             if let Some(j) = Self::ix(x, y + 1) {
                 let t = self.temp[i];
@@ -2401,10 +2422,10 @@ impl World {
         if self.moisture[i] >= SOIL_VAPOUR && t > 0.0 && self.at(x, y - 1) == Mat::Empty && self.mask_free(x, y - 1) {
             let dry = 1.0 - self.flow.moisture_at(x, y - 1);
             let (wx, wy) = self.flow.sample(x, y - 1);
-            let breeze = 1.0 + 2.0 * ((wx * wx + wy * wy).sqrt() / flow::GAIN).min(1.0);
+            let breeze = 1.0 + 2.0 * ((wx * wx + wy * wy).sqrt() / flow::gain()).min(1.0);
             let wet = (self.moisture[i] as f32 / SOIL_WATER as f32).min(1.0);
             let leaves = if self.cells[i].m == Mat::Grass { 1.5 } else { 1.0 };
-            let rate = VAPOUR_PER_WATER as f32 * wet * leaves * dry * breeze * vapour_pressure(t) / vapour_pressure(40.0) / EVAPORATE_40C;
+            let rate = VAPOUR_PER_WATER as f32 * wet * leaves * dry * breeze * vapour_pressure(t) / vapour_pressure(40.0) / evaporate_40c();
             if self.chance_f(rate) {
                 // A quarter of a cell of water leaves as vapour, with the heat that takes: the
                 // soil and the air over it cool.
@@ -2466,7 +2487,7 @@ impl World {
         // Creep: now and then a cell oozes a few cells sideways and one down, so a heap keeps
         // slumping flatter than a heap of grains. Where the ground is flat it needs a drop to
         // flow into, so a thin layer stays put.
-        if self.chance(SNOW_CREEP) {
+        if self.chance_per_cell(SNOW_CREEP, 1) {
             if let Some(to) = self.snow_creep_target(x, y) {
                 self.swap((x, y), to);
             }
@@ -2889,7 +2910,7 @@ impl World {
         if self.at(x, y - 1).kind() == Kind::Liquid {
             // (A bubble keeps its zone awake: it moves too seldom to do so by itself.)
             self.zones.wake(i);
-            if self.chance(BUBBLE_RISE) {
+            if self.chance_per_cell(BUBBLE_RISE, 1) {
                 let d = self.dir();
                 for dx in [0, d, -d] {
                     if self.at(x + dx, y - 1).kind() == Kind::Liquid && self.mask_free(x + dx, y - 1) && self.mask[i] == 0 {
@@ -3071,7 +3092,7 @@ impl World {
         // Soil drinks the water on it and beside it, until it is saturated: the water goes into the
         // ground (the soil gets moist) and the rest stays on top as a puddle.
         let soils = [(x, y + 1), (x - 1, y), (x + 1, y)];
-        if soils.iter().any(|&n| self.soil_drinks(n)) && self.chance(25) {
+        if soils.iter().any(|&n| self.soil_drinks(n)) && self.chance_per_cell(25, 1) {
             let n = soils[(self.rand() % 3) as usize];
             if self.soil_drinks(n) {
                 let j = Self::idx(n.0, n.1);
@@ -3091,11 +3112,11 @@ impl World {
             if t > 0.0 {
                 let dry = 1.0 - self.flow.moisture_at(x, y - 1);
                 let (wx, wy) = self.flow.sample(x, y - 1);
-                let breeze = 1.0 + 2.0 * ((wx * wx + wy * wy).sqrt() / flow::GAIN).min(1.0);
+                let breeze = 1.0 + 2.0 * ((wx * wx + wy * wy).sqrt() / flow::gain()).min(1.0);
                 // A falling drop is tiny and bathed in air all round: it dries far faster than a
                 // puddle (in warm, dry air some rain never reaches the ground).
                 let airborne = if self.at(x, y + 1) == Mat::Empty { DROP_EVAPORATION } else { 1.0 };
-                let rate = airborne * dry * breeze * vapour_pressure(t) / vapour_pressure(40.0) / EVAPORATE_40C;
+                let rate = airborne * dry * breeze * vapour_pressure(t) / vapour_pressure(40.0) / evaporate_40c();
                 // Water that may hold less than a cell dries a quarter at a time (one cell of
                 // steam's worth, as often again): the surface of a lake sinks slowly, where a
                 // whole cell gone at once would dig a hole for the water round it to splash into.
@@ -3581,7 +3602,7 @@ impl World {
     /// Charcoal touching a flame catches when it has air, as an ember that lasts much longer
     /// than one of wood.
     pub(super) fn light_charcoal(&mut self, x: i32, y: i32, one_in: u32) {
-        if !self.chance(one_in) || !self.breathes(x, y) {
+        if !self.chance_per_cell(one_in, 1) || !self.breathes(x, y) {
             return;
         }
         self.set(x, y, Mat::Ember);
@@ -4456,14 +4477,14 @@ impl World {
     /// oil, molten metal) hold no water and show as dry.
     pub fn humidity_field(&self) -> Vec<f32> {
         // The same squares as the wind, which carries the humidity.
-        const B: usize = flow::CELL;
-        let (bw, bh) = (W() / B, H().div_ceil(B));
+        let b = flow::CELL();
+        let (bw, bh) = (W() / b, H().div_ceil(b));
         let (mut vapour, mut wet, mut temp) = (vec![0.0f32; bw * bh], vec![0.0f32; bw * bh], vec![0.0f32; bw * bh]);
         let mut air = vec![0.0f32; bw * bh];
         for y in 0..H() {
             for x in 0..W() {
                 let i = y * W() + x;
-                let k = (y / B) * bw + (x / B).min(bw - 1);
+                let k = (y / b) * bw + (x / b).min(bw - 1);
                 match self.cells[i].m {
                     Mat::Steam | Mat::Cloud => vapour[k] += 1.0,
                     Mat::Water => wet[k] += 1.0,
@@ -4475,7 +4496,7 @@ impl World {
                 }
             }
         }
-        let cell = (B * B) as f32;
+        let cell = (b * b) as f32;
         let blur = |src: &[f32], r: i32| -> Vec<f32> {
             let mut out = vec![0.0f32; bw * bh];
             for j in 0..bh as i32 {
@@ -4499,15 +4520,15 @@ impl World {
         let wet_b = blur(&wet.iter().map(|v| v / cell).collect::<Vec<_>>(), 3);
         let rh: Vec<f32> = (0..bw * bh)
             .map(|k| {
-                let t = if air[k] > 4.0 { temp[k] / air[k] } else { self.ambient_c(((k / bw) * B) as i32) };
+                let t = if air[k] > 4.0 { temp[k] / air[k] } else { self.ambient_c(((k / bw) * b) as i32) };
                 let capacity = (0.05 * (0.07 * t).exp()).clamp(0.01, 2.0);
                 // The humidity the wind carries replaces the guess made from water nearby.
-                let carried = self.flow.moisture_at(((k % bw) * B + B / 2) as i32, ((k / bw) * B + B / 2) as i32);
+                let carried = self.flow.moisture_at(((k % bw) * b + b / 2) as i32, ((k / bw) * b + b / 2) as i32);
                 let base = carried.max(0.18 + 0.55 * (wet_b[k] * 4.0).min(1.0));
                 (base + vapour_b[k] / capacity).clamp(0.0, 1.0)
             })
             .collect();
-        upsample(&rh, bw, bh, B)
+        upsample(&rh, bw, bh, b)
     }
 
     /// Colour of a cell in the humidity view: dry tan, through green, to wet blue.

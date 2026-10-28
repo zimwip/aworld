@@ -139,7 +139,7 @@ impl World {
     pub fn field_value(&self, field: Field, x: usize, y: usize) -> Option<f32> {
         let i = y * W() + x;
         let m = self.cells[i].m;
-        let (fi, fj) = ((x / FLOW_CELL).min(FW() - 1), (y / FLOW_CELL).min(FH() - 1));
+        let (fi, fj) = ((x / FLOW_CELL()).min(FW() - 1), (y / FLOW_CELL()).min(FH() - 1));
         match field {
             Field::LiquidPa => self.liquid_pa(x, y),
             Field::LiquidAtm => (m.kind() == Kind::Liquid).then(|| self.liq_p[i]),

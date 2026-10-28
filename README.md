@@ -126,8 +126,21 @@ pluie, 0,9 m/s pour la neige), les morceaux de structure qui tombent, les dalles
 (une colonne d'eau de 10,3 m, 206 cellules, fait une atmosphère), les souffles d'explosion, la dynamite, les débris,
 les voitures, les blocs (Rapier garde son unité de 16 cellules, ses forces et raideurs suivent g), le petit garçon,
 les feux d'artifice et la baleine (leur allure suit √g). La conduction de la chaleur suit la finesse de la grille.
-Les shaders des liquides reçoivent la même taille de cellule. Pas encore mis à l'échelle pour une autre largeur que
-960 : les taux par cellule (propagation du feu, évaporation, pousse, vent, orage) et la taille des objets en cellules.
+Les shaders des liquides reçoivent la même taille de cellule. Les grilles grossières gardent leur taille en mètres :
+la maille du vent fait environ 40 cm (8 cellules à 960, 16 à 1920, 3 à 384, le diviseur de la largeur le plus
+proche) et ses vitesses sont les mêmes en m/s, le carré des charges d'orage environ 30 cm. Les taux qui font avancer
+quelque chose d'une cellule à la suivante (le feu et les braises qui gagnent le bois, l'herbe qui s'étend, l'eau que
+le sol boit ou qui en goutte, la neige qui flue, une bulle qui remonte) sont d'autant plus fréquents que la cellule
+est petite, l'humidité qui diffuse dans le sol comme le carré, l'évaporation d'une surface comme la finesse
+(`World::chance_per_cell`). La sonde `grids_probe` (dans `bench.rs`, à lancer seule, une fois par taille :
+`AWORLD_TEST_GRID=1920x1080 cargo test --release --bin aworld -- --ignored --exact world::bench::grids_probe
+--nocapture`) refait les mêmes scènes en mètres : à 384, 960 et 1920 colonnes, un grain lâché de 4 m touche le sol
+en 0,90 s, le front d'un mètre d'eau lâché est à 3,1 m après une seconde, le feu parcourt 2 m d'une planche en 16 à
+19 s, le vent à pleine force souffle à 1,5 m/s ; l'évaporation d'une mare reste du même ordre (1,0 à 2,1 mm par
+minute), l'humidité de l'air sur la maille du vent dépendant de la place de la surface dans la maille. Restent
+liés à la cellule : les gaz et les flammes avancent d'une cellule par tick au plus (la fumée et la vapeur montent
+plus lentement en m/s sur une grille fine), la pousse des plantes, la durée de vie d'une flamme ou d'une braise, et
+la taille des objets (voitures, arbres, personnages) en cellules.
 
 
 ## Son

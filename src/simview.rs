@@ -542,7 +542,7 @@ impl SimView {
         }
         if self.velocity[3] {
             // The air: at the middle of each flow cell (every other one from afar).
-            let c = world::flow::CELL;
+            let c = world::flow::CELL();
             let every = if c as f32 * view.s < 10.0 { 2 } else { 1 };
             for y in y_range(c * every) {
                 for x in x_range(c * every) {

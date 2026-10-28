@@ -24,16 +24,33 @@ pub const ATM: f32 = 101_325.0;
 pub const RHO_AIR: f32 = 1.2;
 pub const RHO_WATER: f32 = 1000.0;
 
-/// The size of a cell, metres (see `cell_m`). A plain read, as `W()`: written once by
-/// `set_cell` from the main thread before any world exists.
-static mut CELL: f32 = REF_CELL_M;
+/// A cell of the air's flow on the design grid, in cells (40 cm).
+pub const REF_FLOW_CELL: usize = 8;
+/// A square of the storms' charge on the design grid, in cells (30 cm).
+pub const REF_CHARGE_CELL: usize = 6;
 
-/// Sets the size of a cell for a world `w` columns across: the design grid's landscape over
-/// that many columns.
-pub fn set_cell(w: usize) {
+/// The size of a cell, metres (see `cell_m`), of a cell of the air's flow and of a square of
+/// the storms' charge, cells (see `flow_cell`, `charge_cell`). Plain reads, as `W()`: written once by `set_cell` from the main thread before
+/// any world exists.
+static mut CELL: f32 = REF_CELL_M;
+static mut FLOW: usize = REF_FLOW_CELL;
+static mut CHARGE: usize = REF_CHARGE_CELL;
+
+/// Sets the size of a cell for a world `w` columns across and `h` rows high: the design grid's
+/// landscape over that many columns.
+pub fn set_cell(w: usize, h: usize) {
+    let cell = REF_CELL_M * BASE_W as f32 / w as f32;
+    // The coarse grids keep their squares about as many metres across as on the design grid:
+    // as many cells as make that, of the numbers that divide the width (the air's flow wraps
+    // round from one side to the other), and the height too for the storms' charge.
+    let nearest = |want: f32, fits: &dyn Fn(usize) -> bool, or: usize| (2..=64).filter(|&d| fits(d)).min_by(|&a, &b| (a as f32 - want).abs().total_cmp(&(b as f32 - want).abs())).unwrap_or(or);
+    let flow = nearest(REF_FLOW_CELL as f32 * REF_CELL_M / cell, &|d| w % d == 0, REF_FLOW_CELL);
+    let charge = nearest(REF_CHARGE_CELL as f32 * REF_CELL_M / cell, &|d| w % d == 0 && h % d == 0, REF_CHARGE_CELL);
     // SAFETY: see `CELL`.
     unsafe {
-        CELL = REF_CELL_M * BASE_W as f32 / w as f32;
+        CELL = cell;
+        FLOW = flow;
+        CHARGE = charge;
     }
 }
 
@@ -41,6 +58,25 @@ pub fn set_cell(w: usize) {
 #[inline(always)]
 pub fn cell_m() -> f32 {
     unsafe { CELL }
+}
+
+/// A cell of the air's flow, in cells (8 on the design grid).
+#[inline(always)]
+pub fn flow_cell() -> usize {
+    unsafe { FLOW }
+}
+
+/// A square of the storms' charge, in cells (6 on the design grid).
+#[inline(always)]
+pub fn charge_cell() -> usize {
+    unsafe { CHARGE }
+}
+
+/// What a speed in cells of the air's flow a tick on the design grid is in those of this grid
+/// (1 on the design grid): its flow cells are 40 cm only to the nearest divisor of the width.
+#[inline]
+pub fn flow_scale() -> f32 {
+    (REF_FLOW_CELL as f32 * REF_CELL_M) / (flow_cell() as f32 * cell_m())
 }
 
 /// How many cells of this grid make a cell of the design grid: the rates tuned per cell of the
@@ -86,11 +122,12 @@ pub fn cell_of_water_kn() -> f32 {
     RHO_WATER * G * cell_m() * cell_m() / 1000.0
 }
 
-/// A WGSL source with its constants of scale (`const CELL_M`, `const G`, `const RHO_AIR`) set to
+/// A WGSL source with its constants of scale (`const CELL_M`, `const G`, `const RHO_AIR`,
+/// `const FLOW_CELL`) set to
 /// the world's: the shaders state them once, for reading, and run with these.
 pub fn wgsl(src: &str) -> String {
     let set = |name: &str, v: f32| (format!("const {name}: f32 ="), format!("const {name}: f32 = {v:?};"));
-    let lines = [set("CELL_M", cell_m()), set("G", G), set("RHO_AIR", RHO_AIR)];
+    let lines = [set("CELL_M", cell_m()), set("G", G), set("RHO_AIR", RHO_AIR), (format!("const FLOW_CELL: u32 ="), format!("const FLOW_CELL: u32 = {}u;", flow_cell()))];
     src.lines()
         .map(|l| lines.iter().find(|(start, _)| l.starts_with(start.as_str())).map_or(l.to_string(), |(_, with)| with.clone()))
         .collect::<Vec<_>>()
@@ -106,6 +143,7 @@ mod tests {
         assert_eq!(cell_m(), REF_CELL_M, "the tests run on the design grid");
         assert!((g_cells() - 196.2).abs() < 0.01);
         assert!((atm_per_cell(1.0) - 1.0 / 206.6).abs() < 1e-5, "10.3 m of water, 206 cells, make an atmosphere");
+        assert_eq!((flow_cell(), flow_scale(), charge_cell()), (REF_FLOW_CELL, 1.0, REF_CHARGE_CELL));
     }
 
     #[test]
@@ -115,6 +153,7 @@ mod tests {
             assert!(out.contains(&format!("const CELL_M: f32 = {:?};", cell_m())), "the liquids' shader states CELL_M");
             assert!(out.contains(&format!("const G: f32 = {G:?};")));
             assert!(out.contains(&format!("const RHO_AIR: f32 = {RHO_AIR:?};")));
+            assert!(out.contains(&format!("const FLOW_CELL: u32 = {}u;", flow_cell())));
         }
     }
 }

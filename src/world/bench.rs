@@ -260,7 +260,7 @@ fn storm() -> World {
     }
     for qy in 0..QH() {
         for qx in 0..QW() {
-            let (x, y) = ((qx * QS) as f32, (qy * QS) as f32);
+            let (x, y) = ((qx * QS()) as f32, (qy * QS()) as f32);
             if (280.0..680.0).contains(&x) && (70.0..200.0).contains(&y) {
                 let u = ((x - 480.0) / 200.0).powi(2);
                 w.charge[qy * QW() + qx] = (if y < 120.0 { 0.8 } else if y > 150.0 { -0.95 } else { 0.0 }) * (1.0 - u);
@@ -605,4 +605,137 @@ fn flood_probe() {
         spent += t.elapsed().as_secs_f64();
     }
     eprint!("{}", w.prof.report().lines().take(16).map(|l| format!("{l}\n")).collect::<String>());
+}
+
+/// The same scenes in metres on a world of any size, measured in metres and seconds: what the
+/// units of the world (`units.rs`) keep alike from one grid to another. Run alone, once a grid
+/// (the size of the world is set once a process):
+///
+/// ```text
+/// AWORLD_TEST_GRID=1920x1080 cargo test --release --bin aworld grids_probe -- --ignored --exact world::bench::grids_probe --nocapture
+/// ```
+#[test]
+#[ignore]
+fn grids_probe() {
+    if let Some((w, h)) = std::env::var("AWORLD_TEST_GRID").ok().and_then(|v| v.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))) {
+        set_grid(w, h);
+    }
+    let c = |m: f32| (m / cell_m()).round() as i32;
+    let m = |cells: f32| cells * cell_m();
+    let floor = |w: &mut World, x0: f32, x1: f32, y: f32| {
+        for x in c(x0)..c(x1) {
+            for k in 0..c(0.3).max(1) {
+                w.set(x, c(y) + k, Mat::Stone);
+            }
+        }
+    };
+    let wall = |w: &mut World, x: f32, y0: f32, y1: f32| {
+        for y in c(y0)..c(y1) {
+            for k in 0..c(0.2).max(1) {
+                w.set(c(x) - k, y, Mat::Stone);
+            }
+        }
+    };
+    println!("grille {}x{} : cellule {:.1} cm, maille du vent {} cellules, carré des orages {} cellules", W(), H(), cell_m() * 100.0, flow::CELL(), storm::QS());
+    // A grain dropped from 4 m: the time it takes to land (free fall: 0.90 s).
+    {
+        let mut w = World::new_static();
+        floor(&mut w, 2.0, 4.0, 20.0);
+        w.set(c(3.0), c(16.0), Mat::Sand);
+        let mut t = 0;
+        while t < 600 && w.raw(c(3.0), c(20.0) - 1) != Mat::Sand {
+            w.step();
+            t += 1;
+        }
+        println!("  grain lâché de 4 m : au sol en {:.2} s", t as f32 * STEP);
+    }
+    // A metre of water let go against a wall: how far its front has run after a second.
+    {
+        let mut w = World::new_static();
+        floor(&mut w, 5.0, 16.0, 20.0);
+        wall(&mut w, 5.0, 17.0, 20.0);
+        wall(&mut w, 16.0, 17.0, 20.0);
+        for x in c(5.0)..c(6.0) {
+            for y in c(19.0)..c(20.0) {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        for _ in 0..60 {
+            w.step();
+        }
+        let front = (c(5.0)..c(16.0)).rev().find(|&x| (c(18.0)..c(20.0)).any(|y| w.raw(x, y) == Mat::Water)).unwrap_or(c(5.0));
+        println!("  barrage d'un mètre : front à {:.2} m après 1 s", m((front - c(5.0)) as f32));
+    }
+    // A bubble of steam at the bottom of 2 m of water: how fast it comes up.
+    {
+        let mut w = World::new_static();
+        floor(&mut w, 19.0, 21.5, 20.0);
+        wall(&mut w, 19.0, 17.5, 20.0);
+        wall(&mut w, 21.5, 17.5, 20.0);
+        for x in c(19.0)..c(21.5) {
+            for y in c(18.0)..c(20.0) {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        w.set(c(20.2), c(20.0) - 1, Mat::Steam);
+        let mut t = 0;
+        let top = |w: &World| (c(18.0)..c(20.0)).find(|&y| (c(19.0)..c(21.5)).any(|x| w.raw(x, y) == Mat::Steam));
+        while t < 1200 && top(&w).is_some_and(|y| y > c(18.0) + 1) {
+            w.step();
+            t += 1;
+        }
+        println!("  bulle de vapeur sous 2 m d'eau : {:.2} m/s", 2.0 / (t as f32 * STEP));
+    }
+    // A plank of wood 4 m long lit at one end: how long the fire takes to go 2 m along it.
+    {
+        let mut w = World::new_static();
+        floor(&mut w, 24.0, 30.0, 20.0);
+        for x in c(25.0)..c(29.0) {
+            for y in c(19.9)..c(20.0) {
+                w.set(x, y, Mat::Wood);
+            }
+        }
+        // (Lit by its first 20 cm, embers.)
+        for x in c(25.0)..c(25.2) {
+            for y in c(19.9)..c(20.0) {
+                w.set(x, y, Mat::Ember);
+            }
+        }
+        let mut t = 0;
+        let burnt = |w: &World| (c(25.0)..c(29.0)).rev().find(|&x| (c(19.5)..c(20.0)).any(|y| matches!(w.raw(x, y), Mat::Ember | Mat::Fire | Mat::Charcoal | Mat::Ash))).unwrap_or(0);
+        while t < 3600 && burnt(&w) < c(27.0) {
+            w.step();
+            t += 1;
+        }
+        println!("  planche allumée par un bout : le feu fait 2 m en {:.1} s", t as f32 * STEP);
+    }
+    // A pond of water 4 m wide and 1 m deep at 15 °C: how much it dries in a minute.
+    {
+        let mut w = World::new_static();
+        floor(&mut w, 33.0, 38.0, 20.0);
+        wall(&mut w, 33.0, 18.5, 20.0);
+        wall(&mut w, 38.0, 18.5, 20.0);
+        for x in c(34.0)..c(38.0) {
+            for y in c(19.0)..c(20.0) {
+                w.set(x, y, Mat::Water);
+            }
+        }
+        // (What went up as vapour, not what is left: the vapour condenses back over the pond the
+        // more as it rises slower, and gases rise a cell a tick at most.)
+        let before = w.dried;
+        for _ in 0..3600 {
+            w.step();
+        }
+        let gone = (w.dried - before) as f32 / field::FULL as f32;
+        println!("  mare de 4 m sur 1 m à 15 °C : {:.2} mm évaporés en une minute", gone * m(1.0) * m(1.0) / (c(38.0) - c(34.0)) as f32 / cell_m() * 1000.0);
+    }
+    // The wind of a gale (`wind` 1) over a flat world, after a minute.
+    {
+        let mut w = World::new_static();
+        for t in 0..3600 {
+            w.flow.step(1.0, t);
+        }
+        let (vx, _) = w.flow.sample(W() as i32 / 2, c(8.0));
+        println!("  vent à pleine force, à 8 m de haut : {:.2} m/s", vx * cell_m() / STEP);
+    }
 }

@@ -3979,7 +3979,7 @@ impl Game {
                 }
                 let (vx, vy) = flow.at_cell(i, j);
                 let speed = (vx * vx + vy * vy).sqrt();
-                let centre = vec2((i as f32 + 0.5) * world::flow::CELL as f32, (j as f32 + 0.5) * world::flow::CELL as f32);
+                let centre = vec2((i as f32 + 0.5) * world::flow::CELL() as f32, (j as f32 + 0.5) * world::flow::CELL() as f32);
                 let c = view.to_screen(centre);
                 let dir = if speed > 1e-4 { vec2(vx, vy) / speed } else { vec2(1.0, 0.0) };
                 let len = (4.0 + 20.0 * speed) * view.s.max(0.8) * 1.4;
@@ -5011,7 +5011,7 @@ async fn game() {
             }
             for qy in 0..world::QH() {
                 for qx in 0..world::QW() {
-                    let (x, y) = ((qx * world::QS) as f32, (qy * world::QS) as f32);
+                    let (x, y) = ((qx * world::QS()) as f32, (qy * world::QS()) as f32);
                     let inside = (280.0..680.0).contains(&x) && (70.0..200.0).contains(&y);
                     if inside {
                         let u = ((x - 480.0) / 200.0).powi(2);
@@ -6149,7 +6149,7 @@ mod tests {
             assert_eq!(w.div_ceil(world::sleep::CS) % 3, 0, "{w}");
         }
         for h in (world::GRID_H.0..=world::GRID_H.1).step_by(world::GRID_H.2) {
-            assert_eq!(h % world::QS, 0, "{h}");
+            assert_eq!(h % world::QS(), 0, "{h}");
             assert_eq!(h % render::LS, 0, "{h}");
         }
     }
