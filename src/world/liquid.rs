@@ -868,7 +868,7 @@ impl World {
                             // A lone drop of water in the air is the cells' rain, and so is
                             // water over a gas that is not open air at its pocket's pressure (a
                             // cloud), alone or not: the gas is a wall to the liquids, and the
-                            // water would lie on the cloud (see `World::step_water`).
+                            // water would lie on the cloud (see `World::move_liquid`).
                             Kind::Liquid if self.cells[i].m == Mat::Water && y + 1 < H() && matches!(self.cells[i + W()].m.kind(), Kind::Empty | Kind::Gas) && (self.lone_liquid(x as i32, y as i32) || self.rain_over_gas(x as i32, y as i32)) => AIR,
                             Kind::Liquid if self.liquid_fill(i) >= field::FULL / HOLDS => FULLISH,
                             Kind::Liquid => WET,

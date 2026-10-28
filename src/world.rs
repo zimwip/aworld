@@ -13,7 +13,7 @@ pub mod liquid_class {
 }
 pub mod units;
 pub mod spec;
-pub use spec::MatSpec;
+pub use spec::{MatSpec, Motion};
 pub use units::cell_m;
 /// A full cell of liquid, in units of fill (see `field.rs`).
 pub use field::FULL as FILL_FULL;
@@ -2008,50 +2008,77 @@ impl World {
         if self.restless(x, y, c) {
             self.zones.mark_restless(zone);
         }
-        match c.m {
-            Mat::Rust => {
-                if !self.magnet_holds(x, y) {
-                    self.step_powder(x, y);
-                }
-            }
-            Mat::Sand | Mat::Mud => self.step_sediment(x, y),
-            Mat::Dirt => self.step_dirt(x, y),
-            Mat::Grass => self.step_grass(x, y),
-            Mat::Snow => self.step_snow(x, y),
-            Mat::Hail => {
-                self.step_powder(x, y);
-            }
-            Mat::Shard => self.step_shard(x, y),
-            Mat::Ash => self.step_ash(x, y),
-            Mat::Charcoal => self.step_charcoal(x, y),
-            Mat::Seed => self.step_seed(x, y),
+        // What the matter does of its own (it may end its turn: it burnt, dissolved, grew), then
+        // it moves the way of its kind (`Motion`), then, if it did not move, what it does where
+        // it lies. A liquid a pocket of gas shoots out goes before anything else (see `jet`).
+        let m = c.m;
+        if MatSpec::of(m).motion == Motion::Liquid && (self.fly(x, y) || self.jet(x, y)) {
+            return;
+        }
+        if self.act(x, y, m) {
+            return;
+        }
+        if !self.move_cell(x, y, m) {
+            self.at_rest(x, y, m);
+        }
+    }
+
+    /// What the matter `m` of the cell at (x, y) does of its own before it moves. Returns whether
+    /// that ends its turn.
+    fn act(&mut self, x: i32, y: i32, m: Mat) -> bool {
+        match m {
+            // A magnet holds rust where it is.
+            Mat::Rust => self.magnet_holds(x, y),
+            Mat::Sand | Mat::Mud => self.react_sediment(x, y),
+            Mat::Snow => self.snow_drifts(x, y),
+            Mat::Ash => self.react_ash(x, y),
+            Mat::Charcoal => self.react_charcoal(x, y),
+            Mat::Gunpowder | Mat::Dynamite => self.react_gunpowder(x, y),
+            Mat::Saltpeter => self.react_saltpeter(x, y),
+            Mat::Water => self.react_water(x, y),
+            Mat::Oil => self.react_oil(x, y),
+            Mat::Lava => self.react_hot_liquid(x, y, Mat::Stone),
+            Mat::Molten => self.react_hot_liquid(x, y, Mat::Iron),
+            Mat::MoltenSteel => self.react_hot_liquid(x, y, Mat::Steel),
+            Mat::Steam => self.react_steam(x, y),
+            Mat::Smoke => self.react_smoke(x, y),
+            Mat::Cloud => self.react_cloud(x, y),
+            Mat::Fire => self.react_fire(x, y),
+            _ => false,
+        }
+    }
+
+    /// Moves the cell at (x, y), of `m`, the way of its kind. Returns whether it moved.
+    fn move_cell(&mut self, x: i32, y: i32, m: Mat) -> bool {
+        match MatSpec::of(m).motion {
+            Motion::Fixed => false,
+            Motion::Grain => self.step_powder(x, y),
+            // (Worlds where nothing falls apart keep the earth as it lies.)
+            Motion::Clod => self.structures_fall && self.step_powder(x, y),
+            Motion::Turf => self.drop_turf(x, y),
+            Motion::Liquid => self.move_liquid(x, y, m),
+            Motion::Gas => self.step_gas(x, y),
+            Motion::Cloud => self.move_cloud(x, y),
+            Motion::Flame => self.move_flame(x, y),
+        }
+    }
+
+    /// What the matter `m` does where it lies, on a turn it did not move (a solid's whole turn).
+    fn at_rest(&mut self, x: i32, y: i32, m: Mat) {
+        match m {
             Mat::Sapling => self.step_sapling(x, y),
             Mat::Leaf => self.step_leaf(x, y),
             Mat::Wood | Mat::Trunk => self.step_wood(x, y),
             Mat::Branch => self.step_branch(x, y),
-            Mat::DeadLeaf => self.step_dead_leaf(x, y),
-            Mat::Cloud => self.step_cloud(x, y),
-            Mat::Oil => {
-                if !self.fly(x, y) && !self.jet(x, y) {
-                    self.step_oil(x, y);
-                }
-            }
-            Mat::Smoke => self.step_smoke(x, y),
-            Mat::Steel => self.step_iron(x, y, 1500),
-            Mat::Gunpowder | Mat::Dynamite => self.step_gunpowder(x, y),
-            Mat::Saltpeter => self.step_saltpeter(x, y),
-            Mat::Water => {
-                if !self.fly(x, y) && !self.jet(x, y) {
-                    self.step_water(x, y);
-                }
-            }
-            Mat::Steam => self.step_steam(x, y),
-            Mat::Fire => self.step_fire(x, y),
             Mat::Ember => self.step_ember(x, y),
-            Mat::Lava => self.step_hot_liquid(x, y, Mat::Stone),
-            Mat::Molten => self.step_hot_liquid(x, y, Mat::Iron),
-            Mat::MoltenSteel => self.step_hot_liquid(x, y, Mat::Steel),
             Mat::Iron => self.step_iron(x, y, 300),
+            Mat::Steel => self.step_iron(x, y, 1500),
+            Mat::Dirt => self.rest_dirt(x, y),
+            Mat::Grass => self.rest_grass(x, y),
+            Mat::Snow => self.snow_creeps(x, y),
+            Mat::Shard => self.rest_shard(x, y),
+            Mat::Seed => self.rest_seed(x, y),
+            Mat::DeadLeaf => self.rest_dead_leaf(x, y),
             _ => {}
         }
     }
@@ -2196,7 +2223,7 @@ impl World {
         // Free fall: the grain gathers speed (gravity) up to a terminal speed (air drag), and goes
         // down a cell each time its way through the cell adds up to a whole one (from rest: 6 cm
         // in its first tenth of a second, as anything else that falls).
-        let terminal = fall_speed(if m == Mat::Snow { SNOW_TERMINAL_MS } else { GRAIN_TERMINAL_MS });
+        let terminal = fall_speed(MatSpec::of(m).fall_ms);
         if matches!(self.at(x, y + 1).kind(), Kind::Empty | Kind::Gas) && self.mask_free(x, y + 1) {
             return self.fall_on(x, y, terminal, true);
         }
@@ -2282,7 +2309,7 @@ impl World {
 
     /// Loose sand and mud: flowing water drags them along (gullies, deltas);
     /// mud that dries out consolidates back into soil. Mud holds water like soil.
-    fn step_sediment(&mut self, x: i32, y: i32) {
+    fn react_sediment(&mut self, x: i32, y: i32) -> bool {
         let mud = self.at(x, y) == Mat::Mud;
         if mud {
             self.step_soil(x, y);
@@ -2292,16 +2319,16 @@ impl World {
             for (dx, dy) in [(d, 0), (d, 1), (-d, 0), (-d, 1)] {
                 if matches!(self.at(x + dx, y + dy), Mat::Empty | Mat::Water) {
                     self.swap((x, y), (x + dx, y + dy));
-                    return;
+                    return true;
                 }
             }
         }
         if mud && self.chance(4000) && Self::neighbors(x, y).iter().all(|&(nx, ny)| self.at(nx, ny) != Mat::Water) {
             // It settles as soil, with the water it held, and goes on drying.
             self.retype(x, y, Mat::Dirt);
-            return;
+            return true;
         }
-        self.step_powder(x, y);
+        false
     }
 
     /// Grass is the living top of the soil. With nothing solid under it, it falls until it lands
@@ -2309,12 +2336,8 @@ impl World {
     /// leaves breathe it out faster); when the soil under it dries it turns straw yellow and dies
     /// back to bare earth, and buried or drowned it dies too. Its roots hold the earth against
     /// erosion, and it burns back to earth (see `thermal`).
-    fn step_grass(&mut self, x: i32, y: i32) {
+    fn rest_grass(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
-        if matches!(self.at(x, y + 1).kind(), Kind::Empty | Kind::Gas | Kind::Liquid) && self.mask_free(x, y + 1) {
-            self.swap((x, y), (x, y + 1));
-            return;
-        }
         self.step_soil(x, y);
         if self.sprout_tree(x, y) {
             return;
@@ -2322,6 +2345,15 @@ impl World {
         if (!self.turf_open(x, y) && self.chance(GRASS_SMOTHER)) || (self.moisture[i] < GRASS_DRY && self.chance(GRASS_WILT)) {
             self.retype(x, y, Mat::Dirt);
         }
+    }
+
+    /// Grass with nothing solid under it drops a cell (`Motion::Turf`). Returns whether it did.
+    fn drop_turf(&mut self, x: i32, y: i32) -> bool {
+        if matches!(self.at(x, y + 1).kind(), Kind::Empty | Kind::Gas | Kind::Liquid) && self.mask_free(x, y + 1) {
+            self.swap((x, y), (x, y + 1));
+            return true;
+        }
+        false
     }
 
     /// Is the soil at (x, y) close enough to the open air for grass: open air right above it, or
@@ -2347,14 +2379,11 @@ impl World {
     /// Bare soil washes away under flowing water (grass roots protect it), and grass grows on it
     /// where it is moist, in the open and in the light: it creeps in from grass nearby, and now
     /// and then a seed blown in by the wind starts a new patch.
-    fn step_dirt(&mut self, x: i32, y: i32) {
+    /// (Earth is a cohesive granular matter, not a solid: a clod with nothing under it drops, and
+    /// a bank only slumps where it is steeper than its angle of repose, see `Motion::Clod` and
+    /// `repose`.)
+    fn rest_dirt(&mut self, x: i32, y: i32) {
         let i = Self::idx(x, y);
-        // Earth is a cohesive granular matter, not a solid: a clod with nothing under it drops, and
-        // a bank only slumps where it is steeper than its angle of repose (see `repose`).
-        // (Worlds where nothing falls apart keep it as it lies.)
-        if self.structures_fall && self.step_powder(x, y) {
-            return;
-        }
         self.step_soil(x, y);
         if self.sprout_tree(x, y) {
             return;
@@ -2416,7 +2445,7 @@ impl World {
             self.moisture[i] -= SOIL_WATER;
             return;
         }
-        // Evaporation, as for open water (see `step_water`): warmer, drier and windier is faster.
+        // Evaporation, as for open water (see `react_water`): warmer, drier and windier is faster.
         // Wet soil dries about as fast as a puddle, drier soil slower; grass breathes out the
         // water its roots draw up, so a lawn dries faster than bare earth.
         let t = self.temp[i];
@@ -2474,20 +2503,22 @@ impl World {
     /// Snowflakes drift on the wind while they fall, slowly (they are light and catch the air).
     /// On the ground snow is a very thick, viscous paste: a heap slumps and spreads out little by
     /// little, but a thin layer (one or two cells) stays where it fell instead of running off.
-    fn step_snow(&mut self, x: i32, y: i32) {
+    /// (See `snow_creeps`.) Returns whether the wind took the flake.
+    fn snow_drifts(&mut self, x: i32, y: i32) -> bool {
         if self.at(x, y + 1) == Mat::Empty && self.wind.abs() > 0.1 && (self.rand() % 100) as f32 <= self.wind.abs() * 60.0 {
             let w = if self.wind > 0.0 { 1 } else { -1 };
             if self.at(x + w, y + 1) == Mat::Empty {
                 self.swap((x, y), (x + w, y + 1));
-                return;
+                return true;
             }
         }
-        if self.step_powder(x, y) {
-            return;
-        }
-        // Creep: now and then a cell oozes a few cells sideways and one down, so a heap keeps
-        // slumping flatter than a heap of grains. Where the ground is flat it needs a drop to
-        // flow into, so a thin layer stays put.
+        false
+    }
+
+    /// Creep: now and then a cell of snow at rest oozes a few cells sideways and one down, so a
+    /// heap keeps slumping flatter than a heap of grains. Where the ground is flat it needs a
+    /// drop to flow into, so a thin layer stays put.
+    fn snow_creeps(&mut self, x: i32, y: i32) {
         if self.chance_per_cell(SNOW_CREEP, 1) {
             if let Some(to) = self.snow_creep_target(x, y) {
                 self.swap((x, y), to);
@@ -2514,42 +2545,41 @@ impl World {
     }
 
     /// Glass shards pile up like sand and, given time, turn back into sand.
-    fn step_shard(&mut self, x: i32, y: i32) {
-        if !self.step_powder(x, y) && self.chance(4000) {
+    fn rest_shard(&mut self, x: i32, y: i32) {
+        if self.chance(4000) {
             self.set(x, y, Mat::Sand);
         }
     }
 
-    fn step_gunpowder(&mut self, x: i32, y: i32) {
+    /// Black powder (and a stick of dynamite) goes off against anything hot.
+    fn react_gunpowder(&mut self, x: i32, y: i32) -> bool {
         for (nx, ny) in Self::neighbors(x, y) {
             if self.at(nx, ny).hot() {
                 self.set_off_powder(x, y);
-                return;
+                return true;
             }
         }
-        self.step_powder(x, y);
+        false
     }
 
     /// Ash is carbon: with water it turns into fertile soil.
-    fn step_ash(&mut self, x: i32, y: i32) {
+    fn react_ash(&mut self, x: i32, y: i32) -> bool {
         let n = Self::neighbors(x, y)[(self.rand() % 4) as usize];
         if self.at(n.0, n.1) == Mat::Water && self.chance(500) {
             self.set(x, y, Mat::Dirt);
-            return;
+            return true;
         }
-        self.step_powder(x, y);
+        false
     }
 
     /// Charcoal is a powder, set alight by lava as well as by flames.
-    fn step_charcoal(&mut self, x: i32, y: i32) {
+    fn react_charcoal(&mut self, x: i32, y: i32) -> bool {
         let n = Self::neighbors(x, y)[(self.rand() % 4) as usize];
         if self.at(n.0, n.1) == Mat::Lava {
             self.light_charcoal(x, y, 20);
-            if self.at(x, y) != Mat::Charcoal {
-                return;
-            }
+            return self.at(x, y) != Mat::Charcoal;
         }
-        self.step_powder(x, y);
+        false
     }
 
     /// Enough light for a plant: daytime and nothing leafy overhead.
@@ -2593,10 +2623,7 @@ impl World {
 
     /// A seed is not a matter that stays: it falls, and the soil it lands on takes it in (the
     /// earth becomes fertile, see `sow`). Fallen on anything else, it rots away.
-    fn step_seed(&mut self, x: i32, y: i32) {
-        if self.step_powder(x, y) {
-            return;
-        }
+    fn rest_seed(&mut self, x: i32, y: i32) {
         if self.sow(x, y + 1) {
             self.set(x, y, Mat::Empty);
             return;
@@ -2768,10 +2795,7 @@ impl World {
     }
 
     /// A dead leaf falls, lies on the ground and slowly rots into soil.
-    fn step_dead_leaf(&mut self, x: i32, y: i32) {
-        if self.step_powder(x, y) {
-            return;
-        }
+    fn rest_dead_leaf(&mut self, x: i32, y: i32) {
         let wet = Self::neighbors(x, y).iter().any(|&(nx, ny)| self.at(nx, ny) == Mat::Water);
         if self.chance(if wet { 1_500 } else { 6_000 }) {
             // The saltpetre bed: a leaf rotting against wood ash leaves white crystals of
@@ -2790,24 +2814,24 @@ impl World {
 
     /// Saltpetre dissolves in water. Ground against charcoal, cold and dry, it makes black
     /// powder (real powder also takes a little sulphur, which only makes it livelier).
-    fn step_saltpeter(&mut self, x: i32, y: i32) {
+    fn react_saltpeter(&mut self, x: i32, y: i32) -> bool {
         let n = Self::neighbors(x, y)[(self.rand() % 4) as usize];
         match self.raw(n.0, n.1) {
             Mat::Water if self.chance(300) => {
                 self.set(x, y, Mat::Empty);
-                return;
+                return true;
             }
             Mat::Charcoal if self.chance(40) && self.temp_c(x, y) < 80.0 => {
                 let dry = !Self::neighbors(x, y).iter().chain(Self::neighbors(n.0, n.1).iter()).any(|&(ax, ay)| self.raw(ax, ay) == Mat::Water);
                 if dry {
                     self.set(x, y, Mat::Gunpowder);
                     self.set(n.0, n.1, Mat::Gunpowder);
-                    return;
+                    return true;
                 }
             }
             _ => {}
         }
-        self.step_powder(x, y);
+        false
     }
 
     /// The skeleton of a crown: in spring and summer it pushes new leaves out
@@ -3018,14 +3042,14 @@ impl World {
     }
 
     /// Oil is a slow, light liquid: it floats on water and burns ferociously.
-    fn step_oil(&mut self, x: i32, y: i32) {
+    fn react_oil(&mut self, x: i32, y: i32) -> bool {
         for (nx, ny) in Self::neighbors(x, y) {
             if matches!(self.at(nx, ny), Mat::Fire | Mat::Ember | Mat::Lava) && self.chance(2) {
                 self.ignite_oil(x, y);
-                return;
+                return true;
             }
         }
-        self.step_liquid(x, y);
+        false
     }
 
     /// Burning oil: a long-lived, very hot flame that sets its neighbours alight.
@@ -3042,20 +3066,20 @@ impl World {
     }
 
     /// Smoke rises, drifts with the wind (wrapping at the sides) and thins out.
-    fn step_smoke(&mut self, x: i32, y: i32) {
+    fn react_smoke(&mut self, x: i32, y: i32) -> bool {
         // In the open air smoke thins out; shut in a box it stays, and chokes the fire.
         if self.chance(900) && !self.sealed(x, y) {
             self.set(x, y, Mat::Empty);
-            return;
+            return true;
         }
-        self.step_gas(x, y);
+        false
     }
 
     /// The one way steam and smoke move (`Kind::Gas`), the matter only setting how it drifts
     /// (`drift`): pushed by the difference of density with the air around (`buoyancy`), then
     /// carried by the wind, and otherwise a warm gas climbs while a cooled one wanders sideways.
     /// (A cloud is droplets hanging in the air: it has its own, stiller wandering, see
-    /// `step_cloud`.) Returns whether it moved.
+    /// `move_cloud`.) Returns whether it moved.
     fn step_gas(&mut self, x: i32, y: i32) -> bool {
         if self.buoyancy(x, y) {
             return true;
@@ -3088,7 +3112,8 @@ impl World {
         false
     }
 
-    fn step_water(&mut self, x: i32, y: i32) {
+    /// Water soaks into the soil and evaporates. Returns whether it is gone.
+    fn react_water(&mut self, x: i32, y: i32) -> bool {
         let i = Self::idx(x, y);
         // Soil drinks the water on it and beside it, until it is saturated: the water goes into the
         // ground (the soil gets moist) and the rest stays on top as a puddle.
@@ -3100,7 +3125,7 @@ impl World {
                 self.moisture[j] += self.water_units_in(i).min(SOIL_WATER);
                 self.zones.wake(j);
                 self.set(x, y, Mat::Empty);
-                return;
+                return true;
             }
         }
         // A free surface evaporates at any temperature above freezing: faster when the water is
@@ -3129,26 +3154,36 @@ impl World {
                     let taken = self.water_fill(i).min(field::FULL / VAPOUR_PER_WATER as u32).max(1);
                     if self.chance_f(rate * field::FULL as f32 / taken as f32) {
                         self.evaporate_quarter(x, y);
-                        return;
+                        return true;
                     }
                 } else if self.chance_f(rate) {
                     // The heat it takes cools the water and the air around (see `vaporize`).
                     self.vaporize(x, y);
-                    return;
+                    return true;
                 }
             }
         }
+        false
+    }
+
+    /// How the cells' turn moves a liquid (`Motion::Liquid`; the solver moves it otherwise, see
+    /// `liquid.rs`): a lone drop of one that falls freely (`fall_ms`) races down through the air,
+    /// else it rises through a heavier liquid on top of it. Returns whether it moved.
+    fn move_liquid(&mut self, x: i32, y: i32, m: Mat) -> bool {
+        let i = Self::idx(x, y);
+        let terminal = MatSpec::of(m).fall_ms;
         // A drop in the air falls like any heavy particle: gravity speeds it up to a terminal speed
         // (air drag) and the wind carries it along on the way down, so the rain slants and gusts.
         // Water with more water on top of it (the roof of a hole in a lake, a thick stream) just
         // sinks a cell at a time: only a free drop races down.
         // (Water on a cloud too, alone or not: the cloud is a wall to the liquids.)
-        let free_drop = self.lone_liquid(x, y) || self.rain_over_gas(x, y);
+        let free_drop = terminal > 0.0 && (self.lone_liquid(x, y) || self.rain_over_gas(x, y));
         if free_drop && matches!(self.at(x, y + 1).kind(), Kind::Empty | Kind::Gas) && self.mask_free(x, y + 1) {
             // Falling through a cloud, the drop sweeps up the droplets in its way and grows: the
             // cloud's water becomes rain (`VAPOUR_PER_WATER` cells of cloud, one cell of rain). It
             // goes by the way it falls (the tick it would go into the cell), not by the time.
-            let into = self.fall_at[i] as u32 + self.vel[i].saturating_add(fall_accel()).min(fall_speed(DROP_TERMINAL_MS)) as u32 >= FALL_UNIT;
+            // (Only rain falls freely: the drop is water, as the cloud is.)
+            let into = self.fall_at[i] as u32 + self.vel[i].saturating_add(fall_accel()).min(fall_speed(terminal)) as u32 >= FALL_UNIT;
             if into && self.raw(x, y + 1) == Mat::Cloud && self.chance(DROP_SWEEP) && self.gather_vapour(x, y + 1) {
                 let j = Self::idx(x, y + 1);
                 let t = self.temp[j].max(self.temp[i]);
@@ -3163,15 +3198,15 @@ impl World {
                 self.liq.drops.push(liquid::Drop { x: x as f32 + 0.5, y: y as f32 + 0.5, vx: 0.0, vy: speed, m: Mat::Water, q: field::FULL, t });
                 self.set(x, y + 1, Mat::Empty);
                 self.temp[j] = t;
-                self.fall_drop(x, y);
-                return;
+                self.fall_drop(x, y, terminal);
+                return true;
             }
-            self.fall_drop(x, y);
-            return;
+            self.fall_drop(x, y, terminal);
+            return true;
         }
         // A drop that has joined other water (or landed) no longer falls freely: moved by their
         // physics, the liquids take it over (see `liquid.rs`).
-        self.step_liquid(x, y);
+        self.step_liquid(x, y)
     }
 
     /// What the cells' turn does to a liquid (`Kind::Liquid`), moved by its physics otherwise
@@ -3190,9 +3225,9 @@ impl World {
     /// Moves a drop with free air under it: it speeds up by gravity as a grain does (see
     /// `fall_on`), goes down a cell when its way adds up to one, and sideways as far as the local
     /// wind carries it.
-    fn fall_drop(&mut self, x: i32, y: i32) {
+    fn fall_drop(&mut self, x: i32, y: i32, terminal: f32) {
         let i = Self::idx(x, y);
-        let v = self.vel[i].saturating_add(fall_accel()).min(fall_speed(DROP_TERMINAL_MS));
+        let v = self.vel[i].saturating_add(fall_accel()).min(fall_speed(terminal));
         let way = self.fall_at[i] as u32 + v as u32;
         self.vel[i] = v;
         // Down as many cells as its way adds up to (a fast drop, several a tick).
@@ -3227,7 +3262,7 @@ impl World {
         }
     }
 
-    fn step_steam(&mut self, x: i32, y: i32) {
+    fn react_steam(&mut self, x: i32, y: i32) -> bool {
         // Condensation is handled by temperature (see thermal.rs); it moves as a gas (`step_gas`).
         let i = Self::idx(x, y);
         // Packed vapour (a full boiler) spreads into any room it finds.
@@ -3241,10 +3276,10 @@ impl World {
                 self.set(n.0, n.1, Mat::Steam);
                 self.temp[j] = t;
                 self.release_heat(x, y, q);
-                return;
+                return true;
             }
         }
-        self.step_gas(x, y);
+        false
     }
 
     /// Water at (x, y) turns to vapour and swells: the cell becomes steam, and the rest of its
@@ -3405,7 +3440,8 @@ impl World {
         n as f32
     }
 
-    fn step_cloud(&mut self, x: i32, y: i32) {
+    /// A cloud rains, and evaporates again. Returns whether the cell is no longer cloud.
+    fn react_cloud(&mut self, x: i32, y: i32) -> bool {
         let i = Self::idx(x, y);
         // Whether at least `n` of the eight cells around are cloud (the look stops there: in a
         // cloud, the first few cells answer).
@@ -3424,7 +3460,7 @@ impl World {
         // A cloud is water: countless droplets too small to fall. Where the cloud is thick they
         // bump into each other and merge until some are heavy enough to fall: rain when it is
         // mild, snow when it freezes, hail when it is very cold. A drop can start anywhere in the
-        // cloud and grows as it falls through it (see `step_water`). Every drop takes
+        // cloud and grows as it falls through it (see `move_liquid`). Every drop takes
         // `VAPOUR_PER_WATER` cells of the cloud's water, so a cloud that rains thins out and the rain eases off by itself until
         // fresh vapour feeds it again. A cloud warmed by the sun keeps its water and does not rain.
         let t = self.temp[i];
@@ -3441,27 +3477,32 @@ impl World {
                 self.set(x, y, to);
                 self.temp[i] = tt;
                 self.release_heat(x, y, own - thermal::heat_of(to, tt));
-                return;
+                return true;
             }
         }
         // Warmed above its dew point (by the sun, by warm air), or left alone in dry air, a cloud
         // evaporates again.
         if (self.chance(600) && self.above_dew_point(x, y)) || (!near(self, 1) && self.chance(3000)) {
             self.evaporate_cloud(x, y);
-            return;
+            return true;
         }
+        false
+    }
+
+    /// How a cloud moves (`Motion::Cloud`). Returns whether it moved.
+    fn move_cloud(&mut self, x: i32, y: i32) -> bool {
         // Up at the top of the weather the jet stream sweeps the cloud along before anything
         // else: the top of a storm cloud is dragged downwind into an anvil.
         if y < CEILING_Y() + 10 {
             if let Some(t) = self.wind_target(x, y) {
                 if self.at(t.0, t.1) == Mat::Empty {
                     self.swap((x, y), t);
-                    return;
+                    return true;
                 }
             }
         }
         if self.buoyancy(x, y) {
-            return;
+            return true;
         }
         // The wind pushes clouds along; otherwise they wander a little.
         let target = if let Some(t) = self.wind_target(x, y) {
@@ -3474,20 +3515,24 @@ impl World {
             } else if r == 2 && y > COLD_Y() {
                 (x, y - 1)
             } else {
-                return;
+                return false;
             }
         };
         // Blown past the left or right edge, it leaves the world like steam does.
         if self.at(target.0, target.1) == Mat::Empty {
             self.swap((x, y), target);
+            return true;
         }
+        false
     }
 
-    fn step_fire(&mut self, x: i32, y: i32) {
+    /// A flame burns its fuel and the air's oxygen, and sets alight what it touches. Returns
+    /// whether it went out.
+    fn react_fire(&mut self, x: i32, y: i32) -> bool {
         let i = Self::idx(x, y);
         if self.fuel[i].left == 0 {
             self.set(x, y, Mat::Empty);
-            return;
+            return true;
         }
         self.fuel[i].left -= 1;
         // A flame burns the oxygen of the air touching it. With no air around (only smoke,
@@ -3507,7 +3552,7 @@ impl World {
                 Mat::Water => {
                     if self.chance(4) {
                         self.set(x, y, Mat::Empty);
-                        return;
+                        return true;
                     }
                 }
                 m if m.is_wooden() => self.ignite(nx, ny, 25),
@@ -3523,16 +3568,22 @@ impl World {
         if self.chance(10) && self.at(x, y - 1) == Mat::Empty {
             self.set(x, y - 1, Mat::Smoke);
         }
-        // Flames lean with the wind.
+        false
+    }
+
+    /// How a flame moves (`Motion::Flame`): it licks upwards, and leans with the wind. Returns
+    /// whether it moved.
+    fn move_flame(&mut self, x: i32, y: i32) -> bool {
         let d = if self.wind.abs() > 0.3 && self.chance(2) { self.wind.signum() as i32 } else { self.dir() };
         let r = self.rand() % 10;
-        let order: [(i32, i32); 2] = if r < 6 { [(0, -1), (d, -1)] } else if r < 8 { [(d, 0), (-d, 0)] } else { return };
+        let order: [(i32, i32); 2] = if r < 6 { [(0, -1), (d, -1)] } else if r < 8 { [(d, 0), (-d, 0)] } else { return false };
         for (dx, dy) in order {
             if self.at(x + dx, y + dy) == Mat::Empty {
                 self.swap((x, y), (x + dx, y + dy));
-                return;
+                return true;
             }
         }
+        false
     }
 
 
@@ -3611,9 +3662,9 @@ impl World {
         self.fuel[i] = Fuel { left: 30 + (self.rand() % 26) as u8, carbon: true };
     }
 
-    /// Lava and molten metal: they flow slowly, set wood alight, and when quenched
-    /// by water set solid (`solid`) while the water flashes to steam.
-    fn step_hot_liquid(&mut self, x: i32, y: i32, solid: Mat) {
+    /// Lava and molten metal: they set wood alight, and when quenched by water set solid
+    /// (`solid`) while the water flashes to steam. Returns whether it set.
+    fn react_hot_liquid(&mut self, x: i32, y: i32, solid: Mat) -> bool {
         for (nx, ny) in Self::neighbors(x, y) {
             match self.at(nx, ny) {
                 // Quenched: it sets solid and the water flashes to steam.
@@ -3631,7 +3682,7 @@ impl World {
                     }
                     self.vaporize(nx, ny);
                     self.release_heat(x, y, q);
-                    return;
+                    return true;
                 }
                 m if m.is_wooden() => self.ignite(nx, ny, 20),
                 _ => {}
@@ -3648,7 +3699,7 @@ impl World {
             self.temp.swap(i, j);
             self.latent.swap(i, j);
         }
-        self.step_liquid(x, y);
+        false
     }
 
 
@@ -3663,8 +3714,8 @@ impl World {
     // ----- structures -------------------------------------------------------
 
     /// Grass is not structural: it holds nothing up and is not carried along, it
-    /// just falls (see `step_grass`) until something solid catches it. Earth is not either: it is
-    /// a granular matter that moves grain by grain (see `step_dirt`).
+    /// just falls (see `Motion::Turf`) until something solid catches it. Earth is not either: it is
+    /// a granular matter that moves grain by grain (see `Motion::Clod`).
     fn structural(m: Mat) -> bool {
         m.kind() == Kind::Static && !matches!(m, Mat::Grass | Mat::Dirt)
     }
@@ -7448,7 +7499,7 @@ mod science {
         w.climate_fixed = Some(-5.0);
         w.reset_temps();
         w.flow.pin_uniform(0.0, 0.0);
-        // (No wind: in the wind a flake drifts down a cell a tick, see `step_snow`.)
+        // (No wind: in the wind a flake drifts down a cell a tick, see `snow_drifts`.)
         w.wind = 0.0;
         w.wind_max = 0.0;
         w.set(400, 20, Mat::Snow);

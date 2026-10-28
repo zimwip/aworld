@@ -1950,7 +1950,7 @@ mod latent_tests {
         w.set(100, 201, Mat::Water);
         w.temp[201 * W() + 100] = 20.0;
         let before = w.total_heat();
-        w.step_hot_liquid(100, 200, Mat::Stone);
+        w.react_hot_liquid(100, 200, Mat::Stone);
         assert_eq!(w.raw(100, 200), Mat::Stone);
         assert!(close(w.total_heat(), before), "{} vs {before}", w.total_heat());
     }
