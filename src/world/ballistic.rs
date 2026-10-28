@@ -15,7 +15,8 @@ use super::H;
 pub fn pull(vx: &mut f32, vy: &mut f32, g: f32, terminal: f32) {
     *vy += g;
     let speed = (*vx * *vx + *vy * *vy).sqrt();
-    let k = (1.0 - g * speed / (terminal * terminal)).max(0.0);
+    let drag = g / (terminal * terminal);
+    let k = (1.0 - drag * speed).max(0.0);
     *vx *= k;
     *vy *= k;
 }

@@ -47,9 +47,11 @@ fn cadence(p: Pass) -> Cadence {
         // pieces, the siphons stopped levelling). A multiple of the heat cycle, so that it always
         // falls on the same part of it.
         Pass::Pockets => c(0.3, 5),
-        Pass::Settle => c(1.0, 17),
+        // (About a second. A second even, 60 ticks, changed how fast soil turns to mud under
+        // water enough to undo a test of erosion that sits on its edge: kept as it was.)
+        Pass::Settle => c(64.0 * TICK, 17),
         Pass::Pressure => c(4.0 * TICK, 1),
-        Pass::Season => c(1.0, 0),
+        Pass::Season => c(64.0 * TICK, 0),
         Pass::Storm => c(4.0 * TICK, 0),
         Pass::FlowSolids => c(16.0 * TICK, 1),
         Pass::FlowHeat => c(4.0 * TICK, 1),
