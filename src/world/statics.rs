@@ -43,13 +43,11 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::f32::consts::FRAC_PI_2;
 
-/// Side of a cell, m.
-const CELL_M: f32 = 0.05;
-/// Gravity, m/s².
-const G: f32 = 9.81;
-/// The pull of gravity on a body in flight, cells per step² (the same as for debris and clods). It
-/// sets the time of a step for the bodies: sqrt(CELL_M · FALL / G), about 25 ms.
-const FALL: f32 = 0.12;
+use super::units::{cell_m, G};
+/// The pull of gravity on a body in flight, cells per tick² (the bodies move every tick).
+fn fall() -> f32 {
+    super::units::g_tick()
+}
 /// Share of the energy of an impact that goes into opening cracks; the rest bounces back, shakes
 /// the ground and warms it.
 const CRACK_SHARE: f32 = 0.0005;
@@ -144,9 +142,9 @@ pub(super) struct Worked {
     margin: f64,
 }
 
-/// Speed in m/s of one cell per step.
+/// Speed in m/s of one cell per tick.
 fn ms_per_cell_step() -> f32 {
-    CELL_M / (CELL_M * FALL / G).sqrt()
+    super::units::metres_per_s(1.0)
 }
 
 /// Whether two touching solid cells belong to one body.
@@ -154,49 +152,19 @@ pub fn same_body(a: Mat, b: Mat) -> bool {
     a == b || (a.is_vegetation() && b.is_vegetation())
 }
 
-/// Fracture energy, J/m²: what it costs to open a crack through the matter. Brittle matters need
-/// little (ice, glass, rock), tough ones a great deal (wood, metal: they bend instead).
+/// Fracture energy, J/m² (see `MatSpec::toughness`).
 pub fn toughness(m: Mat) -> f32 {
-    match m {
-        Mat::Ice => 1.0,
-        Mat::Glass => 8.0,
-        Mat::Clay => 5.0,
-        Mat::Brick | Mat::Terracotta => 30.0,
-        Mat::Stone | Mat::Vault => 50.0,
-        Mat::Diamond => 20.0,
-        Mat::Ember => 100.0,
-        Mat::Dynamite => 300.0,
-        Mat::Leaf | Mat::Sapling => 500.0,
-        Mat::Wood | Mat::Branch => 8_000.0,
-        Mat::Trunk => 15_000.0,
-        Mat::Iron => 50_000.0,
-        Mat::Steel => 100_000.0,
-        _ => 1.0e6,
-    }
+    MatSpec::of(m).toughness
 }
 
-/// What a solid crushed finer than a cell becomes.
+/// What a solid crushed finer than a cell becomes (see `MatSpec::rubble`).
 pub fn rubble(m: Mat) -> Option<Mat> {
-    match m {
-        Mat::Ice => Some(Mat::Hail),
-        Mat::Glass => Some(Mat::Shard),
-        Mat::Stone | Mat::Brick | Mat::Terracotta | Mat::Vault => Some(Mat::Sand),
-        Mat::Clay => Some(Mat::Dirt),
-        Mat::Diamond => Some(Mat::Diamond),
-        _ => None,
-    }
+    MatSpec::of(m).rubble
 }
 
-/// Coefficient of restitution of matter `m`: the share of the speed along the normal a body of
-/// it bounces back with.
+/// Coefficient of restitution of matter `m` (see `MatSpec::restitution`).
 fn restitution(m: Mat) -> f32 {
-    match m {
-        Mat::Wood | Mat::Trunk | Mat::Branch => 0.45,
-        Mat::Iron | Mat::Steel | Mat::Glass | Mat::Diamond => 0.4,
-        Mat::Ice => 0.35,
-        Mat::Clay | Mat::Leaf | Mat::Sapling => 0.05,
-        _ => 0.3,
-    }
+    MatSpec::of(m).restitution
 }
 
 /// Typical size of the pieces, in cells, when matter `m` hits at `v` m/s.
@@ -206,7 +174,7 @@ fn piece_size(m: Mat, v: f32) -> f32 {
     }
     // Breaking a body of area A into squares of side s opens about 2A/s of crack (per metre of
     // depth); its kinetic energy is ½ρAv². The share that cracks it pays for the cracks.
-    4.0 * toughness(m) / (CRACK_SHARE * density(m) * 1000.0 * v * v) / CELL_M
+    4.0 * toughness(m) / (CRACK_SHARE * density(m) * 1000.0 * v * v) / cell_m()
 }
 
 /// One cell of a body in flight, as it was when the body broke loose.
@@ -306,7 +274,7 @@ impl Slab {
 
     /// Its weight, kN per metre of depth.
     pub fn weight(&self) -> f32 {
-        self.mass * G * CELL_M * CELL_M
+        self.mass * G * cell_m() * cell_m()
     }
 
     /// The edge it still turns on, if it does (cells).
@@ -316,7 +284,7 @@ impl Slab {
 
     /// The moment of its weight about the edge it turns on, kN·m per metre (positive: clockwise).
     pub fn moment(&self) -> f32 {
-        self.hinge.map_or(0.0, |h| self.weight() * (self.c.0 - h.0) * CELL_M)
+        self.hinge.map_or(0.0, |h| self.weight() * (self.c.0 - h.0) * cell_m())
     }
 
     /// The pose it has after `dt` of a step: turned about its edge, or moved and turned about
@@ -377,7 +345,7 @@ impl World {
         // Nothing changed in the anchored bodies since the last check: their loads are the same.
         // The push of the liquids on each cell (in cells of water, see `liquid_push`), counted in
         // quarters of a cell in the fingerprints so that a body is worked out again when it changes.
-        let push: Vec<(f32, f32)> = if self.liquid_physics { order.par_iter().map(|&i| self.liquid_push(i)).collect() } else { Vec::new() };
+        let push: Vec<(f32, f32)> = order.par_iter().map(|&i| self.liquid_push(i)).collect();
         let quarters = |k: usize| push.get(k).map_or(0, |&(fx, fy)| (((fx * 4.0).round() as i32 as u64) << 20) ^ ((fy * 4.0).round() as i32 as u64 & 0xf_ffff));
         let key = order.iter().enumerate().fold(order.len() as u64, |h, (k, &i)| (h ^ ((i as u64) << 8 | self.cells[i].m as u64) ^ quarters(k).rotate_left(29)).wrapping_mul(0x100_0000_01b3));
         if key == self.strain_key {
@@ -535,7 +503,7 @@ impl World {
                         end += 1;
                     }
                     let (across, along) = ((line / 2) as f32 + 0.5, along / f);
-                    let f = f * liquid::CELL_OF_WATER_KN;
+                    let f = f * super::units::cell_of_water_kn();
                     self.pushes.push(if down {
                         LiquidPush { x: along, y: across, fx: 0.0, fy: f }
                     } else {
@@ -779,7 +747,7 @@ impl World {
         let (mut worst, mut pivot) = (0.0f64, first);
         for (e, dir) in [-1.0f64, 1.0].into_iter().enumerate() {
             let (px, py, p, holding) = s.edges[e];
-            let turning = G as f64 * CELL_M as f64 * 1000.0 * dir * ((moment - mass * px) - (side_moment - side * py));
+            let turning = G as f64 * cell_m() as f64 * 1000.0 * dir * ((moment - mass * px) - (side_moment - side * py));
             if turning <= 0.0 {
                 continue;
             }
@@ -803,7 +771,7 @@ impl World {
         }
         let (across, down) = w.plan.span;
         let turn: f64 = w.push.iter().zip(now).map(|(a, b)| (b.1 - a.1).abs() as f64 * across + (b.0 - a.0).abs() as f64 * down).sum::<f64>()
-            * G as f64 * CELL_M as f64 * 1000.0;
+            * G as f64 * cell_m() as f64 * 1000.0;
         turn < w.margin && turn < SHARE_SLACK * w.plan.weakest
     }
 
@@ -934,9 +902,6 @@ impl World {
     /// moment of the push about the edge beats the moment of the weight that holds them. The edge
     /// it turns about if so.
     fn pushed_over(&self, cells: &[usize], (lo, hi): (i32, i32), base: usize) -> Option<(f32, f32)> {
-        if !self.liquid_physics {
-            return None;
-        }
         let pushes: Vec<(usize, (f32, f32))> = cells.iter().map(|&i| (i, self.liquid_push(i))).collect();
         let side: f32 = pushes.iter().map(|p| p.1 .0).sum();
         if side == 0.0 {
@@ -974,7 +939,7 @@ impl World {
             let (px, py) = xy(p);
             // Moment of the weight (and of the liquids' push) about the edge (N·m per metre of
             // depth, over h³)...
-            let turning = G as f64 * CELL_M as f64 * 1000.0 * dir * ((moment - mass * px) - (side_moment - side * py));
+            let turning = G as f64 * cell_m() as f64 * 1000.0 * dir * ((moment - mass * px) - (side_moment - side * py));
             if turning <= 0.0 {
                 continue;
             }
@@ -1026,8 +991,8 @@ impl World {
                 }
                 let under = self.cells[t].m;
                 if self.mask[t] == 0 {
-                    // Firm ground holds it up; a liquid buoys it (it floats, see `drop_structures`),
-                    // but only where it dips in: a long arm reaching out beyond tips it over all the same.
+                    // Firm ground holds it up; a liquid buoys it (it floats, see `drop_structures`):
+                    // on firm ground, a long arm reaching out over the liquid tips it over all the same.
                     // Leaves and twigs give way under it (see `crush_foliage`): they hold nothing up.
                     if matches!(under, Mat::Leaf | Mat::Branch | Mat::Sapling) {
                         continue;
@@ -1058,10 +1023,16 @@ impl World {
             });
             let (cx, cy) = (mx / mass.max(1e-6), my / mass.max(1e-6));
             let base = p.cells.iter().map(|&i| i / W() + 1).max().unwrap_or(0);
-            let pushed = self.pushed_over(&p.cells, (lo.0, hi.0), base);
+            // (Only a body standing on firm ground turns over an edge of it. One that floats has
+            // no edge to turn about: the liquid bears it wherever it dips in, and it rights itself
+            // as it bobs (see `drop_structures`). A log landing on the waves a rock had raised
+            // tipped over the edge of the crest it touched, and sank as a slab.)
+            let pushed = if firm { self.pushed_over(&p.cells, (lo.0, hi.0), base) } else { None };
             let hinge = if let Some(edge) = pushed {
                 // Pushed over by the liquid against it (a wall of a dam that is too thin).
                 Some(edge)
+            } else if !firm {
+                None
             } else if cx < lo.0 as f32 {
                 Some((lo.0 as f32, lo.1 as f32 + 1.0))
             } else if cx > hi.0 as f32 + 1.0 {
@@ -1070,21 +1041,17 @@ impl World {
                 None
             };
             // For the stress view: what holds it and what turns it.
-            let w = mass * G * CELL_M * CELL_M;
-            let push = if self.liquid_physics {
-                p.cells.iter().fold((0.0f32, 0.0f32), |a, &i| {
-                    let f = self.liquid_push(i);
-                    (a.0 + f.0, a.1 + f.1)
-                })
-            } else {
-                (0.0, 0.0)
-            };
+            let w = mass * G * cell_m() * cell_m();
+            let push = p.cells.iter().fold((0.0f32, 0.0f32), |a, &i| {
+                let f = self.liquid_push(i);
+                (a.0 + f.0, a.1 + f.1)
+            });
             let span = (lo.0 as f32, hi.0 as f32 + 1.0);
             // The moment of the weight about the edge it turns over (positive: it tips), or how
             // far it is from tipping (negative: the moment that holds it, about the nearer edge).
             let moment = match hinge {
-                Some(h) => w * (cx - h.0).abs() * CELL_M,
-                None => -w * (cx - span.0).min(span.1 - cx) * CELL_M,
+                Some(h) => w * (cx - h.0).abs() * cell_m(),
+                None => -w * (cx - span.0).min(span.1 - cx) * cell_m(),
             };
             let hooked = hinge.is_some_and(|h| cy > h.1);
             let state = if hinge.is_none() {
@@ -1097,7 +1064,7 @@ impl World {
                 Balance::Tips
             };
             if self.bodies.len() < MAX_SHOWN {
-                self.bodies.push(FreeBody { c: (cx, cy), cells: p.cells.len(), weight: w, push: (push.0 * liquid::CELL_OF_WATER_KN, push.1 * liquid::CELL_OF_WATER_KN), span, base: base as f32, hinge, moment, state });
+                self.bodies.push(FreeBody { c: (cx, cy), cells: p.cells.len(), weight: w, push: (push.0 * super::units::cell_of_water_kn(), push.1 * super::units::cell_of_water_kn()), span, base: base as f32, hinge, moment, state });
             }
             if state != Balance::Tips && firm {
                 self.spread_ground(false, &p.cells);
@@ -1176,16 +1143,16 @@ impl World {
             let r = (s.c.0 - h.0, s.c.1 - h.1);
             let r2 = r.0 * r.0 + r.1 * r.1;
             // Torque of its weight about the edge (clockwise when the centre is to the right).
-            s.spin += FALL * s.mass * r.0 / (s.inertia + s.mass * r2);
+            s.spin += fall() * s.mass * r.0 / (s.inertia + s.mass * r2);
             // The edge only pushes: once gravity alone no longer bends the path of the centre of
             // mass round it (ω²r > g·cos), the body leaves it and flies.
             let rl = r2.sqrt().max(1e-3);
-            if s.spin * s.spin * rl > -FALL * r.1 / rl {
+            if s.spin * s.spin * rl > -fall() * r.1 / rl {
                 s.v = s.velocity_at(s.c);
                 s.hinge = None;
             }
         } else {
-            s.v.1 += FALL;
+            s.v.1 += fall();
         }
         let lever = match s.hinge {
             Some(h) => ((s.c.0 - h.0).powi(2) + (s.c.1 - h.1).powi(2)).sqrt() + s.reach,
@@ -1309,7 +1276,7 @@ impl World {
         }
         let before = (s.v, s.spin);
         // A slow touch does not bounce (else a body at rest would hop under its own weight).
-        let e = if worst > 3.0 * FALL { (restitution(s.parts[0].cell.m) + restitution(hit.m)) / 2.0 } else { 0.0 };
+        let e = if worst > 3.0 * fall() { (restitution(s.parts[0].cell.m) + restitution(hit.m)) / 2.0 } else { 0.0 };
         struct Contact {
             r: (f32, f32),
             n: (f32, f32),
@@ -1624,7 +1591,7 @@ impl World {
         if !firm {
             return false;
         }
-        let v = (2.0 * G * piece.fallen * CELL_M).sqrt();
+        let v = (2.0 * G * piece.fallen * cell_m()).sqrt();
         let cells = piece.cells.clone();
         self.fracture(&cells, &vec![(0.0, v); cells.len()]).is_some()
     }
@@ -1975,7 +1942,8 @@ mod tests {
             }
         }
         let cells: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Wood).collect();
-        w.loosen(cells, None, (1.5, 0.0), 0.0);
+        // (At 3 m/s.)
+        w.loosen(cells, None, (super::super::units::cells_per_tick(3.0), 0.0), 0.0);
         run(&mut w, 600);
         assert!(w.slabs.is_empty(), "it came to rest");
         let wood = cells_of(&w, Mat::Wood);

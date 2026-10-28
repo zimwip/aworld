@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::blocks::anchor_at;
-use crate::blocks::{Physics, ReelRef, PX_PER_M};
+use crate::blocks::{Physics, ReelRef, px_per_m};
 use crate::mech::{self, Axle, End, Event, Gear, GearSize, Motor, Pivot, Pulley, Rod, Slider};
 
 /// A multi-click build in progress.
@@ -1027,7 +1027,7 @@ impl Game {
             match mech_end {
                 End::Pin { gear, .. } => {
                     if let Some(gi) = self.mech.gear_index(gear) {
-                        let r = (p - self.mech.gears[gi].pos) / blocks::PX_PER_M;
+                        let r = (p - self.mech.gears[gi].pos) / blocks::px_per_m();
                         self.mech.gears[gi].ext_torque += (r.x * pull.y - r.y * pull.x) / WHEEL_TORQUE_PER_UNIT;
                     }
                 }
@@ -1105,7 +1105,7 @@ impl Game {
             c.len = len;
             let at_start = matches!(c.a, Anchor::Reel { .. });
             let pull = Physics::rope_tension(c, at_start);
-            self.mech.gears[gi].ext_torque -= pull * (r.radius / PX_PER_M) / WHEEL_TORQUE_PER_UNIT;
+            self.mech.gears[gi].ext_torque -= pull * (r.radius / px_per_m()) / WHEEL_TORQUE_PER_UNIT;
         }
     }
 

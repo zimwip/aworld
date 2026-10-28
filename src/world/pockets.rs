@@ -13,7 +13,7 @@
 //!   partial vacuum;
 //! - liquids carry the pressure (Pascal) and their own weight: a hole low in a dam or in a boiler
 //!   shoots a jet, faster the deeper it is (Torricelli), and the pressure of a boiler lifts its
-//!   water up a pipe (`hydro.rs` balances heads, not just heights);
+//!   water up a pipe (the liquids' solver reads the pocket's pressure on their surface);
 //! - a steam motor (see `mechgame.rs`) takes its power from the pocket it sits in.
 
 use super::*;
@@ -26,10 +26,8 @@ pub const STEAM_N: f32 = 8.0;
 /// Pockets and liquid pressure are re-read every this many steps (a multiple of 6, so that the
 /// pass always falls on the same part of the heat cycle, see `after_cells`).
 pub const POCKETS_EVERY: u32 = 18;
-/// Atmospheres per cell of water depth (the same scale as the pressure view).
-pub const ATM_PER_CELL: f32 = 1.0 / 60.0;
-/// A liquid shoots out sideways once the pressure behind a hole is worth this many cells of head.
-const JET_HEAD: f32 = 3.0;
+/// A liquid shoots out sideways once the pressure behind a hole is worth this much head, m.
+const JET_HEAD_M: f32 = 0.5;
 /// Air temperature (K) at which a closed pocket of plain air is at 1 atm.
 const T0: f32 = 288.15;
 
@@ -71,29 +69,15 @@ impl Pocket {
     }
 }
 
-/// How much excess pressure (atm) a wall of this material holds before it gives way.
-/// `None`: it never does (or it is not a wall).
+/// How much excess pressure (atm) a wall of this material holds before it gives way (see
+/// `MatSpec::holds_atm`). `None`: it never does (or it is not a wall).
 pub fn wall_strength(m: Mat) -> Option<f32> {
-    Some(match m {
-        Mat::Ice => 0.6,
-        Mat::Glass => 0.8,
-        Mat::Snow | Mat::Hail | Mat::Ash | Mat::Charcoal | Mat::Sand | Mat::Mud | Mat::Seed | Mat::Shard | Mat::Rust | Mat::Gunpowder | Mat::Saltpeter | Mat::DeadLeaf => 0.6,
-        Mat::Dirt | Mat::Grass => 2.0,
-        Mat::Clay => 1.5,
-        Mat::Wood | Mat::Trunk => 2.5,
-        Mat::Brick => 2.0,
-        Mat::Terracotta => 3.0,
-        Mat::Stone => 5.0,
-        Mat::Iron => 8.0,
-        Mat::Steel => 14.0,
-        _ => return None,
-    })
+    super::MatSpec::of(m).holds_atm
 }
 
-/// Ground that gas seeps through: a cave dug in soil or sand, or air trapped among wet grains,
-/// does not hold pressure the way a boiler does.
+/// Ground that gas seeps through (see `MatSpec::porous`).
 fn porous(m: Mat) -> bool {
-    matches!(m, Mat::Sand | Mat::Dirt | Mat::Grass | Mat::Mud | Mat::Snow | Mat::Hail | Mat::Shard | Mat::Seed | Mat::DeadLeaf | Mat::Gunpowder | Mat::Saltpeter | Mat::Rust)
+    super::MatSpec::of(m).porous
 }
 
 /// Least energy (excess atmospheres times cells of gas) that breaks a wall: a bubble of a few
@@ -137,7 +121,7 @@ impl World {
                 } else {
                     0
                 };
-                liq_w[x] = if cls[x] == 3 { density(m) * ATM_PER_CELL } else { 0.0 };
+                liq_w[x] = if cls[x] == 3 { units::atm_per_cell(density(m)) } else { 0.0 };
             }
         });
         // Label the connected gas a row span at a time, adding up each pocket's volume, steam and
@@ -468,13 +452,10 @@ impl World {
                 if wall_strength(m).map_or(true, |s| s > excess * 1.5) {
                     continue;
                 }
+                // What it crumbles into; earth soaked by the steam, mud.
                 let into = match m {
-                    Mat::Glass => Mat::Shard,
-                    Mat::Stone => Mat::Sand,
-                    Mat::Ice => Mat::Snow,
-                    Mat::Wood | Mat::Trunk => Mat::Empty,
-                    Mat::Dirt | Mat::Grass | Mat::Clay | Mat::Brick | Mat::Terracotta => Mat::Mud,
-                    _ => Mat::Empty,
+                    Mat::Dirt | Mat::Grass | Mat::Clay => Mat::Mud,
+                    _ => super::MatSpec::of(m).rubble.unwrap_or(Mat::Empty),
                 };
                 let into = if self.chance(2) { into } else { Mat::Empty };
                 self.set(x, y, into);
@@ -496,7 +477,8 @@ impl World {
     pub(super) fn jet(&mut self, x: i32, y: i32) -> bool {
         let i = Self::idx(x, y);
         let p = self.liq_p[i];
-        if p < 1.0 + JET_HEAD * ATM_PER_CELL {
+        let jet_head = JET_HEAD_M / units::cell_m();
+        if p < 1.0 + units::atm_per_cell(jet_head) {
             return false;
         }
         let m = self.cells[i].m;
@@ -515,7 +497,7 @@ impl World {
             // Only into gas that was already gas at the last count: a fresh hole (a bubble, a cell a
             // pipe just took) has a pressure nobody knows yet.
             let outside = w.pockets[w.pocket_at(nx, ny)?].pressure;
-            Some((p - outside) / (rho * ATM_PER_CELL) - 1.0).filter(|&h| h >= JET_HEAD)
+            Some((p - outside) / units::atm_per_cell(rho) - 1.0).filter(|&h| h >= jet_head)
         };
         let (right, left) = (head(self, 1), head(self, -1));
         let (dir, head) = match (right, left) {
@@ -524,9 +506,9 @@ impl World {
             (None, Some(l)) => (-1, l),
             (None, None) => return false,
         };
-        // Speed in cells per step: the drop keeps it while it falls (see `fly`), so it lands
-        // further from a deep hole than from a shallow one.
-        let v = (0.7 * head.sqrt()).round().clamp(1.0, 10.0) as i32;
+        // Speed in cells per step, Torricelli's: the drop keeps it while it falls (see `fly`), so
+        // it lands further from a deep hole than from a shallow one.
+        let v = units::cells_per_tick((2.0 * units::G * head * units::cell_m()).sqrt()).round().clamp(1.0, 10.0) as i32;
         let mut k = 1;
         while k < v && self.at(x + dir * (k + 1), y) == Mat::Empty {
             k += 1;
@@ -739,7 +721,9 @@ mod tests {
         fill(&mut o, 101, 113, 129, 130, Mat::Water, 25.0);
         o.update_pockets();
         let q = o.liquid_pressure(115, 120);
-        assert!(q > 1.05 && q < 1.3, "open water 8 cells down: {q}");
+        // 8 cells down (40 cm): 1 atm and the weight of the water over it.
+        let own = units::atm_per_cell(1.0) * 8.0;
+        assert!(q > 1.0 + own * 0.6 && q < 1.0 + own * 1.6, "open water 8 cells down: {q}");
     }
 
     #[test]
@@ -760,7 +744,9 @@ mod tests {
             for _ in 0..30 {
                 w.step();
                 for x in 261..400 {
-                    for y in hole_y..302 {
+                    // How far the jet gets while it drops its first 5 cells: its speed out of the
+                    // hole (where it lands also depends on how far it has to fall).
+                    for y in hole_y..=hole_y + 5 {
                         if w.raw(x, y) == Mat::Water {
                             far = far.max(x - 260);
                         }

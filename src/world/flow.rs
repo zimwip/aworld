@@ -2,41 +2,55 @@
 //! opposite ways, gusts that curl into vortices, warm air rising, and a flow that goes around
 //! solid ground. Clouds, steam and smoke are carried along; the cells themselves stay as they are.
 //!
-//! Velocities are kept in coarse cells per step (a coarse cell is `CELL` world cells wide).
+//! Velocities are kept in coarse cells per step (a coarse cell is `CELL()` world cells wide).
 
 use super::num::{floor_f, wrap_i};
 use super::{Cell, Kind, World, H, W};
 use rayon::prelude::*;
 
-/// Width of a flow cell, in world cells.
-pub const CELL: usize = 8;
+/// Width of a flow cell, in world cells: about 40 cm, 8 cells on the design grid (see
+/// `units::flow_cell`).
+#[allow(non_snake_case)]
+#[inline(always)]
+pub fn CELL() -> usize {
+    super::units::flow_cell()
+}
 #[allow(non_snake_case)]
 pub fn FW() -> usize {
-    W() / CELL
+    W() / CELL()
 }
 #[allow(non_snake_case)]
 pub fn FH() -> usize {
-    H().div_ceil(CELL)
+    H().div_ceil(CELL())
 }
-/// The wind the cells read is tabled by blocks of `BLOCK` world cells (see `wind_at`).
-pub const BLOCK: usize = 4;
+/// The wind the cells read is tabled by blocks of `BLOCK()` world cells (see `wind_at`): 4, or
+/// a flow cell if that is less.
+#[allow(non_snake_case)]
+#[inline(always)]
+fn BLOCK() -> usize {
+    CELL().min(4)
+}
 #[allow(non_snake_case)]
 fn BW() -> usize {
-    W() / BLOCK
+    W() / BLOCK()
 }
 #[allow(non_snake_case)]
 fn BH() -> usize {
-    H().div_ceil(BLOCK)
+    H().div_ceil(BLOCK())
 }
 
 /// Base wind at full strength, in world cells per step (a gale moves gas about this fast).
 pub const GAIN: f32 = 1.2;
+/// `GAIN` in world cells per step of this grid: the same wind in m/s on any grid.
+pub fn gain() -> f32 {
+    GAIN * super::units::finer()
+}
 /// The jet stream, as a multiple of the base wind, and the flow row it blows along (just under
 /// the tropopause, `CEILING_Y`).
 const JET: f32 = 0.8;
 #[allow(non_snake_case)]
 fn JET_ROW() -> f32 {
-    super::CEILING_Y() as f32 / CELL as f32 + 0.5
+    super::CEILING_Y() as f32 / CELL() as f32 + 0.5
 }
 
 /// How many flow cells up the wind over a solid cell is looked for (`skim`).
@@ -51,11 +65,11 @@ pub fn skim_at(skim: &[f32], sky: &[f32], x: usize, y: usize) -> f32 {
     if y as f32 >= sky[x] {
         return 0.0;
     }
-    let fx = (x as f32 + 0.5) / CELL as f32 - 0.5;
+    let fx = (x as f32 + 0.5) / CELL() as f32 - 0.5;
     let i0 = floor_f(fx);
     let t = fx - i0;
     let i0 = i0 as i32;
-    let row = (y / CELL).min(FH() - 1) * FW();
+    let row = (y / CELL()).min(FH() - 1) * FW();
     let a = skim[row + wrap_i(i0, FW() as i32) as usize];
     let b = skim[row + wrap_i(i0 + 1, FW() as i32) as usize];
     a + (b - a) * t
@@ -110,7 +124,7 @@ pub struct Flow {
     rng: u32,
     /// Tests can pin the field.
     pub frozen: bool,
-    /// The velocity at the middle of each block of `BLOCK` world cells, in world cells per step:
+    /// The velocity at the middle of each block of `BLOCK()` world cells, in world cells per step:
     /// what the cells' rules read (`wind_at`), tabled once a flow step rather than interpolated
     /// for every cell of gas.
     gusts: Vec<(f32, f32)>,
@@ -176,7 +190,7 @@ impl Flow {
             *sky = (0..H()).find(|&y| solid(&cells[y * W() + x])).unwrap_or(H()) as f32;
         }
         for x in (0..W()).step_by(2) {
-            let i = x / CELL;
+            let i = x / CELL();
             let mut lies = true;
             for y in (0..H()).rev() {
                 let c = &cells[y * W() + x];
@@ -186,7 +200,7 @@ impl Flow {
                     lies = h || !matches!(c.m.kind(), Kind::Empty | Kind::Gas | Kind::Flame);
                 }
                 if y % 2 == 0 {
-                    let k = (y / CELL) * FW() + i;
+                    let k = (y / CELL()) * FW() + i;
                     n[k] += 1;
                     hard[k] += h as u32;
                     wet[k] += (l && lies) as u32;
@@ -226,18 +240,18 @@ impl Flow {
         for j in 0..FH() {
             for i in 0..FW() {
                 let (mut sum, mut n) = (0.0, 0);
-                for dy in (0..CELL).step_by(2) {
-                    let y = j * CELL + dy;
+                for dy in (0..CELL()).step_by(2) {
+                    let y = j * CELL() + dy;
                     if y >= H() {
                         break;
                     }
-                    for dx in (0..CELL).step_by(2) {
-                        sum += temp[y * W() + i * CELL + dx] - ambient[y];
+                    for dx in (0..CELL()).step_by(2) {
+                        sum += temp[y * W() + i * CELL() + dx] - ambient[y];
                         n += 1;
                     }
                 }
                 self.heat[j * FW() + i] = sum / n.max(1) as f32;
-                let amb = ambient[(j * CELL + CELL / 2).min(H() - 1)] + 273.15;
+                let amb = ambient[(j * CELL() + CELL() / 2).min(H() - 1)] + 273.15;
                 let k = j * FW() + i;
                 let theta = ((amb + self.heat[k]) / amb.max(1.0)).clamp(0.5, 3.0);
                 // Heating in the open air makes the air expand at once (sound crosses a room in no
@@ -256,14 +270,14 @@ impl Flow {
         for j in 0..FH() {
             for i in 0..FW() {
                 let (mut n, mut wet) = (0, 0);
-                for dy in (0..CELL).step_by(2) {
-                    let y = j * CELL + dy;
+                for dy in (0..CELL()).step_by(2) {
+                    let y = j * CELL() + dy;
                     if y >= H() {
                         break;
                     }
-                    for dx in (0..CELL).step_by(2) {
+                    for dx in (0..CELL()).step_by(2) {
                         n += 1;
-                        wet += is_wet(&cells[y * W() + i * CELL + dx]) as u32;
+                        wet += is_wet(&cells[y * W() + i * CELL() + dx]) as u32;
                     }
                 }
                 self.wet[j * FW() + i] = wet as f32 / n.max(1) as f32;
@@ -280,7 +294,7 @@ impl Flow {
     /// Relative humidity of the air at a world position (0..1), as carried by the wind.
     /// In a pond, it is the air's over it.
     pub fn moisture_at(&self, x: i32, y: i32) -> f32 {
-        let (i, j) = ((x.max(0) as usize / CELL).min(FW() - 1), (y.max(0) as usize / CELL).min(FH() - 1));
+        let (i, j) = ((x.max(0) as usize / CELL()).min(FW() - 1), (y.max(0) as usize / CELL()).min(FH() - 1));
         self.moist[self.over(j * FW() + i)]
     }
 
@@ -303,8 +317,8 @@ impl Flow {
             return None;
         }
         // Bilinear between the centres of the flow cells, so the picture has no visible blocks.
-        let fx = (x as f32 + 0.5) / CELL as f32 - 0.5;
-        let fy = ((y as f32 + 0.5) / CELL as f32 - 0.5).clamp(0.0, FH() as f32 - 1.001);
+        let fx = (x as f32 + 0.5) / CELL() as f32 - 0.5;
+        let fy = ((y as f32 + 0.5) / CELL() as f32 - 0.5).clamp(0.0, FH() as f32 - 1.001);
         let (i0, j0) = (floor_f(fx), floor_f(fy));
         let (tx, ty) = (fx - i0, fy - j0);
         let (i0, j0) = (i0 as i32, j0 as i32);
@@ -320,8 +334,8 @@ impl Flow {
 
     /// A blast: compresses the air around `(x, y)` (world cells) within `r` world cells by up to `amount`.
     pub fn blast(&mut self, x: i32, y: i32, r: i32, amount: f32) {
-        let reach = (r / CELL as i32 + 1).max(1);
-        let (ci, cj) = (x / CELL as i32, y / CELL as i32);
+        let reach = (r / CELL() as i32 + 1).max(1);
+        let (ci, cj) = (x / CELL() as i32, y / CELL() as i32);
         for dj in -reach..=reach {
             let j = cj + dj;
             if j < 0 || j >= FH() as i32 {
@@ -332,7 +346,7 @@ impl Flow {
                 if self.solid[k] {
                     continue;
                 }
-                let d = ((di * di + dj * dj) as f32).sqrt() * CELL as f32 / r.max(1) as f32;
+                let d = ((di * di + dj * dj) as f32).sqrt() * CELL() as f32 / r.max(1) as f32;
                 if d < 1.5 {
                     self.rho[k] = (self.rho[k] + amount * (-d * d * 1.5).exp()).min(3.5);
                 }
@@ -350,7 +364,7 @@ impl Flow {
         let bands = (std::f32::consts::TAU * (height * 1.7 + phase)).sin();
         let layers = 0.75 * bands + 0.35 + 0.35 * height;
         let jet = (-((j as f32 + 0.5 - JET_ROW()) / 2.5).powi(2)).exp();
-        wind * (GAIN / CELL as f32) * (layers * (1.0 - jet) + JET * jet)
+        wind * (GAIN / super::units::REF_FLOW_CELL as f32) * super::units::flow_scale() * (layers * (1.0 - jet) + JET * jet)
     }
 
     /// Adds a swirl: velocity going round `(x, y)` (coarse cell units).
@@ -375,9 +389,10 @@ impl Flow {
         }
     }
 
-    /// A gust curls up: a new vortex somewhere in the open air.
+    /// A gust curls up: a new vortex somewhere in the open air (`gamma` in flow cells a step of
+    /// the design grid: the same swirl in m/s on any grid).
     pub fn spawn_vortex(&mut self, x: f32, y: f32, r: f32, gamma: f32) {
-        self.vortices.push(Vortex { x, y, r, gamma, life: 40 });
+        self.vortices.push(Vortex { x, y, r, gamma: gamma * super::units::flow_scale(), life: 40 });
     }
 
     pub fn step(&mut self, wind: f32, ticks: u32) {
@@ -401,6 +416,7 @@ impl Flow {
         }
 
         // Forces: the layers pull the air towards their wind, warm air rises, cold air sinks.
+        let s = super::units::flow_scale();
         for j in 0..FH() {
             let target = Self::profile(wind, j, ticks);
             for i in 0..FW() {
@@ -410,7 +426,7 @@ impl Flow {
                 }
                 self.vx[k] += (target - self.vx[k]) * 0.012;
                 if !self.compress {
-                    self.vy[k] -= (self.heat[k] / 12.0).clamp(-1.0, 3.0) * 0.012;
+                    self.vy[k] -= (self.heat[k] / 12.0).clamp(-1.0, 3.0) * 0.012 * s;
                 }
             }
         }
@@ -422,6 +438,7 @@ impl Flow {
         }
         self.carry_moisture();
         let damp = 0.997;
+        let most = 0.6 * s;
         for k in 0..FW() * FH() {
             if self.solid[k] {
                 self.vx[k] = 0.0;
@@ -430,8 +447,8 @@ impl Flow {
                 self.vx[k] *= damp;
                 self.vy[k] *= damp;
                 // Keep numerical accidents from running away.
-                self.vx[k] = self.vx[k].clamp(-0.6, 0.6);
-                self.vy[k] = self.vy[k].clamp(-0.6, 0.6);
+                self.vx[k] = self.vx[k].clamp(-most, most);
+                self.vy[k] = self.vy[k].clamp(-most, most);
             }
         }
         self.tabulate();
@@ -441,8 +458,10 @@ impl Flow {
     /// to low, the wind moves the air and so changes its density, and air lighter than its
     /// surroundings (warmer, so thinner at the same pressure: 1 - 1/theta) floats up. Hot air at first expands, a closed room keeps its pressure for a while.
     fn compress_step(&mut self) {
-        const C2: f32 = 0.12; // squared speed of sound, coarse cells² per step²
-        const BUOYANCY: f32 = 0.3;
+        // Squared speed of sound, coarse cells² per step², and the lift of warm air, coarse cells
+        // per step², on the design grid (`flow_scale`: the same in m/s on any grid).
+        let s = super::units::flow_scale();
+        let (c2, buoyancy) = (0.12 * s * s, 0.3 * s);
         for k in 0..FW() * FH() {
             self.pr[k] = if self.solid[k] { 1.0 } else { self.rho[k] * self.theta[k] };
         }
@@ -456,8 +475,8 @@ impl Flow {
                 let p = |di: i32, dj: i32| if self.solid_at(i + di, j + dj) { pc } else { self.pr[at(i + di, j + dj)] };
                 let (gx, gy) = (0.5 * (p(1, 0) - p(-1, 0)), 0.5 * (p(0, 1) - p(0, -1)));
                 let inv = 1.0 / self.rho[k].max(0.3);
-                self.vx[k] -= C2 * gx * inv;
-                self.vy[k] -= C2 * gy * inv + BUOYANCY * (1.0 - 1.0 / self.theta[k]).clamp(-0.1, 0.15);
+                self.vx[k] -= c2 * gx * inv;
+                self.vy[k] -= c2 * gy * inv + buoyancy * (1.0 - 1.0 / self.theta[k]).clamp(-0.1, 0.15);
             }
         }
         // Continuity, in flux form with upwind density: mass is moved, not created.
@@ -623,8 +642,8 @@ impl Flow {
 
     /// The air velocity at a position in world cells (the middle of cell x is x + 0.5).
     fn sample_at(&self, x: f32, y: f32) -> (f32, f32) {
-        let fx = x / CELL as f32 - 0.5;
-        let fy = (y / CELL as f32 - 0.5).clamp(0.0, FH() as f32 - 1.001);
+        let fx = x / CELL() as f32 - 0.5;
+        let fy = (y / CELL() as f32 - 0.5).clamp(0.0, FH() as f32 - 1.001);
         let (i0, j0) = (floor_f(fx), floor_f(fy));
         let (tx, ty) = (fx - i0, fy - j0);
         // The four cells round it, wrapped (a plane flying in from off the screen, a drop on
@@ -633,33 +652,33 @@ impl Flow {
         let (ia, ib) = (wrap_i(i0, FW() as i32) as usize, wrap_i(i0 + 1, FW() as i32) as usize);
         let (k0, k1) = (j0 * FW(), (j0 + 1) * FW());
         let s = |a: &[f32]| (a[k0 + ia] * (1.0 - tx) + a[k0 + ib] * tx) * (1.0 - ty) + (a[k1 + ia] * (1.0 - tx) + a[k1 + ib] * tx) * ty;
-        (s(&self.vx) * CELL as f32, s(&self.vy) * CELL as f32)
+        (s(&self.vx) * CELL() as f32, s(&self.vy) * CELL() as f32)
     }
 
     /// The wind at a world cell as the cells' rules read it: the velocity sampled at the middle
-    /// of the cell's block of `BLOCK` × `BLOCK` cells, in world cells per step. A gas cell reads
+    /// of the cell's block of `BLOCK()` × `BLOCK()` cells, in world cells per step. A gas cell reads
     /// the wind once or twice a step, and there can be a hundred thousand of them: the table is
     /// a lookup where `sample` interpolates.
     #[inline]
     pub fn wind_at(&self, x: i32, y: i32) -> (f32, f32) {
         debug_assert!(x >= 0 && x < W() as i32 && y >= 0 && y < H() as i32);
-        self.gusts[(y as usize / BLOCK).min(BH() - 1) * BW() + (x as usize / BLOCK).min(BW() - 1)]
+        self.gusts[(y as usize / BLOCK()).min(BH() - 1) * BW() + (x as usize / BLOCK()).min(BW() - 1)]
     }
 
     /// Tables the wind of every block (`wind_at`), after the field has changed.
     fn tabulate(&mut self) {
         let mut gusts = std::mem::take(&mut self.gusts);
         gusts.par_chunks_mut(BW()).enumerate().for_each(|(by, row)| {
-            let y = (by * BLOCK) as f32 + BLOCK as f32 / 2.0;
+            let y = (by * BLOCK()) as f32 + BLOCK() as f32 / 2.0;
             for (bx, g) in row.iter_mut().enumerate() {
-                *g = self.sample_at((bx * BLOCK) as f32 + BLOCK as f32 / 2.0, y);
+                *g = self.sample_at((bx * BLOCK()) as f32 + BLOCK() as f32 / 2.0, y);
             }
         });
         self.gusts = gusts;
         // The wind over the surface of the liquids, from the first open cell up.
         for k in 0..FW() * FH() {
             let q = self.over(k);
-            self.skim[k] = if self.solid[q] { 0.0 } else { self.vx[q] * CELL as f32 * super::liquid::CELL_M / super::liquid::DT };
+            self.skim[k] = if self.solid[q] { 0.0 } else { self.vx[q] * CELL() as f32 * super::units::cell_m() / super::units::TICK };
         }
     }
 
@@ -682,7 +701,7 @@ impl Flow {
     /// Wakes the zones whose liquid the wind over it is strong enough to stir.
     pub(super) fn wake_ponds(&self, zones: &mut super::sleep::Zones) {
         for k in 0..FW() * FH() {
-            let (x, y) = ((k % FW()) * CELL + CELL / 2, ((k / FW()) * CELL).min(H() - 1));
+            let (x, y) = ((k % FW()) * CELL() + CELL() / 2, ((k / FW()) * CELL()).min(H() - 1));
             if self.pond[k] && self.skim(x, y).abs() > STIR {
                 zones.wake(y * W() + x);
             }
@@ -692,13 +711,13 @@ impl Flow {
     /// The solver's pressure at a world position (arbitrary units: it is the push that keeps the air
     /// from piling up, large where a stream meets an obstacle).
     pub fn pressure_at(&self, x: i32, y: i32) -> f32 {
-        let (i, j) = ((x.max(0) as usize / CELL).min(FW() - 1), (y.max(0) as usize / CELL).min(FH() - 1));
+        let (i, j) = ((x.max(0) as usize / CELL()).min(FW() - 1), (y.max(0) as usize / CELL()).min(FH() - 1));
         self.p[j * FW() + i]
     }
 
     /// Whole-field access for drawing and tests: velocity of flow cell `(i, j)` in world cells per step.
     pub fn at_cell(&self, i: usize, j: usize) -> (f32, f32) {
-        (self.vx[j * FW() + i] * CELL as f32, self.vy[j * FW() + i] * CELL as f32)
+        (self.vx[j * FW() + i] * CELL() as f32, self.vy[j * FW() + i] * CELL() as f32)
     }
 
     pub fn is_solid(&self, i: usize, j: usize) -> bool {
@@ -751,8 +770,8 @@ impl Flow {
     /// Fills the whole field with one velocity (world cells per step) and pins it (for tests).
     #[cfg(test)]
     pub fn pin_uniform(&mut self, vx: f32, vy: f32) {
-        self.vx.fill(vx / CELL as f32);
-        self.vy.fill(vy / CELL as f32);
+        self.vx.fill(vx / CELL() as f32);
+        self.vy.fill(vy / CELL() as f32);
         self.frozen = true;
         self.tabulate();
     }
@@ -762,7 +781,7 @@ impl Flow {
     pub fn pin_opposed(&mut self, vx: f32, split: usize) {
         for j in 0..FH() {
             for i in 0..FW() {
-                self.vx[j * FW() + i] = if j < split { vx } else { -vx } / CELL as f32;
+                self.vx[j * FW() + i] = if j < split { vx } else { -vx } / CELL() as f32;
                 self.vy[j * FW() + i] = 0.0;
             }
         }
@@ -800,9 +819,7 @@ impl World {
             let wind = self.wind;
             self.flow.step(wind, t);
         }
-        if self.liquid_physics {
-            self.flow.wake_ponds(&mut self.zones);
-        }
+        self.flow.wake_ponds(&mut self.zones);
     }
 
     /// What the wind goes round: hard ground, and liquid lying on something.

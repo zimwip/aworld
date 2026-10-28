@@ -21,8 +21,6 @@ const SPEED: f32 = 0.8;
 /// Water in the tank, in cells, and drops thrown per step.
 pub const TANK: u32 = 3600;
 const JET: u32 = 3;
-/// Downward pull on the drops, cells per step squared.
-const G: f32 = 0.05;
 /// Steps between two looks for a big fire, and before another engine may come.
 const LOOK_EVERY: u32 = 60;
 const REST: u32 = 60 * 25;
@@ -257,7 +255,7 @@ impl FireTrucks {
                     let d = t.aim - nozzle;
                     let steps = (d.x.abs() / 1.8).clamp(18.0, 60.0);
                     let jitter = vec2(self.between(0.94, 1.06), self.between(0.94, 1.06));
-                    let vel = vec2(d.x / steps, d.y / steps - 0.5 * G * steps) * jitter;
+                    let vel = vec2(d.x / steps, d.y / steps - 0.5 * crate::world::units::g_tick() * steps) * jitter;
                     self.drops.push(Drop { pos: nozzle, vel });
                     t.tank -= 1;
                 }
@@ -345,7 +343,7 @@ impl FireTrucks {
     fn step_drops(&mut self, world: &mut World) {
         let mut keep = Vec::with_capacity(self.drops.len());
         for mut d in std::mem::take(&mut self.drops) {
-            d.vel.y += G;
+            d.vel.y += crate::world::units::g_tick();
             let n = d.vel.length().ceil().max(1.0) as i32;
             let mut landed = false;
             let mut last = d.pos;

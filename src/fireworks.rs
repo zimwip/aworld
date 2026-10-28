@@ -6,8 +6,15 @@
 use crate::render::View;
 use crate::gfx::*;
 
-/// Downward pull on rockets and sparks, in world cells per second squared.
-const GRAVITY: f32 = 90.0;
+/// The pull the show was drawn for, cells per second²; under the world's gravity
+/// (`units::g_cells`) it plays the same shapes faster (see `pace`).
+const DRAWN_G: f32 = 90.0;
+
+/// How much faster the show goes than it was drawn: speeds up by this, times down by it, so that
+/// every rocket and spark follows the same path under the world's gravity.
+fn pace() -> f32 {
+    (crate::world::units::g_cells() / DRAWN_G).sqrt()
+}
 /// At most this many rockets in the air, and sparks on screen.
 const MAX_ROCKETS: usize = 24;
 const MAX_SPARKS: usize = 2500;
@@ -100,8 +107,8 @@ impl Fireworks {
                 _ => Shape::Peony,
             };
             let color = if shape == Shape::Willow { Color::from_rgba(255, 196, 90, 255) } else { Color::from_rgba(salt.0, salt.1, salt.2, 255) };
-            let vel = vec2(self.between(-40.0, 40.0), -self.between(170.0, 230.0));
-            let fuse = self.between(1.0, 1.6);
+            let vel = vec2(self.between(-40.0, 40.0), -self.between(170.0, 230.0)) * pace();
+            let fuse = self.between(1.0, 1.6) / pace();
             self.rockets.push(Rocket { pos: at, vel, fuse, color, shape });
         }
         true
@@ -117,7 +124,7 @@ impl Fireworks {
         let mut burst = vec![];
         let mut trail = vec![];
         for r in &mut self.rockets {
-            r.vel.y += GRAVITY * dt;
+            r.vel.y += crate::world::units::g_cells() * dt;
             r.pos += r.vel * dt;
             r.fuse -= dt;
             trail.push(r.pos);
@@ -129,8 +136,8 @@ impl Fireworks {
         // The rocket's own glowing trail.
         for p in trail {
             if self.sparks.len() < MAX_SPARKS {
-                let jitter = vec2(self.between(-8.0, 8.0), self.between(0.0, 15.0));
-                self.sparks.push(Spark { pos: p, vel: jitter, age: 0.0, life: 0.35, color: Color::from_rgba(255, 200, 120, 255), drag: 2.0 });
+                let jitter = vec2(self.between(-8.0, 8.0), self.between(0.0, 15.0)) * pace();
+                self.sparks.push(Spark { pos: p, vel: jitter, age: 0.0, life: 0.35 / pace(), color: Color::from_rgba(255, 200, 120, 255), drag: 2.0 * pace() });
             }
         }
         for r in burst {
@@ -140,7 +147,7 @@ impl Fireworks {
             s.age += dt;
             let k = (-s.drag * dt).exp();
             s.vel *= k;
-            s.vel.y += GRAVITY * 0.45 * dt;
+            s.vel.y += crate::world::units::g_cells() * 0.45 * dt;
             s.pos += s.vel * dt;
         }
         self.sparks.retain(|s| s.age < s.life);
@@ -174,8 +181,8 @@ impl Fireworks {
                 Some(c) if k % 2 == 1 => c,
                 _ => r.color,
             };
-            let vel = vec2(a.cos(), a.sin()) * speed + r.vel * 0.3;
-            self.sparks.push(Spark { pos: r.pos, vel, age: 0.0, life, color, drag });
+            let vel = vec2(a.cos(), a.sin()) * speed * pace() + r.vel * 0.3;
+            self.sparks.push(Spark { pos: r.pos, vel, age: 0.0, life: life / pace(), color, drag: drag * pace() });
         }
     }
 
@@ -215,9 +222,10 @@ mod tests {
         let mut f = Fireworks::new();
         assert!(f.launch(vec2(400.0, 400.0), 3));
         assert_eq!(f.rockets.len(), 3);
-        run(&mut f, 0.8);
+        // (The show goes at `pace`: the times are the ones it was drawn with.)
+        run(&mut f, 0.8 / pace());
         assert!(f.rockets.iter().all(|r| r.pos.y < 300.0), "rockets climb high above the blast");
-        run(&mut f, 1.0);
+        run(&mut f, 1.0 / pace());
         assert!(f.rockets.is_empty(), "every rocket has burst");
         assert_eq!(f.take_bursts(), 3);
         assert!(f.sparks.len() > 150, "a shower of sparks: {}", f.sparks.len());

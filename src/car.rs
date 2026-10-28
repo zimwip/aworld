@@ -7,8 +7,16 @@ use crate::gfx::{vec2, Vec2};
 
 /// Everything below is tuned in "design units"; this shrinks the car to fit the finer grid.
 pub const S: f32 = 0.67;
-const GRAVITY: f32 = 0.12 * S;
 const WHEEL_INERTIA: f32 = 8.0 * S * S;
+/// The gravity the cars were tuned under, cells per step². They fall at the world's
+/// (`units::g_tick`); their springs, dampers and engines go with it (`load_scale`), so that a car
+/// sits as low on its springs and grips the ground as hard as it was tuned to.
+const TUNED_G: f32 = 0.12 * S;
+
+/// The world's gravity over the one the cars were tuned under.
+fn load_scale() -> f32 {
+    crate::world::units::g_tick() / TUNED_G
+}
 const SLIP_GAIN: f32 = 2.0;
 const SAMPLES: usize = 24;
 /// Speed (design units) above which the hull breaks through glass.
@@ -443,7 +451,7 @@ impl Car {
         let travel_len = m.travel * S;
         let crash = m.crash_speed * S * self.tuning.tough;
         let down = rot(self.angle, vec2(0.0, 1.0));
-        let mut acc = vec2(0.0, GRAVITY);
+        let mut acc = vec2(0.0, crate::world::units::g_tick());
         let mut torque = 0.0f32;
         let mut crashed = false;
         let mut touching = 0;
@@ -499,7 +507,7 @@ impl Car {
                     crashed = true;
                 }
                 let comp = travel_len - ext + depth * 2.0;
-                let normal_force = (m.stiffness * self.tuning.stiffness * comp - m.damping * self.tuning.damping * vn).max(0.0);
+                let normal_force = load_scale() * (m.stiffness * self.tuning.stiffness * comp - m.damping * self.tuning.damping * vn).max(0.0);
                 let f = n * normal_force;
                 self.loads.push((pos - n * (r + 0.8), normal_force));
                 load_total += normal_force;
@@ -514,7 +522,7 @@ impl Car {
                 let soft = (soft_share(world, pos, r)).min(1.0);
                 soft_total += soft;
                 let grip = m.grip * self.tuning.grip * if self.boost > 0 { 1.35 } else { 1.0 } * (1.0 - 0.2 * soft) * (1.0 - 0.3 * self.dig);
-                ft = (SLIP_GAIN * slip).clamp(-grip * normal_force, grip * normal_force);
+                ft = (load_scale() * SLIP_GAIN * slip).clamp(-grip * normal_force, grip * normal_force);
                 if soft > 0.3 {
                     max_slip = max_slip.max(slip.abs());
                 }
@@ -534,7 +542,7 @@ impl Car {
             if self.is_driven(i) {
                 let w_max = m.top_speed * self.tuning.speed * S / r;
                 let forward = (self.dir * self.wheels[i].spin).max(ground_speed / r);
-                te = self.dir * m.torque * self.tuning.power * S * S * if self.boost > 0 { 2.6 } else { 1.25 } * (1.0 - forward / w_max).clamp(-0.2, 1.5);
+                te = load_scale() * self.dir * m.torque * self.tuning.power * S * S * if self.boost > 0 { 2.6 } else { 1.25 } * (1.0 - forward / w_max).clamp(-0.2, 1.5);
             }
             let w = &mut self.wheels[i];
             w.spin += (te - ft * r) / WHEEL_INERTIA;
@@ -931,7 +939,14 @@ mod tests {
     #[test]
     fn four_by_four_climbs_a_ramp() {
         let w = ramp_world(0.45);
-        let car = drive(ModelKind::Offroad, &w, (40, 216), 1500);
+        // Up to the top, before it runs off the far end of the plateau.
+        let mut car = Car::new(ModelKind::Offroad, (40, 216));
+        for _ in 0..1500 {
+            car.step(&w, None);
+            if car.p.x > 400.0 {
+                break;
+            }
+        }
         assert_eq!(car.fate, Fate::Driving);
         assert!(car.p.x > 320.0, "stuck at {}", car.p.x);
     }

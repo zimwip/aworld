@@ -117,6 +117,40 @@ colonnes et de 18 lignes) ; au lancement : `cargo run --release -- --grid 1440x8
 relief et le ciel s'étirent avec le monde ; les objets (voitures, blocs, arbres, personnages) gardent leur taille en
 cellules. Une sauvegarde ne se charge que dans un monde de sa taille. Pas dans le navigateur pour l'instant.
 
+**Les unités du monde** (`src/world/units.rs`) : la grille de référence fait 960 colonnes de 5 cm (48 m de large), un
+tick dure 1/60 s, g vaut 9,81 m/s². Un monde d'une autre largeur est le même paysage en cellules plus fines ou plus
+grosses : 2,5 cm à 1920 colonnes, 12,5 cm à 384 (la taille d'une cellule est fixée au lancement, avec celle de la
+grille). Tout ce qui bouge par une loi physique en tire son échelle : les liquides (pression en pascals, vitesses en
+m/s), les grains et les gouttes qui tombent (accélération g, vitesses limites en m/s : 9 m/s pour le sable et la
+pluie, 0,9 m/s pour la neige), les morceaux de structure qui tombent, les dalles qui basculent, les poches de gaz
+(une colonne d'eau de 10,3 m, 206 cellules, fait une atmosphère), les souffles d'explosion, la dynamite, les débris,
+les voitures, les blocs (Rapier garde son unité de 16 cellules, ses forces et raideurs suivent g), le petit garçon,
+les feux d'artifice et la baleine (leur allure suit √g). La conduction de la chaleur suit la finesse de la grille.
+Les shaders des liquides reçoivent la même taille de cellule. Les grilles grossières gardent leur taille en mètres :
+la maille du vent fait environ 40 cm (8 cellules à 960, 16 à 1920, 3 à 384, le diviseur de la largeur le plus
+proche) et ses vitesses sont les mêmes en m/s, le carré des charges d'orage environ 30 cm. Les taux qui font avancer
+quelque chose d'une cellule à la suivante (le feu et les braises qui gagnent le bois, l'herbe qui s'étend, l'eau que
+le sol boit ou qui en goutte, la neige qui flue, une bulle qui remonte) sont d'autant plus fréquents que la cellule
+est petite, l'humidité qui diffuse dans le sol comme le carré, l'évaporation d'une surface comme la finesse
+(`World::chance_per_cell`). La sonde `grids_probe` (dans `bench.rs`, à lancer seule, une fois par taille :
+`AWORLD_TEST_GRID=1920x1080 cargo test --release --bin aworld -- --ignored --exact world::bench::grids_probe
+--nocapture`) refait les mêmes scènes en mètres : à 384, 960 et 1920 colonnes, un grain lâché de 4 m touche le sol
+en 0,90 s, le front d'un mètre d'eau lâché est à 3,1 m après une seconde, le feu parcourt 2 m d'une planche en 16 à
+19 s, le vent à pleine force souffle à 1,5 m/s ; l'évaporation d'une mare reste du même ordre (1,0 à 2,1 mm par
+minute), l'humidité de l'air sur la maille du vent dépendant de la place de la surface dans la maille. Restent
+liés à la cellule : les gaz et les flammes avancent d'une cellule par tick au plus (la fumée et la vapeur montent
+plus lentement en m/s sur une grille fine), la pousse des plantes, la durée de vie d'une flamme ou d'une braise, et
+la taille des objets (voitures, arbres, personnages) en cellules.
+
+**Une fiche par matière** (`src/world/spec.rs`, `MatSpec`) : densité (kg/m³), résistance (MPa), ténacité (J/m²),
+pression que tient un mur d'une cellule autour d'une poche de gaz, ce que la matière devient broyée, restitution et
+porosité, dans un seul `match` sans bras par défaut (une matière nouvelle ne compile pas sans sa fiche). La chute et
+la flottaison, les explosions, les structures, les poches de gaz et le poids de la matière sur le sol y lisent tous ;
+c'étaient des tables à part qui ne disaient pas toujours pareil. La glace broyée donne de la grêle partout (de la
+neige sous une explosion ou dans une chaudière qui crève, avant), l'argile broyée de la terre (une explosion laisse
+l'argile qu'elle a tassée), et un mur ne tient jamais plus de pression que la résistance de sa matière (un test le
+vérifie : la terre et l'herbe tenaient 2 atm pour une cohésion de 0,5 et 0,8).
+
 
 ## Son
 
@@ -259,7 +293,7 @@ et faire des loopings et des culbutes. S'il touche quoi que ce soit (sol, eau, b
   des feux, courbe de la chaleur du monde sur 24 h, et trois curseurs (*Soleil*, *Sortie vers l'espace*, *Nuages et fumée
   gardent*) avec un bouton *Revenir au neutre*. La bulle reprend aussi *Temps*, *Saison* et *Vent* : l'onglet Monde
   donne le point de départ, la bulle permet de jouer avec en pleine simulation. En bas, **Matières du monde** : le
-  volume de chaque matière présente, de la plus abondante à la moins (une cellule est un cube de 17 cm, 4,6 L ; une
+  volume de chaque matière présente, de la plus abondante à la moins (une cellule est un cube de 5 cm, 0,13 L, sur la grille de référence ; une
   cellule de liquide compte ce qu'elle contient vraiment, la vapeur tassée compte toute sa vapeur), chacune avec sa
   courbe sur 24 h. Compté toutes les demi-secondes, et à chaque relevé de la chaleur pour les courbes
   (`--demo out.png --climate --advance 1200`).
@@ -312,14 +346,7 @@ Une explosion sous l'eau lève maintenant un panache : plus elle est peu profond
 
 ## Liquides sous pression : vases communicants, siphons
 
-Case par case, un liquide ne fait que tomber et s'étaler, comme des grains qui ne s'entassent pas : il ne peut pas remonter. Ce qui en fait un liquide, c'est qu'il transmet sa pression. `src/world/hydro.rs` applique une seule règle à tous les liquides (eau, huile, lave, métal fondu), paramétrée par leur densité et leur fluidité :
-
-- Tous les 2 pas, les masses connectées de chaque liquide sont retrouvées. Dans une masse, le liquide passe des endroits où sa charge (hauteur + pression du gaz qui appuie dessus) est la plus haute vers ceux où elle est la plus basse, quelques cases à la fois, d'autant plus vite que l'écart est grand (Torricelli : en racine carrée). Une surface ne donne que si elle est calme (fermée d'une rive à l'autre). L'eau remonte dans un tube en U, deux vases reliés par le fond s'égalisent, une chaudière sous pression pousse son eau dans un tuyau.
-- **Embouchures** : le liquide au bas d'un tuyau plein (ou d'un trou étroit, 8 cases au plus) est tenu par la pression derrière lui, comme une paille bouchée du doigt : la colonne ne se casse pas. Si l'embouchure est sous la surface, le liquide s'y écoule (en jet, plusieurs cases d'un coup quand la charge est grande). Un tuyau qui passe par-dessus un rebord fait donc un **siphon** : amorcé (plein), il vide le réservoir jusqu'à son embouchure, puis l'air entre et il s'arrête. Vide, il ne fait rien.
-- **Limite de l'air** : l'air ne peut pousser l'eau qu'à environ 10 m (60 cases, `ATM_PER_CELL`) au-dessus de la surface : un siphon dont le sommet est plus haut se désamorce. Plus le liquide est dense, plus cette hauteur est faible (environ 20 cases pour la lave).
-- Un filet qui tombe dans l'air (de l'air à côté) ne transmet pas la pression : une cascade ne pompe pas le lac dans le bassin sous elle.
-- **Fluidité** : eau 1, huile 0,6, métal fondu 0,3, lave 0,12. La lave s’égalise environ huit fois plus lentement que l’eau, et fige si le tuyau est froid.
-- Coût : seules les masses qui touchent une zone éveillée sont parcourues (environ 0,05 ms par pas en campagne, 0,35 ms sur la mer).
+Tous les liquides (eau, huile, lave, métal fondu) sont mus par leur physique (`src/world/liquid.rs`, voir plus bas « Liquides physiques ») : une vitesse sur chaque arête, une pression résolue en pascals dans chaque cellule. Les vases communicants, les tubes en U et les siphons en sortent d'eux-mêmes ; l'air ne pousse l'eau qu'à environ 10 m (206 cellules de 5 cm) au-dessus de la surface. L'ancien mode où chaque case de liquide était une particule, nivelée tous les deux pas par `hydro.rs`, a été retiré : les cellules ne font plus que trier les liquides par densité (l'huile remonte à travers l'eau).
 
 `--demo out.png --siphon --advance 900` montre deux vases d'eau, un siphon et un tube en U d'huile après 900 pas.
 
@@ -331,7 +358,7 @@ Case par case, un liquide ne fait que tomber et s'étaler, comme des grains qui 
 
 **Métriques de la simulation (Ctrl+D)** : un panneau au-dessus du compteur dit où passe le temps d'un pas, partie par partie (`src/metrics.rs`) : le monde et ses phases (cellules, chaleur et ses passes, liquides et leurs passes, pression…), la dynamite, les capteurs, les voitures, les débris, les blocs et ponts, les mécanismes, les tuyaux, les empreintes des blocs, les suites (feu, rouille, explosions) et les pompiers. Pour chacune : millisecondes par pas, part du pas et pire pas sur la dernière seconde (rouge au-delà de 16,7 ms, le budget d'un pas à x1). Au-dessus du tableau, le pas moyen, le pire pas, la part du temps passée à simuler, les zones éveillées, le niveau de simplification, le nombre d'objets, et un graphe des 240 derniers pas avec la ligne du budget ; en bas, le temps par image passé autour des pas (animaux, petit garçon…), à dessiner le monde et à dessiner l'interface. Caché, le panneau ne lit aucune horloge. `AWORLD_PROFILE=1` imprime les mêmes chiffres dans le terminal tous les 600 pas ; `--demo out.png --metrics` montre le panneau sur une capture. **Les pas sont lissés** : la passe de chaleur est répartie sur les trois pas de son cycle (conduction avec l'air et les réactions, puis espace et soleil, puis le vent une fois sur deux), et les passes qui reviennent tous les quelques pas sont décalées pour ne jamais tomber ensemble (structures tous les 9 pas, poches tous les 18, orage et pression de l'air tous les 4, à des phases différentes). Avant, un pas sur trois coûtait dix fois les deux autres et le pire pas de la démo atteignait 29 ms ; il est à 13 ms pour la même moyenne.
 
-**Liquides physiques** (par défaut depuis l'étape 4 ; `AWORLD_LIQUIDS=0` rend les liquides aux cellules, et les scènes de test écrites pour les cellules, `World::new_static`, les gardent : un test des liquides physiques le dit) : la pression est résolue jusqu'à convergence par gradients conjugués préconditionnés par un multigrille géométrique (`src/world/mgpcg.rs`, d'après McAdams, Sifakis et Teran 2010) : les grilles grossières portent la correction d'un bout à l'autre du bassin en quelques balayages, les fines la polissent, et le départ de la pression du sous-pas précédent fait qu'un bassin au repos est réglé en une itération. Les anciens balayages rouge-noir n'avaient jamais le temps de converger sur un bassin large, et la pression fausse faisait lentement gonfler ou dégonfler le liquide. Trois à quatre itérations suffisent (tolérance relative 10⁻³, absolue 1 Pa), chacune un cycle en V sur des listes compactes de cellules par couleur. Avec la physique des liquides, les cellules ne jouent plus le tour des liquides, qui était ce qui sortait différemment sur plusieurs cœurs : le tour des cellules passe alors sur tous les cœurs par défaut (`AWORLD_CELLS_PAR=0` pour l'éviter). Sur la scène « liquides » (60 pas, 4 cœurs) : 70 ms par pas avant, 61 après, pour une pression juste ; les passes de transport sont fusionnées (onze à cinq), et une cellule de liquide endormie ne donne plus de liquide (elle était hors des rangées travaillées, et ce qu'elle donnait n'était jamais débité).
+**Liquides physiques** (seul mode depuis le retrait des liquides en particules) : la pression est résolue jusqu'à convergence par gradients conjugués préconditionnés par un multigrille géométrique (`src/world/mgpcg.rs`, d'après McAdams, Sifakis et Teran 2010) : les grilles grossières portent la correction d'un bout à l'autre du bassin en quelques balayages, les fines la polissent, et le départ de la pression du sous-pas précédent fait qu'un bassin au repos est réglé en une itération. Les anciens balayages rouge-noir n'avaient jamais le temps de converger sur un bassin large, et la pression fausse faisait lentement gonfler ou dégonfler le liquide. Trois à quatre itérations suffisent (tolérance relative 10⁻³, absolue 1 Pa), chacune un cycle en V sur des listes compactes de cellules par couleur. Avec la physique des liquides, les cellules ne jouent plus le tour des liquides, qui était ce qui sortait différemment sur plusieurs cœurs : le tour des cellules passe alors sur tous les cœurs par défaut (`AWORLD_CELLS_PAR=0` pour l'éviter). Sur la scène « liquides » (60 pas, 4 cœurs) : 70 ms par pas avant, 61 après, pour une pression juste ; les passes de transport sont fusionnées (onze à cinq), et une cellule de liquide endormie ne donne plus de liquide (elle était hors des rangées travaillées, et ce qu'elle donnait n'était jamais débité).
 
 **La chaleur de l'air et la pluie en physique** : la relaxation de l'air (chaleur de l'air et réactions) passe sur tous les cœurs, rangée par rangée, et ne visite plus que les cellules qui peuvent réagir à leur température (une plage de repos par matière : la neige sous −2 °C, le bois loin de son point de feu, etc. ; les zones sans cellule active sont sautées) ; de 3,96 à 1,46 ms la passe (démo 6,1 → 4,7 ms par pas). La seule différence : la chaleur qu'une réaction lâche sur ses voisines arrive après leur relaxation du même pas et non avant. Le vent que lisent les gaz et les gouttes est tabulé par blocs de 4×4 cellules à chaque pas du vent (`Flow::wind_at`) au lieu d'être interpolé cellule par cellule (tour des cellules de l'orage 8,0 → 6,7 ms). Avec la physique des liquides, la pluie sur le champ coûtait un prix fixe par sous-pas, pas lié au peu de liquide qui court : le solveur n'empile plus que les niveaux que la taille du système demande, ses passes de construction et de remise à zéro sont fusionnées, les forces et le reclassement entre deux sous-pas ne touchent que les travées de liquide actif (et une cellule autour) ; 2,7 → 1,5 ms par résolution, et l'orage en physique passe de 31 à 17 ms par pas (liquides 21 → 7,5).
 

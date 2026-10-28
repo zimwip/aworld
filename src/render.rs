@@ -927,9 +927,9 @@ impl Renderer {
                 if q < 0.45 {
                     continue;
                 }
-                let x = (qx * QS + QS / 2) as i32;
+                let x = (qx * QS() + QS() / 2) as i32;
                 // The top of the matter in this square, with air just above it.
-                let Some(y) = ((qy * QS) as i32..((qy + 1) * QS) as i32)
+                let Some(y) = ((qy * QS()) as i32..((qy + 1) * QS()) as i32)
                     .find(|&y| !matches!(world.raw(x, y).kind(), crate::world::Kind::Empty | crate::world::Kind::Gas | crate::world::Kind::Flame))
                     .filter(|&y| matches!(world.raw(x, y - 1).kind(), crate::world::Kind::Empty | crate::world::Kind::Gas))
                 else {

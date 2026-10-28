@@ -22,7 +22,13 @@ const RISE: f32 = 5.0;
 const SURFACE: f32 = 12.0;
 const DIVE: f32 = 15.5;
 const BLOWS: [f32; 2] = [5.6, 9.0];
-const GRAVITY: f32 = 90.0;
+/// The pull the spray was drawn for, cells per second²: under the world's gravity it goes the
+/// same way faster (`pace`, as the fireworks).
+const DRAWN_G: f32 = 90.0;
+
+fn pace() -> f32 {
+    (crate::world::units::g_cells() / DRAWN_G).sqrt()
+}
 
 #[derive(Clone, Debug)]
 pub struct Whale {
@@ -141,8 +147,8 @@ impl Whales {
     pub fn update(&mut self, dt: f32, world: &World) -> bool {
         for d in &mut self.mist {
             d.age += dt;
-            d.vel.y += GRAVITY * dt;
-            d.vel.x *= (-1.5 * dt).exp();
+            d.vel.y += crate::world::units::g_cells() * dt;
+            d.vel.x *= (-1.5 * pace() * dt).exp();
             d.pos += d.vel * dt;
         }
         self.mist.retain(|d| d.age < d.life);
@@ -173,8 +179,8 @@ impl Whales {
             let at = w.blowhole();
             for k in 0..48 {
                 let spread = (k as f32 / 47.0 - 0.5) * 2.0;
-                let vel = vec2(spread * 14.0 + self.between(-4.0, 4.0), -self.between(55.0, 85.0) * (1.0 - spread.abs() * 0.3));
-                let life = self.between(1.1, 1.6);
+                let vel = vec2(spread * 14.0 + self.between(-4.0, 4.0), -self.between(55.0, 85.0) * (1.0 - spread.abs() * 0.3)) * pace();
+                let life = self.between(1.1, 1.6) / pace();
                 self.mist.push(Drop { pos: at, vel, age: 0.0, life });
             }
         }

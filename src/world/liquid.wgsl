@@ -136,6 +136,8 @@ const RUNS: u32 = 4u;
 const MAT_EMPTY: u32 = 0u;
 const MAT_WATER: u32 = 2u;
 const MAT_STONE: u32 = 7u;
+/// The most cells of a lighter liquid an overfull cell lifts (`LIFT` on the CPU).
+const LIFT: u32 = 64u;
 const K_EMPTY: u32 = 0u;
 const K_STATIC: u32 = 1u;
 const K_LIQUID: u32 = 3u;
@@ -643,7 +645,7 @@ fn viscous_u(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         if wall {
             d += c * n;
-        } else if nn > 0.0 {
+        } else if cell_nu(xi - 1, ny) + cell_nu(xi, ny) > 0.0 {
             sum += c * nn * u[ui(xx, u32(ny))];
             d += c * nn;
         }
@@ -678,7 +680,7 @@ fn viscous_v(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         if wall {
             d += c * n;
-        } else if nn > 0.0 {
+        } else if cell_nu(nx, yi - 1) + cell_nu(nx, yi) > 0.0 {
             sum += c * nn * v[vi(u32(nx), yy)];
             d += c * nn;
         }
@@ -1167,8 +1169,9 @@ fn carry_commit(@builtin(global_invocation_id) id: vec3<u32>) {
     fill[c] = u32(q);
 }
 
-/// A cell holding more than full pushes the extra up, into air or the same liquid: one thread
-/// a column, from the top of the band down, a cell a sub-step (see the CPU).
+/// A cell holding more than full pushes the extra up, into air or the same liquid, or lifts a
+/// lighter liquid over it: one thread a column, from the top of the band down, a cell a sub-step
+/// (see the CPU).
 @compute @workgroup_size(256)
 fn overflow(@builtin(global_invocation_id) id: vec3<u32>) {
     let xx = id.x;
@@ -1186,6 +1189,33 @@ fn overflow(@builtin(global_invocation_id) id: vec3<u32>) {
             up = 0u;
         } else if mj == m {
             up = fill[j];
+        } else if raw_kind(j) == K_LIQUID && (code[j] & MASKED) == 0u && density(mj) < density(m) {
+            // Under a lighter liquid: its column goes up a cell into the air over it, and the
+            // extra takes the cell freed (see the CPU).
+            var top = j;
+            while top >= P.w && j - top < LIFT * P.w && mat_of(top - P.w) == mj && (code[top - P.w] & MASKED) == 0u {
+                top -= P.w;
+            }
+            if top / P.w <= P.y0 || mat_of(top - P.w) != MAT_EMPTY || (code[top - P.w] & MASKED) != 0u {
+                continue;
+            }
+            var k = top - P.w;
+            while k < j {
+                let b = k + P.w;
+                let cb = code[b];
+                code[b] = code[k];
+                code[k] = cb;
+                let tb = temp[b];
+                temp[b] = temp[k];
+                temp[k] = tb;
+                let fb = fill[b];
+                fill[b] = fill[k];
+                fill[k] = fb;
+                note_change(k);
+                k = b;
+            }
+            note_change(j);
+            up = 0u;
         } else {
             continue;
         }
