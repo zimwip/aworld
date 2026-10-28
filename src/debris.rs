@@ -6,11 +6,13 @@
 use crate::car::{Car, S};
 use crate::firetruck::{self, Truck};
 use crate::render::View;
-use crate::world::{Mat, World, H, W};
+use crate::world::{ballistic, units, Mat, World, H, W};
 use crate::gfx::*;
 
 /// Steps a piece lasts before it is gone (it fades during the last second).
 const LIFE: u32 = 60 * 9;
+/// The fastest a piece falls through the air, m/s: a wheel, a panel of steel.
+const TERMINAL_MS: f32 = 50.0;
 /// No more pieces than this at once: the oldest go first.
 const MAX_PIECES: usize = 90;
 
@@ -166,11 +168,13 @@ impl Debris {
                 }
                 pc.rest = false;
             }
-            pc.v.y += crate::world::units::g_tick();
             // Water and other liquids brake a piece hard; the air barely.
             let here = world.raw(pc.p.x as i32, pc.p.y as i32);
             let wet = matches!(here, Mat::Water | Mat::Oil | Mat::Mud | Mat::Lava);
-            pc.v *= if wet { 0.9 } else { 0.997 };
+            ballistic::pull(&mut pc.v.x, &mut pc.v.y, units::g_tick(), units::cells_per_tick(TERMINAL_MS));
+            if wet {
+                pc.v *= 0.9;
+            }
             if wet && here == Mat::Water {
                 pc.hot = 0.0;
             }

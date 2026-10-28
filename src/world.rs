@@ -3,6 +3,7 @@
 //! so particles and the car treat them as solid.
 
 mod blast;
+pub mod ballistic;
 pub mod matter;
 pub use blast::Ejecta;
 /// The classes of the liquids' cells, for the simulation view.

@@ -10,7 +10,7 @@
 //! almost together, much faster than fuse after fuse.
 
 use crate::render::View;
-use crate::world::{units, Kind, World, H, W};
+use crate::world::{ballistic, units, Kind, World, H, W};
 use crate::gfx::*;
 
 /// Size of a stick lying down, cells (5 cm each: a fat stick, so that it can be seen).
@@ -18,7 +18,7 @@ pub const LEN: i32 = 10;
 pub const THICK: i32 = 3;
 /// Steps the fuse burns (3 s at x1).
 pub const FUSE: u32 = 180;
-/// The fastest fall in air and in a liquid, m/s (the pull is gravity, `units::g_tick`).
+/// The fastest fall in air and in a liquid, m/s (see `ballistic::pull`).
 const MAX_FALL_MS: f32 = 12.0;
 const MAX_SINK_MS: f32 = 1.5;
 /// How far the shock of one stick sets off the others, cells (more for a bigger charge).
@@ -110,8 +110,9 @@ impl Dynamite {
             }
             let wet = world.raw(c.x as i32, c.y as i32).kind() == Kind::Liquid;
             let s = &mut self.sticks[i];
-            let g = units::g_tick();
-            s.vy = if wet { (s.vy + g * 0.3).min(units::cells_per_tick(MAX_SINK_MS)) } else { (s.vy + g).min(units::cells_per_tick(MAX_FALL_MS)) };
+            // In a liquid it weighs less (Archimedes) and the liquid holds it back far harder.
+            let (g, terminal) = if wet { (units::g_tick() * 0.3, MAX_SINK_MS) } else { (units::g_tick(), MAX_FALL_MS) };
+            ballistic::pull(&mut 0.0, &mut s.vy, g, units::cells_per_tick(terminal));
             s.carry += s.vy;
             while self.sticks[i].carry >= 1.0 {
                 self.sticks[i].carry -= 1.0;

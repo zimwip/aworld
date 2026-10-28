@@ -202,6 +202,10 @@ enum Fate {
     Throw(f32, f32),
 }
 
+/// The fastest a clod thrown by a blast falls, m/s: a lump of earth or rock a few centimetres
+/// across (see `ballistic::pull`).
+const CLOD_TERMINAL_MS: f32 = 30.0;
+
 fn passable(m: Mat) -> bool {
     matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame)
 }
@@ -730,24 +734,17 @@ impl World {
         self.revision += 1;
         let mut flying = std::mem::take(&mut self.ejecta);
         let mut landed: Vec<(i32, i32, Mat)> = vec![];
+        let terminal = super::units::cells_per_tick(CLOD_TERMINAL_MS);
         flying.retain_mut(|p| {
-            p.vy += super::units::g_tick();
-            p.vx *= 0.995;
-            p.vy *= 0.995;
-            let steps = p.vx.abs().max(p.vy.abs()).ceil().max(1.0) as i32;
-            for _ in 0..steps {
-                let (nx, ny) = (p.x + p.vx / steps as f32, p.y + p.vy / steps as f32);
-                let (ix, iy) = (nx.floor() as i32, ny.floor() as i32);
-                if ix < 0 || ix >= W() as i32 || iy >= H() as i32 {
-                    return false;
-                }
-                if iy >= 0 && !passable(self.at(ix, iy)) {
+            super::ballistic::pull(&mut p.vx, &mut p.vy, super::units::g_tick(), terminal);
+            match super::ballistic::sweep(&mut p.x, &mut p.y, p.vx, p.vy, |ix, iy| (!passable(self.at(ix, iy))).then_some(())) {
+                super::ballistic::Path::Clear => true,
+                super::ballistic::Path::Out => false,
+                super::ballistic::Path::Hit(()) => {
                     landed.push((p.x.floor() as i32, p.y.floor() as i32, p.m));
-                    return false;
+                    false
                 }
-                (p.x, p.y) = (nx, ny);
             }
-            true
         });
         self.ejecta = flying;
         for (x, y, m) in landed {
