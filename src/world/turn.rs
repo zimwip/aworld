@@ -131,16 +131,10 @@ fn mix(seed: u32, zx: u32) -> u32 {
     h | 1
 }
 
-/// Whether new worlds take the cells' turn on every core: `AWORLD_CELLS_PAR=1`, or the physics
-/// of the liquids on (see `parallel_with_liquids`).
+/// Whether new worlds take the cells' turn on every core: yes unless `AWORLD_CELLS_PAR=0`. The
+/// liquids, moved by their physics, do not take the cells' turn, which was what came out
+/// differently on every core.
 pub(super) fn parallel_by_default() -> bool {
-    std::env::var_os("AWORLD_CELLS_PAR").is_some_and(|v| v != "0") || (liquid::physics_by_default() && parallel_with_liquids())
-}
-
-/// Whether the physics of the liquids turns the cells' turn on every core on (unless
-/// `AWORLD_CELLS_PAR=0`): the liquids then no longer take the cells' turn, which was what came
-/// out differently on every core.
-pub(super) fn parallel_with_liquids() -> bool {
     std::env::var_os("AWORLD_CELLS_PAR").is_none_or(|v| v != "0")
 }
 
@@ -328,8 +322,6 @@ impl World {
                 seen: Vec::new(),
                 ground: Vec::new(),
                 stack: Vec::new(),
-                released: share(&self.released),
-                released_list: Vec::new(),
                 falling: Vec::new(),
                 slabs: Vec::new(),
                 level: Vec::new(),
@@ -383,7 +375,6 @@ impl World {
                 pressure_forces: self.pressure_forces,
                 lod: self.lod,
                 parallel_cells: true,
-                liquid_physics: self.liquid_physics,
                 // (The drops the cells make in the turn, the rain sweeping a cloud, `absorb` takes.)
                 liq: Default::default(),
                 fill: share(&self.fill),

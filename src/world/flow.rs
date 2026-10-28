@@ -800,9 +800,7 @@ impl World {
             let wind = self.wind;
             self.flow.step(wind, t);
         }
-        if self.liquid_physics {
-            self.flow.wake_ponds(&mut self.zones);
-        }
+        self.flow.wake_ponds(&mut self.zones);
     }
 
     /// What the wind goes round: hard ground, and liquid lying on something.

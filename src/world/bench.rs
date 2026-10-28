@@ -80,7 +80,6 @@ fn deluge() -> World {
 #[ignore]
 fn cloud_probe() {
     let mut w = countryside();
-    w.set_liquid_physics(true);
     for y in 120..400 {
         for x in 300..900 {
             w.set(x, y, Mat::Cloud);
@@ -140,7 +139,6 @@ fn cloud_probe() {
 #[ignore]
 fn slab_probe() {
     let mut w = World::new_static();
-    w.set_liquid_physics(true);
     for y in 60..120 {
         for x in 80..140 {
             w.set(x, y, Mat::Cloud);
@@ -238,7 +236,6 @@ fn flame_probe() {
 /// Water painted over a big cloud, as `cloud_probe` has it.
 fn cloud() -> World {
     let mut w = countryside();
-    w.set_liquid_physics(true);
     for y in 120..400 {
         for x in 300..900 {
             w.set(x, y, Mat::Cloud);
@@ -494,7 +491,6 @@ fn falls_probe() {
         format!("{:.1} (bas {low})", s / n.max(1.0))
     };
     let mut w = World::new_static();
-    w.liquid_physics = true;
     for y in 40..50 {
         for x in 100..110 {
             w.set(x, y, Mat::Water);

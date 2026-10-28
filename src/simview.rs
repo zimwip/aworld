@@ -446,7 +446,7 @@ impl SimView {
         let vis = Rect::new(a.x, a.y, b.x - a.x, b.y - a.y);
         let p = view.to_world(ui.mouse);
         self.hover = (!ui.over_ui() && area.contains(ui.mouse) && p.x >= 0.0 && p.y >= 0.0 && (p.x as usize) < W() && (p.y as usize) < H()).then(|| (p.x as usize, p.y as usize));
-        if self.solver && w.liquid_physics {
+        if self.solver {
             self.draw_solver(w, view);
         }
         if self.zones {
@@ -617,18 +617,13 @@ impl SimView {
             Back::Diff(of) => of,
             _ => DiffOf::Matter,
         };
-        let mut choices = vec![
+        let choices = vec![
             ("La matière", Back::Matter),
+            ("Le calcul des liquides (plein, film, goutte)", Back::Classes),
             ("La pression (liquides, poches de gaz)", Back::Pressure),
             ("La pression de l'air", Back::Air),
             ("Les changements du dernier pas", Back::Diff(diff)),
         ];
-        // Only the liquids moving by their physics have classes.
-        if w.liquid_physics {
-            choices.insert(1, ("Le calcul des liquides (plein, film, goutte)", Back::Classes));
-        } else if self.back == Back::Classes {
-            self.back = Back::Matter;
-        }
         for (label, b) in choices {
             let on = self.back == b || matches!((self.back, b), (Back::Diff(_), Back::Diff(_)));
             if ui.checkbox(Rect::new(x, y, cw, 20.0), label, on, true) {
@@ -667,23 +662,21 @@ impl SimView {
         y += 28.0;
         let flying = w.liquid_drops().len() + w.ejecta_motion().count() + self.particles[0] + self.particles[1];
         let card = w.liquid_card_rows().is_some();
-        if w.liquid_physics {
-            let [full, film, drops, walls] = self.solver_counts;
-            if ui.checkbox(Rect::new(x, y, cw, 20.0), &format!("Liquides du solveur ({})", full + film), self.solver, true) {
-                self.solver = !self.solver;
+        let [full, film, drops, walls] = self.solver_counts;
+        if ui.checkbox(Rect::new(x, y, cw, 20.0), &format!("Liquides du solveur ({})", full + film), self.solver, true) {
+            self.solver = !self.solver;
+        }
+        y += 22.0;
+        if self.solver {
+            let keys = [((60, 140, 255), format!("plein {}", count(full))), ((150, 215, 255), format!("film {}", count(film))), ((255, 220, 60), format!("goutte {}", count(drops)))];
+            for (k, (c, label)) in keys.iter().enumerate() {
+                let bx = x + 8.0 + k as f32 * (cw - 8.0) / 3.0;
+                draw_rectangle(bx, y + 2.0, 9.0, 9.0, Color::from_rgba(c.0, c.1, c.2, 255));
+                ui.text(label, bx + 13.0, y + 11.0, 11, DIM);
             }
-            y += 22.0;
-            if self.solver {
-                let keys = [((60, 140, 255), format!("plein {}", count(full))), ((150, 215, 255), format!("film {}", count(film))), ((255, 220, 60), format!("goutte {}", count(drops)))];
-                for (k, (c, label)) in keys.iter().enumerate() {
-                    let bx = x + 8.0 + k as f32 * (cw - 8.0) / 3.0;
-                    draw_rectangle(bx, y + 2.0, 9.0, 9.0, Color::from_rgba(c.0, c.1, c.2, 255));
-                    ui.text(label, bx + 13.0, y + 11.0, 11, DIM);
-                }
-                draw_rectangle(x + 8.0, y + 17.0, 9.0, 9.0, Color::from_rgba(255, 110, 0, 255));
-                ui.text(&format!("gaz pris pour une paroi : {} cases", count(walls)), x + 21.0, y + 26.0, 11, if walls > 0 { TEXT } else { DIM });
-                y += 32.0;
-            }
+            draw_rectangle(x + 8.0, y + 17.0, 9.0, 9.0, Color::from_rgba(255, 110, 0, 255));
+            ui.text(&format!("gaz pris pour une paroi : {} cases", count(walls)), x + 21.0, y + 26.0, 11, if walls > 0 { TEXT } else { DIM });
+            y += 32.0;
         }
         let mut layers = vec![
             (format!("Zones de calcul actives ({})", w.zones.awake_count()), &mut self.zones),

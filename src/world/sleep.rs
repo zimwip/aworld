@@ -285,7 +285,6 @@ mod tests {
     fn a_body_of_water_falling_in_steps_of_several_ticks_keeps_its_zones_running() {
         // The game takes steps of three ticks when it falls behind; the liquids run once a step.
         let mut w = World::new_static();
-        w.set_liquid_physics(true);
         for y in 64..224 {
             for x in 192..352 {
                 w.set(x, y, Mat::Water);

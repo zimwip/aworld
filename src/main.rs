@@ -3742,30 +3742,16 @@ impl Game {
         if ui.checkbox(cr, "Air compressible (P V = n R T)", self.world.flow.compress, true) {
             self.world.flow.compress = !self.world.flow.compress;
         }
-        // Two ways of computing, side by side as toggles (the panel has no room for two more rows):
-        // the cells' turn on every core, about twice as fast when much is moving, but water spreads
-        // and drains a little differently (see `world/turn.rs`); and the liquids as particles (one
-        // cell each) or by their physics (see `world/liquid.rs`).
-        let half = (PANEL_W - 18.0) / 2.0;
-        let pr = Rect::new(6.0, cr.y + 27.0, half, 24.0);
-        let fr = Rect::new(12.0 + half, cr.y + 27.0, half, 24.0);
+        // The cells' turn on every core, about twice as fast when much is moving, but not quite the
+        // same turn (see `world/turn.rs`).
+        let pr = Rect::new(6.0, cr.y + 27.0, PANEL_W - 12.0, 24.0);
         if ui.button(pr, "Tous les cœurs", Icon::None, self.world.parallel_cells, true, GREEN) {
             self.world.parallel_cells = !self.world.parallel_cells;
-        }
-        let label = if self.world.liquid_physics { "Liquides : physique" } else { "Liquides : particules" };
-        if ui.button(fr, label, Icon::None, self.world.liquid_physics, true, BLUE) {
-            self.world.set_liquid_physics(!self.world.liquid_physics);
         }
         if ui.hover(pr) {
             self.hover_info = Some((
                 "Calcul sur tous les cœurs".to_string(),
-                "Jusqu'à deux fois plus vite quand beaucoup bouge, mais l'eau s'écoule un peu autrement.".to_string(),
-            ));
-        }
-        if ui.hover(fr) {
-            self.hover_info = Some((
-                "Liquides : particules ou physique".to_string(),
-                "Particules : chaque case de liquide est une particule. Physique (prototype) : tous les liquides ont une vitesse et une pression en unités réelles, la lave épaisse et figée en refroidissant.".to_string(),
+                "Jusqu'à deux fois plus vite quand beaucoup bouge, mais les cellules jouent leur tour dans un autre ordre.".to_string(),
             ));
         }
     }
@@ -4347,7 +4333,6 @@ fn demo_balance(g: &mut Game) {
 /// it over. Best seen in the stress view (`--view efforts`).
 fn demo_dam(g: &mut Game) {
     g.empty_world();
-    g.world.set_liquid_physics(true);
     let floor = 440;
     for x in 0..W() as i32 {
         for y in floor..H() as i32 {

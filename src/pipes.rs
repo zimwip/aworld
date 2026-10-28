@@ -9,9 +9,8 @@
 //! locks (basins joined by valved pipes), siphons that run over a hump, and their limit: a column of
 //! liquid cannot be sucked higher than the atmosphere can hold it, and then the siphon breaks.
 
-use crate::world::{Kind, Mat, World, H};
-#[cfg(test)]
-use crate::world::W;
+use crate::world::{Kind, Mat, World, H, W};
+use crate::world::FILL_FULL as FULL;
 
 /// How high (in cells) the atmosphere can hold a column of liquid: the limit of a siphon's hump
 /// above the surface it draws from.
@@ -68,19 +67,33 @@ impl Env for World {
 
     fn take_liquid(&mut self, p: (f32, f32)) -> Option<Mat> {
         let (px, py) = (p.0.floor() as i32, p.1.floor() as i32);
-        let mut best: Option<(f32, i32, i32, Mat)> = None;
+        let mut near: Vec<(f32, i32, i32, Mat)> = vec![];
         let r = PORT_REACH.ceil() as i32;
         for dy in -r..=r {
             for dx in -r..=r {
                 let d = ((dx * dx + dy * dy) as f32).sqrt();
                 let m = self.raw(px + dx, py + dy);
-                if d <= PORT_REACH && is_liquid(m) && best.map_or(true, |b| d < b.0) {
-                    best = Some((d, px + dx, py + dy, m));
+                if d <= PORT_REACH && is_liquid(m) {
+                    near.push((d, px + dx, py + dy, m));
                 }
             }
         }
-        let (_, x, y, m) = best?;
-        self.set(x, y, Mat::Empty);
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let m = near.first()?.3;
+        // A whole cell's worth of the nearest liquid: with the liquids moving by their physics a
+        // cell may hold less than a full one (a film, the top of a surface), and taking it as a
+        // whole cell while `put_liquid` gives back a full one made water out of nothing.
+        let cells: Vec<(i32, i32)> = near.iter().filter(|c| c.3 == m).map(|c| (c.1, c.2)).collect();
+        if cells.iter().map(|&(x, y)| self.water_fill(y as usize * W() + x as usize) as u64).sum::<u64>() < FULL as u64 {
+            return None;
+        }
+        let mut owed = FULL;
+        for (x, y) in cells {
+            owed -= self.take_fill(x, y, owed);
+            if owed == 0 {
+                break;
+            }
+        }
         Some(m)
     }
 
@@ -503,13 +516,21 @@ mod tests {
         w
     }
 
+    /// Cells of water between columns `x0` and `x1`, a cell partly filled counting for its share.
     fn water_in(w: &World, x0: i32, x1: i32) -> usize {
-        (0..H() as i32).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water).count()
+        let units: u64 = (0..H() as i32).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water).map(|(x, y)| w.water_fill(y as usize * W() + x as usize) as u64).sum();
+        (units as f64 / FULL as f64).round() as usize
     }
 
+    /// The height of the water's surface in column `x` of a vessel (its floor 20 cells up), from
+    /// the water the column holds: a cell partly filled counts for its share.
     fn surface(w: &World, x: i32) -> f32 {
-        let y = (0..H() as i32).find(|&y| w.raw(x, y) == Mat::Water).unwrap_or(H() as i32);
-        H() as f32 - y as f32
+        let floor = H() as i32 - 20;
+        let units: u64 = (0..floor).filter(|&y| w.raw(x, y) == Mat::Water).map(|y| w.water_fill(y as usize * W() + x as usize) as u64).sum();
+        if units == 0 {
+            return 0.0;
+        }
+        20.0 + (units as f64 / FULL as f64) as f32
     }
 
     fn run(p: &mut Plumbing, w: &mut World, steps: usize) -> Vec<Event> {

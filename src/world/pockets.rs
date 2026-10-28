@@ -13,7 +13,7 @@
 //!   partial vacuum;
 //! - liquids carry the pressure (Pascal) and their own weight: a hole low in a dam or in a boiler
 //!   shoots a jet, faster the deeper it is (Torricelli), and the pressure of a boiler lifts its
-//!   water up a pipe (`hydro.rs` balances heads, not just heights);
+//!   water up a pipe (the liquids' solver reads the pocket's pressure on their surface);
 //! - a steam motor (see `mechgame.rs`) takes its power from the pocket it sits in.
 
 use super::*;
@@ -760,7 +760,9 @@ mod tests {
             for _ in 0..30 {
                 w.step();
                 for x in 261..400 {
-                    for y in hole_y..302 {
+                    // How far the jet gets while it drops its first 5 cells: its speed out of the
+                    // hole (where it lands also depends on how far it has to fall).
+                    for y in hole_y..=hole_y + 5 {
                         if w.raw(x, y) == Mat::Water {
                             far = far.max(x - 260);
                         }

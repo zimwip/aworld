@@ -112,7 +112,7 @@ impl World {
             return Some(Motion { vx: v * CELL_STEP_MS, vy: CELL_STEP_MS, source: Source::Jet });
         }
         match m.kind() {
-            Kind::Liquid if self.liquid_physics => {
+            Kind::Liquid => {
                 let class = self.liq.class.get(i)?;
                 if class & 3 < liquid::WET {
                     // A lone drop the liquids leave to the cells' turn.
@@ -121,7 +121,7 @@ impl World {
                 let (vx, vy) = self.liquid_velocity(x, y)?;
                 Some(Motion { vx, vy, source: Source::LiquidGrid })
             }
-            Kind::Liquid | Kind::Powder => fall(self.vel[i]),
+            Kind::Powder => fall(self.vel[i]),
             Kind::Empty | Kind::Gas | Kind::Flame => {
                 let (vx, vy) = self.flow.sample(x as i32, y as i32);
                 Some(Motion { vx: vx * CELL_STEP_MS, vy: vy * CELL_STEP_MS, source: Source::Wind })
@@ -138,7 +138,7 @@ impl World {
         let (fi, fj) = ((x / FLOW_CELL).min(FW() - 1), (y / FLOW_CELL).min(FH() - 1));
         match field {
             Field::LiquidPa => self.liquid_pa(x, y),
-            Field::LiquidAtm => (m.kind() == Kind::Liquid && !self.liquid_physics).then(|| self.liq_p[i]),
+            Field::LiquidAtm => (m.kind() == Kind::Liquid).then(|| self.liq_p[i]),
             Field::Air => (matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) && !self.flow.is_solid(fi, fj) && self.flow.compress).then(|| self.flow.excess_at_cell(fi, fj)),
         }
     }
@@ -224,11 +224,12 @@ mod tests {
             }
         }
         w.update_pockets();
-        // The cells' liquids: one atmosphere at the surface, more under it.
+        // The weight of the water, as the pockets work it out (what sets its boiling point): one
+        // atmosphere at the surface, more under it.
         let (top, deep) = (w.field_value(Field::LiquidAtm, 220, 280).unwrap(), w.field_value(Field::LiquidAtm, 220, 299).unwrap());
         assert!(top >= 1.0 && deep > top, "{top} {deep}");
         assert!(w.field_value(Field::LiquidAtm, 220, 270).is_none());
-        assert!(w.field_value(Field::LiquidPa, 220, 290).is_none(), "no physics, no liquid pressure");
+        assert!(w.field_value(Field::LiquidPa, 220, 290).is_none(), "the liquids' own pressure only once they have taken a step");
         // The open air is a pocket at one atmosphere; the ground is in no pocket.
         assert_eq!(w.pocket_info(220, 100).map(|p| (p.2, p.3)), Some((1.0, true)));
         assert!(w.pocket_info(220, 300).is_none());

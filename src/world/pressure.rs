@@ -14,6 +14,10 @@ const QUIET: f32 = 0.006;
 const QUIET_LOOSE: f32 = 0.02;
 /// How eagerly a gradient above it moves a cell of water (lighter matter moves more readily).
 const PUSH: f32 = 40.0;
+/// A surge of the air (atmospheres over the slow part) weaker than this does not press on the
+/// physical liquids: a blast does, not the air pushed about by a falling rock or a breaking dam
+/// (at a twentieth of an atmosphere, those already bent the dam break and the log's float).
+const SURGE_QUIET: f32 = 0.15;
 
 #[inline]
 fn at(i: i32, j: i32) -> usize {
@@ -149,6 +153,21 @@ impl World {
         a * (1.0 - ty) + b * ty
     }
 
+    /// The surge of the air's pressure on a liquid's surface at cell (x, y), Pa: the quickly
+    /// changing part (a blast wave), as the physical liquids feel it on top of their pocket's
+    /// pressure. A weak one (the gusts, the breath of a fire) is left out, as `QUIET` leaves it
+    /// out for the cells: still water stays still.
+    pub(super) fn surge_pa(&self, x: i32, y: i32) -> f32 {
+        if !self.pressure_forces || self.dpd.is_empty() {
+            return 0.0;
+        }
+        let d = Self::bilinear(&self.dpd, x as f32 + 0.5, y as f32 + 0.5);
+        if d.abs() < SURGE_QUIET {
+            return 0.0;
+        }
+        d * super::liquid::ATM
+    }
+
     /// Gradient of the quickly changing excess pressure at a world position, in atmospheres per
     /// world cell: the part that pushes.
     pub fn pressure_gradient(&self, x: f32, y: f32) -> (f32, f32) {
@@ -178,17 +197,13 @@ impl World {
                     for dx in 0..CELL as i32 {
                         let (x, y) = (x0 + dx, y0 + dy);
                         let m = self.at(x, y);
-                        if !matches!(m.kind(), Kind::Liquid | Kind::Powder) {
+                        // (Only loose matter: the liquids are pushed by the gas pressure in their
+                        // own step, which may be running on the graphics card right now: a cell
+                        // moved here behind its back would be counted twice or lost.)
+                        if m.kind() != Kind::Powder {
                             continue;
                         }
-                        // (The physical liquids are pushed by the gas pressure in their own step,
-                        // which may be running on the graphics card right now: a cell moved here
-                        // behind its back would be counted twice or lost.)
-                        if m.kind() == Kind::Liquid && self.liquid_physics {
-                            continue;
-                        }
-                        let quiet = if m.kind() == Kind::Liquid { QUIET } else { QUIET_LOOSE };
-                        let p = ((g - quiet) * PUSH / density(m).max(0.2)).min(1.0);
+                        let p = ((g - QUIET_LOOSE) * PUSH / density(m).max(0.2)).min(1.0);
                         if p <= 0.0 {
                             continue;
                         }
@@ -411,13 +426,13 @@ mod boom {
     fn a_falling_body_does_not_blow_the_ground_away_before_it_lands() {
         for (seed, x) in [(7, 300), (7, 520), (11, 420)] {
             let mut w = World::new();
-            w.set_liquid_physics(false);
             w.generate(seed);
             // Long enough for the air to settle into its layers (low pressure near the ground).
             for _ in 0..300 {
                 w.step();
             }
-            let top = (0..H() as i32).find(|&y| w.raw(x, y) != Mat::Empty).unwrap();
+            // (The ground, not a cloud drifting over it.)
+            let top = (0..H() as i32).find(|&y| !matches!(w.raw(x, y).kind(), Kind::Empty | Kind::Gas)).unwrap();
             let ground = |w: &World| -> Vec<Mat> { (top..top + 12).flat_map(|y| (x - 40..x + 40).map(move |xx| w.raw(xx, y))).collect() };
             let before = ground(&w);
             for y in 40..60 {

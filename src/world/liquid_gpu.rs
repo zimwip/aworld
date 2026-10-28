@@ -685,7 +685,7 @@ mod native {
                             c |= OPEN;
                         }
                         code[x] = c;
-                        gaspa[x] = pocket.map_or(0.0, |k| (world.pockets[k].pressure - 1.0) * ATM);
+                        gaspa[x] = pocket.map_or(0.0, |k| (world.pockets[k].pressure - 1.0) * ATM + world.surge_pa(x as i32, y as i32));
                         temp[x] = world.temp[i];
                         if m.kind() == Kind::Liquid {
                             let f = world.liquid_fill(i);

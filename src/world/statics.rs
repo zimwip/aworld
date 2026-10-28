@@ -377,7 +377,7 @@ impl World {
         // Nothing changed in the anchored bodies since the last check: their loads are the same.
         // The push of the liquids on each cell (in cells of water, see `liquid_push`), counted in
         // quarters of a cell in the fingerprints so that a body is worked out again when it changes.
-        let push: Vec<(f32, f32)> = if self.liquid_physics { order.par_iter().map(|&i| self.liquid_push(i)).collect() } else { Vec::new() };
+        let push: Vec<(f32, f32)> = order.par_iter().map(|&i| self.liquid_push(i)).collect();
         let quarters = |k: usize| push.get(k).map_or(0, |&(fx, fy)| (((fx * 4.0).round() as i32 as u64) << 20) ^ ((fy * 4.0).round() as i32 as u64 & 0xf_ffff));
         let key = order.iter().enumerate().fold(order.len() as u64, |h, (k, &i)| (h ^ ((i as u64) << 8 | self.cells[i].m as u64) ^ quarters(k).rotate_left(29)).wrapping_mul(0x100_0000_01b3));
         if key == self.strain_key {
@@ -934,9 +934,6 @@ impl World {
     /// moment of the push about the edge beats the moment of the weight that holds them. The edge
     /// it turns about if so.
     fn pushed_over(&self, cells: &[usize], (lo, hi): (i32, i32), base: usize) -> Option<(f32, f32)> {
-        if !self.liquid_physics {
-            return None;
-        }
         let pushes: Vec<(usize, (f32, f32))> = cells.iter().map(|&i| (i, self.liquid_push(i))).collect();
         let side: f32 = pushes.iter().map(|p| p.1 .0).sum();
         if side == 0.0 {
@@ -1071,14 +1068,10 @@ impl World {
             };
             // For the stress view: what holds it and what turns it.
             let w = mass * G * CELL_M * CELL_M;
-            let push = if self.liquid_physics {
-                p.cells.iter().fold((0.0f32, 0.0f32), |a, &i| {
-                    let f = self.liquid_push(i);
-                    (a.0 + f.0, a.1 + f.1)
-                })
-            } else {
-                (0.0, 0.0)
-            };
+            let push = p.cells.iter().fold((0.0f32, 0.0f32), |a, &i| {
+                let f = self.liquid_push(i);
+                (a.0 + f.0, a.1 + f.1)
+            });
             let span = (lo.0 as f32, hi.0 as f32 + 1.0);
             // The moment of the weight about the edge it turns over (positive: it tips), or how
             // far it is from tipping (negative: the moment that holds it, about the nearer edge).

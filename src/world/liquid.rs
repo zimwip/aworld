@@ -1,4 +1,4 @@
-//! Liquids by their physics (`World::liquid_physics`, on unless `AWORLD_LIQUIDS=0`).
+//! Liquids by their physics.
 //!
 //! Every liquid (water, oil, lava, the melts) is moved here by real forces in real units: a
 //! velocity in m/s on each edge between two cells (a "MAC" grid: the velocity lives where the
@@ -149,11 +149,6 @@ pub(super) fn wind_pa(wind: f32, x: f32, t: f32) -> f32 {
         sum += share * (k * (x * CELL_M - wind.signum() * c * t) + length).sin();
     }
     GUST * RHO_AIR * wind * wind * sum
-}
-
-/// Whether new worlds take their liquids by physics: yes, unless `AWORLD_LIQUIDS=0`.
-pub(super) fn physics_by_default() -> bool {
-    !std::env::var_os("AWORLD_LIQUIDS").is_some_and(|v| v == "0")
 }
 
 /// What a cell is to the liquids.
@@ -337,43 +332,6 @@ fn around(a: &[f32], w: usize, h: usize, x: f32, y: f32, node: impl Fn(usize, us
 }
 
 impl World {
-    /// Turns the physics of liquids on or off. Off, a cell of liquid is always full again: the
-    /// cells under half full go and the others fill up, about as much as there was.
-    pub fn set_liquid_physics(&mut self, on: bool) {
-        if on {
-            // The liquids no longer take the cells' turn, so that turn can run on every core.
-            if turn::parallel_with_liquids() {
-                self.parallel_cells = true;
-            }
-        } else {
-            // The drops in flight come down where they are (a cell for at least half of one).
-            for d in std::mem::take(&mut self.liq.drops) {
-                let (x, y) = (d.x as i32, d.y as i32);
-                if d.q >= field::FULL / 2 && Self::inb(x, y) && self.raw(x, y) == Mat::Empty && self.mask_free(x, y) {
-                    self.set(x, y, d.m);
-                    self.temp[Self::idx(x, y)] = d.t;
-                }
-            }
-            for i in 0..W() * H() {
-                if self.cells[i].m.kind() == Kind::Liquid && self.fill[i] != 0 {
-                    if self.fill[i] < field::FULL / 2 {
-                        self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
-                        self.clear_states(i);
-                    }
-                    self.fill[i] = 0;
-                    self.zones.wake(i);
-                }
-            }
-            self.revision += 1;
-        }
-        self.liq.clear();
-        self.liquid_physics = on;
-        if !on {
-            // The liquids take the cells' turn again: that turn runs on every core only if asked.
-            self.parallel_cells = std::env::var_os("AWORLD_CELLS_PAR").is_some_and(|v| v != "0");
-        }
-    }
-
     /// The drops of liquid in flight.
     pub fn liquid_drops(&self) -> &[Drop] {
         self.liq.drops()
@@ -383,14 +341,14 @@ impl World {
     /// their physics (None in a cell that holds no pressure).
     pub fn liquid_pa(&self, x: usize, y: usize) -> Option<f32> {
         let i = y * W() + x;
-        (self.liquid_physics && self.liq.p.len() == W() * H() && self.liq.class[i] & 3 == FULLISH && self.cells[i].m.kind() == Kind::Liquid).then(|| self.liq.p[i])
+        (self.liq.p.len() == W() * H() && self.liq.class[i] & 3 == FULLISH && self.cells[i].m.kind() == Kind::Liquid).then(|| self.liq.p[i])
     }
 
     /// The push of the liquids on the solid cell `i`, from the pressure on each of its wet sides,
     /// as a weight (x, y; down positive): in cells of water, the column of water that would press
     /// as hard (none unless the liquids run by their physics).
     pub(super) fn liquid_push(&self, i: usize) -> (f32, f32) {
-        if !self.liquid_physics || self.liq.p.len() != W() * H() {
+        if self.liq.p.len() != W() * H() {
             return (0.0, 0.0);
         }
         let (x, y) = xy(i);
@@ -487,12 +445,14 @@ impl World {
         self.liq = liq;
     }
 
-    /// The world is open on its sides: a liquid that reaches the first or the last column leaves
-    /// it, as a drop thrown off the side does. The cells of those columns are emptied in `rows`
+    /// The world is open on its sides and at its bottom: a liquid that reaches the first or the
+    /// last column, or the bottom row, leaves it, as a drop thrown off the side does (so digging
+    /// out the rock under a lake empties it). The cells of those columns are emptied in `rows`
     /// (after a sub-step, or after the card's step), and what left is counted in `gone`.
     pub(super) fn drain_sides(&mut self, rows: impl Iterator<Item = usize>) {
         for y in rows {
-            for i in [y * W(), y * W() + W() - 1] {
+            let bottom = if y + 1 == H() { 1..W() - 1 } else { 0..0 };
+            for i in [y * W(), y * W() + W() - 1].into_iter().chain(bottom.map(|x| y * W() + x)) {
                 if self.cells[i].m.kind() == Kind::Liquid && self.mask[i] == 0 {
                     self.gone += self.liquid_fill(i) as u64;
                     self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
@@ -1224,9 +1184,10 @@ impl World {
         liq.v2 = before;
     }
 
-    /// Pressure of the gas over the ambient one at (x, y), Pa (0 outside a closed pocket).
+    /// Pressure of the gas over the ambient one at (x, y), Pa: a closed pocket's, and the surge
+    /// of a blast wave in the air (`surge_pa`); 0 in still open air.
     fn gas_pa(&self, x: i32, y: i32) -> f32 {
-        self.pocket_at(x, y).map_or(0.0, |p| (self.pockets[p].pressure - 1.0) * ATM)
+        self.pocket_at(x, y).map_or(0.0, |p| (self.pockets[p].pressure - 1.0) * ATM + self.surge_pa(x, y))
     }
 
     /// The pressure that stands on the liquid at (x, y) from a cell that is not full liquid: the
@@ -1951,9 +1912,7 @@ mod tests {
     use super::*;
 
     fn world() -> World {
-        let mut w = World::new_static();
-        w.set_liquid_physics(true);
-        w
+        World::new_static()
     }
 
     fn rect(w: &mut World, x0: i32, y0: i32, x1: i32, y1: i32, m: Mat) {
