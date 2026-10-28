@@ -1665,27 +1665,39 @@ impl World {
         }
     }
 
-    /// Digs a tunnel along a stroke: like the eraser, but the vault is lined with masonry as it
-    /// goes, so the roof does not cave in (see `tunnel`).
+    /// Digs a tunnel along a stroke: like the eraser, but the roof is lined with masonry where it
+    /// would cave in (see `tunnel`).
     pub fn tunnel_line(&mut self, a: (i32, i32), b: (i32, i32), r: i32) {
         let steps = (b.0 - a.0).abs().max((b.1 - a.1).abs()).max(1);
-        for i in 0..=steps {
-            let x = a.0 + (b.0 - a.0) * i / steps;
-            let y = a.1 + (b.1 - a.1) * i / steps;
-            self.tunnel(x, y, r);
+        let centres: Vec<(i32, i32)> = (0..=steps).map(|i| (a.0 + (b.0 - a.0) * i / steps, a.1 + (b.1 - a.1) * i / steps)).collect();
+        for &(x, y) in &centres {
+            self.paint_rule(x, y, r, Mat::Empty, PaintRule::Fill);
+        }
+        // What the whole stroke has left joined to the base of the world: a solid roof that still
+        // is holds by itself.
+        if self.structures_fall {
+            self.spread_ground(true, &[]);
+        }
+        for &(x, y) in &centres {
+            self.line_roof(x, y, r);
         }
     }
 
-    /// Empties a disc of radius `r`, then lines the ring just around it with masonry, from the
-    /// top down to a little below the middle: a masonry vault. Sand, snow or water above can no
-    /// longer pour in, and the roof holds as long as the walls rest on something. Rock is lined
-    /// too: the rock over a bore is held by the vault (the world is flat: a tunnel through it
-    /// cuts the rock above from the rock below). Metal and masonry are left as they are, and so
-    /// is the floor.
+    /// Empties a disc of radius `r`, then lines its roof with masonry where it would cave in (see
+    /// `line_roof`).
     pub fn tunnel(&mut self, cx: i32, cy: i32, r: i32) {
-        self.paint_rule(cx, cy, r, Mat::Empty, PaintRule::Fill);
+        self.tunnel_line((cx, cy), (cx, cy), r);
+    }
+
+    /// Lines the top half of the ring just around a hole of radius `r` with masonry, a vault, but
+    /// only where the roof would come down: sand, earth, snow or water, which drop as soon as
+    /// nothing is under them, and solid rock that the hole has cut off from the base of the world
+    /// (the world is flat: a tunnel right through a hill cuts the rock above from the rock below).
+    /// Rock that still holds by itself, metal and masonry are left as they are, and so are the
+    /// walls and the floor.
+    fn line_roof(&mut self, cx: i32, cy: i32, r: i32) {
         let outer = r + TUNNEL_LINING;
-        for dy in -outer..=r / 2 {
+        for dy in -outer..0 {
             for dx in -outer..=outer {
                 let d2 = dx * dx + dy * dy;
                 if d2 <= r * r + r / 2 || d2 > outer * outer + outer / 2 {
@@ -1695,21 +1707,30 @@ impl World {
                 if !Self::inb(x, y) || self.mask[Self::idx(x, y)] != 0 {
                     continue;
                 }
-                if Self::needs_lining(self.raw(x, y)) {
+                if self.caves_in(x, y) {
                     self.set(x, y, Mat::Vault);
                 }
             }
         }
     }
 
-    /// Whether a tunnel's vault must be lined where it meets this material.
-    fn needs_lining(m: Mat) -> bool {
+    /// Whether the matter at (x, y), over a tunnel, would come down into it (`ground` holds what
+    /// is still joined to the base of the world).
+    fn caves_in(&self, x: i32, y: i32) -> bool {
+        let m = self.raw(x, y);
         match m.kind() {
             Kind::Empty | Kind::Gas | Kind::Flame => false,
             // Hot liquids would fire the masonry: they are left to the player's care.
             Kind::Liquid => !m.hot() && !matches!(m, Mat::Molten | Mat::MoltenSteel),
             Kind::Powder => true,
-            Kind::Static => !m.is_vegetation() && !matches!(m, Mat::Iron | Mat::Steel | Mat::Brick | Mat::Terracotta | Mat::Glass | Mat::Vault),
+            Kind::Static => {
+                if m.is_vegetation() || matches!(m, Mat::Iron | Mat::Steel | Mat::Brick | Mat::Terracotta | Mat::Glass | Mat::Vault) || !self.structures_fall {
+                    return false;
+                }
+                // Earth crumbles as soon as there is nothing under it; rock only falls as a
+                // whole, when nothing joins it to the ground any more.
+                matches!(m, Mat::Dirt | Mat::Grass) || !self.ground[Self::idx(x, y)]
+            }
         }
     }
 
@@ -5624,6 +5645,33 @@ mod tests {
         }
         assert_eq!(w.raw(200, y), Mat::Empty, "the tunnel stays open");
         assert_eq!(w.raw(200, H() as i32 - 89), Mat::Stone, "the rock over it stays up");
+    }
+
+    #[test]
+    fn a_tunnel_lines_only_the_roof_and_only_where_it_would_cave_in() {
+        let y = H() as i32 - 40;
+        // In sand, the roof is lined, but not the walls nor the floor.
+        let mut w = dune();
+        w.tunnel_line((150, y), (250, y), 6);
+        assert_eq!(w.raw(200, y - 7), Mat::Vault, "the roof is lined");
+        assert_eq!(w.raw(143, y), Mat::Sand, "not the walls");
+        assert_eq!(w.raw(200, y + 7), Mat::Sand, "nor the floor");
+        assert!(!(y..H() as i32).any(|yy| (100..300).any(|x| w.raw(x, yy) == Mat::Vault)), "nothing from the middle down");
+        // A short gallery in a mountain of rock: the rock still holds by itself, nothing is lined.
+        let mut w = World::new_static();
+        w.structures_fall = true;
+        for x in 100..300 {
+            for yy in H() as i32 - 90..H() as i32 {
+                w.set(x, yy, Mat::Stone);
+            }
+        }
+        w.tunnel_line((150, y), (250, y), 6);
+        assert!(!w.cells.iter().any(|c| c.m == Mat::Vault), "sound rock needs no vault");
+        for _ in 0..100 {
+            w.step();
+        }
+        assert_eq!(w.raw(200, y), Mat::Empty, "and the gallery stays open");
+        assert_eq!(w.raw(200, y - 7), Mat::Stone, "under its roof of rock");
     }
 
     #[test]
