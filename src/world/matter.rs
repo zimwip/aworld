@@ -184,8 +184,6 @@ pub fn shocked(m: Mat, shock: f32, temp: f32, loose: bool) -> Option<&'static Tr
     TRANSITIONS.iter().find(|t| t.from == m && t.by_shock() && (!loose || t.needs_heat()) && t.holds(&here))
 }
 
-/// The lasting changes are looked at once every this many steps.
-pub const SETTLE_EVERY: u32 = 64;
 
 /// Whether any lasting (not shock) change starts from `m`.
 fn settles(m: Mat) -> bool {
@@ -247,6 +245,7 @@ impl World {
     /// The slow changes: every cell whose conditions hold may change, with its chance.
     pub(super) fn settle_matter(&mut self) {
         let load = self.load();
+        let every = super::cadence::every(super::cadence::Pass::Settle);
         for i in 0..W() * H() {
             let m = self.cells[i].m;
             if !settles(m) || self.mask[i] != 0 {
@@ -254,7 +253,9 @@ impl World {
             }
             let here = Here { temp: self.temp[i], pressure: load[i], shock: 0.0, above: (i >= W()).then(|| self.cells[i - W()].m.kind()), air: false };
             for tr in TRANSITIONS.iter().filter(|t| t.from == m && !t.by_shock() && !t.by_heat()) {
-                if tr.holds(&here) && (tr.every <= SETTLE_EVERY || self.rand() % tr.every < SETTLE_EVERY) {
+                // (Looked at once every `every` ticks: a change that takes longer happens on
+                // that share of the looks.)
+                if tr.holds(&here) && (tr.every <= every || self.rand() % tr.every < every) {
                     self.change_state(i, tr.to, tr.latent);
                     break;
                 }

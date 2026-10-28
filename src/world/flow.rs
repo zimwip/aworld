@@ -807,15 +807,16 @@ impl World {
     /// itself is advanced every other step.
     pub(super) fn update_flow(&mut self) {
         let t = self.ticks;
-        if t % 16 == 1 {
+        use super::cadence::{due, Pass};
+        if due(Pass::FlowSolids, t) {
             self.refresh_flow_solids();
         }
-        if t % 4 == 1 {
+        if due(Pass::FlowHeat, t) {
             let ambient: Vec<f32> = (0..H() as i32).map(|y| self.ambient_c(y)).collect();
             self.flow.refresh_heat(&self.temp, &ambient);
             self.flow.refresh_wet(&self.cells, |c| matches!(c.m, super::Mat::Water | super::Mat::Mud | super::Mat::Cloud | super::Mat::Steam));
         }
-        if t % 2 == 0 {
+        if due(Pass::FlowStep, t) {
             let wind = self.wind;
             self.flow.step(wind, t);
         }

@@ -23,9 +23,6 @@ use rayon::prelude::*;
 pub const OPEN_POCKET: u32 = 40_000;
 /// How many times more gas a cell of steam holds than a cell of air (boiling water swells a lot).
 pub const STEAM_N: f32 = 8.0;
-/// Pockets and liquid pressure are re-read every this many steps (a multiple of 6, so that the
-/// pass always falls on the same part of the heat cycle, see `after_cells`).
-pub const POCKETS_EVERY: u32 = 18;
 /// A liquid shoots out sideways once the pressure behind a hole is worth this much head, m.
 const JET_HEAD_M: f32 = 0.5;
 /// Air temperature (K) at which a closed pocket of plain air is at 1 atm.

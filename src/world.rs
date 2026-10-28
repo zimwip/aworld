@@ -3,6 +3,7 @@
 //! so particles and the car treat them as solid.
 
 mod blast;
+pub mod cadence;
 pub mod ballistic;
 pub mod matter;
 pub use blast::Ejecta;
@@ -52,6 +53,7 @@ pub const STEP: f32 = units::TICK;
 /// speed) is several steps: past it the heat and the liquids would need sub-steps of their own.
 pub const MAX_DT: f32 = 3.0 * STEP;
 use thermal::adiabatic_cooling_c;
+use cadence::Pass;
 
 /// How the brush treats what is already there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2100,37 +2102,36 @@ impl World {
     /// `last` tick of the step the heat.
     fn after_cells(&mut self, last: bool) {
         self.ticks = self.ticks.wrapping_add(1);
-        // The passes that come back every few steps are set on different steps, so that the
-        // heavy ones never fall together, and the heat pass is spread over the three steps of its
-        // cycle (conduction with the air and the reactions, then space and the sun, then the wind
-        // carrying heat every other cycle): a step costs about the same as the next, instead of
-        // one step in three carrying everything. The structures come back every 9 steps (on
-        // 9k + 1: always beside space and the sun, the lightest part of the heat), the pockets
-        // every 18 (on 18k + 5: never with the structures), the storm
-        // every 4 (on 4k), the air's pressure every 4 (on 4k + 1).
-        if self.structures_fall && self.ticks % 9 == 1 {
+        // The passes that come back every few ticks are set on different ticks (see `cadence`),
+        // so that the heavy ones never fall together, and the heat pass is spread over the three
+        // steps of its cycle (conduction with the air and the reactions, then space and the sun,
+        // then the wind carrying heat every other cycle): a step costs about the same as the
+        // next, instead of one step in three carrying everything.
+        let t = self.ticks;
+        let due = |p| cadence::due(p, t);
+        if self.structures_fall && due(Pass::Structures) {
             timed!(self, 1, self.structure_pass());
         }
-        if self.structures_fall && self.ticks % 2 == 0 {
+        if self.structures_fall && due(Pass::Drops) {
             timed!(self, 2, self.drop_structures());
         }
         if self.structures_fall {
             timed!(self, 3, self.step_slabs());
         }
-        if self.ticks % pockets::POCKETS_EVERY == 5 {
+        if due(Pass::Pockets) {
             timed!(self, 4, self.update_pockets());
         }
         timed!(self, 5, self.step_ejecta());
-        if self.ticks % matter::SETTLE_EVERY == 17 {
+        if due(Pass::Settle) {
             timed!(self, 6, self.settle_matter());
         }
         timed!(self, 7, self.update_wind());
         timed!(self, 8, self.update_flow());
-        if self.ticks % 4 == 1 {
+        if due(Pass::Pressure) {
             timed!(self, 9, self.update_pressure());
         }
         timed!(self, 10, self.pressure_push());
-        if self.ticks % 64 == 0 {
+        if due(Pass::Season) {
             timed!(self, 11, self.update_season_cache());
         }
         if last {
