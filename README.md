@@ -151,6 +151,23 @@ neige sous une explosion ou dans une chaudière qui crève, avant), l'argile bro
 l'argile qu'elle a tassée), et un mur ne tient jamais plus de pression que la résistance de sa matière (un test le
 vérifie : la terre et l'herbe tenaient 2 atm pour une cohésion de 0,5 et 0,8).
 
+**Le mouvement décidé par le type** : la fiche dit aussi comment le tour des cellules déplace la matière (`Motion` :
+grain, motte de terre, gazon, liquide, gaz, nuage, flamme, fixe) et sa vitesse limite de chute (`fall_ms`). Le tour
+d'une cellule fait agir la matière (`act` : ce qu'elle fait d'elle-même, brûler, se dissoudre, être tenue par
+l'aimant), la déplace selon sa façon de bouger (`move_cell`), puis, si elle n'a pas bougé, ce qu'elle fait au repos
+(`at_rest` : le sol qui boit et pousse, la neige qui flue, les solides). Un grain de plus n'a besoin que de sa fiche.
+Le changement n'a rien changé au monde : l'empreinte des scènes de `bench_fingerprint` est restée la même.
+
+**Ce qui vole hors de la grille** (`src/world/ballistic.rs`) : les gouttes des liquides, les mottes des explosions,
+le jet des pompiers, les débris de voiture et les bâtons de dynamite volent de la même façon, la gravité du monde et
+une traînée en carré de la vitesse réglée par leur vitesse limite (`pull` : 9,1 m/s une goutte, 30 m/s une motte,
+15 m/s une tôle, 12 m/s un bâton ; le jet, un filet d'eau, sans traînée), et un trajet cellule par cellule qui
+s'arrête à la première qui bloque (`sweep`). Chacun garde ce qu'il fait en arrivant.
+
+**Les cadences** (`src/world/cadence.rs`) : chaque passe qui ne tourne pas à chaque tick (structures, chutes,
+poches, transformations lentes, pression de l'air, saison, orage, flux d'air) a sa période en secondes du monde et
+sa phase dans un seul tableau ; un test vérifie que les passes lourdes ne tombent jamais sur le même tick.
+
 
 ## Son
 
