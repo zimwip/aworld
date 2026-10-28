@@ -142,6 +142,15 @@ liés à la cellule : les gaz et les flammes avancent d'une cellule par tick au 
 plus lentement en m/s sur une grille fine), la pousse des plantes, la durée de vie d'une flamme ou d'une braise, et
 la taille des objets (voitures, arbres, personnages) en cellules.
 
+**Une fiche par matière** (`src/world/spec.rs`, `MatSpec`) : densité (kg/m³), résistance (MPa), ténacité (J/m²),
+pression que tient un mur d'une cellule autour d'une poche de gaz, ce que la matière devient broyée, restitution et
+porosité, dans un seul `match` sans bras par défaut (une matière nouvelle ne compile pas sans sa fiche). La chute et
+la flottaison, les explosions, les structures, les poches de gaz et le poids de la matière sur le sol y lisent tous ;
+c'étaient des tables à part qui ne disaient pas toujours pareil. La glace broyée donne de la grêle partout (de la
+neige sous une explosion ou dans une chaudière qui crève, avant), l'argile broyée de la terre (une explosion laisse
+l'argile qu'elle a tassée), et un mur ne tient jamais plus de pression que la résistance de sa matière (un test le
+vérifie : la terre et l'herbe tenaient 2 atm pour une cohésion de 0,5 et 0,8).
+
 
 ## Son
 

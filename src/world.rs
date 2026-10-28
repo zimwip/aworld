@@ -12,6 +12,8 @@ pub mod liquid_class {
     pub use super::liquid::SOLID;
 }
 pub mod units;
+pub mod spec;
+pub use spec::MatSpec;
 pub use units::cell_m;
 /// A full cell of liquid, in units of fill (see `field.rs`).
 pub use field::FULL as FILL_FULL;
@@ -464,31 +466,9 @@ fn glow((r, g, b): (i32, i32, i32), t: f32) -> (i32, i32, i32, i32) {
     (m(r, hr), m(g, hg), m(b, hb), 255)
 }
 
-/// Weight of a cell of this material, relative to water.
+/// Weight of a cell of this material, relative to water (see `spec.rs`).
 fn density(m: Mat) -> f32 {
-    match m {
-        Mat::Water | Mat::Oil => if m == Mat::Oil { 0.8 } else { 1.0 },
-        Mat::Lava => 3.0,
-        Mat::Molten | Mat::MoltenSteel => 6.5,
-        Mat::Stone => 2.7,
-        Mat::Dirt | Mat::Sand | Mat::Mud => 1.6,
-        Mat::Clay => 1.8,
-        Mat::Terracotta | Mat::Vault => 2.0,
-        Mat::Brick => 1.2,
-        Mat::Wood | Mat::Trunk | Mat::Branch => 0.6,
-        Mat::Leaf | Mat::Sapling | Mat::Grass | Mat::Seed | Mat::DeadLeaf => 0.3,
-        Mat::Iron | Mat::Steel => 7.8,
-        Mat::Glass | Mat::Shard => 2.5,
-        Mat::Ice | Mat::Hail => 0.92,
-        Mat::Snow => 0.3,
-        Mat::Ash => 0.5,
-        Mat::Charcoal => 0.3,
-        Mat::Gunpowder | Mat::Rust => 1.5,
-        Mat::Saltpeter => 2.1,
-        Mat::Diamond => 3.5,
-        Mat::Dynamite => 1.4,
-        _ => 1.0,
-    }
+    MatSpec::of(m).density / units::RHO_WATER
 }
 
 /// How a gas drifts when neither its buoyancy nor the wind moves it, as `World::step_gas` reads

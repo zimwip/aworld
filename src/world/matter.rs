@@ -19,7 +19,7 @@
 //! (it peaks at a few thousand atmospheres): it neither packs the soil nor makes diamond.
 
 use super::thermal::{cap, heat_of, latent0, GLASS_C, KILN_C, LATENT_FUSION, LATENT_METAL, LATENT_ROCK, MELT_C, METAL_MELT_C, ROCK_MELT_C, WOOD_IGNITE_C};
-use super::{density, xy_i32, Kind, Mat, World, H, W};
+use super::{xy_i32, Kind, Mat, World, H, W};
 
 /// A condition a change needs; all the conditions of a change must hold.
 #[derive(Clone, Copy, Debug)]
@@ -214,11 +214,7 @@ pub(super) fn by_heat(m: Mat) -> &'static [&'static Transition] {
 
 /// Weight of one cell of `m`, atm.
 fn weight(m: Mat) -> f32 {
-    let rho = match m.kind() {
-        Kind::Empty | Kind::Gas | Kind::Flame => super::units::RHO_AIR / super::units::RHO_WATER,
-        _ => density(m),
-    };
-    super::units::atm_per_cell(rho)
+    super::units::atm_per_cell(super::MatSpec::of(m).density / super::units::RHO_WATER)
 }
 
 impl World {

@@ -24,7 +24,7 @@
 //! meadow, a hole in a brick wall or a dent in an iron plate.
 
 use super::num::round_i;
-use super::{density, xy_i32, Kind, Mat, World, H, W};
+use super::{xy_i32, Kind, Mat, MatSpec, World, H, W};
 use rayon::prelude::*;
 
 use super::units::{cell_m, G};
@@ -134,39 +134,14 @@ pub fn grain_energy() -> f32 {
     e.energy * e.rho * cell_m().powi(3) * e.coupling
 }
 
-/// Strength of a material, MPa (tensile or shear strength for solids, cohesion for soils). Loose
-/// matter, liquids and gases have none: they only weigh.
+/// Strength of a material, MPa (see `MatSpec::strength`).
 pub fn strength(m: Mat) -> f32 {
-    match m {
-        Mat::Stone => 10.0,
-        Mat::Brick => 3.0,
-        Mat::Terracotta => 4.0,
-        Mat::Vault => 5.0,
-        Mat::Clay => 0.15,
-        Mat::Dirt => 0.05,
-        Mat::Grass => 0.08,
-        Mat::Iron => 250.0,
-        Mat::Steel => 400.0,
-        Mat::Glass => 7.0,
-        Mat::Ice => 1.5,
-        Mat::Wood => 5.0,
-        Mat::Trunk => 8.0,
-        Mat::Branch => 4.0,
-        Mat::Leaf | Mat::Sapling => 0.1,
-        Mat::Ember => 0.5,
-        // Diamond is hard but brittle: it breaks at about 2 GPa.
-        Mat::Diamond => 2_000.0,
-        Mat::Dynamite => 1.0,
-        _ => 0.0,
-    }
+    MatSpec::of(m).strength
 }
 
 /// Density, kg/m³ (air for gas and empty cells).
 fn rho(m: Mat) -> f32 {
-    match m.kind() {
-        Kind::Empty | Kind::Gas | Kind::Flame => 1.2,
-        _ => density(m) * 1000.0,
-    }
+    MatSpec::of(m).density
 }
 
 /// Energy to tear one cell of `m` loose at `d` cells from the centre and throw it out, J.
@@ -186,7 +161,7 @@ fn thrown(m: Mat, roll: u32) -> Mat {
         Mat::Stone => if roll % 3 == 0 { Mat::Stone } else { Mat::Sand },
         Mat::Grass => Mat::Dirt,
         Mat::Glass => Mat::Shard,
-        Mat::Ice => if roll % 2 == 0 { Mat::Ice } else { Mat::Snow },
+        Mat::Ice => if roll % 2 == 0 { Mat::Ice } else { Mat::Hail },
         Mat::Brick | Mat::Terracotta | Mat::Vault => if roll % 2 == 0 { m } else { Mat::Sand },
         Mat::Leaf | Mat::Sapling => Mat::DeadLeaf,
         Mat::Wood | Mat::Trunk | Mat::Branch => if roll % 3 == 0 { Mat::Ember } else { Mat::Wood },
@@ -194,14 +169,15 @@ fn thrown(m: Mat, roll: u32) -> Mat {
     }
 }
 
-/// What a crushed (or cracked) solid leaves, if anything.
+/// What a crushed (or cracked) solid leaves, if anything: its rubble (`MatSpec::rubble`), and
+/// the splinters of wood the blast sets alight. Clay is left as it is: the blast packs the soil
+/// round the hole into it (`a_detonation_packs_the_soil_left_around_the_hole`), it does not
+/// loosen it again.
 fn rubble(m: Mat) -> Option<Mat> {
     match m {
-        Mat::Stone | Mat::Brick | Mat::Terracotta | Mat::Vault => Some(Mat::Sand),
-        Mat::Glass => Some(Mat::Shard),
-        Mat::Ice => Some(Mat::Snow),
+        Mat::Clay => None,
         Mat::Wood | Mat::Trunk | Mat::Branch => Some(Mat::Ember),
-        _ => None,
+        _ => MatSpec::of(m).rubble,
     }
 }
 

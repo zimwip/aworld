@@ -69,29 +69,15 @@ impl Pocket {
     }
 }
 
-/// How much excess pressure (atm) a wall of this material holds before it gives way.
-/// `None`: it never does (or it is not a wall).
+/// How much excess pressure (atm) a wall of this material holds before it gives way (see
+/// `MatSpec::holds_atm`). `None`: it never does (or it is not a wall).
 pub fn wall_strength(m: Mat) -> Option<f32> {
-    Some(match m {
-        Mat::Ice => 0.6,
-        Mat::Glass => 0.8,
-        Mat::Snow | Mat::Hail | Mat::Ash | Mat::Charcoal | Mat::Sand | Mat::Mud | Mat::Seed | Mat::Shard | Mat::Rust | Mat::Gunpowder | Mat::Saltpeter | Mat::DeadLeaf => 0.6,
-        Mat::Dirt | Mat::Grass => 2.0,
-        Mat::Clay => 1.5,
-        Mat::Wood | Mat::Trunk => 2.5,
-        Mat::Brick => 2.0,
-        Mat::Terracotta => 3.0,
-        Mat::Stone => 5.0,
-        Mat::Iron => 8.0,
-        Mat::Steel => 14.0,
-        _ => return None,
-    })
+    super::MatSpec::of(m).holds_atm
 }
 
-/// Ground that gas seeps through: a cave dug in soil or sand, or air trapped among wet grains,
-/// does not hold pressure the way a boiler does.
+/// Ground that gas seeps through (see `MatSpec::porous`).
 fn porous(m: Mat) -> bool {
-    matches!(m, Mat::Sand | Mat::Dirt | Mat::Grass | Mat::Mud | Mat::Snow | Mat::Hail | Mat::Shard | Mat::Seed | Mat::DeadLeaf | Mat::Gunpowder | Mat::Saltpeter | Mat::Rust)
+    super::MatSpec::of(m).porous
 }
 
 /// Least energy (excess atmospheres times cells of gas) that breaks a wall: a bubble of a few
@@ -466,13 +452,10 @@ impl World {
                 if wall_strength(m).map_or(true, |s| s > excess * 1.5) {
                     continue;
                 }
+                // What it crumbles into; earth soaked by the steam, mud.
                 let into = match m {
-                    Mat::Glass => Mat::Shard,
-                    Mat::Stone => Mat::Sand,
-                    Mat::Ice => Mat::Snow,
-                    Mat::Wood | Mat::Trunk => Mat::Empty,
-                    Mat::Dirt | Mat::Grass | Mat::Clay | Mat::Brick | Mat::Terracotta => Mat::Mud,
-                    _ => Mat::Empty,
+                    Mat::Dirt | Mat::Grass | Mat::Clay => Mat::Mud,
+                    _ => super::MatSpec::of(m).rubble.unwrap_or(Mat::Empty),
                 };
                 let into = if self.chance(2) { into } else { Mat::Empty };
                 self.set(x, y, into);

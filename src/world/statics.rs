@@ -152,49 +152,19 @@ pub fn same_body(a: Mat, b: Mat) -> bool {
     a == b || (a.is_vegetation() && b.is_vegetation())
 }
 
-/// Fracture energy, J/m²: what it costs to open a crack through the matter. Brittle matters need
-/// little (ice, glass, rock), tough ones a great deal (wood, metal: they bend instead).
+/// Fracture energy, J/m² (see `MatSpec::toughness`).
 pub fn toughness(m: Mat) -> f32 {
-    match m {
-        Mat::Ice => 1.0,
-        Mat::Glass => 8.0,
-        Mat::Clay => 5.0,
-        Mat::Brick | Mat::Terracotta => 30.0,
-        Mat::Stone | Mat::Vault => 50.0,
-        Mat::Diamond => 20.0,
-        Mat::Ember => 100.0,
-        Mat::Dynamite => 300.0,
-        Mat::Leaf | Mat::Sapling => 500.0,
-        Mat::Wood | Mat::Branch => 8_000.0,
-        Mat::Trunk => 15_000.0,
-        Mat::Iron => 50_000.0,
-        Mat::Steel => 100_000.0,
-        _ => 1.0e6,
-    }
+    MatSpec::of(m).toughness
 }
 
-/// What a solid crushed finer than a cell becomes.
+/// What a solid crushed finer than a cell becomes (see `MatSpec::rubble`).
 pub fn rubble(m: Mat) -> Option<Mat> {
-    match m {
-        Mat::Ice => Some(Mat::Hail),
-        Mat::Glass => Some(Mat::Shard),
-        Mat::Stone | Mat::Brick | Mat::Terracotta | Mat::Vault => Some(Mat::Sand),
-        Mat::Clay => Some(Mat::Dirt),
-        Mat::Diamond => Some(Mat::Diamond),
-        _ => None,
-    }
+    MatSpec::of(m).rubble
 }
 
-/// Coefficient of restitution of matter `m`: the share of the speed along the normal a body of
-/// it bounces back with.
+/// Coefficient of restitution of matter `m` (see `MatSpec::restitution`).
 fn restitution(m: Mat) -> f32 {
-    match m {
-        Mat::Wood | Mat::Trunk | Mat::Branch => 0.45,
-        Mat::Iron | Mat::Steel | Mat::Glass | Mat::Diamond => 0.4,
-        Mat::Ice => 0.35,
-        Mat::Clay | Mat::Leaf | Mat::Sapling => 0.05,
-        _ => 0.3,
-    }
+    MatSpec::of(m).restitution
 }
 
 /// Typical size of the pieces, in cells, when matter `m` hits at `v` m/s.
