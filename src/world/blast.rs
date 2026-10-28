@@ -27,11 +27,7 @@ use super::num::round_i;
 use super::{density, xy_i32, Kind, Mat, World, H, W};
 use rayon::prelude::*;
 
-/// Side of a cell, in metres.
-const CELL_M: f32 = 0.05;
-/// Volume of a cell, m³.
-const CELL_V: f32 = CELL_M * CELL_M * CELL_M;
-const G: f32 = 9.81;
+use super::units::{cell_m, G};
 /// Speed a torn-off clod must be thrown at to clear the hole, m/s.
 const THROW: f32 = 50.0;
 /// An explosive, as the blast sees it.
@@ -80,9 +76,9 @@ pub struct Charge {
 impl Charge {
     fn add(&mut self, m: Mat) {
         let Some(e) = explosive(m) else { return };
-        let mass = e.rho * CELL_V;
+        let mass = e.rho * cell_m().powi(3);
         self.work += e.energy * mass * e.coupling;
-        self.gas += e.gas * mass / CELL_V;
+        self.gas += e.gas * mass / cell_m().powi(3);
         self.shock = self.shock.max(e.shock);
         self.flame = self.flame.max(e.flame);
         self.cells += 1.0;
@@ -116,12 +112,12 @@ impl Charge {
         self.work / grain_energy()
     }
 }
-/// Speed in world cells per step for one metre per second (the world's clock is not a real one).
-const SPEED: f32 = 0.08;
-/// Fastest projectile, cells per step.
-const MAX_SPEED: f32 = 9.0;
-/// Pull on projectiles, cells per step².
-const FALL: f32 = 0.12;
+/// The share of the speed its energy gives a torn-off clod that it flies off at: most of the work
+/// of a blast goes into crushing and heating the ground, and clods thrown at the whole of it
+/// would leave the sky.
+const THROWN_SHARE: f32 = 0.16;
+/// Fastest projectile, m/s: about 17 m up at most, the depth of the design world.
+const MAX_SPEED_MS: f32 = 18.0;
 /// No more flying clods than this at once; the rest stay where they were, broken.
 const MAX_EJECTA: usize = 14_000;
 /// Longest ray, cells.
@@ -135,7 +131,7 @@ const CRACKS: usize = 11;
 /// Mechanical energy one grain of powder gives the ground, J.
 pub fn grain_energy() -> f32 {
     let e = explosive(Mat::Gunpowder).unwrap();
-    e.energy * e.rho * CELL_V * e.coupling
+    e.energy * e.rho * cell_m().powi(3) * e.coupling
 }
 
 /// Strength of a material, MPa (tensile or shear strength for solids, cohesion for soils). Loose
@@ -175,7 +171,7 @@ fn rho(m: Mat) -> f32 {
 
 /// Energy to tear one cell of `m` loose at `d` cells from the centre and throw it out, J.
 pub fn cell_cost(m: Mat, d: f32) -> f32 {
-    CELL_V * (strength(m) * 1.0e6 + 0.5 * rho(m) * (THROW * THROW + 2.0 * G * d * CELL_M))
+    cell_m().powi(3) * (strength(m) * 1.0e6 + 0.5 * rho(m) * (THROW * THROW + 2.0 * G * d * cell_m()))
 }
 
 /// Radius the fire, the pressure wave and the shove of a charge of `grains` reach, cells.
@@ -623,7 +619,7 @@ impl World {
                         break;
                     }
                     s.e -= cost;
-                    s.dug.push((i, rho(m) * CELL_V * share(d)));
+                    s.dug.push((i, rho(m) * cell_m().powi(3) * share(d)));
                     s.at += 1;
                 }
                 if s.at >= ray.len() && !s.out {
@@ -673,8 +669,7 @@ impl World {
             if s.out && !s.dug.is_empty() {
                 // Half the energy left goes to the clods, the rest rushes out with the gas.
                 let mass: f32 = s.dug.iter().map(|c| c.1).sum();
-                let v = (THROW * THROW + s.e.max(0.0) / mass).sqrt() * SPEED;
-                let v = v.min(MAX_SPEED);
+                let v = super::units::cells_per_tick(((THROW * THROW + s.e.max(0.0) / mass).sqrt() * THROWN_SHARE).min(MAX_SPEED_MS));
                 for &(i, _) in &s.dug {
                     mark(&mut fates, i, Fate::Throw(a.cos() * v, a.sin() * v));
                 }
@@ -760,7 +755,7 @@ impl World {
         let mut flying = std::mem::take(&mut self.ejecta);
         let mut landed: Vec<(i32, i32, Mat)> = vec![];
         flying.retain_mut(|p| {
-            p.vy += FALL;
+            p.vy += super::units::g_tick();
             p.vx *= 0.995;
             p.vy *= 0.995;
             let steps = p.vx.abs().max(p.vy.abs()).ceil().max(1.0) as i32;

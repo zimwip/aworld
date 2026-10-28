@@ -9,8 +9,6 @@ use crate::render::View;
 use crate::world::{Mat, World, H, W};
 use crate::gfx::*;
 
-/// Same pull as the cars feel, cells per step².
-const GRAVITY: f32 = 0.12 * S;
 /// Steps a piece lasts before it is gone (it fades during the last second).
 const LIFE: u32 = 60 * 9;
 /// No more pieces than this at once: the oldest go first.
@@ -168,7 +166,7 @@ impl Debris {
                 }
                 pc.rest = false;
             }
-            pc.v.y += GRAVITY;
+            pc.v.y += crate::world::units::g_tick();
             // Water and other liquids brake a piece hard; the air barely.
             let here = world.raw(pc.p.x as i32, pc.p.y as i32);
             let wet = matches!(here, Mat::Water | Mat::Oil | Mat::Mud | Mat::Lava);

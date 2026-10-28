@@ -1831,11 +1831,11 @@ impl Game {
     /// The particles the game moves besides the world's cells, for the simulation view: the
     /// pieces of wrecked cars (cells a step) and the fireworks (cells a second), in m/s.
     fn flying_particles(&self) -> Vec<simview::Particle> {
-        use world::inspect::{CELL_METRES, CELL_STEP_MS};
-        let debris = self.debris.pieces.iter().filter(|p| !p.rest).map(|p| simview::Particle { x: p.p.x, y: p.p.y, vx: p.v.x * CELL_STEP_MS, vy: p.v.y * CELL_STEP_MS, kind: 0 });
+        use world::inspect::{cell_metres, cell_step_ms};
+        let debris = self.debris.pieces.iter().filter(|p| !p.rest).map(|p| simview::Particle { x: p.p.x, y: p.p.y, vx: p.v.x * cell_step_ms(), vy: p.v.y * cell_step_ms(), kind: 0 });
         let rockets = self.fireworks.rockets.iter().map(|r| (r.pos, r.vel));
         let sparks = self.fireworks.sparks.iter().map(|s| (s.pos, s.vel));
-        let fireworks = rockets.chain(sparks).map(|(p, v)| simview::Particle { x: p.x, y: p.y, vx: v.x * CELL_METRES, vy: v.y * CELL_METRES, kind: 1 });
+        let fireworks = rockets.chain(sparks).map(|(p, v)| simview::Particle { x: p.x, y: p.y, vx: v.x * cell_metres(), vy: v.y * cell_metres(), kind: 1 });
         debris.chain(fireworks).collect()
     }
 
@@ -2754,8 +2754,9 @@ impl Game {
         let x = r.x + 14.0;
         draw_line(x, r.y + 2.0, r.x + r.w - 14.0, r.y + 2.0, 1.0, Color::new(1.0, 1.0, 1.0, 0.12));
         ui.text("Matières du monde", x, r.y + 26.0, 16, ACCENT);
-        let litres = world::CELL_M.powi(3) * 1000.0;
-        let note = format!("une cellule : un cube de {:.0} cm, {:.1} L  ·  courbes : dernières 24 h", world::CELL_M * 100.0, litres);
+        let litres = world::cell_m().powi(3) * 1000.0;
+        let cm = format!("{:.1}", world::cell_m() * 100.0);
+        let note = format!("une cellule : un cube de {} cm, {:.2} L  ·  courbes : dernières 24 h", cm.trim_end_matches(".0"), litres);
         ui.text(&note, x + 156.0, r.y + 25.0, 12, DIM);
         let mut mats: Vec<(Mat, f32)> = Mat::ALL.iter().map(|&m| (m, self.volumes[m as usize])).filter(|&(m, v)| m != Mat::Empty && v > 0.0).collect();
         mats.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -5652,7 +5653,8 @@ mod tests {
         g.set_running(true);
         let (y0, y1) = (g.blocks[0].pos.y, g.blocks[1].pos.y);
         let (mut down, mut up) = (0.0f32, 0.0f32);
-        for _ in 0..100 {
+        // (Two seconds: the world's gravity is three quarters of the one the blocks were tuned under.)
+        for _ in 0..120 {
             g.sim_step();
             down = down.max(g.blocks[0].pos.y - y0);
             up = up.max(y1 - g.blocks[1].pos.y);

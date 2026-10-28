@@ -512,7 +512,7 @@ fn falls_probe() {
 }
 
 /// Everything falls by the same gravity, whatever the length of the steps: a block of sand
-/// dropped from rest goes down about ½ g t² (29 cells of 1/6 m in a second, a little less with
+/// dropped from rest goes down about ½ g t² (98 cells of 5 cm in a second, a little less with
 /// the drag), and keeps together on the way.
 #[test]
 fn a_block_of_sand_falls_by_gravity_at_any_step() {
@@ -529,7 +529,8 @@ fn a_block_of_sand_falls_by_gravity_at_any_step() {
         }
         let ys: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Sand).map(|i| i / W()).collect();
         let (low, high) = (*ys.iter().max().unwrap(), *ys.iter().min().unwrap());
-        assert!((24..=31).contains(&(low - 49)), "steps of 1/{:.0} s: the bottom fell {} cells in a second", 1.0 / dt, low - 49);
+        let free = 0.5 * units::g_cells();
+        assert!(((free * 0.85) as usize..=free.ceil() as usize).contains(&(low - 49)), "steps of 1/{:.0} s: the bottom fell {} cells in a second", 1.0 / dt, low - 49);
         assert!(low - high <= 12, "steps of 1/{:.0} s: the block spread over {} rows", 1.0 / dt, low - high + 1);
     }
 }

@@ -9,8 +9,28 @@ use std::collections::{HashMap, HashSet};
 
 /// Size of one stud in cells.
 pub const STUD: f32 = 10.0;
-/// Cells per physics meter.
-pub const PX_PER_M: f32 = 16.0;
+/// Cells per unit of length of the blocks' physics. The blocks' strengths, springs and motors are
+/// tuned in that unit (a stud and a half): it is not the world's metre (`units::cell_m`), but
+/// the blocks fall at the world's gravity (`gravity`).
+#[inline]
+pub fn px_per_m() -> f32 {
+    16.0
+}
+
+/// The pull of gravity in the blocks' units: the world's, in cells per second², over
+/// `px_per_m`.
+fn gravity() -> f32 {
+    crate::world::units::g_cells() / px_per_m()
+}
+
+/// The gravity the blocks' strengths and springs were tuned under, in their units.
+const TUNED_G: f32 = 16.0;
+
+/// The strengths and the stiffness of the springs go with gravity: a bridge that holds a truck
+/// holds it under the world's gravity, and a spring stretches as far under the same weight.
+fn load_scale() -> f32 {
+    gravity() / TUNED_G
+}
 const TILE: i32 = 16;
 /// Weld breaking limits (per step): force and torque impulses.
 const BREAK_FORCE: f32 = 1.3;
@@ -530,7 +550,7 @@ impl MemberMat {
 
     /// Force (impulse per step) the beam can carry before it breaks.
     pub fn limit(self) -> f32 {
-        match self {
+        load_scale() * match self {
             MemberMat::Wood => 3.8,
             MemberMat::Iron => 6.5,
             MemberMat::Steel => 11.0,
@@ -940,7 +960,7 @@ impl CableMat {
 
     /// Spring stiffness of each link: steel hardly stretches, rope stretches a lot.
     pub fn stiffness(self) -> f32 {
-        match self {
+        load_scale() * match self {
             CableMat::Steel => 20000.0,
             CableMat::Iron => 8000.0,
             CableMat::Wood => 700.0,
@@ -949,7 +969,7 @@ impl CableMat {
 
     /// Impulse per step a link can carry before the cable snaps.
     pub fn limit(self) -> f32 {
-        match self {
+        load_scale() * match self {
             CableMat::Steel => 12.0,
             CableMat::Iron => 6.0,
             CableMat::Wood => 2.4,
@@ -1025,7 +1045,7 @@ impl SpringKind {
 
     /// Newtons per metre in the physics world.
     pub fn stiffness(self) -> f32 {
-        match self {
+        load_scale() * match self {
             SpringKind::Coil => 420.0,
             SpringKind::Elastic => 55.0,
         }
@@ -1153,13 +1173,13 @@ pub struct Physics {
 
 
 fn v2(v: Vec2) -> Vector {
-    Vector::new(v.x / PX_PER_M, v.y / PX_PER_M)
+    Vector::new(v.x / px_per_m(), v.y / px_per_m())
 }
 
 impl Physics {
     pub fn new() -> Self {
         let mut w = PhysicsWorld::new();
-        w.gravity = Vector::new(0.0, 16.0);
+        w.gravity = Vector::new(0.0, gravity());
         w.integration_parameters.dt = 1.0 / 60.0;
         let terrain = w.insert_body(RigidBodyBuilder::fixed());
         Physics { w, terrain, tiles: HashMap::new(), welds: HashMap::new(), last_vel: HashMap::new(), impacts: vec![], bumps: vec![], pins: HashMap::new(), reels: HashMap::new(), pulleys: HashMap::new(), pressed: vec![], bending: HashMap::new(), rod_pins: Default::default() }
@@ -1175,9 +1195,9 @@ impl Physics {
             .linear_damping(0.05)
             .angular_damping(0.3);
         let shape = if s.round {
-            ColliderBuilder::ball(s.w / 2.0 / PX_PER_M)
+            ColliderBuilder::ball(s.w / 2.0 / px_per_m())
         } else {
-            ColliderBuilder::cuboid(s.w / 2.0 / PX_PER_M, s.h / 2.0 / PX_PER_M)
+            ColliderBuilder::cuboid(s.w / 2.0 / px_per_m(), s.h / 2.0 / px_per_m())
         };
         let (h, _) = self.w.insert(body, shape.density(s.density).friction(0.8).restitution(0.05));
         b.body = Some(h);
@@ -1190,7 +1210,7 @@ impl Physics {
     }
 
     fn member_end_local(m: &Member, end: u8) -> Vector {
-        let h = m.len() / 2.0 / PX_PER_M;
+        let h = m.len() / 2.0 / px_per_m();
         Vector::new(if end == 0 { -h } else { h }, 0.0)
     }
 
@@ -1204,7 +1224,7 @@ impl Physics {
             .ccd_enabled(true)
             .linear_damping(0.05)
             .angular_damping(0.4);
-        let col = ColliderBuilder::cuboid(len / 2.0 / PX_PER_M, th / 2.0 / PX_PER_M)
+        let col = ColliderBuilder::cuboid(len / 2.0 / px_per_m(), th / 2.0 / px_per_m())
             .density(m.mat.density())
             .friction(0.7)
             .collision_groups(InteractionGroups { memberships: Group::GROUP_3, filter: Group::GROUP_1, test_mode: InteractionTestMode::And });
@@ -1222,7 +1242,7 @@ impl Physics {
                 Anchor::Ground(w) => Some((self.terrain, v2(w))),
                 Anchor::Block { uid, local } => blocks.iter().find(|b| b.uid == uid).and_then(|b| Some((b.body?, v2(local)))),
                 Anchor::End { uid, end: e } => members.iter().find(|o| o.uid == uid).and_then(|o| Some((o.body?, Self::member_end_local(o, e)))),
-                Anchor::Along { uid, t } => members.iter().find(|o| o.uid == uid).and_then(|o| Some((o.body?, Vector::new((t - 0.5) * o.len() / PX_PER_M, 0.0)))),
+                Anchor::Along { uid, t } => members.iter().find(|o| o.uid == uid).and_then(|o| Some((o.body?, Vector::new((t - 0.5) * o.len() / px_per_m(), 0.0)))),
                 Anchor::Free(_) | Anchor::Reel { .. } => None,
             };
             if let Some((tb, tl)) = target {
@@ -1281,7 +1301,7 @@ impl Physics {
             let rb = &mut self.w.bodies[h];
             if wet > 0 {
                 let f = wet as f32 / n as f32;
-                let area = m.len() * m.mat.thickness() / (PX_PER_M * PX_PER_M);
+                let area = m.len() * m.mat.thickness() / (px_per_m() * px_per_m());
                 rb.apply_impulse_at_point(Vector::new(0.0, -area * f * g * dt), v2(c / wet as f32), true);
                 rb.set_linear_damping(0.05 + 2.5 * f);
             } else {
@@ -1309,7 +1329,7 @@ impl Physics {
             let Some(h) = m.body else { continue };
             let rb = &self.w.bodies[h];
             let (t, a) = (rb.translation(), rb.rotation().angle());
-            let c = vec2(t.x, t.y) * PX_PER_M;
+            let c = vec2(t.x, t.y) * px_per_m();
             let half = rot(a, vec2(m.len() / 2.0, 0.0));
             m.p0 = c - half;
             m.p1 = c + half;
@@ -1355,7 +1375,7 @@ impl Physics {
             }
             Anchor::Along { uid, t } => {
                 let m = members.iter().find(|m| m.uid == *uid)?;
-                Some((m.body?, Vector::new((t - 0.5) * m.len() / PX_PER_M, 0.0)))
+                Some((m.body?, Vector::new((t - 0.5) * m.len() / px_per_m(), 0.0)))
             }
             Anchor::Free(_) => None,
             Anchor::Reel { uid, .. } => self.reels.get(uid).map(|h| (*h, Vector::new(0.0, 0.0))),
@@ -1371,7 +1391,7 @@ impl Physics {
             Some(x) => x,
             None => {
                 let rb = RigidBodyBuilder::dynamic().translation(v2(pb)).can_sleep(false).linear_damping(0.4).angular_damping(2.0);
-                let col = ColliderBuilder::ball(2.0 / PX_PER_M)
+                let col = ColliderBuilder::ball(2.0 / px_per_m())
                     .density(40.0)
                     .collision_groups(InteractionGroups { memberships: Group::GROUP_2, filter: Group::GROUP_1, test_mode: InteractionTestMode::And });
                 let (h, _) = self.w.insert(rb, col);
@@ -1381,7 +1401,7 @@ impl Physics {
         };
         let k = sp.kind.stiffness() / sp.soft.clamp(0.3, 4.0);
         let damping = 0.3 * k.sqrt();
-        let j = SpringJointBuilder::new(sp.rest / PX_PER_M, k, damping).local_anchor1(la).local_anchor2(lb).contacts_enabled(false);
+        let j = SpringJointBuilder::new(sp.rest / px_per_m(), k, damping).local_anchor1(la).local_anchor2(lb).contacts_enabled(false);
         sp.joint = Some(self.w.insert_impulse_joint(ha, hb, j));
         sp.p0 = pa;
         sp.p1 = pb;
@@ -1410,7 +1430,7 @@ impl Physics {
             sp.p1 = match sp.bead {
                 Some(h) => {
                     let t = self.w.bodies[h].translation();
-                    vec2(t.x, t.y) * PX_PER_M
+                    vec2(t.x, t.y) * px_per_m()
                 }
                 None => anchor_world(&sp.b, blocks, members).unwrap_or(sp.p1),
             };
@@ -1459,7 +1479,7 @@ impl Physics {
             let u = i as f32 / (n as f32 + 1.0);
             let p = if path.is_empty() { pa + (pb - pa) * u + vec2(0.0, sag * 4.0 * u * (1.0 - u)) } else { along(u) };
             let rb = RigidBodyBuilder::dynamic().translation(v2(p)).can_sleep(false).linear_damping(0.6).angular_damping(2.0);
-            let col = ColliderBuilder::ball(1.4 / PX_PER_M)
+            let col = ColliderBuilder::ball(1.4 / px_per_m())
                 .density(c.mat.density())
                 .friction(0.6)
                 .collision_groups(InteractionGroups { memberships: Group::GROUP_2, filter: Group::GROUP_1, test_mode: InteractionTestMode::And });
@@ -1479,7 +1499,7 @@ impl Physics {
                 }
                 Anchor::Along { uid, t } => {
                     let m = members.iter().find(|m| m.uid == *uid)?;
-                    Some((m.body?, Vector::new((t - 0.5) * m.len() / PX_PER_M, 0.0)))
+                    Some((m.body?, Vector::new((t - 0.5) * m.len() / px_per_m(), 0.0)))
                 }
                 Anchor::Free(_) => None,
                 Anchor::Reel { uid, .. } => this.reels.get(uid).map(|h| (*h, Vector::new(0.0, 0.0))),
@@ -1491,7 +1511,7 @@ impl Physics {
         if (ea.is_none() && !loose(&c.a)) || (eb.is_none() && !loose(&c.b)) || (ea.is_none() && eb.is_none()) {
             return;
         }
-        let rest = link_len / PX_PER_M;
+        let rest = link_len / px_per_m();
         // A softer cable has weaker springs (it stretches more); damping follows the stiffness.
         let stiffness = c.mat.stiffness() / c.soft.clamp(0.3, 4.0);
         let damping = 0.27 * stiffness.sqrt();
@@ -1546,7 +1566,7 @@ impl Physics {
             }
             for h in &c.links {
                 let t = self.w.bodies[*h].translation();
-                pts.push(vec2(t.x, t.y) * PX_PER_M);
+                pts.push(vec2(t.x, t.y) * px_per_m());
             }
             if let (Some(p), false) = (anchor_world(&c.b, blocks, members), matches!(c.b, Anchor::Free(_))) {
                 pts.push(p);
@@ -1573,8 +1593,8 @@ impl Physics {
     fn weld(&mut self, a: &Block, b: &Block) {
         let (Some(ha), Some(hb)) = (a.body, b.body) else { return };
         let mid = (a.pos + b.pos) * 0.5;
-        let la = rot(-a.angle, mid - a.pos) / PX_PER_M;
-        let lb = rot(-b.angle, mid - b.pos) / PX_PER_M;
+        let la = rot(-a.angle, mid - a.pos) / px_per_m();
+        let lb = rot(-b.angle, mid - b.pos) / px_per_m();
         let studs = block_studs(a, b);
         let frame1 = Pose::new(Vector::new(la.x, la.y), 0.0);
         let frame2 = Pose::new(Vector::new(lb.x, lb.y), a.angle - b.angle);
@@ -1583,8 +1603,8 @@ impl Physics {
         // side, beams, planks) is welded rigidly as before.
         let h = if studs > 0 {
             // They come apart (positive when the first is the upper one) but cannot sink into each other.
-            let sink = 0.1 / PX_PER_M;
-            let apart = STUD_PLAY / PX_PER_M;
+            let sink = 0.1 / px_per_m();
+            let apart = STUD_PLAY / px_per_m();
             let range = if a.pos.y < b.pos.y { [-sink, apart] } else { [-apart, sink] };
             let joint = GenericJointBuilder::new(JointAxesMask::LIN_X)
                 .local_frame1(frame1)
@@ -1643,8 +1663,8 @@ impl Physics {
         let mut out: HashMap<u32, f32> = HashMap::new();
         for (h, j) in self.w.impulse_joints() {
             let k = self.welds.get(&h).copied().unwrap_or(1.0);
-            let f = (j.impulses.x * j.impulses.x + j.impulses.y * j.impulses.y).sqrt() / (BREAK_FORCE * k);
-            let t = j.impulses.z.abs() / (BREAK_TORQUE * k);
+            let f = (j.impulses.x * j.impulses.x + j.impulses.y * j.impulses.y).sqrt() / (BREAK_FORCE * load_scale() * k);
+            let t = j.impulses.z.abs() / (BREAK_TORQUE * load_scale() * k);
             let ratio = f.max(t);
             for body in [j.body1(), j.body2()] {
                 if let Some(b) = blocks.iter().find(|b| b.body == Some(body)) {
@@ -1681,7 +1701,7 @@ impl Physics {
             Anchor::Ground(p) | Anchor::Free(p) => Some((self.terrain, v2(*p))),
             Anchor::Block { uid, local } => blocks.iter().find(|b| b.uid == *uid).and_then(|b| Some((b.body?, v2(*local)))),
             Anchor::End { uid, end } => members.iter().find(|m| m.uid == *uid).and_then(|m| Some((m.body?, Self::member_end_local(m, *end)))),
-            Anchor::Along { uid, t } => members.iter().find(|m| m.uid == *uid).and_then(|m| Some((m.body?, Vector::new((t - 0.5) * m.len() / PX_PER_M, 0.0)))),
+            Anchor::Along { uid, t } => members.iter().find(|m| m.uid == *uid).and_then(|m| Some((m.body?, Vector::new((t - 0.5) * m.len() / px_per_m(), 0.0)))),
             Anchor::Reel { .. } => None,
         };
         let Some((hs, local)) = target else { return false };
@@ -1702,13 +1722,13 @@ impl Physics {
             Anchor::Ground(p) | Anchor::Free(p) => Some((self.terrain, v2(*p))),
             Anchor::Block { uid, local } => blocks.iter().find(|b| b.uid == *uid).and_then(|b| Some((b.body?, v2(*local)))),
             Anchor::End { uid, end } => members.iter().find(|m| m.uid == *uid).and_then(|m| Some((m.body?, Self::member_end_local(m, *end)))),
-            Anchor::Along { uid, t } => members.iter().find(|m| m.uid == *uid).and_then(|m| Some((m.body?, Vector::new((t - 0.5) * m.len() / PX_PER_M, 0.0)))),
+            Anchor::Along { uid, t } => members.iter().find(|m| m.uid == *uid).and_then(|m| Some((m.body?, Vector::new((t - 0.5) * m.len() / px_per_m(), 0.0)))),
             Anchor::Reel { .. } => None,
         };
         let Some((hb, local)) = target else { return false };
         let body = RigidBodyBuilder::kinematic_position_based().translation(v2(pin)).can_sleep(false);
         let hp = self.w.insert_body(body);
-        let j = SpringJointBuilder::new(len / PX_PER_M, ROD_STIFFNESS, 0.3 * ROD_STIFFNESS.sqrt()).local_anchor1(Vector::new(0.0, 0.0)).local_anchor2(local).contacts_enabled(false);
+        let j = SpringJointBuilder::new(len / px_per_m(), ROD_STIFFNESS, 0.3 * ROD_STIFFNESS.sqrt()).local_anchor1(Vector::new(0.0, 0.0)).local_anchor2(local).contacts_enabled(false);
         let h = self.w.insert_impulse_joint(hp, hb, j);
         // The rod is as strong as the mechanism's rod (the game breaks it), not like a weld.
         self.welds.insert(h, 1e6);
@@ -1739,7 +1759,7 @@ impl Physics {
         if dist < 1e-4 {
             return Vec2::ZERO;
         }
-        d / dist * ((dist - len) / PX_PER_M * ROD_STIFFNESS)
+        d / dist * ((dist - len) / px_per_m() * ROD_STIFFNESS)
     }
 
     /// A body at a winch drum, which the end of a rope on that reel is attached to.
@@ -1768,7 +1788,7 @@ impl Physics {
             },
             _ => (self.terrain, v2(pos)),
         };
-        let col = ColliderBuilder::ball(radius / PX_PER_M)
+        let col = ColliderBuilder::ball(radius / px_per_m())
             .translation(local)
             .friction(0.0)
             .collision_groups(InteractionGroups { memberships: Group::GROUP_1, filter: Group::GROUP_2, test_mode: InteractionTestMode::And });
@@ -1782,7 +1802,7 @@ impl Physics {
         if links == 0 {
             return;
         }
-        let rest = len / links as f32 / PX_PER_M;
+        let rest = len / links as f32 / px_per_m();
         let stiffness = c.mat.stiffness() / c.soft.clamp(0.3, 4.0);
         let damping = 0.27 * stiffness.sqrt();
         for h in &c.joints {
@@ -1802,7 +1822,7 @@ impl Physics {
         let (a, b) = if at_start { (c.pts[0], c.pts[1]) } else { (c.pts[n - 1], c.pts[n - 2]) };
         let rest = c.len / c.joints.len() as f32;
         let stiffness = c.mat.stiffness() / c.soft.clamp(0.3, 4.0);
-        ((a - b).length() - rest).max(0.0) / PX_PER_M * stiffness
+        ((a - b).length() - rest).max(0.0) / px_per_m() * stiffness
     }
 
     /// How fast a block turns, in radians per second.
@@ -1871,13 +1891,13 @@ impl Physics {
             let s = b.spec();
             let half = b.half();
             // Wind pushes on whatever is in the open air, in proportion to the surface it offers.
-            let gust = world.wind * world.wind.abs() * (s.h.max(s.w) * s.w.min(s.h)) / (PX_PER_M * PX_PER_M) * g.abs() * 0.045 * dt;
+            let gust = world.wind * world.wind.abs() * (s.h.max(s.w) * s.w.min(s.h)) / (px_per_m() * px_per_m()) * g.abs() * 0.045 * dt;
             self.w.bodies[h].apply_impulse(Vector::new(gust, 0.0), false);
             // A difference of pressure across the block pushes it from high to low (a blast wave,
             // a surge of water). The still weight of the liquid is the buoyancy below.
             let (gx, gy) = world.pressure_gradient(b.pos.x, b.pos.y);
             if gx * gx + gy * gy > 0.004 * 0.004 {
-                let k = -600.0 * (s.w * s.h) / (PX_PER_M * PX_PER_M) * dt;
+                let k = -600.0 * (s.w * s.h) / (px_per_m() * px_per_m()) * dt;
                 self.w.bodies[h].apply_impulse(Vector::new(gx * k, gy * k), true);
             }
             let reach = half.length() + 2.0;
@@ -1906,7 +1926,7 @@ impl Physics {
                 continue;
             }
             let f = wet as f32 / total as f32;
-            let area = s.w * s.h / (PX_PER_M * PX_PER_M);
+            let area = s.w * s.h / (px_per_m() * px_per_m());
             let lift = 1.0 * area * f * g * dt;
             rb.apply_impulse_at_point(Vector::new(0.0, -lift), v2(centroid / wet as f32), true);
             rb.set_linear_damping(0.05 + 2.5 * f);
@@ -1993,7 +2013,7 @@ impl Physics {
                 }
                 let k = welds.get(h).copied().unwrap_or(1.0);
                 let f = (j.impulses.x * j.impulses.x + j.impulses.y * j.impulses.y).sqrt();
-                f > BREAK_FORCE * k || j.impulses.z.abs() > BREAK_TORQUE * k
+                f > BREAK_FORCE * load_scale() * k || j.impulses.z.abs() > BREAK_TORQUE * load_scale() * k
             })
             .map(|(h, _)| h)
             .collect();
@@ -2006,7 +2026,7 @@ impl Physics {
             if let Some(h) = b.body {
                 let rb = &self.w.bodies[h];
                 let t = rb.translation();
-                b.pos = vec2(t.x, t.y) * PX_PER_M;
+                b.pos = vec2(t.x, t.y) * px_per_m();
                 b.angle = rb.rotation().angle();
             }
         }
@@ -2065,7 +2085,7 @@ impl Physics {
         for b in blocks {
             let Some(h) = b.body else { continue };
             let v = self.w.bodies[h].linvel();
-            let reach = 10.0 + (v.x.abs().max(v.y.abs()) * PX_PER_M / 60.0) * 4.0;
+            let reach = 10.0 + (v.x.abs().max(v.y.abs()) * px_per_m() / 60.0) * 4.0;
             let r = b.half().length() + reach;
             let (x0, y0) = (((b.pos.x - r) / TILE as f32).floor() as i32, ((b.pos.y - r) / TILE as f32).floor() as i32);
             let (x1, y1) = (((b.pos.x + r) / TILE as f32).floor() as i32, ((b.pos.y + r) / TILE as f32).floor() as i32);
@@ -2091,7 +2111,7 @@ impl Physics {
             let mut handles = vec![];
             for (x, y, w, h) in Self::tile_rects(world, tx, ty) {
                 let c = vec2(x as f32 + w as f32 / 2.0, y as f32 + h as f32 / 2.0);
-                let col = ColliderBuilder::cuboid(w as f32 / 2.0 / PX_PER_M, h as f32 / 2.0 / PX_PER_M)
+                let col = ColliderBuilder::cuboid(w as f32 / 2.0 / px_per_m(), h as f32 / 2.0 / px_per_m())
                     .translation(v2(c))
                     .friction(0.9);
                 handles.push(self.w.insert_collider(col, Some(self.terrain)));

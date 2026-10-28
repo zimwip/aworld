@@ -338,6 +338,9 @@ struct Tables {
     /// The temperatures (open interval) where a matter with no latent heat stored cannot react:
     /// `react` is skipped there (see `quiet_range`).
     quiet: [(f32, f32); NMAT],
+    /// The conductivities are per cell of the design grid: heat crosses a finer grid's cells
+    /// faster, by the square of how much finer they are (a diffusion).
+    finer2: f32,
 }
 
 /// Heat flowing between cells `i` and `j` of `temp` (made of `mi` and `mj`) during one pass.
@@ -373,7 +376,7 @@ fn conduct_pair([ti, tj]: [&mut f32; 2], mi: Mat, mj: Mat, ts: f32, lod3: bool, 
     };
     // (Capped so that a longer covered time, or a cell that holds little heat, can never
     // overshoot and oscillate: at most 90 % of the way to the same temperature.)
-    let flux = d * (k * ts).min(0.9).min(0.9 / (tb.inv_c[mi] + tb.inv_c[mj]));
+    let flux = d * (k * tb.finer2 * ts).min(0.9).min(0.9 / (tb.inv_c[mi] + tb.inv_c[mj]));
     *ti += flux * tb.inv_c[mi];
     *tj -= flux * tb.inv_c[mj];
 }
@@ -438,7 +441,7 @@ fn quiet_range(m: Mat) -> (f32, f32) {
 fn tables() -> &'static Tables {
     static T: std::sync::OnceLock<Tables> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        let mut t = Tables { k: [0.1; NMAT], inv_c: [1.0; NMAT], reactive: [false; NMAT], airy: [false; NMAT], quiet: [(f32::INFINITY, f32::NEG_INFINITY); NMAT] };
+        let mut t = Tables { k: [0.1; NMAT], inv_c: [1.0; NMAT], reactive: [false; NMAT], airy: [false; NMAT], quiet: [(f32::INFINITY, f32::NEG_INFINITY); NMAT], finer2: super::units::finer().powi(2) };
         for m in Mat::ALL {
             let (k, c) = props(m);
             t.k[m as usize] = k;

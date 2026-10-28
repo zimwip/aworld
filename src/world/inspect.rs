@@ -13,7 +13,7 @@
 //!   and the slabs that tip over (`statics.rs`, a rigid body with a spin).
 
 use super::flow::{CELL as FLOW_CELL, FH, FW};
-use super::liquid::{CELL_M, DT};
+use super::units::{cell_m, TICK as DT};
 use super::*;
 use std::collections::HashMap;
 
@@ -21,10 +21,14 @@ use std::collections::HashMap;
 pub const FULL: u32 = super::field::FULL;
 
 /// A cell, in metres.
-pub const CELL_METRES: f32 = CELL_M;
+pub fn cell_metres() -> f32 {
+    cell_m()
+}
 
 /// A cell a step, in m/s.
-pub const CELL_STEP_MS: f32 = CELL_M / DT;
+pub fn cell_step_ms() -> f32 {
+    cell_m() / DT
+}
 
 /// Which model a velocity comes from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -84,7 +88,7 @@ impl World {
         let mut out = HashMap::new();
         // A piece moves `vy` cells every other step.
         for p in &self.falling {
-            let m = Motion { vx: 0.0, vy: p.vy * 0.5 * CELL_STEP_MS, source: Source::Piece };
+            let m = Motion { vx: 0.0, vy: p.vy * 0.5 * cell_step_ms(), source: Source::Piece };
             for &i in &p.cells {
                 out.insert(i, m);
             }
@@ -92,7 +96,7 @@ impl World {
         for s in &self.slabs {
             for &i in s.cells() {
                 let (vx, vy) = s.velocity_at({ let (x, y) = xy(i); (x as f32 + 0.5, y as f32 + 0.5) });
-                out.insert(i, Motion { vx: vx * CELL_STEP_MS, vy: vy * CELL_STEP_MS, source: Source::Slab });
+                out.insert(i, Motion { vx: vx * cell_step_ms(), vy: vy * cell_step_ms(), source: Source::Slab });
             }
         }
         out
@@ -104,12 +108,12 @@ impl World {
     pub fn cell_motion(&self, x: usize, y: usize, solids: &HashMap<usize, Motion>) -> Option<Motion> {
         let i = y * W() + x;
         let m = self.cells[i].m;
-        let fall = |v: u8| (v != 0).then(|| Motion { vx: 0.0, vy: v as f32 / super::FALL_UNIT as f32 * CELL_STEP_MS, source: Source::Fall });
+        let fall = |v: u16| (v != 0).then(|| Motion { vx: 0.0, vy: v as f32 / super::FALL_UNIT as f32 * cell_step_ms(), source: Source::Fall });
         // A drop shot out of a jet flies a cell down and `v` cells sideways a step (see `fly`).
         let jet = self.jet[i];
         if m.kind() == Kind::Liquid && jet >= 2 {
             let v = (jet >> 1) as f32 * if jet & 1 == 1 { 1.0 } else { -1.0 };
-            return Some(Motion { vx: v * CELL_STEP_MS, vy: CELL_STEP_MS, source: Source::Jet });
+            return Some(Motion { vx: v * cell_step_ms(), vy: cell_step_ms(), source: Source::Jet });
         }
         match m.kind() {
             Kind::Liquid => {
@@ -124,7 +128,7 @@ impl World {
             Kind::Powder => fall(self.vel[i]),
             Kind::Empty | Kind::Gas | Kind::Flame => {
                 let (vx, vy) = self.flow.sample(x as i32, y as i32);
-                Some(Motion { vx: vx * CELL_STEP_MS, vy: vy * CELL_STEP_MS, source: Source::Wind })
+                Some(Motion { vx: vx * cell_step_ms(), vy: vy * cell_step_ms(), source: Source::Wind })
             }
             Kind::Static => solids.get(&i).copied(),
         }
@@ -157,13 +161,13 @@ impl World {
     }
 
     /// The falling speed a grain or a drop keeps (`vel`, in `FALL_UNIT`ths of a cell a tick).
-    pub fn cell_fall(&self, x: usize, y: usize) -> u8 {
+    pub fn cell_fall(&self, x: usize, y: usize) -> u16 {
         self.vel[y * W() + x]
     }
 
     /// The clods thrown out of craters, in flight: where they are (cells) and their velocity (m/s).
     pub fn ejecta_motion(&self) -> impl Iterator<Item = (f32, f32, f32, f32)> + '_ {
-        self.ejecta.iter().map(|e| (e.x, e.y, e.vx * CELL_STEP_MS, e.vy * CELL_STEP_MS))
+        self.ejecta.iter().map(|e| (e.x, e.y, e.vx * cell_step_ms(), e.vy * cell_step_ms()))
     }
 
     /// Steps since the world began (the step counter of the step-by-step mode).
@@ -196,7 +200,7 @@ mod tests {
         // The air and a gas ride the flow: half a cell a step is 5 m/s.
         let air = w.cell_motion(700, 50, &solids).expect("the air");
         assert_eq!(air.source, Source::Wind);
-        assert!((air.vx - 0.5 * CELL_STEP_MS).abs() < 0.01 && air.vy.abs() < 0.01, "{air:?}");
+        assert!((air.vx - 0.5 * cell_step_ms()).abs() < 0.01 && air.vy.abs() < 0.01, "{air:?}");
         // The ground stands still.
         assert!(w.cell_motion(50, 300, &solids).is_none());
     }
@@ -209,7 +213,7 @@ mod tests {
         w.jet[100 * W() + 300] = 3 << 1;
         let m = w.cell_motion(300, 100, &HashMap::new()).expect("a flying drop");
         assert_eq!(m.source, Source::Jet);
-        assert!((m.vx + 3.0 * CELL_STEP_MS).abs() < 1e-3 && (m.vy - CELL_STEP_MS).abs() < 1e-3, "{m:?}");
+        assert!((m.vx + 3.0 * cell_step_ms()).abs() < 1e-3 && (m.vy - cell_step_ms()).abs() < 1e-3, "{m:?}");
     }
 
     #[test]

@@ -184,9 +184,6 @@ pub fn shocked(m: Mat, shock: f32, temp: f32, loose: bool) -> Option<&'static Tr
     TRANSITIONS.iter().find(|t| t.from == m && t.by_shock() && (!loose || t.needs_heat()) && t.holds(&here))
 }
 
-/// Side of a cell, m (as in `blast.rs`).
-const CELL_M: f32 = 0.05;
-const ATM: f32 = 101_325.0;
 /// The lasting changes are looked at once every this many steps.
 pub const SETTLE_EVERY: u32 = 64;
 
@@ -218,10 +215,10 @@ pub(super) fn by_heat(m: Mat) -> &'static [&'static Transition] {
 /// Weight of one cell of `m`, atm.
 fn weight(m: Mat) -> f32 {
     let rho = match m.kind() {
-        Kind::Empty | Kind::Gas | Kind::Flame => 1.2,
-        _ => density(m) * 1000.0,
+        Kind::Empty | Kind::Gas | Kind::Flame => super::units::RHO_AIR / super::units::RHO_WATER,
+        _ => density(m),
     };
-    rho * 9.81 * CELL_M / ATM
+    super::units::atm_per_cell(rho)
 }
 
 impl World {

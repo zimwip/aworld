@@ -822,7 +822,7 @@ impl SimView {
         }
         let fall = w.cell_fall(x, y);
         if fall != 0 {
-            out.push((format!("vel = {fall} (huitièmes de case par pas)"), DIM));
+            out.push((format!("vel = {fall} ({}e de case par pas)", world::FALL_UNIT), DIM));
         }
         let solids = w.solid_motions();
         match w.cell_motion(x, y, &solids) {

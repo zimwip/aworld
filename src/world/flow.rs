@@ -659,7 +659,7 @@ impl Flow {
         // The wind over the surface of the liquids, from the first open cell up.
         for k in 0..FW() * FH() {
             let q = self.over(k);
-            self.skim[k] = if self.solid[q] { 0.0 } else { self.vx[q] * CELL as f32 * super::liquid::CELL_M / super::liquid::DT };
+            self.skim[k] = if self.solid[q] { 0.0 } else { self.vx[q] * CELL as f32 * super::units::cell_m() / super::units::TICK };
         }
     }
 

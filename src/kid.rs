@@ -6,7 +6,7 @@
 
 use crate::render::View;
 use crate::ui::{rrect, rrect_lines, Ui};
-use crate::world::{Kind, Mat, World, H, W};
+use crate::world::{units, Kind, Mat, World, H, W};
 use crate::gfx::*;
 use std::f32::consts::TAU;
 
@@ -16,9 +16,10 @@ const SH: usize = 24;
 const PIX: f32 = 1.3;
 /// From the soles to the top of the hair, in cells.
 pub const HEIGHT: f32 = 22.0 * PIX;
-/// Walking speed (cells per second) and pull of gravity (cells per second squared).
+/// Walking speed (cells per second).
 const SPEED: f32 = 14.0;
-const GRAVITY: f32 = 320.0;
+/// How high his flip takes him, cells.
+const FLIP_HEIGHT: f32 = 20.7;
 /// He climbs steps this high, jumps walls up to this high, and turns round before higher ones.
 const STEP: i32 = 4;
 const MAX_JUMP: i32 = 20;
@@ -480,7 +481,7 @@ impl Kids {
                     match ground_near(world, ax, y, MAX_JUMP, 0) {
                         Some(top) if k.act != Act::Cartwheel => {
                             let h = (y - top) as f32 + 4.0;
-                            k.vy = -(2.0 * GRAVITY * h).sqrt();
+                            k.vy = -(2.0 * units::g_cells() * h).sqrt();
                             k.vx = k.dir * SPEED;
                             k.air = true;
                             k.act = Act::Jump;
@@ -507,7 +508,7 @@ impl Kids {
 
     /// In the air: jumping, flipping, falling.
     fn fly(&mut self, k: &mut Kid, world: &World, dt: f32) {
-        k.vy += GRAVITY * dt;
+        k.vy += units::g_cells() * dt;
         let (nx, ny) = (k.x + k.vx * dt, k.y + k.vy * dt);
         // He bumps into walls (not on the way up: he jumps over them) and ceilings.
         if k.vy >= 0.0 && (2..14).any(|d| floor(world, nx as i32 + k.dir as i32 * 3, ny as i32 - d)) && (0.0..W() as f32).contains(&nx) {
@@ -576,7 +577,7 @@ impl Kids {
         } else if i == 1 {
             k.act = Act::Flip;
             k.air = true;
-            k.vy = -(GRAVITY * 0.72 / 2.0);
+            k.vy = -(2.0 * units::g_cells() * FLIP_HEIGHT).sqrt();
             k.vx = k.dir * SPEED * 0.8;
             if !k.talking() && self.rand() < 0.4 {
                 k.say("Regardez ! BRAVE MOVES !", false);

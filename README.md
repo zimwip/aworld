@@ -117,6 +117,18 @@ colonnes et de 18 lignes) ; au lancement : `cargo run --release -- --grid 1440x8
 relief et le ciel s'étirent avec le monde ; les objets (voitures, blocs, arbres, personnages) gardent leur taille en
 cellules. Une sauvegarde ne se charge que dans un monde de sa taille. Pas dans le navigateur pour l'instant.
 
+**Les unités du monde** (`src/world/units.rs`) : la grille de référence fait 960 colonnes de 5 cm (48 m de large), un
+tick dure 1/60 s, g vaut 9,81 m/s². Un monde d'une autre largeur est le même paysage en cellules plus fines ou plus
+grosses : 2,5 cm à 1920 colonnes, 12,5 cm à 384 (la taille d'une cellule est fixée au lancement, avec celle de la
+grille). Tout ce qui bouge par une loi physique en tire son échelle : les liquides (pression en pascals, vitesses en
+m/s), les grains et les gouttes qui tombent (accélération g, vitesses limites en m/s : 9 m/s pour le sable et la
+pluie, 0,9 m/s pour la neige), les morceaux de structure qui tombent, les dalles qui basculent, les poches de gaz
+(une colonne d'eau de 10,3 m, 206 cellules, fait une atmosphère), les souffles d'explosion, la dynamite, les débris,
+les voitures, les blocs (Rapier garde son unité de 16 cellules, ses forces et raideurs suivent g), le petit garçon,
+les feux d'artifice et la baleine (leur allure suit √g). La conduction de la chaleur suit la finesse de la grille.
+Les shaders des liquides reçoivent la même taille de cellule. Pas encore mis à l'échelle pour une autre largeur que
+960 : les taux par cellule (propagation du feu, évaporation, pousse, vent, orage) et la taille des objets en cellules.
+
 
 ## Son
 
@@ -259,7 +271,7 @@ et faire des loopings et des culbutes. S'il touche quoi que ce soit (sol, eau, b
   des feux, courbe de la chaleur du monde sur 24 h, et trois curseurs (*Soleil*, *Sortie vers l'espace*, *Nuages et fumée
   gardent*) avec un bouton *Revenir au neutre*. La bulle reprend aussi *Temps*, *Saison* et *Vent* : l'onglet Monde
   donne le point de départ, la bulle permet de jouer avec en pleine simulation. En bas, **Matières du monde** : le
-  volume de chaque matière présente, de la plus abondante à la moins (une cellule est un cube de 17 cm, 4,6 L ; une
+  volume de chaque matière présente, de la plus abondante à la moins (une cellule est un cube de 5 cm, 0,13 L, sur la grille de référence ; une
   cellule de liquide compte ce qu'elle contient vraiment, la vapeur tassée compte toute sa vapeur), chacune avec sa
   courbe sur 24 h. Compté toutes les demi-secondes, et à chaque relevé de la chaleur pour les courbes
   (`--demo out.png --climate --advance 1200`).
@@ -312,7 +324,7 @@ Une explosion sous l'eau lève maintenant un panache : plus elle est peu profond
 
 ## Liquides sous pression : vases communicants, siphons
 
-Tous les liquides (eau, huile, lave, métal fondu) sont mus par leur physique (`src/world/liquid.rs`, voir plus bas « Liquides physiques ») : une vitesse sur chaque arête, une pression résolue en pascals dans chaque cellule. Les vases communicants, les tubes en U et les siphons en sortent d'eux-mêmes ; l'air ne pousse l'eau qu'à environ 10 m (60 cases) au-dessus de la surface. L'ancien mode où chaque case de liquide était une particule, nivelée tous les deux pas par `hydro.rs`, a été retiré : les cellules ne font plus que trier les liquides par densité (l'huile remonte à travers l'eau).
+Tous les liquides (eau, huile, lave, métal fondu) sont mus par leur physique (`src/world/liquid.rs`, voir plus bas « Liquides physiques ») : une vitesse sur chaque arête, une pression résolue en pascals dans chaque cellule. Les vases communicants, les tubes en U et les siphons en sortent d'eux-mêmes ; l'air ne pousse l'eau qu'à environ 10 m (206 cellules de 5 cm) au-dessus de la surface. L'ancien mode où chaque case de liquide était une particule, nivelée tous les deux pas par `hydro.rs`, a été retiré : les cellules ne font plus que trier les liquides par densité (l'huile remonte à travers l'eau).
 
 `--demo out.png --siphon --advance 900` montre deux vases d'eau, un siphon et un tube en U d'huile après 900 pas.
 

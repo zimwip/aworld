@@ -225,7 +225,7 @@ mod native {
             // A shader that does not compile would leave a card that does nothing, quietly: the
             // liquids then stay on the CPU, and the error is said once.
             d.push_error_scope(wgpu::ErrorFilter::Validation);
-            let shader = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("liquid"), source: wgpu::ShaderSource::Wgsl(include_str!("liquid.wgsl").into()) });
+            let shader = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("liquid"), source: wgpu::ShaderSource::Wgsl(crate::world::units::wgsl(include_str!("liquid.wgsl")).into()) });
             if let Some(e) = pollster::block_on(d.pop_error_scope()) {
                 eprintln!("aworld: the liquids' shader does not compile, the liquids stay on the CPU: {e}");
                 return None;
@@ -695,7 +695,7 @@ mod native {
                                 thick |= m == Mat::Lava;
                             }
                             if world.vel[i] != 0 && !world.lone_liquid(x as i32, y as i32) {
-                                fallen.push((i, world.vel[i] as f32 / FALL_UNIT as f32 * CELL_M / DT));
+                                fallen.push((i, world.vel[i] as f32 / FALL_UNIT as f32 * cell_m() / DT));
                             }
                         } else {
                             fill[x] = 0;

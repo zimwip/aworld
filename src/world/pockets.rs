@@ -26,10 +26,8 @@ pub const STEAM_N: f32 = 8.0;
 /// Pockets and liquid pressure are re-read every this many steps (a multiple of 6, so that the
 /// pass always falls on the same part of the heat cycle, see `after_cells`).
 pub const POCKETS_EVERY: u32 = 18;
-/// Atmospheres per cell of water depth (the same scale as the pressure view).
-pub const ATM_PER_CELL: f32 = 1.0 / 60.0;
-/// A liquid shoots out sideways once the pressure behind a hole is worth this many cells of head.
-const JET_HEAD: f32 = 3.0;
+/// A liquid shoots out sideways once the pressure behind a hole is worth this much head, m.
+const JET_HEAD_M: f32 = 0.5;
 /// Air temperature (K) at which a closed pocket of plain air is at 1 atm.
 const T0: f32 = 288.15;
 
@@ -137,7 +135,7 @@ impl World {
                 } else {
                     0
                 };
-                liq_w[x] = if cls[x] == 3 { density(m) * ATM_PER_CELL } else { 0.0 };
+                liq_w[x] = if cls[x] == 3 { units::atm_per_cell(density(m)) } else { 0.0 };
             }
         });
         // Label the connected gas a row span at a time, adding up each pocket's volume, steam and
@@ -496,7 +494,8 @@ impl World {
     pub(super) fn jet(&mut self, x: i32, y: i32) -> bool {
         let i = Self::idx(x, y);
         let p = self.liq_p[i];
-        if p < 1.0 + JET_HEAD * ATM_PER_CELL {
+        let jet_head = JET_HEAD_M / units::cell_m();
+        if p < 1.0 + units::atm_per_cell(jet_head) {
             return false;
         }
         let m = self.cells[i].m;
@@ -515,7 +514,7 @@ impl World {
             // Only into gas that was already gas at the last count: a fresh hole (a bubble, a cell a
             // pipe just took) has a pressure nobody knows yet.
             let outside = w.pockets[w.pocket_at(nx, ny)?].pressure;
-            Some((p - outside) / (rho * ATM_PER_CELL) - 1.0).filter(|&h| h >= JET_HEAD)
+            Some((p - outside) / units::atm_per_cell(rho) - 1.0).filter(|&h| h >= jet_head)
         };
         let (right, left) = (head(self, 1), head(self, -1));
         let (dir, head) = match (right, left) {
@@ -524,9 +523,9 @@ impl World {
             (None, Some(l)) => (-1, l),
             (None, None) => return false,
         };
-        // Speed in cells per step: the drop keeps it while it falls (see `fly`), so it lands
-        // further from a deep hole than from a shallow one.
-        let v = (0.7 * head.sqrt()).round().clamp(1.0, 10.0) as i32;
+        // Speed in cells per step, Torricelli's: the drop keeps it while it falls (see `fly`), so
+        // it lands further from a deep hole than from a shallow one.
+        let v = units::cells_per_tick((2.0 * units::G * head * units::cell_m()).sqrt()).round().clamp(1.0, 10.0) as i32;
         let mut k = 1;
         while k < v && self.at(x + dir * (k + 1), y) == Mat::Empty {
             k += 1;
@@ -739,7 +738,9 @@ mod tests {
         fill(&mut o, 101, 113, 129, 130, Mat::Water, 25.0);
         o.update_pockets();
         let q = o.liquid_pressure(115, 120);
-        assert!(q > 1.05 && q < 1.3, "open water 8 cells down: {q}");
+        // 8 cells down (40 cm): 1 atm and the weight of the water over it.
+        let own = units::atm_per_cell(1.0) * 8.0;
+        assert!(q > 1.0 + own * 0.6 && q < 1.0 + own * 1.6, "open water 8 cells down: {q}");
     }
 
     #[test]
