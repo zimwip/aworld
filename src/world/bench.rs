@@ -6,7 +6,7 @@
 //! ```
 //!
 //! `AWORLD_BENCH_STEPS` sets how many steps each scene is measured over (300 by default),
-//! `AWORLD_BENCH_SCENE` runs only the scene of that name, `AWORLD_BENCH_SERIES=1` also prints
+//! `AWORLD_BENCH_SCENE` runs only the scene of that name, `AWORLD_BENCH_TIER` simplifies the liquids (see `World::liq_tier`), `AWORLD_BENCH_SERIES=1` also prints
 //! the time of the first 96 measured steps one by one (to see the steps that stick out).
 
 use super::*;
@@ -312,6 +312,8 @@ pub(super) fn scenes() -> Vec<(&'static str, fn() -> World, Option<fn(&mut World
 fn bench_scenes() {
     let steps: u32 = std::env::var("AWORLD_BENCH_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
     let only = std::env::var("AWORLD_BENCH_SCENE").ok();
+    // The liquids' tier (`World::liq_tier`: AWORLD_BENCH_TIER=1 the cheap one, 2 the drops).
+    let tier: u8 = std::env::var("AWORLD_BENCH_TIER").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     // The length of a step, in ticks of 1/60 s (AWORLD_BENCH_DT=2: steps of 1/30 s).
     let ticks: f32 = std::env::var("AWORLD_BENCH_DT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let dt = ticks * super::STEP;
@@ -321,6 +323,7 @@ fn bench_scenes() {
             continue;
         }
         let mut w = make();
+        w.liq_tier = tier;
         // A short warm-up so that the first explosions and flows get going.
         for i in 0..30 {
             if let Some(f) = each {
@@ -331,6 +334,7 @@ fn bench_scenes() {
         w.prof.on = true;
         w.prof.reset();
         let mut worst = 0f64;
+        let mut work = 0u64;
         let mut series = String::new();
         let t = Instant::now();
         for i in 0..steps {
@@ -339,6 +343,7 @@ fn bench_scenes() {
             }
             let s = Instant::now();
             w.step_dt(dt);
+            work += w.liq_work;
             let ms = s.elapsed().as_secs_f64() * 1000.0;
             worst = worst.max(ms);
             if i < 96 {
@@ -352,6 +357,7 @@ fn bench_scenes() {
             "\n=== {name}: {ms:.2} ms/pas en moyenne, pire pas {worst:.1} ms, {awake}/{} zones éveillées à la fin",
             w.zones.awake.len()
         );
+        eprintln!("travail des liquides : {:.2} grille par pas (cases de leurs bandes, sous-pas compris)", work as f64 / steps as f64 / (W() * H()) as f64);
         if std::env::var_os("AWORLD_BENCH_SERIES").is_some() {
             eprintln!("{series}");
         }

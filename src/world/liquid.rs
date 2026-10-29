@@ -81,6 +81,15 @@ pub(super) fn max_sub(dt: f32) -> usize {
 }
 /// The most turns of `DT` in a step (one of `MAX_DT`), and so the most pressure solves.
 pub(super) const MAX_TURNS: usize = MAX_SUB_ALL / MAX_SUB;
+/// The cheap tier of the liquids (`World::liq_tier` 1 and up, when the game runs slow): at most
+/// this many sub-steps in a turn of `DT`, and iterations of the pressure solver. The same physics,
+/// less exact: a fast flow crosses up to two cells a sub-step (the transport still never takes
+/// more out of a cell than it holds), and a splash is a little less incompressible.
+pub(super) const CHEAP_SUB: usize = 2;
+pub(super) const CHEAP_ITER: u32 = 4;
+/// On the drops tier (`World::liq_tier` 2), liquid falling faster than this (m/s), or with air
+/// under it, is free: it goes over to drops in a zone where most of the liquid is free.
+pub(super) const FREE_FALL: f32 = 1.0;
 
 /// How a step of `step` seconds (a whole number of `DT`, the ticks of the cells) is cut, for a
 /// liquid whose fastest edge goes at `fastest` m/s: as many turns of `DT` as the step holds,
@@ -93,9 +102,10 @@ pub(super) const MAX_TURNS: usize = MAX_SUB_ALL / MAX_SUB;
 /// a liquid run once a step was twice as stiff at 1/120 s and half at 1/30 s, and shed more
 /// or less of itself as drops. (`fastest` is read once a step: the turns after the first take
 /// the sub-steps the first needed.)
-pub(super) fn turns(step: f32, fastest: f32) -> (usize, usize) {
+/// At most `most` sub-steps a turn (`MAX_SUB`, or `CHEAP_SUB` on the cheap tier).
+pub(super) fn turns(step: f32, fastest: f32, most: usize) -> (usize, usize) {
     let turns = ((step / DT).round() as usize).clamp(1, MAX_TURNS);
-    let sub = (((fastest + G * DT) * DT / cell_m()).ceil() as usize).clamp(1, MAX_SUB);
+    let sub = (((fastest + G * DT) * DT / cell_m()).ceil() as usize).clamp(1, most.min(MAX_SUB));
     (turns, sub)
 }
 /// A cell left with this little liquid or less (units of fill, 1/8192 of a cell) is emptied: so
@@ -460,10 +470,21 @@ impl World {
         }
     }
 
+    /// The most sub-steps of the liquids in a turn of `DT`, at their tier.
+    pub(super) fn liquid_sub_steps(&self) -> usize {
+        if self.liq_tier >= 1 { CHEAP_SUB } else { MAX_SUB }
+    }
+
+    /// The most iterations of the pressure solver, at the liquids' tier.
+    pub(super) fn liquid_iterations(&self) -> u32 {
+        if self.liq_tier >= 1 { CHEAP_ITER } else { MAX_ITER }
+    }
+
     /// The liquids' turn, for `step` seconds (a whole number of `DT`, at most `MAX_DT`): a turn
     /// of `DT` for each, in as many sub-steps as the fastest liquid needs to cross at most a
     /// cell in each (`turns`).
     pub(super) fn step_liquids(&mut self, step: f32) {
+        self.liq_work = 0;
         let mut liq = std::mem::take(&mut self.liq);
         liq.ready();
         let audit = std::env::var_os("AWORLD_DEBUG_MASS").is_some();
@@ -497,6 +518,15 @@ impl World {
             self.liq = liq;
             return;
         }
+        // On the drops tier, the liquid that flies or falls freely goes over to drops: they fly
+        // on their own (`fly_drops`), and the solver only has the bodies at rest left.
+        if self.liq_tier >= 2 && self.fall_to_drops(&mut liq) {
+            self.classify(&mut liq, true);
+            if liq.rows.iter().all(Option::is_none) {
+                self.liq = liq;
+                return;
+            }
+        }
         // A drop that lands gives its speed to the edges under and over it.
         for y in 0..H() {
             let Some((x0, x1)) = liq.span(y) else { continue };
@@ -520,7 +550,7 @@ impl World {
                 u.chain(v).fold(0.0f32, |a, v| a.max(v.abs()))
             })
             .reduce(|| 0.0, f32::max);
-        let (turns, per_turn) = turns(step, fastest);
+        let (turns, per_turn) = turns(step, fastest, self.liquid_sub_steps());
         let sub = turns * per_turn;
         let dt = step / sub as f32;
         for k in 0..sub {
@@ -529,6 +559,7 @@ impl World {
                 self.classify(&mut liq, true);
                 self.prof.stop(prof::LIQ_CLASSIFY, clock);
             }
+            self.liq_work += liq.rows.iter().flatten().map(|&(a, b)| (b + 1 - a) as u64).sum::<u64>();
             let clock = self.prof.start();
             self.forces(&mut liq, dt);
             self.prof.stop(prof::LIQ_FORCES, clock);
@@ -703,6 +734,101 @@ impl World {
             self.revision += 1;
             self.zones.wake(i);
         }
+    }
+
+    /// The drops tier (`World::liq_tier` 2): in each zone where most of the liquid that runs is
+    /// free (spray, a falling sheet or block, a fast stream: air under it, or falling faster than
+    /// `FREE_FALL`, or running faster than `THROW`), the free cells go over to drops with their
+    /// velocity and their heat. The drops fall under gravity and the drag of the air, and land
+    /// back into the liquid or on the ground (`land_drop`), where the solver, whose work is the
+    /// liquid at rest, spreads them; nothing is created or lost. Thick liquids (lava) stay on
+    /// the grid. Whether any cell went over.
+    fn fall_to_drops(&mut self, liq: &mut Liquids) -> bool {
+        let (class, u, v) = (&liq.class, &liq.u, &liq.v);
+        let world: &World = self;
+        let (cw, cs) = (sleep::CW(), sleep::CS);
+        // Whether the liquid under each cell, down the column, ends on air: a falling body or
+        // stream, and not liquid lying on the ground (which a drop that just landed in it sets
+        // falling for a moment).
+        let mut hangs = vec![false; W() * H()];
+        hangs.par_chunks_mut(H()).enumerate().for_each(|(x, col)| {
+            let mut air = false;
+            for y in (0..H()).rev() {
+                col[y] = air;
+                match class[y * W() + x] & 3 {
+                    AIR => air = true,
+                    SOLID => air = false,
+                    _ => {}
+                }
+            }
+        });
+        let hangs = &hangs;
+        let free = |x: usize, y: usize| -> Option<(f32, f32)> {
+            let i = y * W() + x;
+            if class[i] & 3 < WET || class[i] & 4 == 0 || world.liquid_fill(i) > field::FULL {
+                return None;
+            }
+            let c = &world.cells[i];
+            if props(c.m, world.temp[i]).1 > 1e-3 {
+                return None;
+            }
+            let (vx, vy) = (0.5 * (u[ui(x, y)] + u[ui(x + 1, y)]), 0.5 * (v[vi(x, y)] + v[vi(x, y + 1)]));
+            // Over air; falling, with air at the end of the liquid under it; or spray thrown fast.
+            let under = y + 1 < H() && class[i + W()] & 3 == AIR;
+            let falls = vy > FREE_FALL && hangs[x * H() + y];
+            let spray = class[i] & 3 == WET && vx.hypot(vy) > THROW;
+            (under || falls || spray).then_some((vx, vy))
+        };
+        // How much liquid runs in each zone, and how much of it is free.
+        let mut count = vec![(0u32, 0u32); cw * sleep::CH()];
+        let rows: Vec<Vec<(u32, u32)>> = (0..H())
+            .into_par_iter()
+            .map(|y| {
+                let mut row = vec![(0u32, 0u32); cw];
+                if let Some((x0, x1)) = liq.rows[y] {
+                    for x in x0..=x1 {
+                        let i = y * W() + x;
+                        if class[i] & 3 >= WET && class[i] & 4 != 0 {
+                            row[x / cs].0 += 1;
+                            row[x / cs].1 += free(x, y).is_some() as u32;
+                        }
+                    }
+                }
+                row
+            })
+            .collect();
+        for (y, row) in rows.iter().enumerate() {
+            for (zx, &(n, f)) in row.iter().enumerate() {
+                let z = &mut count[y / cs * cw + zx];
+                z.0 += n;
+                z.1 += f;
+            }
+        }
+        let flying: Vec<bool> = count.iter().map(|&(n, f)| n > 0 && 2 * f >= n).collect();
+        if !flying.iter().any(|&f| f) {
+            return false;
+        }
+        let picks: Vec<(usize, f32, f32)> = (0..H())
+            .into_par_iter()
+            .flat_map_iter(|y| {
+                let (x0, x1) = liq.rows[y].unwrap_or((1, 0));
+                let (flying, free) = (&flying, &free);
+                (x0..=x1).filter(move |&x| flying[y / cs * cw + x / cs]).filter_map(move |x| free(x, y).map(|(vx, vy)| (y * W() + x, vx, vy)))
+            })
+            .collect();
+        for &(i, vx, vy) in &picks {
+            let (x, y) = xy(i);
+            let (m, t, q) = (self.cells[i].m, self.temp[i], self.liquid_fill(i));
+            self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
+            self.clear_states(i);
+            self.vel[i] = 0;
+            liq.class[i] = AIR | (liq.class[i] & 4);
+            // (No faster up than a thrown drop: the grid packs a splash into a few cells.)
+            liq.drops.push(Drop { x: x as f32 + 0.5, y: y as f32 + 0.5, vx, vy: vy.max(-LAUNCH), m, q, t });
+            self.zones.wake(i);
+        }
+        self.revision += 1;
+        !picks.is_empty()
     }
 
     /// Moves the drops in flight a step; those that land go back into the liquid (or make a cell
@@ -1392,10 +1518,10 @@ impl World {
         }).sum();
         let gpu = if unknowns >= mgpcg_gpu::threshold() { liq.gpu.get_or_insert_with(|| mgpcg_gpu::PressureGpu::new(W(), H())).as_mut() } else { None };
         let iterations = if let Some(gpu) = gpu {
-            gpu.solve(solver.fine(), SETTLED, RELATIVE, MAX_ITER)
+            gpu.solve(solver.fine(), SETTLED, RELATIVE, self.liquid_iterations())
         } else {
             solver.coarsen();
-            solver.solve(SETTLED, RELATIVE, MAX_ITER)
+            solver.solve(SETTLED, RELATIVE, self.liquid_iterations())
         };
         // The solution back into the pressures, and the solver's grid left clean.
         {
@@ -2384,6 +2510,47 @@ mod tests {
             let after = w.liquid_units(m) + w.gone + if m == Mat::Water { w.dried } else { 0 };
             assert!(after <= before && before - after < before / 10_000, "{m:?}: {before} -> {after}");
         }
+    }
+
+    #[test]
+    fn on_the_cheap_tier_a_dam_still_breaks_and_none_is_lost() {
+        let mut w = dam(Mat::Water);
+        w.liq_tier = 1;
+        let before = w.liquid_units(Mat::Water);
+        for _ in 0..(60.0 * model().sqrt()).round() as usize {
+            w.step();
+        }
+        // Fewer sub-steps and iterations: the front runs about as far (13 m for real water).
+        let f = front(&w, Mat::Water, 100, 400, 339, 449) as f32 * cell_m() / model();
+        assert!((7.0..17.0).contains(&f), "{f} m");
+        let after = w.liquid_units(Mat::Water) + w.gone + w.dried;
+        assert!(after <= before && before - after < before / 10_000, "{before} -> {after}");
+    }
+
+    #[test]
+    fn on_the_drops_tier_a_falling_block_goes_over_to_drops_and_lands_whole() {
+        let mut w = world();
+        tank(&mut w, 100, 200, 339, 449);
+        rect(&mut w, 200, 220, 239, 259, Mat::Water);
+        w.temp.fill(0.0);
+        w.liq_tier = 2;
+        let before = w.liquid_units(Mat::Water);
+        let mut most = 0;
+        for _ in 0..30 {
+            w.step();
+            most = most.max(w.liq.drops.len());
+        }
+        assert!(most > 400, "the falling block flies as drops ({most} at most)");
+        for _ in 30..240 {
+            w.step();
+        }
+        // (A few from the slosh of the pool, which a landing drop keeps up.)
+        assert!(w.liq.drops.len() < 100, "{} drops still in the air after 4 s", w.liq.drops.len());
+        // All of it lies at the bottom of the tank.
+        let low = (420..450).flat_map(|y| (100..340).map(move |x| (x, y))).filter(|&(x, y)| w.at(x, y) == Mat::Water).count();
+        assert!(low > 1200, "only {low} cells of water at the bottom");
+        let after = w.liquid_units(Mat::Water) + w.gone + w.dried;
+        assert!(after <= before && before - after < before / 10_000, "{before} -> {after}");
     }
 
     #[test]

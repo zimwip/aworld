@@ -747,7 +747,7 @@ mod native {
                 fastest = fastest.max(pt.value.abs());
             }
             patches.truncate(MAX_PATCHES);
-            let (turns, per_turn) = turns(step, fastest);
+            let (turns, per_turn) = turns(step, fastest, self.liquid_sub_steps());
             let sub = turns * per_turn;
             let dt = step / sub as f32;
             // To the card.
