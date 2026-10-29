@@ -1829,7 +1829,7 @@ impl Game {
             b.age += dt;
         }
         self.bolts.retain(|b| b.age < BOLT_LIFE);
-        for bolt in std::mem::take(&mut self.world.bolts) {
+        for bolt in std::mem::take(&mut self.world.storm.bolts) {
             // Lightning that comes down through the fire engine sets its fuel off.
             if bolt.ground && self.trucks.truck.as_ref().map_or(false, |t| bolt.path.iter().any(|&(x, y)| t.touches(vec2(x, y), 2.0))) {
                 self.blow_up_truck();
@@ -3925,8 +3925,8 @@ impl Game {
                 ui.text("−", bar.x, bar.y + 25.0, 11, DIM);
                 ui.text("0", bar.x + bar.w * 0.5 - 3.0, bar.y + 25.0, 11, DIM);
                 ui.text("+", bar.x + bar.w - 8.0, bar.y + 25.0, 11, DIM);
-                let peak = (self.world.charge.iter().fold(0.0f32, |a, q| a.max(q.abs())) / world::BREAKDOWN)
-                    .max(self.world.mcharge.iter().fold(0.0f32, |a, q| a.max(q.abs())) / world::GROUND_BREAKDOWN);
+                let peak = (self.world.storm.charge.iter().fold(0.0f32, |a, q| a.max(q.abs())) / world::BREAKDOWN)
+                    .max(self.world.storm.mcharge.iter().fold(0.0f32, |a, q| a.max(q.abs())) / world::GROUND_BREAKDOWN);
                 ui.text(&format!("Claquage : {:.0} %", peak.min(1.0) * 100.0), bar.x, bar.y + 44.0, 13, TEXT);
                 ui.wrapped("Dans un gros nuage froid et ascendant, les cristaux de glace (+) montent en haut, le grésil (−) reste en bas. Sous le nuage, le sol et ce qui s'y dresse prennent la charge opposée, surtout ce qui est haut et conduit. Quand la tension atteint le claquage, l'éclair part, et il laisse sa charge là où il frappe. Or : métal, cyan : eau.", bar.x, bar.y + 60.0, bar.w, 11, DIM);
             }
@@ -5042,7 +5042,7 @@ async fn game() {
                     let inside = (280.0..680.0).contains(&x) && (70.0..200.0).contains(&y);
                     if inside {
                         let u = ((x - 480.0) / 200.0).powi(2);
-                        game.world.charge[qy * world::QW() + qx] = (if y < 120.0 { 0.8 } else if y > 150.0 { -0.95 } else { 0.0 }) * (1.0 - u);
+                        game.world.storm.charge[qy * world::QW() + qx] = (if y < 120.0 { 0.8 } else if y > 150.0 { -0.95 } else { 0.0 }) * (1.0 - u);
                     }
                 }
             }

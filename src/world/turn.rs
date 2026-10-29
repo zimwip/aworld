@@ -118,6 +118,16 @@ unsafe fn share<T>(v: &T) -> T {
     std::ptr::read(v)
 }
 
+impl super::storm::Storm {
+    /// The strip's view of the storms: the world's grids, its own bolts and draws.
+    ///
+    /// # Safety
+    /// As `share`.
+    unsafe fn view(&self) -> Self {
+        Self { charge: share(&self.charge), mcharge: share(&self.mcharge), magnet: share(&self.magnet), polar: share(&self.polar), bolts: Vec::new(), rng: self.rng.clone() }
+    }
+}
+
 /// The seed of strip `zx`'s draws this step. The draws are xorshift, which is linear: seeds that
 /// only differ by a constant, or follow one another in the world's stream, would give a strip
 /// nearly the same draws step after step (a heap of sand creeps to one side). Hence a hash.
@@ -298,7 +308,7 @@ impl World {
         self.ejecta.append(&mut v.ejecta);
         self.thuds.append(&mut v.thuds);
         self.bursts.append(&mut v.bursts);
-        self.bolts.append(&mut v.bolts);
+        self.storm.bolts.append(&mut v.storm.bolts);
         self.falling.append(&mut v.falling);
         self.slabs.append(&mut v.slabs);
         self.liq.drops.append(&mut v.liq.drops);
@@ -394,12 +404,7 @@ impl World {
                 liq_w: share(&self.liq_w),
                 zones: self.zones.view(),
                 bursts: Vec::new(),
-                charge: share(&self.charge),
-                mcharge: share(&self.mcharge),
-                magnet: share(&self.magnet),
-                polar: share(&self.polar),
-                bolts: Vec::new(),
-                storm_rng: self.storm_rng.clone(),
+                storm: self.storm.view(),
                 pressure_cache: std::sync::Mutex::new(None),
                 prof: prof::Profile::default(),
                 air_rows: share(&self.air_rows),

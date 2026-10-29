@@ -923,7 +923,7 @@ impl Renderer {
         use crate::world::{GROUND_BREAKDOWN, QH, QS, QW};
         for qy in 1..QH() {
             for qx in 0..QW() {
-                let q = world.mcharge[qy * QW() + qx].abs() / GROUND_BREAKDOWN;
+                let q = world.storm.mcharge[qy * QW() + qx].abs() / GROUND_BREAKDOWN;
                 if q < 0.45 {
                     continue;
                 }

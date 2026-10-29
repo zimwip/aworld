@@ -876,19 +876,8 @@ pub struct World {
     pub zones: sleep::Zones,
     /// Walls that gave way under the pressure of a pocket this step: (x, y, pressure in atm).
     pub bursts: Vec<(i32, i32, f32)>,
-    /// Electric charge of the clouds, one value per `QS`×`QS` square (see `storm.rs`).
-    pub charge: Vec<f32>,
-    /// Electric charge held in the ground and the things on it, one value per `QS`×`QS` square:
-    /// what a charged cloud draws up under it, and what a bolt leaves behind (see `storm.rs`).
-    pub mcharge: Vec<f32>,
-    /// How strongly the iron of each `QS`×`QS` square is magnetised (by the current of a bolt).
-    pub magnet: Vec<f32>,
-    /// The opposite charge a charged square draws into the matter round it (influence), worked
-    /// out afresh each storm step from `mcharge`.
-    pub polar: Vec<f32>,
-    /// Bolts of lightning since they were last read. For the picture and the thunder.
-    pub bolts: Vec<Bolt>,
-    storm_rng: storm::StormRng,
+    /// The storms: the charge of the clouds and of the ground, the bolts (see `storm.rs`).
+    pub storm: storm::Storm,
     /// The last pressure field read through `pressure_at_cell` (the loupe): (revision, tick, field).
     pressure_cache: std::sync::Mutex<Option<(u64, u32, Vec<f32>)>>,
     /// Time spent in each phase of a step, when switched on (see `prof.rs`).
@@ -998,12 +987,7 @@ impl World {
             liq_w: vec![0.0; W() * H()],
             bursts: Vec::new(),
             zones: sleep::Zones::new(),
-            charge: vec![0.0; QW() * QH()],
-            mcharge: vec![0.0; QW() * QH()],
-            magnet: vec![0.0; QW() * QH()],
-            polar: vec![0.0; QW() * QH()],
-            bolts: Vec::new(),
-            storm_rng: storm::StormRng(0x9e37_79b9),
+            storm: storm::Storm::new(),
             prof: prof::Profile::default(),
             air_rows: Vec::new(),
             air_sky: 0.0,
@@ -1023,10 +1007,7 @@ impl World {
 
     pub fn clear(&mut self) {
         self.revision += 1;
-        self.charge.fill(0.0);
-        self.mcharge.fill(0.0);
-        self.magnet.fill(0.0);
-        self.polar.fill(0.0);
+        self.storm.clear();
         self.cells.fill(EMPTY);
         self.fill.fill(0);
         self.liq.clear();
@@ -1064,8 +1045,8 @@ impl World {
             climate_fixed, climate, revision, wind, wind_max, wind_changes, windiness, wind_clock, biome, leaf_rgb, autumn, grass_rgb,
             structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, dp,
             dp_slow, dpd, pressure_forces, lod, liq_tier, liq_work, parallel_cells, liq, fill, pocket_of,
-            pockets, latent, vel, fall_at, moisture, fuel, growth, jet, liq_p, cls: _, liq_w: _, zones, bursts, charge, mcharge, magnet, polar,
-            bolts, storm_rng, pressure_cache: _, prof: _, air_rows, air_sky, later: _, dried, gone,
+            pockets, latent, vel, fall_at, moisture, fuel, growth, jet, liq_p, cls: _, liq_w: _, zones, bursts, storm,
+            pressure_cache: _, prof: _, air_rows, air_sky, later: _, dried, gone,
         } = from;
         self.dried = *dried;
         self.gone = *gone;
@@ -1135,12 +1116,7 @@ impl World {
         self.liq_p.clone_from(liq_p);
         self.zones.clone_from(zones);
         self.bursts.clone_from(bursts);
-        self.charge.clone_from(charge);
-        self.mcharge.clone_from(mcharge);
-        self.magnet.clone_from(magnet);
-        self.polar.clone_from(polar);
-        self.bolts.clone_from(bolts);
-        self.storm_rng.clone_from(storm_rng);
+        self.storm.copy_picture(storm);
         self.air_rows.clone_from(air_rows);
         self.air_sky = *air_sky;
     }
