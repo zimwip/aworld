@@ -40,6 +40,8 @@ pub(super) const MAX_ITER: u32 = 12;
 pub(super) const RELATIVE: f32 = 1e-3;
 /// Sweeps of the viscosity a sub-step.
 pub(super) const VISCOUS_SWEEPS: usize = 12;
+/// Fewer thick edges than this are swept on one core (see `viscosity`).
+const PAR_EDGES: usize = 16_384;
 /// Slower than this (m/s), an edge between two cells of liquid stands still: still water stops,
 /// so that its zones can sleep.
 pub(super) const REST: f32 = 0.01;
@@ -947,6 +949,9 @@ impl World {
             let Some((x0, x1)) = rows[y] else { return };
             for x in x0..=(x1 + 1).min(W()) {
                 row[x] = match u_vel(x, y) {
+                    // (An edge at rest carries itself: the sample at its own node, without the
+                    // reads around it. Not on the last edges, which `nodes` reads one back.)
+                    Ok((0.0, 0.0)) if x < W() && y < H() - 1 => u[ui(x, y)],
                     Ok((vx, vy)) => sample(u, W() + 1, H(), x as f32 - vx * step, y as f32 - vy * step, u_node(u[ui(x, y)])),
                     Err(keep) => keep,
                 };
@@ -958,6 +963,7 @@ impl World {
             let Some((x0, x1)) = rows[y] else { return };
             for x in x0..=x1 {
                 row[x] = match v_vel(x, y) {
+                    Ok((0.0, 0.0)) if x < W() - 1 && y < H() => v[vi(x, y)],
                     Ok((vx, vy)) => sample(v, W(), H() + 1, x as f32 - vx * step, y as f32 - vy * step, v_node(v[vi(x, y)])),
                     Err(keep) => keep,
                 };
@@ -973,10 +979,15 @@ impl World {
             row[x0..=(x1 + 1).min(W())].copy_from_slice(&uf[ui(x0, y)..=ui((x1 + 1).min(W()), y)]);
             for x in x0..=(x1 + 1).min(W()) {
                 let Ok((vx, vy)) = u_vel(x, y) else { continue };
-                let (px, py) = (x as f32 - vx * step, y as f32 - vy * step);
-                let back = sample(uf, W() + 1, H(), x as f32 + vx * step, y as f32 + vy * step, u_node(uf[ui(x, y)]));
-                let (lo, hi) = around(u, W() + 1, H(), px, py, u_node(u[ui(x, y)]));
-                let to = (uf[ui(x, y)] + 0.5 * (u[ui(x, y)] - back)).clamp(lo, hi);
+                // (At rest, carried forward and back it is itself, within what is around it.)
+                let to = if vx == 0.0 && vy == 0.0 && x < W() && y < H() - 1 {
+                    uf[ui(x, y)] + 0.0
+                } else {
+                    let (px, py) = (x as f32 - vx * step, y as f32 - vy * step);
+                    let back = sample(uf, W() + 1, H(), x as f32 + vx * step, y as f32 + vy * step, u_node(uf[ui(x, y)]));
+                    let (lo, hi) = around(u, W() + 1, H(), px, py, u_node(u[ui(x, y)]));
+                    (uf[ui(x, y)] + 0.5 * (u[ui(x, y)] - back)).clamp(lo, hi)
+                };
                 // Away from any full cell, liquid in the air is slowed by it (drops and spray, at
                 // most as fast as falling rain).
                 let (a, b) = (kind(x as i32 - 1, y as i32), kind(x as i32, y as i32));
@@ -998,12 +1009,16 @@ impl World {
             row[x0..=x1].copy_from_slice(&vf[vi(x0, y)..=vi(x1, y)]);
             for x in x0..=x1 {
                 let Ok((vx, vy)) = v_vel(x, y) else { continue };
-                let (px, py) = (x as f32 - vx * step, y as f32 - vy * step);
-                let back = sample(vf, W(), H() + 1, x as f32 + vx * step, y as f32 + vy * step, v_node(vf[vi(x, y)]));
-                let (lo, hi) = around(v, W(), H() + 1, px, py, v_node(v[vi(x, y)]));
+                let was = if vx == 0.0 && vy == 0.0 && x < W() - 1 && y < H() {
+                    vf[vi(x, y)] + 0.0
+                } else {
+                    let (px, py) = (x as f32 - vx * step, y as f32 - vy * step);
+                    let back = sample(vf, W(), H() + 1, x as f32 + vx * step, y as f32 + vy * step, v_node(vf[vi(x, y)]));
+                    let (lo, hi) = around(v, W(), H() + 1, px, py, v_node(v[vi(x, y)]));
+                    (vf[vi(x, y)] + 0.5 * (v[vi(x, y)] - back)).clamp(lo, hi)
+                };
                 let (xi, yi) = (x as i32, y as i32);
                 let (a, b) = (kind(xi, yi - 1), kind(xi, yi));
-                let was = (vf[vi(x, y)] + 0.5 * (v[vi(x, y)] - back)).clamp(lo, hi);
                 // (Not a surface that falls: liquid over air, or liquid over a cell with air
                 // under it, the front of a falling body or a film under air; calming those held
                 // a falling body at CALM-th of g, three metres a second, or its front behind it.)
@@ -1036,14 +1051,16 @@ impl World {
             liq.nu.fill(0.0);
         }
         // How thick each cell is, from its liquid, its heat and (yield stress) how little it moves.
+        // (And the first and last thick cell of each row: the sweeps only run there, the rest of
+        // the liquid, water, having no viscosity to smooth.)
         let (u, v, class, rows) = (&liq.u, &liq.v, &liq.class, &liq.rows);
-        liq.thick = liq
+        let thick: Vec<Option<(usize, usize)>> = liq
             .nu
             .par_chunks_mut(W())
             .enumerate()
             .map(|(y, row)| {
-                let Some((x0, x1)) = rows[y] else { return false };
-                let mut any = false;
+                let Some((x0, x1)) = rows[y] else { return None };
+                let mut span: Option<(usize, usize)> = None;
                 for x in x0..=x1 {
                     let i = y * W() + x;
                     if class[i] & 3 < WET || class[i] & 4 == 0 {
@@ -1065,15 +1082,46 @@ impl World {
                         n += tau / (rho * (rate + 1e-3));
                     }
                     row[x] = n.min(50.0);
-                    any = true;
+                    span = Some(span.map_or((x, x), |(a, _)| (a, x)));
                 }
-                any
+                span
             })
-            .reduce(|| false, |a, b| a || b);
+            .collect();
+        liq.thick = thick.iter().any(Option::is_some);
         if !liq.thick {
             return;
         }
         let c = dt / (cell_m() * cell_m());
+        let join = |a: Option<(usize, usize)>, b: Option<(usize, usize)>| match (a, b) {
+            (Some((a0, a1)), Some((b0, b1))) => Some((a0.min(b0), a1.max(b1))),
+            (a, b) => a.or(b),
+        };
+        // The edges each sweep runs over, row by row: a rightward edge is thick where a cell on
+        // either side of it is, a downward one where the cell over or under it is. A little lava
+        // is a few hundred edges, which one core sweeps faster than all of them can share out.
+        let u_rows: Vec<(usize, usize, usize)> = (0..H())
+            .filter_map(|y| {
+                let ((x0, x1), (t0, t1)) = (rows[y]?, thick[y]?);
+                let (a, b) = (x0.max(t0).max(1), x1.min(t1 + 1).min(W() - 1));
+                (a <= b).then_some((y, a, b))
+            })
+            .collect();
+        let v_rows: Vec<(usize, usize, usize)> = (1..H())
+            .filter_map(|y| {
+                let ((x0, x1), (t0, t1)) = (rows[y]?, join(thick[y - 1], thick[y])?);
+                let (a, b) = (x0.max(t0), x1.min(t1));
+                (a <= b).then_some((y, a, b))
+            })
+            .collect();
+        let edges: usize = u_rows.iter().chain(&v_rows).map(|&(_, a, b)| b + 1 - a).sum();
+        // (Red-black: the edges of a colour do not read each other, so the order does not matter.)
+        let each = |rows: &[(usize, usize, usize)], f: &(dyn Fn(&(usize, usize, usize)) + Sync)| {
+            if edges < PAR_EDGES {
+                rows.iter().for_each(f);
+            } else {
+                rows.par_iter().for_each(f);
+            }
+        };
         let nu = &liq.nu;
         let cell_nu = |x: i32, y: i32| if x < 0 || y < 0 || x >= W() as i32 || y >= H() as i32 { 0.0 } else { nu[y as usize * W() + x as usize] };
         // Rightward edges.
@@ -1082,9 +1130,8 @@ impl World {
         for sweep in 0..2 * VISCOUS_SWEEPS {
             let colour = sweep % 2;
             let us = Shared::new(&mut liq.u);
-            (0..H()).into_par_iter().for_each(|y| {
-                let Some((x0, x1)) = rows[y] else { return };
-                for x in x0.max(1)..=x1.min(W() - 1) {
+            each(&u_rows, &|&(y, a, b)| {
+                for x in a..=b {
                     if (x + y) % 2 != colour {
                         continue;
                     }
@@ -1127,9 +1174,8 @@ impl World {
         for sweep in 0..2 * VISCOUS_SWEEPS {
             let colour = sweep % 2;
             let vs = Shared::new(&mut liq.v);
-            (1..H()).into_par_iter().for_each(|y| {
-                let Some((x0, x1)) = rows[y] else { return };
-                for x in x0..=x1 {
+            each(&v_rows, &|&(y, a, b)| {
+                for x in a..=b {
                     if (x + y) % 2 != colour {
                         continue;
                     }

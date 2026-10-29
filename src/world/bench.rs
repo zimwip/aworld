@@ -29,6 +29,16 @@ fn demo() -> World {
     countryside()
 }
 
+/// The game's demo (`--demo`): a little lava poured on the fields far from a pool of water on the
+/// same rows, so that the liquids' spans run from one to the other.
+fn lava() -> World {
+    let mut w = countryside();
+    let (gl, gw) = (ground(&w, 650), ground(&w, 300));
+    w.paint(650, gl - 30, 6, Mat::Lava);
+    w.paint(300, gw - 60, 8, Mat::Water);
+    w
+}
+
 /// Six charges of powder and dynamite going off under the fields at once.
 fn explosions() -> World {
     let mut w = countryside();
@@ -293,6 +303,7 @@ pub(super) fn scenes() -> Vec<(&'static str, fn() -> World, Option<fn(&mut World
         })),
         ("incendie", fire, None),
         ("nuage", cloud, None),
+        ("lave", lava, None),
     ]
 }
 
@@ -737,5 +748,35 @@ fn grids_probe() {
         }
         let (vx, _) = w.flow.sample(W() as i32 / 2, c(8.0));
         println!("  vent à pleine force, à 8 m de haut : {:.2} m/s", vx * cell_m() / STEP);
+    }
+}
+
+/// What one pass of the structures costs on its own, on the flood after a second (the pass
+/// that comes back every 0.15 s and makes the step it falls on stick out):
+///
+/// ```text
+/// cargo test --release --bin aworld structures_probe -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn structures_probe() {
+    for (name, make) in [("démo", demo as fn() -> World), ("déluge", deluge)] {
+        let mut w = make();
+        for _ in 0..60 {
+            w.step();
+        }
+        let mut times: Vec<f64> = (0..40)
+            .map(|k| {
+                // Every other pass with the liquids' push moved a little, as in a flood.
+                if k % 2 == 0 {
+                    w.step();
+                }
+                let t = Instant::now();
+                w.structure_pass();
+                t.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        times.sort_by(f64::total_cmp);
+        eprintln!("{name}: passe des structures {:.2} ms (médiane), {:.2} ms (la moins chère)", times[times.len() / 2], times[0]);
     }
 }

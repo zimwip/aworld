@@ -3764,7 +3764,7 @@ impl World {
     /// anchored when it touches something fixed: the base of the world, a tunnel's vault, or the
     /// ground its roots grow in. Anchored bodies are then checked for overloaded sections (see
     /// `stress_pass`); free bodies either fall, tip over their edge (see `tip_pass`) or rest.
-    fn structure_pass(&mut self) {
+    pub(super) fn structure_pass(&mut self) {
         let mut seen = std::mem::take(&mut self.seen);
         let mut stack = std::mem::take(&mut self.stack);
         let mut level = std::mem::take(&mut self.level);
