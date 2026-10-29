@@ -5,7 +5,7 @@
 //! makes the embers into ash and runs off into the ground like any other water.
 
 use crate::render::View;
-use crate::world::{Kind, Mat, World, H, W};
+use crate::world::{ballistic, units, Kind, Mat, World, H, W};
 use crate::gfx::*;
 
 /// Length and height of the engine, in world cells.
@@ -255,7 +255,7 @@ impl FireTrucks {
                     let d = t.aim - nozzle;
                     let steps = (d.x.abs() / 1.8).clamp(18.0, 60.0);
                     let jitter = vec2(self.between(0.94, 1.06), self.between(0.94, 1.06));
-                    let vel = vec2(d.x / steps, d.y / steps - 0.5 * crate::world::units::g_tick() * steps) * jitter;
+                    let vel = vec2(d.x / steps, d.y / steps - 0.5 * units::g_tick() * steps) * jitter;
                     self.drops.push(Drop { pos: nozzle, vel });
                     t.tank -= 1;
                 }
@@ -343,43 +343,29 @@ impl FireTrucks {
     fn step_drops(&mut self, world: &mut World) {
         let mut keep = Vec::with_capacity(self.drops.len());
         for mut d in std::mem::take(&mut self.drops) {
-            d.vel.y += crate::world::units::g_tick();
-            let n = d.vel.length().ceil().max(1.0) as i32;
-            let mut landed = false;
-            let mut last = d.pos;
-            for k in 1..=n {
-                let p = d.pos + d.vel * (k as f32 / n as f32);
-                let (x, y) = (p.x as i32, p.y as i32);
-                if y >= H() as i32 || x < -2 || x > W() as i32 + 2 {
-                    landed = true;
-                    break;
+            // A jet is a stream, not a spray of drops: the air hardly slows it (and the monitor
+            // aims it as if it did not).
+            ballistic::pull(&mut d.vel.x, &mut d.vel.y, units::g_tick(), f32::INFINITY);
+            let (mut x, mut y) = (d.pos.x, d.pos.y);
+            let path = ballistic::sweep(&mut x, &mut y, d.vel.x, d.vel.y, |cx, cy| match world.at(cx, cy).kind() {
+                Kind::Empty | Kind::Gas => None,
+                k => Some((cx, cy, k == Kind::Flame)),
+            });
+            match path {
+                ballistic::Path::Clear => {
+                    d.pos = vec2(x, y);
+                    keep.push(d);
                 }
-                if !World::inb(x, y) {
-                    last = p;
-                    continue;
-                }
-                match world.at(x, y).kind() {
-                    Kind::Empty | Kind::Gas => last = p,
-                    // Water on a flame: it is out, in a puff of steam.
-                    Kind::Flame => {
-                        world.set(x, y, Mat::Steam);
-                        landed = true;
-                        break;
-                    }
-                    // Anything else: the drop stays where it hit, as water.
-                    _ => {
-                        let (lx, ly) = (last.x as i32, last.y as i32);
-                        if World::inb(lx, ly) && world.block_at_cell(lx, ly).is_none() && matches!(world.raw(lx, ly).kind(), Kind::Empty | Kind::Gas) {
-                            world.set(lx, ly, Mat::Water);
-                        }
-                        landed = true;
-                        break;
+                ballistic::Path::Out => {}
+                // Water on a flame: it is out, in a puff of steam.
+                ballistic::Path::Hit((cx, cy, true)) => world.set(cx, cy, Mat::Steam),
+                // Anything else: the drop stays where it hit, as water.
+                ballistic::Path::Hit((_, _, false)) => {
+                    let (lx, ly) = (x.floor() as i32, y.floor() as i32);
+                    if World::inb(lx, ly) && world.block_at_cell(lx, ly).is_none() && matches!(world.raw(lx, ly).kind(), Kind::Empty | Kind::Gas) {
+                        world.set(lx, ly, Mat::Water);
                     }
                 }
-            }
-            if !landed {
-                d.pos += d.vel;
-                keep.push(d);
             }
         }
         self.drops = keep;

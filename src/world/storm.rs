@@ -34,8 +34,6 @@ const SEPARATION: f32 = 0.0006;
 pub const BREAKDOWN: f32 = 1.0;
 /// Below this temperature a cloud holds ice: crystals and graupel can trade charge.
 const ICE_C: f32 = -2.0;
-/// How often (in steps) the charge is updated.
-const STORM_EVERY: u32 = 4;
 /// Temperature of the lightning channel (the air in it reaches about 30 000 °C for an instant; the
 /// game keeps it to something its heat flow can cope with).
 const CHANNEL_C: f32 = 2500.0;
@@ -120,7 +118,7 @@ impl World {
     }
 
     pub(super) fn storm_step(&mut self) {
-        if self.ticks % STORM_EVERY != 0 {
+        if !super::cadence::due(super::cadence::Pass::Storm, self.ticks) {
             return;
         }
         // Cloud in each square, and how cold it is.
@@ -172,7 +170,7 @@ impl World {
         }
         // 1. Separation: in thick, icy cloud with cloud under it (a deep cloud), driven by the
         //    updraft, the positive charge goes up to the top and the negative stays low.
-        let dt = STORM_EVERY as f32;
+        let dt = super::cadence::every(super::cadence::Pass::Storm) as f32;
         let mut q = std::mem::take(&mut self.charge);
         for qy in 3..QH() - 1 {
             for qx in 0..QW() {

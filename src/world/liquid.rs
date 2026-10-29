@@ -711,43 +711,30 @@ impl World {
         }
         let mut drops = std::mem::take(&mut liq.drops);
         let s = dt / cell_m();
-        let drag = G * dt / (DROP_TERMINAL_MS * DROP_TERMINAL_MS);
         drops.retain_mut(|d| {
-            d.vy += G * dt;
-            // Quadratic drag: g (v / v_t)², against the motion.
-            let speed = (d.vx * d.vx + d.vy * d.vy).sqrt();
-            let k = (1.0 - drag * speed).max(0.0);
-            d.vx *= k;
-            d.vy *= k;
-            let (dx, dy) = (d.vx * s, d.vy * s);
-            let n = dx.abs().max(dy.abs()).ceil().max(1.0) as usize;
-            for _ in 0..n {
-                let (nx, ny) = (d.x + dx / n as f32, d.y + dy / n as f32);
-                let (ix, iy) = (nx.floor() as i32, ny.floor() as i32);
-                if ix < 0 || ix >= W() as i32 || iy >= H() as i32 {
-                    // Off the side or the bottom of the world: gone (and counted).
-                    self.gone += d.q as u64;
-                    return false;
+            ballistic::pull(&mut d.vx, &mut d.vy, G * dt, DROP_TERMINAL_MS);
+            let path = ballistic::sweep(&mut d.x, &mut d.y, d.vx * s, d.vy * s, |ix, iy| {
+                let j = Self::idx(ix, iy);
+                let c = self.cells[j].m;
+                if c == d.m && self.mask[j] == 0 && self.liquid_fill(j) >= field::FULL / 2 {
+                    return Some(Some(j));
                 }
-                if iy >= 0 {
-                    let j = Self::idx(ix, iy);
-                    let c = self.cells[j].m;
-                    if c == d.m && self.mask[j] == 0 && self.liquid_fill(j) >= field::FULL / 2 {
-                        self.land_drop(liq, d, j);
-                        return false;
-                    }
-                    if self.mask[j] != 0 || !matches!(c.kind(), Kind::Empty | Kind::Gas) && c != d.m {
-                        // Against the ground, a wall or another liquid: it stays in the last free cell.
-                        let (px, py) = (d.x.floor() as i32, d.y.floor() as i32);
-                        if Self::inb(px, py) {
-                            self.land_drop(liq, d, Self::idx(px, py));
-                        }
-                        return false;
+                // Against the ground, a wall or another liquid: it stays in the last free cell.
+                (self.mask[j] != 0 || !matches!(c.kind(), Kind::Empty | Kind::Gas) && c != d.m).then_some(None)
+            });
+            match path {
+                ballistic::Path::Clear => return true,
+                // Off the side or the bottom of the world: gone (and counted).
+                ballistic::Path::Out => self.gone += d.q as u64,
+                ballistic::Path::Hit(Some(j)) => self.land_drop(liq, d, j),
+                ballistic::Path::Hit(None) => {
+                    let (px, py) = (d.x.floor() as i32, d.y.floor() as i32);
+                    if Self::inb(px, py) {
+                        self.land_drop(liq, d, Self::idx(px, py));
                     }
                 }
-                (d.x, d.y) = (nx, ny);
             }
-            true
+            false
         });
         liq.drops = drops;
     }
@@ -868,7 +855,7 @@ impl World {
                             // A lone drop of water in the air is the cells' rain, and so is
                             // water over a gas that is not open air at its pocket's pressure (a
                             // cloud), alone or not: the gas is a wall to the liquids, and the
-                            // water would lie on the cloud (see `World::step_water`).
+                            // water would lie on the cloud (see `World::move_liquid`).
                             Kind::Liquid if self.cells[i].m == Mat::Water && y + 1 < H() && matches!(self.cells[i + W()].m.kind(), Kind::Empty | Kind::Gas) && (self.lone_liquid(x as i32, y as i32) || self.rain_over_gas(x as i32, y as i32)) => AIR,
                             Kind::Liquid if self.liquid_fill(i) >= field::FULL / HOLDS => FULLISH,
                             Kind::Liquid => WET,

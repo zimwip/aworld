@@ -7,10 +7,38 @@
 //! earth or nothing, and a wall of glass, as strong as 7 MPa for a blast, held 0.8 atm in a
 //! boiler with nothing to say how both could be.
 //!
+//! It also says how the cells' turn moves the matter (`Motion`, see `World::cell_turn`): one way
+//! for all the grains, one for all the liquids, one for all the gases, the matter only setting
+//! how fast it falls (`fall_ms`), how its heap holds (`World::repose`), how it drifts (`drift`).
+//!
 //! The match in `of` has no catch-all arm: a new matter does not compile until it has its record.
 
 use super::units::RHO_AIR;
-use super::Mat;
+use super::{Mat, DROP_TERMINAL_MS, GRAIN_TERMINAL_MS, SNOW_TERMINAL_MS};
+
+/// How the cells' turn moves a matter (`World::move_cell`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Motion {
+    /// It stays where it is (solids: when they move, it is as a body, see `statics.rs`).
+    Fixed,
+    /// A grain: it falls, slides down the side of its heap and sinks or floats in a liquid
+    /// (`World::step_powder`).
+    Grain,
+    /// Earth: grains that hold together, and only fall in a world where things fall apart.
+    Clod,
+    /// Grass, the living top of the soil: with nothing under it, it drops straight down, through
+    /// a liquid too, until it lands on something.
+    Turf,
+    /// A liquid: the solver moves it (see `liquid.rs`); in the cells' turn a pocket of gas
+    /// shoots it out, a lone drop falls through the air, and it rises through a heavier liquid.
+    Liquid,
+    /// A gas: buoyancy, the wind, and a warm gas climbs (`World::step_gas`, `drift`).
+    Gas,
+    /// Droplets hanging in the air: carried by the wind, otherwise a still wandering.
+    Cloud,
+    /// A flame: it licks upwards and leans with the wind.
+    Flame,
+}
 
 /// What the models know of a matter.
 #[derive(Clone, Copy, Debug)]
@@ -39,6 +67,11 @@ pub struct MatSpec {
     /// Gas seeps through it: a cave dug in soil or sand, or air trapped among wet grains, does
     /// not hold pressure the way a boiler does.
     pub porous: bool,
+    /// How the cells' turn moves it.
+    pub motion: Motion,
+    /// The fastest a lone cell of it falls through the air in the cells' turn, m/s (its drag
+    /// balances gravity); 0: it does not fall there (a lone cell of oil or lava is the solver's).
+    pub fall_ms: f32,
 }
 
 /// No fracture to speak of: what loose matter, liquids and gases take (they never crack).
@@ -60,30 +93,40 @@ impl MatSpec {
 }
 
 /// Air: a gas, a flame, the empty cell.
-const AIR: MatSpec = MatSpec { density: RHO_AIR, strength: 0.0, toughness: NO_CRACK, holds_atm: None, rubble: None, restitution: 0.3, porous: false };
+const AIR: MatSpec = MatSpec { density: RHO_AIR, strength: 0.0, toughness: NO_CRACK, holds_atm: None, rubble: None, restitution: 0.3, porous: false, motion: Motion::Fixed, fall_ms: 0.0 };
+/// A gas moving as `motion`.
+const fn gas(motion: Motion) -> MatSpec {
+    MatSpec { motion, ..AIR }
+}
 /// A liquid of density `rho`.
 const fn liquid(rho: f32) -> MatSpec {
-    MatSpec { density: rho, ..AIR }
+    MatSpec { density: rho, motion: Motion::Liquid, ..AIR }
 }
 /// Loose grains of density `rho`: they hold a little pressure by their weight.
 const fn loose(rho: f32, porous: bool) -> MatSpec {
-    MatSpec { density: rho, holds_atm: Some(0.6), porous, ..AIR }
+    MatSpec { density: rho, holds_atm: Some(0.6), porous, motion: Motion::Grain, fall_ms: GRAIN_TERMINAL_MS, ..AIR }
 }
 /// A solid.
 const fn solid(density: f32, strength: f32, toughness: f32, holds_atm: Option<f32>, rubble: Option<Mat>, restitution: f32) -> MatSpec {
-    MatSpec { density, strength, toughness, holds_atm, rubble, restitution, porous: false }
+    MatSpec { density, strength, toughness, holds_atm, rubble, restitution, porous: false, motion: Motion::Fixed, fall_ms: 0.0 }
 }
 
 fn record(m: Mat) -> MatSpec {
     use Mat::*;
     match m {
-        Empty | Fire | Steam | Cloud | Smoke => AIR,
-        Water => liquid(1000.0),
+        Empty => AIR,
+        Steam | Smoke => gas(Motion::Gas),
+        Cloud => gas(Motion::Cloud),
+        Fire => gas(Motion::Flame),
+        // A raindrop falls at the speed of a grain.
+        Water => MatSpec { fall_ms: DROP_TERMINAL_MS, ..liquid(1000.0) },
         Oil => liquid(800.0),
         Lava => liquid(3000.0),
         Molten | MoltenSteel => liquid(6500.0),
         Sand | Mud => loose(1600.0, true),
-        Snow | DeadLeaf | Seed => loose(300.0, true),
+        // Snowflakes catch the air and fall gently.
+        Snow => MatSpec { fall_ms: SNOW_TERMINAL_MS, ..loose(300.0, true) },
+        DeadLeaf | Seed => loose(300.0, true),
         Hail => loose(920.0, true),
         Shard => loose(2500.0, true),
         Rust | Gunpowder => loose(1500.0, true),
@@ -91,8 +134,8 @@ fn record(m: Mat) -> MatSpec {
         Ash => loose(500.0, false),
         Charcoal => loose(300.0, false),
         // Soils: their cohesion is what they hold (and gas seeps through them anyway).
-        Dirt => MatSpec { strength: 0.05, holds_atm: Some(0.45), ..loose(1600.0, true) },
-        Grass => MatSpec { strength: 0.08, holds_atm: Some(0.75), ..loose(300.0, true) },
+        Dirt => MatSpec { strength: 0.05, holds_atm: Some(0.45), motion: Motion::Clod, ..loose(1600.0, true) },
+        Grass => MatSpec { strength: 0.08, holds_atm: Some(0.75), motion: Motion::Turf, ..loose(300.0, true) },
         Clay => solid(1800.0, 0.15, 5.0, Some(1.4), Some(Dirt), 0.05),
         Stone => solid(2700.0, 10.0, 50.0, Some(5.0), Some(Sand), 0.3),
         Brick => solid(1200.0, 3.0, 30.0, Some(2.0), Some(Sand), 0.3),
@@ -111,7 +154,8 @@ fn record(m: Mat) -> MatSpec {
         Leaf | Sapling => solid(300.0, 0.1, 500.0, None, None, 0.05),
         // (A coal of burning wood weighs as a cell of water, as it always has here.)
         Ember => solid(1000.0, 0.5, 100.0, None, None, 0.3),
-        Dynamite => solid(1400.0, 1.0, 300.0, None, None, 0.3),
+        // A stick of dynamite lying loose falls and rolls off a heap as a grain does.
+        Dynamite => MatSpec { motion: Motion::Grain, fall_ms: GRAIN_TERMINAL_MS, ..solid(1400.0, 1.0, 300.0, None, None, 0.3) },
     }
 }
 
