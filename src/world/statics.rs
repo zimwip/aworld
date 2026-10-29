@@ -347,7 +347,16 @@ impl World {
         // quarters of a cell in the fingerprints so that a body is worked out again when it changes.
         let push: Vec<(f32, f32)> = order.par_iter().map(|&i| self.liquid_push(i)).collect();
         let quarters = |k: usize| push.get(k).map_or(0, |&(fx, fy)| (((fx * 4.0).round() as i32 as u64) << 20) ^ ((fy * 4.0).round() as i32 as u64 & 0xf_ffff));
-        let key = order.iter().enumerate().fold(order.len() as u64, |h, (k, &i)| (h ^ ((i as u64) << 8 | self.cells[i].m as u64) ^ quarters(k).rotate_left(29)).wrapping_mul(0x100_0000_01b3));
+        // (Folded by pieces of `order` on every core, then the pieces in order: the ground alone
+        // is a few hundred thousand cells.)
+        const PIECE: usize = 8192;
+        let key = order
+            .par_chunks(PIECE)
+            .enumerate()
+            .map(|(c, piece)| piece.iter().enumerate().fold(c as u64, |h, (k, &i)| (h ^ ((i as u64) << 8 | self.cells[i].m as u64) ^ quarters(c * PIECE + k).rotate_left(29)).wrapping_mul(0x100_0000_01b3)))
+            .collect::<Vec<u64>>()
+            .into_iter()
+            .fold(order.len() as u64, |h, piece| (h ^ piece).wrapping_mul(0x100_0000_01b3));
         if key == self.strain_key {
             return;
         }
@@ -396,22 +405,33 @@ impl World {
             count += 1;
         }
         // Each body's places, rising, a fingerprint of its cells, and where each place comes in
-        // its body's list.
-        let mut bodies: Vec<Vec<u32>> = vec![vec![]; count as usize];
-        let mut keys: Vec<u64> = vec![0; count as usize];
-        // (And a fingerprint of the shape alone: the plan of the body, see `StressPlan`.)
-        let mut shapes: Vec<u64> = vec![0; count as usize];
+        // its body's list. (The places sorted by body in one list, each body a slice of it.)
+        let mut start = vec![0usize; count as usize + 1];
+        for &b in &body_of {
+            start[b as usize + 1] += 1;
+        }
+        for b in 0..count as usize {
+            start[b + 1] += start[b];
+        }
+        let mut places = vec![0u32; n];
+        let mut next = start.clone();
         for (k, &b) in body_of.iter().enumerate() {
-            let i = order[k];
-            let cell = (i as u64) << 8 | self.cells[i].m as u64;
-            keys[b as usize] = (keys[b as usize] ^ cell ^ quarters(k).rotate_left(29)).wrapping_mul(0x100_0000_01b3);
-            shapes[b as usize] = (shapes[b as usize] ^ cell).wrapping_mul(0x100_0000_01b3);
-            bodies[b as usize].push(k as u32);
+            places[next[b as usize]] = k as u32;
+            next[b as usize] += 1;
         }
-        for ((key, shape), b) in keys.iter_mut().zip(shapes.iter_mut()).zip(&bodies) {
-            *key ^= b.len() as u64;
-            *shape ^= b.len() as u64;
-        }
+        let bodies: Vec<&[u32]> = start.windows(2).map(|s| &places[s[0]..s[1]]).collect();
+        // (And a fingerprint of the shape alone: the plan of the body, see `StressPlan`.)
+        let (keys, shapes): (Vec<u64>, Vec<u64>) = bodies
+            .par_iter()
+            .map(|members| {
+                let (key, shape) = members.iter().fold((0u64, 0u64), |(key, shape), &k| {
+                    let i = order[k as usize];
+                    let cell = (i as u64) << 8 | self.cells[i].m as u64;
+                    ((key ^ cell ^ quarters(k as usize).rotate_left(29)).wrapping_mul(0x100_0000_01b3), (shape ^ cell).wrapping_mul(0x100_0000_01b3))
+                });
+                (key ^ members.len() as u64, shape ^ members.len() as u64)
+            })
+            .unzip();
         // (Only the bodies that have to be worked out again.)
         let mut local = std::mem::take(&mut self.stress_local);
         local.resize(n, 0);
@@ -479,7 +499,7 @@ impl World {
             // the body would hide.
             if !push.is_empty() {
                 let mut wet: Vec<(bool, usize, usize, f32)> = vec![];
-                for &k in members {
+                for &k in members.iter() {
                     let (px, py) = push[k as usize];
                     let i = order[k as usize];
                     let (x, y) = xy(i);

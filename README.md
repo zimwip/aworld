@@ -182,7 +182,7 @@ sur la carte), `AWORLD_GPU_MIN` (inconnues qu'il faut pour aller sur la carte), 
 multigrille fait en un seul lancement), `AWORLD_CELLS_PAR=0` (le tour des cellules sur un seul cœur),
 `AWORLD_PROFILE` (le temps de chaque partie d'un pas, au journal ; `0` l'éteint), `AWORLD_DEBUG_MASS` (les liquides
 vérifient qu'ils ne gagnent ni ne perdent rien), `AWORLD_DEBUG_CARD` (ce que fait la carte, et ses passes chronométrées).
-Les bancs et sondes des tests : `AWORLD_BENCH_STEPS`, `AWORLD_BENCH_SCENE`, `AWORLD_BENCH_DT`, `AWORLD_BENCH_SERIES`,
+Les bancs et sondes des tests : `AWORLD_BENCH_STEPS`, `AWORLD_BENCH_SCENE`, `AWORLD_BENCH_DT`, `AWORLD_BENCH_TIER`, `AWORLD_BENCH_SERIES`,
 `AWORLD_BENCH_GRID`, `AWORLD_FLAME_DIR`, `AWORLD_SEEDS`, `AWORLD_PROBE_DT`, `AWORLD_PROBE_STEPS`, `AWORLD_FLOOD_DIR`,
 `AWORLD_TEST_GRID`, `AWORLD_SNAP`. Quelques sondes de laboratoire gardent leurs propres boutons (`WIND`, `PHASE`, `DAYS`…).
 

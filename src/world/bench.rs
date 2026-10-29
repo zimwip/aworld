@@ -6,7 +6,7 @@
 //! ```
 //!
 //! `AWORLD_BENCH_STEPS` sets how many steps each scene is measured over (300 by default),
-//! `AWORLD_BENCH_SCENE` runs only the scene of that name, `AWORLD_BENCH_SERIES=1` also prints
+//! `AWORLD_BENCH_SCENE` runs only the scene of that name, `AWORLD_BENCH_TIER` simplifies the liquids (see `World::liq_tier`), `AWORLD_BENCH_SERIES=1` also prints
 //! the time of the first 96 measured steps one by one (to see the steps that stick out).
 
 use super::*;
@@ -27,6 +27,16 @@ fn countryside() -> World {
 /// The world the game opens on, left to run: grass, trees, sky, weather.
 fn demo() -> World {
     countryside()
+}
+
+/// The game's demo (`--demo`): a little lava poured on the fields far from a pool of water on the
+/// same rows, so that the liquids' spans run from one to the other.
+fn lava() -> World {
+    let mut w = countryside();
+    let (gl, gw) = (ground(&w, 650), ground(&w, 300));
+    w.paint(650, gl - 30, 6, Mat::Lava);
+    w.paint(300, gw - 60, 8, Mat::Water);
+    w
 }
 
 /// Six charges of powder and dynamite going off under the fields at once.
@@ -293,6 +303,7 @@ pub(super) fn scenes() -> Vec<(&'static str, fn() -> World, Option<fn(&mut World
         })),
         ("incendie", fire, None),
         ("nuage", cloud, None),
+        ("lave", lava, None),
     ]
 }
 
@@ -301,6 +312,8 @@ pub(super) fn scenes() -> Vec<(&'static str, fn() -> World, Option<fn(&mut World
 fn bench_scenes() {
     let steps: u32 = crate::config::bench().steps.unwrap_or(300);
     let only = crate::config::bench().scene.clone();
+    // The liquids' tier (`World::liq_tier`: AWORLD_BENCH_TIER=1 the cheap one, 2 the drops).
+    let tier: u8 = crate::config::bench().tier.unwrap_or(0);
     // The length of a step, in ticks of 1/60 s (AWORLD_BENCH_DT=2: steps of 1/30 s).
     let ticks: f32 = crate::config::bench().ticks.unwrap_or(1.0);
     let dt = ticks * super::STEP;
@@ -310,6 +323,7 @@ fn bench_scenes() {
             continue;
         }
         let mut w = make();
+        w.liq_tier = tier;
         // A short warm-up so that the first explosions and flows get going.
         for i in 0..30 {
             if let Some(f) = each {
@@ -320,6 +334,7 @@ fn bench_scenes() {
         w.prof.on = true;
         w.prof.reset();
         let mut worst = 0f64;
+        let mut work = 0u64;
         let mut series = String::new();
         let t = Instant::now();
         for i in 0..steps {
@@ -328,6 +343,7 @@ fn bench_scenes() {
             }
             let s = Instant::now();
             w.step_dt(dt);
+            work += w.liq_work;
             let ms = s.elapsed().as_secs_f64() * 1000.0;
             worst = worst.max(ms);
             if i < 96 {
@@ -341,6 +357,7 @@ fn bench_scenes() {
             "\n=== {name}: {ms:.2} ms/pas en moyenne, pire pas {worst:.1} ms, {awake}/{} zones éveillées à la fin",
             w.zones.awake.len()
         );
+        eprintln!("travail des liquides : {:.2} grille par pas (cases de leurs bandes, sous-pas compris)", work as f64 / steps as f64 / (W() * H()) as f64);
         if crate::config::bench().series {
             eprintln!("{series}");
         }
@@ -737,5 +754,35 @@ fn grids_probe() {
         }
         let (vx, _) = w.flow.sample(W() as i32 / 2, c(8.0));
         println!("  vent à pleine force, à 8 m de haut : {:.2} m/s", vx * cell_m() / STEP);
+    }
+}
+
+/// What one pass of the structures costs on its own, on the flood after a second (the pass
+/// that comes back every 0.15 s and makes the step it falls on stick out):
+///
+/// ```text
+/// cargo test --release --bin aworld structures_probe -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn structures_probe() {
+    for (name, make) in [("démo", demo as fn() -> World), ("déluge", deluge)] {
+        let mut w = make();
+        for _ in 0..60 {
+            w.step();
+        }
+        let mut times: Vec<f64> = (0..40)
+            .map(|k| {
+                // Every other pass with the liquids' push moved a little, as in a flood.
+                if k % 2 == 0 {
+                    w.step();
+                }
+                let t = Instant::now();
+                w.structure_pass();
+                t.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        times.sort_by(f64::total_cmp);
+        eprintln!("{name}: passe des structures {:.2} ms (médiane), {:.2} ms (la moins chère)", times[times.len() / 2], times[0]);
     }
 }

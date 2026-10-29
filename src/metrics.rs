@@ -248,11 +248,12 @@ impl Metrics {
         y += 18.0;
         ui.text(
             &format!(
-                "zones {s}×{s} éveillées {}/{} ({:.0} %) · simplification {}/3 · x{}",
+                "zones {s}×{s} éveillées {}/{} ({:.0} %) · simplification {}/3 · liquides {}/2 · x{}",
                 info.awake,
                 info.zones,
                 100.0 * info.awake as f32 / info.zones.max(1) as f32,
                 info.lod,
+                info.liq_tier,
                 info.speed,
                 s = crate::world::sleep::CS
             ),
@@ -389,6 +390,7 @@ pub struct Info {
     pub awake: usize,
     pub zones: usize,
     pub lod: u8,
+    pub liq_tier: u8,
     pub speed: usize,
     pub blocks: usize,
     pub members: usize,

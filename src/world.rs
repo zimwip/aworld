@@ -835,6 +835,14 @@ pub struct World {
     /// 1 = the wind carries air heat in 2 x 2 blocks, 2 = the heat pass runs half as often (with
     /// doubled rates), 3 = same, and calm air next to air no longer conducts heat (it only relaxes).
     pub lod: u8,
+    /// How much the liquids are simplified to keep the game smooth (see `liquid.rs`): 0 = the
+    /// exact physics, 1 = fewer sub-steps and solver iterations (`CHEAP`), 2 = that, and the
+    /// liquid that flies or falls freely goes over to drops (`fall_to_drops`).
+    pub liq_tier: u8,
+    /// The liquids' work in the last step: cells of their spans, summed over the sub-steps (what
+    /// their turn costs, the same on every machine: the game reads it to tell whether the liquids
+    /// are what makes it slow).
+    pub liq_work: u64,
     /// Whether the cells take their turn on every core: faster, but not the same turn (see
     /// `turn.rs`). Off unless `AWORLD_CELLS_PAR=1`.
     pub parallel_cells: bool,
@@ -971,6 +979,8 @@ impl World {
             dpd: vec![0.0; flow::FW() * flow::FH()],
             pressure_forces: true,
             lod: 0,
+            liq_tier: 0,
+            liq_work: 0,
             parallel_cells: turn::parallel_by_default(),
             liq: liquid::Liquids::default(),
             fill: vec![0; W() * H()],
@@ -1053,7 +1063,7 @@ impl World {
             stress_pos: _, stress_local: _, ticks, log, paint_log, temp, clock, dt, tick_time, heat_stage, day_cycle, thermal_flip, heat_carry, temp_old: _, heat_took: _,
             climate_fixed, climate, revision, wind, wind_max, wind_changes, windiness, wind_clock, biome, leaf_rgb, autumn, grass_rgb,
             structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, dp,
-            dp_slow, dpd, pressure_forces, lod, parallel_cells, liq, fill, pocket_of,
+            dp_slow, dpd, pressure_forces, lod, liq_tier, liq_work, parallel_cells, liq, fill, pocket_of,
             pockets, latent, vel, fall_at, moisture, fuel, growth, jet, liq_p, cls: _, liq_w: _, zones, bursts, charge, mcharge, magnet, polar,
             bolts, storm_rng, pressure_cache: _, prof: _, air_rows, air_sky, later: _, dried, gone,
         } = from;
@@ -1107,6 +1117,8 @@ impl World {
         self.dpd.clone_from(dpd);
         self.pressure_forces = *pressure_forces;
         self.lod = *lod;
+        self.liq_tier = *liq_tier;
+        self.liq_work = *liq_work;
         self.parallel_cells = *parallel_cells;
         self.liq.copy_picture(liq);
         self.fill.clone_from(fill);
@@ -3764,7 +3776,7 @@ impl World {
     /// anchored when it touches something fixed: the base of the world, a tunnel's vault, or the
     /// ground its roots grow in. Anchored bodies are then checked for overloaded sections (see
     /// `stress_pass`); free bodies either fall, tip over their edge (see `tip_pass`) or rest.
-    fn structure_pass(&mut self) {
+    pub(super) fn structure_pass(&mut self) {
         let mut seen = std::mem::take(&mut self.seen);
         let mut stack = std::mem::take(&mut self.stack);
         let mut level = std::mem::take(&mut self.level);

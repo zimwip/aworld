@@ -1634,6 +1634,12 @@ impl Game {
     /// On the desktop it runs in the simulation thread (see `simthread.rs`): it must not touch
     /// what only the screen owns (the camera, the menus); its messages and sounds go to the screen
     /// with the next picture.
+    /// Whether the liquids are the bulk of the world's work: their spans, over the sub-steps of
+    /// a step, cover more than a fifth of the grid (a pond is a few hundredths, a flood one or two).
+    fn liquids_heavy(&self) -> bool {
+        self.world.liq_work * 5 > (W() * H()) as u64
+    }
+
     fn update_world(&mut self, dt: f32, pace: f32) -> Option<(usize, f32)> {
         let around = self.metrics.start();
         self.time += dt;
@@ -1655,7 +1661,17 @@ impl Game {
             self.slow_frames = 0;
             self.frame_ema = 0.016;
             self.fast_frames = 0;
-            if self.world.lod < 3 {
+            if self.liquids_heavy() && self.world.liq_tier < 2 {
+                // The liquids are what costs (the scenes of a flood are four to six times over
+                // the budget, see docs/PERFORMANCE.md): they are simplified first.
+                self.world.liq_tier += 1;
+                self.lod_lock = 300.0;
+                self.say(match self.world.liq_tier {
+                    1 => "Simplification des liquides 1/2 : moins de sous-pas et d'itérations",
+                    _ => "Simplification des liquides 2/2 : l'eau qui tombe ou qui vole part en gouttes",
+                }
+                .to_string());
+            } else if self.world.lod < 3 {
                 self.world.lod += 1;
                 // A simplification that has to come back straight away: do not try to undo it for a while.
                 self.lod_lock = 300.0;
@@ -1671,13 +1687,22 @@ impl Game {
             }
         }
         // Long smooth stretches bring the exact simulation back, one level at a time.
-        if self.running && self.world.lod > 0 && self.frame_ema < 0.011 && self.lod_lock <= 0.0 {
+        // (The heat first, then the liquids: their exact physics is what costs most to bring back.)
+        if self.running && (self.world.lod > 0 || self.world.liq_tier > 0) && self.frame_ema < 0.011 && self.lod_lock <= 0.0 {
             self.fast_frames += 1;
             if self.fast_frames > 900 {
                 self.fast_frames = 0;
-                self.world.lod -= 1;
                 self.frame_ema = 0.016;
-                self.say(if self.world.lod == 0 { "Simulation exacte rétablie".to_string() } else { format!("Simplification allégée : niveau {}/3", self.world.lod) });
+                if self.world.lod > 0 {
+                    self.world.lod -= 1;
+                } else {
+                    self.world.liq_tier -= 1;
+                }
+                self.say(match (self.world.lod, self.world.liq_tier) {
+                    (0, 0) => "Simulation exacte rétablie".to_string(),
+                    (0, t) => format!("Liquides : simplification allégée, niveau {t}/2"),
+                    (l, _) => format!("Simplification allégée : niveau {l}/3"),
+                });
             }
         } else {
             self.fast_frames = 0;
@@ -1785,6 +1810,7 @@ impl Game {
             awake: self.world.zones.awake_count(),
             zones: world::sleep::CW() * world::sleep::CH(),
             lod: self.world.lod,
+            liq_tier: self.world.liq_tier,
             speed: self.speed,
             blocks: self.blocks.len(),
             members: self.members.len(),

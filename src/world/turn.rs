@@ -374,6 +374,8 @@ impl World {
                 dpd: share(&self.dpd),
                 pressure_forces: self.pressure_forces,
                 lod: self.lod,
+                liq_tier: self.liq_tier,
+                liq_work: 0,
                 parallel_cells: true,
                 // (The drops the cells make in the turn, the rain sweeping a cloud, `absorb` takes.)
                 liq: Default::default(),

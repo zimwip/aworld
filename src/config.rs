@@ -70,6 +70,9 @@ pub struct Bench {
     pub steps: Option<u32>,
     /// `AWORLD_BENCH_SCENE`: the one scene to run.
     pub scene: Option<String>,
+    /// `AWORLD_BENCH_TIER`: the liquids' tier of the scenes (`World::liq_tier`; 1 the cheap one, 2
+    /// the drops).
+    pub tier: Option<u8>,
     /// `AWORLD_BENCH_DT`: the length of a step, in ticks of 1/60 s.
     pub ticks: Option<f32>,
     /// `AWORLD_BENCH_SERIES`: print the time of the first steps one by one.
@@ -98,6 +101,7 @@ pub fn bench() -> &'static Bench {
     B.get_or_init(|| Bench {
         steps: number("AWORLD_BENCH_STEPS"),
         scene: var("AWORLD_BENCH_SCENE"),
+        tier: number("AWORLD_BENCH_TIER"),
         ticks: number("AWORLD_BENCH_DT"),
         series: var("AWORLD_BENCH_SERIES").is_some(),
         grid: var("AWORLD_BENCH_GRID"),

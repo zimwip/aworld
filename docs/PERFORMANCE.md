@@ -1,0 +1,67 @@
+# Performance audit: i7-8550U + UHD 620
+
+Measured on 2026-10-29 with the built-in bench (`cargo test --release --bin aworld bench_scenes -- --ignored --nocapture`)
+and a `--demo` run with `AWORLD_PROFILE=1`. Machine: Intel i7-8550U (4 cores / 8 threads), Intel UHD 620 iGPU.
+Budget: 16.7 ms per step at 60 fps.
+
+## Results
+
+| Scene | ms/step | worst step | Liquids' share |
+|---|---|---|---|
+| démo | 8 | 22 | 7 % |
+| incendie | 10 | 33 | 7 % |
+| orage | 30 | 70 | 52 % |
+| nuage | 60 | 132 | 71 % |
+| liquides | 61 | 99 | 78 % |
+| déluge | 109 | 145 | 85 % |
+
+## Findings
+
+1. **Liquid physics is the bottleneck.** Any scene with liquid in motion is 4–6× over budget. Heat, air, cells and
+   structures stay small (a `structures` spike of 10–20 ms every 30 steps aside).
+2. **Cost is spread over `forces`, `transport`, `pression`, `itérations`.** In *liquides*, forces + transport are about
+   50 % and the pressure solver about 20 %. Forces and transport run once per sub-step, and the scene takes 3.5–4
+   sub-steps per step (cap `MAX_SUB` = 4), so the cost is nearly proportional to the sub-step count.
+3. **More threads do not help.** Liquid time: 142 ms on 1 thread, 59 ms on 4, 50 ms on 8.
+4. **The iGPU does not help.** `AWORLD_GPU=auto`: card kernels take 44 ms per step plus about 8 ms of transfers, the same
+   as the CPU. Keeping the GPU off by default is right for this machine.
+5. **The `lod` simplification levels (1–3) never touch liquids** (`main.rs` `update_world`; they only change heat in
+   `thermal.rs`). In liquid-heavy scenes the only relief is lowering the game speed.
+6. **Viscosity is 23 % of the step in `--demo`** (10 ms, 2.4 ms per pass), probably lava. `VISCOUS_SWEEPS` = 12.
+
+## Proposal
+
+1. **Load-driven liquid fallback**, using the existing frame-time measure (`frame_ema`) with a state per zone:
+   - *Exact*: current MAC + multigrid-PCG solver.
+   - *Cheap*: fewer sub-steps (`MAX_SUB` 4 → 2) and fewer solver iterations (`MAX_ITER` 12 → 4). Same physics, less accurate.
+   - *Particles*: zones that are mostly spray, falling or fast liquid switch to the existing `Drop` system
+     (`liquid.rs`, `fly_drops`). Rules mimicking the liquid: gravity, sliding on slopes, spreading when blocked,
+     level piling, mass conserved. Calm bodies keep the solver or sleep.
+2. **Quick wins** (no behaviour change): lower or space out viscosity sweeps; spread the `structures` spike over steps;
+   skip `forces` on unchanged edges.
+
+Suggested order: cheap tier + viscosity + `structures` first (measurable with the bench), particle fallback after.
+
+## What was done (October 29)
+
+Measured on the cloud machine of the work (4 cores), `AWORLD_BENCH_TIER` setting the liquids' tier:
+
+| Scene | exact | cheap (tier 1) | drops (tier 2) |
+|---|---|---|---|
+| liquides | 75 ms | 50 ms | 43 ms |
+| déluge | 116 ms | 70 ms | 76 ms |
+| nuage | 59 ms | 49 ms | 40 ms |
+| orage | 30 ms | 25 ms | 21 ms |
+
+- **Quick wins** (the world comes out the same, `bench_fingerprint`): the viscosity sweeps only run over the thick
+  edges, on one core when there are few (scene `lave`, the game's demo: 3.4 → 0.9 ms a pass); the structures'
+  fingerprints and grouping on every core (−15 to −25 %, `structures_probe`); an edge at rest carries itself in
+  `forces`. The structures pass is lighter but not spread over steps: cut between two ticks it would read a stale
+  world.
+- **Load-driven liquid tiers** (`World::liq_tier`): when the game stays slow and the liquids are the bulk of the work
+  (`World::liq_work`, their spans over the sub-steps, above a fifth of the grid), the liquids are simplified before
+  the heat. Tier 1: `CHEAP_SUB` = 2 sub-steps a turn, `CHEAP_ITER` = 4 solver iterations. Tier 2: also, in each zone
+  where most of the running liquid is free (air under it, falling with air at the end of the liquid under it, or
+  spray thrown fast), the free cells go over to drops (`fall_to_drops`), which fly and land on their own; the solver
+  keeps the bodies at rest. Mass is conserved (tests). The smooth game brings the heat back first, then the liquids.
+  On the flood, tier 2 is no cheaper than tier 1: the landing drops wake the pool they fall in.
