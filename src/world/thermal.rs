@@ -141,6 +141,36 @@ const RADIATE_K: f32 = 0.01;
 const SAMPLE_STEPS: f32 = DAY_STEPS as f32 / 96.0;
 const SAMPLES: usize = 96;
 
+/// Where the heat pass is in its cycle (it is spread over several steps), and what it keeps
+/// from one part to the next.
+#[derive(Default)]
+pub struct HeatPass {
+    /// The heat passes since the world began: which part of the cycle comes next.
+    pub(super) stage: u32,
+    /// Which way the heat flows this pass (across or up and down).
+    pub(super) flip: bool,
+    /// What part 2 hands part 3 (heat the open air took from the sky, heat the flames gave off).
+    pub(super) carry: (f32, f32),
+    /// Scratch of the wind carrying the air's warmth: the temperatures as they were.
+    pub(super) old: Vec<f32>,
+    /// The heat the air took from the sky in the last pass, per cell (see `heat_air_and_reactions`).
+    pub(super) took: Vec<f32>,
+}
+
+impl HeatPass {
+    /// Makes this a picture of `from` (see `World::copy_picture`): not the scratch.
+    pub fn copy_picture(&mut self, from: &HeatPass) {
+        self.stage = from.stage;
+        self.flip = from.flip;
+        self.carry = from.carry;
+    }
+
+    /// A strip's view: where the cycle is, without the scratch.
+    pub(super) fn view(&self) -> Self {
+        HeatPass { stage: self.stage, flip: self.flip, ..Default::default() }
+    }
+}
+
 /// The energy budget of the world (see the top of this file).
 #[derive(Clone)]
 pub struct Climate {
@@ -819,8 +849,8 @@ impl World {
         // covers twice the time, so every rate is doubled to keep the same speed of change.
         let scale = self.thermal_scale();
         let ts = TS * scale;
-        self.thermal_flip = !self.thermal_flip;
-        let horizontal = self.thermal_flip;
+        self.heat.flip = !self.heat.flip;
+        let horizontal = self.heat.flip;
 
         // 1. Conduction between neighbours (alternating direction). Each row (each column) is
         //    one sweep that no other row (column) reads, so they run side by side.
@@ -885,7 +915,7 @@ impl World {
         let clock = self.prof.start();
         let (sun, gx, gy, row_amb, _surf, fixed) = self.heat_frame();
         let shut = self.shut_in_means();
-        let mut took = std::mem::take(&mut self.heat_took);
+        let mut took = std::mem::take(&mut self.heat.took);
         took.resize(W() * H(), 0.0);
         // 2a. The air relaxes, on every core.
         let (cells, pocket_of, latent) = (&self.cells, &self.pocket_of, &self.latent);
@@ -964,17 +994,17 @@ impl World {
                 }
             }
         }
-        self.heat_took = took;
+        self.heat.took = took;
 
         self.prof.stop(super::prof::HEAT_AIR, clock);
         // (For part 3, which closes the energy budget of the pass.)
-        self.heat_carry = (to_cells, flames);
+        self.heat.carry = (to_cells, flames);
     }
 
     /// Part 4 of the heat pass, every other pass: the wind carries the air's warmth, with twice
     /// the reach (the wind is slow next to the thermal clock).
     fn heat_wind(&mut self) {
-        if self.thermal_flip {
+        if self.heat.flip {
             let clock = self.prof.start();
             self.carry_air_heat();
             self.prof.stop(super::prof::HEAT_WIND, clock);
@@ -988,7 +1018,7 @@ impl World {
         let ts = TS * scale;
         let (t05, t04) = (self.relax_ts(0.05, ts), self.relax_ts(0.04, ts));
         let tb = tables();
-        let (to_cells, flames) = std::mem::take(&mut self.heat_carry);
+        let (to_cells, flames) = std::mem::take(&mut self.heat.carry);
         let (sun, gx, _gy, row_amb, surf, fixed) = self.heat_frame();
         let clock = self.prof.start();
         // 3. Day and night, the first surface each column shows the sky radiates its excess
@@ -1247,7 +1277,7 @@ impl World {
     fn carry_air_heat(&mut self) {
         // (The temperatures as they were: a buffer kept from one pass to the next, so that the
         // pass does not allocate and fault in 2 MB every time.)
-        let mut old = std::mem::take(&mut self.temp_old);
+        let mut old = std::mem::take(&mut self.heat.old);
         old.clear();
         old.extend_from_slice(&self.temp);
         let reach = 2.0 * THERMAL_EVERY as f32 * self.thermal_scale();
@@ -1354,7 +1384,7 @@ impl World {
                 }
             }
         }
-        self.temp_old = old;
+        self.heat.old = old;
     }
 
     /// The air that reaches cell `i` (at `x`, `y`) from `(ox, oy)` upwind, averaged along the way.

@@ -350,9 +350,8 @@ impl World {
                 clock: self.clock,
                 dt: self.dt,
                 tick_time: self.tick_time,
-                heat_stage: self.heat_stage,
+                heat: self.heat.view(),
                 day_cycle: self.day_cycle,
-                thermal_flip: self.thermal_flip,
                 climate_fixed: self.climate_fixed,
                 climate: self.climate.view(),
                 revision: self.revision,
@@ -409,9 +408,6 @@ impl World {
                 prof: prof::Profile::default(),
                 air_rows: share(&self.air_rows),
                 air_sky: self.air_sky,
-                heat_carry: (0.0, 0.0),
-                temp_old: Vec::new(),
-                heat_took: Vec::new(),
                 later: Some(Vec::new()),
             }
         }

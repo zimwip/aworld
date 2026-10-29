@@ -741,18 +741,11 @@ pub struct World {
     pub dt: f32,
     /// The time the world has gone through that the cells have not ticked yet, in seconds.
     tick_time: f32,
-    /// The heat passes since the world began: which part of its cycle comes next.
-    heat_stage: u32,
+    /// Where the heat pass is in its cycle, and what it keeps from one part to the next (see
+    /// `thermal.rs`).
+    heat: thermal::HeatPass,
     /// When false the sun stands still.
     pub day_cycle: bool,
-    thermal_flip: bool,
-    /// What part 2 of the heat pass hands part 3 (heat the open air took from the sky, heat the
-    /// flames gave off), when the pass is spread over the steps of its cycle.
-    heat_carry: (f32, f32),
-    /// Scratch of the wind carrying the air's warmth: the temperatures as they were.
-    temp_old: Vec<f32>,
-    /// The heat the air took from the sky in the last heat pass, per cell (see `heat_air_and_reactions`).
-    heat_took: Vec<f32>,
     /// Tests (and calm sandboxes) can pin the air temperature everywhere.
     pub climate_fixed: Option<f32>,
     /// The energy budget of the world: the sun in, the sky out to space (see `thermal.rs`).
@@ -897,12 +890,8 @@ impl World {
             clock: DAY_STEPS / 5,
             dt: STEP,
             tick_time: 0.0,
-            heat_stage: 0,
+            heat: Default::default(),
             day_cycle: true,
-            thermal_flip: false,
-            heat_carry: (0.0, 0.0),
-            temp_old: Vec::new(),
-            heat_took: Vec::new(),
             climate_fixed: None,
             climate: thermal::Climate::default(),
             revision: 1,
@@ -1007,7 +996,7 @@ impl World {
     pub fn copy_picture(&mut self, from: &World) {
         let World {
             cells, frame, rng, seen: _, ground: _, stack: _, structures,
-            ticks, log, paint_log, temp, clock, dt, tick_time, heat_stage, day_cycle, thermal_flip, heat_carry, temp_old: _, heat_took: _,
+            ticks, log, paint_log, temp, clock, dt, tick_time, heat, day_cycle,
             climate_fixed, climate, revision, wind, wind_max, wind_changes, windiness, wind_clock, biome, leaf_rgb, autumn, grass_rgb,
             structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, dp,
             dp_slow, dpd, pressure_forces, lod, liq_tier, liq_work, parallel_cells, liq, fill, pocket_of,
@@ -1027,10 +1016,8 @@ impl World {
         self.clock = *clock;
         self.dt = *dt;
         self.tick_time = *tick_time;
-        self.heat_stage = *heat_stage;
+        self.heat.copy_picture(heat);
         self.day_cycle = *day_cycle;
-        self.thermal_flip = *thermal_flip;
-        self.heat_carry = *heat_carry;
         self.climate_fixed = *climate_fixed;
         self.climate.clone_from(climate);
         self.revision = *revision;
@@ -1941,9 +1928,9 @@ impl World {
 
     /// The next part of the heat pass, over the step's `dt` (see `thermal_stage`).
     fn heat_turn(&mut self) {
-        self.heat_stage = self.heat_stage.wrapping_add(1);
+        self.heat.stage = self.heat.stage.wrapping_add(1);
         let cycle = thermal::THERMAL_EVERY * self.thermal_lod_scale() as u32;
-        timed!(self, 12, self.thermal_stage(self.heat_stage % cycle));
+        timed!(self, 12, self.thermal_stage(self.heat.stage % cycle));
     }
 
     /// The turn of the cell at (x, y), in zone `zone` (see `turn.rs` for the order).
