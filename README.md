@@ -295,7 +295,9 @@ Touche **V** pour voir les flèches.
   tours puis le moteur cale ou repart — ou par un rail), **pompes** (poussent du 1er bout vers le 2e, clic pour inverser
   ou arrêter ; menées par un engrenage, la poussée suit la vitesse et freine le moteur). Chaque bout libre est ouvert :
   il aspire le liquide où il plonge ou le rejette. Le liquide suit la charge hydraulique : vases communicants, **siphon**
-  (limité par la hauteur que l'air peut soutenir, ce que la pompe dépasse), **écluse** (deux bassins et une vanne).
+  (limité par la hauteur que l'air peut soutenir, une dizaine de mètres d'eau quelle que soit la grille, ce que la pompe
+  dépasse), **écluse** (deux bassins et une vanne). La pression du gaz sur l'eau compte dans la charge : une chaudière
+  ou un réservoir fermé sous pression pousse son eau dans un tuyau plus haut que sa surface.
 - **Vue Pression** (touche P) : pression de l'air (plus mince en altitude, courants), poids des colonnes de liquide,
   poids au-dessus des solides, frontières gaz / liquide / solide ; les tuyaux sont colorés par leur pression.
 - **Argile / terre cuite** : l'argile cuit vers 550 °C. Un feu de bois sous un creuset de terre cuite (braises couvertes :
