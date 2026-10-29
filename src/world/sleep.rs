@@ -189,7 +189,12 @@ impl World {
                 // lighter than the liquid above it rises.
                 let rolls = Self::grain_pick(x, y) < self.repose(x, y, c.m).1
                     && ((sinks_into(self.at(x - 1, y)) && sinks_into(self.at(x - 2, y + 1))) || (sinks_into(self.at(x + 1, y)) && sinks_into(self.at(x + 2, y + 1))));
-                let floats = self.at(x, y - 1).kind() == Kind::Liquid && density(self.at(x, y - 1)) > density(c.m);
+                let lifts = |nx: i32, ny: i32| self.at(nx, ny).kind() == Kind::Liquid && density(self.at(nx, ny)) > density(c.m);
+                let floats = lifts(x, y - 1)
+                    // Held down under the surface, it rises aslant; on the side of a heap that
+                    // floats, it runs out onto the surface (see `World::float_on`).
+                    || ((lifts(x - 1, y - 1) || lifts(x + 1, y - 1) || !free(self.at(x, y - 1))) && (lifts(x - 1, y) || lifts(x + 1, y) || lifts(x, y + 1)))
+                    || (!lifts(x, y + 1) && [-1, 1].iter().any(|&d| lifts(x + d, y + 1) && free(self.at(x + d, y))));
                 // Deep snow creeps sideways onto free ground (see `World::snow_creeps`).
                 let creeps = c.m == Mat::Snow && self.snow_creep_target(x, y).is_some();
                 let can_fall = can_fall || rolls || floats || creeps;

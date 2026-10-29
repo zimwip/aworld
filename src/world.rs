@@ -312,13 +312,10 @@ impl Mat {
         matches!(self, Mat::Trunk | Mat::Leaf | Mat::Branch | Mat::Sapling)
     }
 
-    /// Thin matter of a 2-D world, a "one-way platform": a tree stands in a plane of its own, so
-    /// what moves sideways goes past it (in front of it or behind), but what comes down on it
-    /// from above rests on it. The kid and the cars walk and drive through a trunk and stand on a
-    /// crown (`World::bears`); a liquid passes through sideways but does not go down through it
-    /// (`World::past_thin`).
+    /// Thin matter, a "one-way platform" (`spec::Holds::FromAbove`): it holds up what comes
+    /// down on it but not what moves into it sideways (trees, ash, charcoal, dead leaves).
     pub fn one_way(self) -> bool {
-        matches!(self, Mat::Trunk | Mat::Branch | Mat::Leaf | Mat::Sapling)
+        MatSpec::of(self).holds == spec::Holds::FromAbove
     }
 
     /// Anything that burns like wood.
@@ -2254,6 +2251,9 @@ impl World {
             self.swap((x, y), (x, y + 1));
             return true;
         }
+        if self.float_on(x, y, light) {
+            return true;
+        }
         // Sliding down the side of the heap. Each material has its own angle of repose: some
         // grains of a cohesive heap (snow, wet sand) only slide where the drop is two cells, which
         // makes it steeper; some grains of a free-running one (dry sand, hail, mud) roll two cells
@@ -2278,6 +2278,66 @@ impl World {
                     self.swap((x, y), (x + 2 * dx, y + 1));
                     return true;
                 }
+            }
+        }
+        false
+    }
+
+    /// A grain lighter than a liquid it touches has little inertia in it: the liquid moves it
+    /// where it pushes, instead of piling up against it. Returns true if the grain moved.
+    /// - The difference of the liquid's pressure on its two sides (`World::side_push`, the
+    ///   weight of a higher level on one side, the push of a current on the side it meets) drives
+    ///   it along, a cell for each weight of a cell of liquid in that difference, at most every
+    ///   other step.
+    /// - Under the surface, held down by what floats over it, it rises aslant, or trades places
+    ///   with the liquid beside it, so that a heap that floats lets the liquid in under it and
+    ///   spreads out into a raft rather than standing as a wall.
+    /// - Out of the liquid, on the side of a heap that floats, it runs out onto the surface.
+    fn float_on(&mut self, x: i32, y: i32, light: f32) -> bool {
+        let floats_in = |w: &World, nx: i32, ny: i32| {
+            let n = w.at(nx, ny);
+            n.kind() == Kind::Liquid && density(n) > light && w.mask_free(nx, ny)
+        };
+        let wet = [(x - 1, y), (x + 1, y), (x, y + 1)].iter().find(|&&(nx, ny)| floats_in(self, nx, ny)).map(|&(nx, ny)| self.at(nx, ny));
+        if wet.is_none() && !floats_in(self, x - 1, y + 1) && !floats_in(self, x + 1, y + 1) {
+            return false;
+        }
+        let d = self.dir();
+        if let Some(liquid) = wet {
+            let push = self.side_push(x, y);
+            let weight = density(liquid) * liquid::G * cell_m();
+            if push != 0.0 && self.chance_f((push.abs() / weight * 0.5).min(0.5)) {
+                let to = x + push.signum() as i32;
+                if floats_in(self, to, y) || (self.at(to, y) == Mat::Empty && self.mask_free(to, y)) {
+                    self.swap((x, y), (to, y));
+                    return true;
+                }
+            }
+            let up = self.at(x, y - 1);
+            if !floats_in(self, x, y - 1) && self.chance(2) {
+                for dx in [d, -d] {
+                    if floats_in(self, x + dx, y - 1) {
+                        self.swap((x, y), (x + dx, y - 1));
+                        return true;
+                    }
+                }
+                // Held down by more of the heap, the liquid beside it gets in under the heap
+                // (which then rises through it).
+                if !matches!(up.kind(), Kind::Empty | Kind::Gas) && self.chance(2) {
+                    for dx in [d, -d] {
+                        if floats_in(self, x + dx, y) {
+                            self.swap((x, y), (x + dx, y));
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+        for dx in [d, -d] {
+            if floats_in(self, x + dx, y + 1) && matches!(self.at(x + dx, y).kind(), Kind::Empty | Kind::Gas) && self.mask_free(x + dx, y) {
+                self.swap((x, y), (x + dx, y + 1));
+                return true;
             }
         }
         false

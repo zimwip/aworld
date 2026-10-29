@@ -40,6 +40,20 @@ pub enum Motion {
     Flame,
 }
 
+/// Which ways a matter holds back what moves into it (a liquid, the kid, a car).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Holds {
+    /// Every way: a wall.
+    Every,
+    /// Only what comes down on it from above, a "one-way platform": thin matter of a 2-D world
+    /// that what moves sideways goes past (in front of it or behind). A tree stands in a plane
+    /// of its own; ash, charcoal and dead leaves are light, open flakes that a flow runs through
+    /// and under (they float on it, see `World::float_on`). The kid and the cars walk and drive
+    /// through it and stand on it (`World::bears`); a liquid runs through it sideways but does
+    /// not go down through it (`World::seep_through_thin`).
+    FromAbove,
+}
+
 /// What the models know of a matter.
 #[derive(Clone, Copy, Debug)]
 pub struct MatSpec {
@@ -72,6 +86,8 @@ pub struct MatSpec {
     /// The fastest a lone cell of it falls through the air in the cells' turn, m/s (its drag
     /// balances gravity); 0: it does not fall there (a lone cell of oil or lava is the solver's).
     pub fall_ms: f32,
+    /// Which ways it holds back what moves into it.
+    pub holds: Holds,
 }
 
 /// No fracture to speak of: what loose matter, liquids and gases take (they never crack).
@@ -93,7 +109,7 @@ impl MatSpec {
 }
 
 /// Air: a gas, a flame, the empty cell.
-const AIR: MatSpec = MatSpec { density: RHO_AIR, strength: 0.0, toughness: NO_CRACK, holds_atm: None, rubble: None, restitution: 0.3, porous: false, motion: Motion::Fixed, fall_ms: 0.0 };
+const AIR: MatSpec = MatSpec { density: RHO_AIR, strength: 0.0, toughness: NO_CRACK, holds_atm: None, rubble: None, restitution: 0.3, porous: false, motion: Motion::Fixed, fall_ms: 0.0, holds: Holds::Every };
 /// A gas moving as `motion`.
 const fn gas(motion: Motion) -> MatSpec {
     MatSpec { motion, ..AIR }
@@ -108,7 +124,7 @@ const fn loose(rho: f32, porous: bool) -> MatSpec {
 }
 /// A solid.
 const fn solid(density: f32, strength: f32, toughness: f32, holds_atm: Option<f32>, rubble: Option<Mat>, restitution: f32) -> MatSpec {
-    MatSpec { density, strength, toughness, holds_atm, rubble, restitution, porous: false, motion: Motion::Fixed, fall_ms: 0.0 }
+    MatSpec { density, strength, toughness, holds_atm, rubble, restitution, porous: false, motion: Motion::Fixed, fall_ms: 0.0, holds: Holds::Every }
 }
 
 fn record(m: Mat) -> MatSpec {
@@ -126,13 +142,15 @@ fn record(m: Mat) -> MatSpec {
         Sand | Mud => loose(1600.0, true),
         // Snowflakes catch the air and fall gently.
         Snow => MatSpec { fall_ms: SNOW_TERMINAL_MS, ..loose(300.0, true) },
-        DeadLeaf | Seed => loose(300.0, true),
+        // Flakes: a flow runs through them sideways.
+        DeadLeaf => MatSpec { holds: Holds::FromAbove, ..loose(300.0, true) },
+        Seed => loose(300.0, true),
         Hail => loose(920.0, true),
         Shard => loose(2500.0, true),
         Rust | Gunpowder => loose(1500.0, true),
         Saltpeter => loose(2100.0, true),
-        Ash => loose(500.0, false),
-        Charcoal => loose(300.0, false),
+        Ash => MatSpec { holds: Holds::FromAbove, ..loose(500.0, false) },
+        Charcoal => MatSpec { holds: Holds::FromAbove, ..loose(300.0, false) },
         // Soils: their cohesion is what they hold (and gas seeps through them anyway).
         Dirt => MatSpec { strength: 0.05, holds_atm: Some(0.45), motion: Motion::Clod, ..loose(1600.0, true) },
         Grass => MatSpec { strength: 0.08, holds_atm: Some(0.75), motion: Motion::Turf, ..loose(300.0, true) },
@@ -149,9 +167,10 @@ fn record(m: Mat) -> MatSpec {
         Iron => solid(7800.0, 250.0, 50_000.0, Some(8.0), None, 0.4),
         Steel => solid(7800.0, 400.0, 100_000.0, Some(14.0), None, 0.4),
         Wood => solid(600.0, 5.0, 8_000.0, Some(2.5), None, 0.45),
-        Trunk => solid(600.0, 8.0, 15_000.0, Some(2.5), None, 0.45),
-        Branch => solid(600.0, 4.0, 8_000.0, None, None, 0.45),
-        Leaf | Sapling => solid(300.0, 0.1, 500.0, None, None, 0.05),
+        // A tree stands in a plane of its own (`Holds::FromAbove`).
+        Trunk => MatSpec { holds: Holds::FromAbove, ..solid(600.0, 8.0, 15_000.0, Some(2.5), None, 0.45) },
+        Branch => MatSpec { holds: Holds::FromAbove, ..solid(600.0, 4.0, 8_000.0, None, None, 0.45) },
+        Leaf | Sapling => MatSpec { holds: Holds::FromAbove, ..solid(300.0, 0.1, 500.0, None, None, 0.05) },
         // (A coal of burning wood weighs as a cell of water, as it always has here.)
         Ember => solid(1000.0, 0.5, 100.0, None, None, 0.3),
         // A stick of dynamite lying loose falls and rolls off a heap as a grain does.
