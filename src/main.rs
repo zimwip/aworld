@@ -2246,7 +2246,7 @@ impl Game {
                 at += 12.0;
             }
         };
-        for b in &self.world.bodies {
+        for b in &self.world.structures.bodies {
             if b.cells < 30 {
                 continue;
             }
@@ -2285,7 +2285,7 @@ impl Game {
             label(&state, c.x + 12.0, c.y - 1.0, col);
         }
         let red = Color::new(1.0, 0.35, 0.3, 0.95);
-        for s in &self.world.slabs {
+        for s in &self.world.structures.slabs {
             let c = view.to_screen(vec2(s.c.0, s.c.1));
             let big = s.cells().count() >= 30;
             if let (Some(h), true) = (s.edge(), big) {
@@ -2368,7 +2368,7 @@ impl Game {
         // The push of the liquids on each solid body: an arrow where it bears, as long as the
         // square root of the force, and the force (kN per metre of depth).
         if self.mode == ViewMode::Stress {
-            for p in &self.world.pushes {
+            for p in &self.world.structures.pushes {
                 let f = (p.fx * p.fx + p.fy * p.fy).sqrt();
                 // (The steps of a slanting face each get a little push: only the faces that count.)
                 if f < 20.0 {

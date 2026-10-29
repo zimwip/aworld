@@ -1254,7 +1254,7 @@ fn stress_color(world: &World, x: usize, y: usize) -> [u8; 4] {
     if m.kind() != Kind::Static || matches!(m, Mat::Dirt | Mat::Grass) {
         return [c[0] / 3, c[1] / 3, c[2] / 3, c[3] / 2];
     }
-    let (r, g, b) = stress_rgb(world.strain[y * W() + x] as f32 / 127.5);
+    let (r, g, b) = stress_rgb(world.structures.strain[y * W() + x] as f32 / 127.5);
     let a = c[3] as f32 / 255.0;
     let mix = |k: f32, base: u8| ((k * 255.0 * 0.75 + base as f32 * 0.25) * a) as u8;
     [mix(r, c[0]), mix(g, c[1]), mix(b, c[2]), c[3]]

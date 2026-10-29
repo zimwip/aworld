@@ -42,7 +42,7 @@ pub mod inspect;
 mod bench;
 #[cfg(test)]
 mod edges;
-pub use statics::{Balance, Slab};
+pub use statics::Balance;
 pub use storm::{Bolt, BREAKDOWN, GROUND_BREAKDOWN, QS, QW, QH};
 pub use thermal::{air_pressure_atm, Season, DAY_STEPS};
 
@@ -724,32 +724,8 @@ pub struct World {
     /// Scratch of `structure_pass`: the cells a chain of matter joins to the base of the world.
     ground: Vec<bool>,
     stack: Vec<usize>,
-    falling: Vec<Piece>,
-    /// Solid bodies tipping over or tumbling down as they fall (see `statics.rs`).
-    pub slabs: Vec<Slab>,
-    /// Scratch for the supports: how many cells each one is from what holds it (u32::MAX: none).
-    level: Vec<u32>,
-    /// Load on each anchored solid cell, as a share of what it can bear (0..255 for 0..2). For the
-    /// stress view.
-    pub strain: Vec<u8>,
-    /// The push of the liquids on each anchored solid body, as the last check of the solids found
-    /// it (see `statics.rs`; only while the liquids run by their physics).
-    pub pushes: Vec<statics::LiquidPush>,
-    /// The free bodies resting on something, with their centre of mass and what turns them (for
-    /// the stress view, see `statics::tip_pass`).
-    pub bodies: Vec<statics::FreeBody>,
-    /// A fingerprint of the anchored cells when their sections were last checked: they are only
-    /// checked again once something changed.
-    strain_key: u64,
-    /// The sections of each anchored body by a fingerprint of its cells, and a scratch map of
-    /// cells to their place in the order of the supports (see `statics::stress_pass`).
-    stress_cache: std::collections::HashMap<u64, std::sync::Arc<statics::BodyStress>>,
-    /// The plan of each anchored body by a fingerprint of its shape, with what it gave last (see
-    /// `statics::StressPlan`).
-    stress_plans: std::collections::HashMap<u64, statics::Worked>,
-    stress_pos: Vec<u32>,
-    /// Where each place of the order comes in its body's list (the same reuse).
-    stress_local: Vec<u32>,
+    /// The solids: their sections and strains, and the bodies that come loose (see `statics.rs`).
+    pub structures: statics::Structures,
     ticks: u32,
     /// Which log each cell of wood belongs to: every stroke of the wood brush is one log, a rigid
     /// body of its own that rests on what is under it but never sticks to anything else (see
@@ -913,17 +889,7 @@ impl World {
             seen: vec![false; W() * H()],
             ground: vec![false; W() * H()],
             stack: Vec::new(),
-            falling: Vec::new(),
-            slabs: Vec::new(),
-            level: vec![u32::MAX; W() * H()],
-            strain: vec![0; W() * H()],
-            pushes: Vec::new(),
-            bodies: Vec::new(),
-            strain_key: 0,
-            stress_cache: std::collections::HashMap::new(),
-            stress_plans: std::collections::HashMap::new(),
-            stress_pos: Vec::new(),
-            stress_local: Vec::new(),
+            structures: statics::Structures::new(),
             ticks: 0,
             log: vec![0; W() * H()],
             paint_log: 0,
@@ -1013,8 +979,8 @@ impl World {
         self.liq.clear();
         self.log.fill(0);
         self.ejecta.clear();
-        self.slabs.clear();
-        self.falling.clear();
+        self.structures.slabs.clear();
+        self.structures.falling.clear();
         self.latent.fill(0.0);
         self.vel.fill(0);
         self.zones.wake_all();
@@ -1040,8 +1006,8 @@ impl World {
     /// copy is never stepped. Every field is named, so that a new one has to be sorted here.
     pub fn copy_picture(&mut self, from: &World) {
         let World {
-            cells, frame, rng, seen: _, ground: _, stack: _, falling, slabs, level: _, strain, pushes, bodies, strain_key, stress_cache: _, stress_plans: _,
-            stress_pos: _, stress_local: _, ticks, log, paint_log, temp, clock, dt, tick_time, heat_stage, day_cycle, thermal_flip, heat_carry, temp_old: _, heat_took: _,
+            cells, frame, rng, seen: _, ground: _, stack: _, structures,
+            ticks, log, paint_log, temp, clock, dt, tick_time, heat_stage, day_cycle, thermal_flip, heat_carry, temp_old: _, heat_took: _,
             climate_fixed, climate, revision, wind, wind_max, wind_changes, windiness, wind_clock, biome, leaf_rgb, autumn, grass_rgb,
             structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, dp,
             dp_slow, dpd, pressure_forces, lod, liq_tier, liq_work, parallel_cells, liq, fill, pocket_of,
@@ -1053,12 +1019,7 @@ impl World {
         self.cells.clone_from(cells);
         self.frame = *frame;
         self.rng = *rng;
-        self.falling.clone_from(falling);
-        self.slabs.clone_from(slabs);
-        self.strain.clone_from(strain);
-        self.pushes.clone_from(pushes);
-        self.bodies.clone_from(bodies);
-        self.strain_key = *strain_key;
+        self.structures.copy_picture(structures);
         self.ticks = *ticks;
         self.log.clone_from(log);
         self.paint_log = *paint_log;
@@ -1129,8 +1090,8 @@ impl World {
         self.restore(&st.matter);
         self.temp.copy_from_slice(&st.temp);
         self.clock = st.clock;
-        self.falling.clear();
-        self.slabs.clear();
+        self.structures.falling.clear();
+        self.structures.slabs.clear();
         self.touched.clear();
         self.blasts.clear();
         self.powder_booms.clear();
@@ -3755,13 +3716,13 @@ impl World {
     pub(super) fn structure_pass(&mut self) {
         let mut seen = std::mem::take(&mut self.seen);
         let mut stack = std::mem::take(&mut self.stack);
-        let mut level = std::mem::take(&mut self.level);
+        let mut level = std::mem::take(&mut self.structures.level);
         seen.fill(false);
         level.fill(u32::MAX);
         // What a chain of matter joins to the base of the world (see `anchors`).
         self.spread_ground(true, &[]);
         // Bodies in flight are moved by their own physics.
-        for s in &self.slabs {
+        for s in &self.structures.slabs {
             for &i in s.cells() {
                 seen[i] = true;
             }
@@ -3795,7 +3756,7 @@ impl World {
                 }
             }
         }
-        self.level = level;
+        self.structures.level = level;
         // Now without the free bodies: what they can rest on (see `tip_pass`).
         self.spread_ground_without_free_bodies();
         self.stress_pass(&order, &mut seen);
@@ -3803,13 +3764,13 @@ impl World {
         // of a small one, else a crumb whose sampled cell is not the one sampled again lost its
         // speed at every pass and never fell faster than a cell a drop).
         let mut speeds: std::collections::HashMap<usize, (f32, f32)> = std::collections::HashMap::new();
-        for p in &self.falling {
+        for p in &self.structures.falling {
             for c in p.cells.iter().step_by(p.cells.len().div_ceil(400).max(1)) {
                 speeds.insert(*c, (p.vy, p.fallen));
             }
         }
         // Group what is left into bodies.
-        self.falling.clear();
+        self.structures.falling.clear();
         let mut free = vec![];
         let mut budget = 300_000usize;
         for start in 0..W() * H() {
@@ -3852,7 +3813,7 @@ impl World {
         if self.mask[i] != 0 {
             return true;
         }
-        matches!(m.kind(), Kind::Static | Kind::Powder | Kind::Liquid) && (free || !Self::structural(m) || self.level[i] != u32::MAX)
+        matches!(m.kind(), Kind::Static | Kind::Powder | Kind::Liquid) && (free || !Self::structural(m) || self.structures.level[i] != u32::MAX)
     }
 
     /// Marks in `ground` the cells a chain of matter that carries (see `carries`) joins to the
@@ -3893,7 +3854,7 @@ impl World {
     /// body: then it stands as it is (the ground without the cells that are not in it is the same).
     fn spread_ground_without_free_bodies(&mut self) {
         use rayon::prelude::*;
-        let leans = self.ground.par_iter().enumerate().any(|(i, &g)| g && self.mask[i] == 0 && Self::structural(self.cells[i].m) && self.level[i] == u32::MAX);
+        let leans = self.ground.par_iter().enumerate().any(|(i, &g)| g && self.mask[i] == 0 && Self::structural(self.cells[i].m) && self.structures.level[i] == u32::MAX);
         if leans {
             self.spread_ground(false, &[]);
         }
@@ -3964,7 +3925,7 @@ impl World {
     /// Moves every unsupported piece down (accelerating) as a rigid whole. A fast
     /// landing bounces a little. Ice pieces float on liquids instead of sinking.
     fn drop_structures(&mut self) {
-        let mut pieces = std::mem::take(&mut self.falling);
+        let mut pieces = std::mem::take(&mut self.structures.falling);
         for piece in &mut pieces {
             piece.cells.sort_unstable_by(|a, b| b.cmp(a));
         }
@@ -4019,7 +3980,7 @@ impl World {
             }
         }
         pieces.retain(|p| !p.cells.is_empty());
-        self.falling = pieces;
+        self.structures.falling = pieces;
     }
 
     /// A falling piece held up only by leaves, twigs or saplings breaks them: they fall as dead

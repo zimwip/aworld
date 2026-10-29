@@ -118,6 +118,16 @@ unsafe fn share<T>(v: &T) -> T {
     std::ptr::read(v)
 }
 
+impl super::statics::Structures {
+    /// The strip's view of the solids: the world's strains, its own bodies that come loose.
+    ///
+    /// # Safety
+    /// As `share`.
+    unsafe fn view(&self) -> Self {
+        Self { strain: share(&self.strain), strain_key: self.strain_key, ..Self::empty() }
+    }
+}
+
 impl super::storm::Storm {
     /// The strip's view of the storms: the world's grids, its own bolts and draws.
     ///
@@ -309,8 +319,8 @@ impl World {
         self.thuds.append(&mut v.thuds);
         self.bursts.append(&mut v.bursts);
         self.storm.bolts.append(&mut v.storm.bolts);
-        self.falling.append(&mut v.falling);
-        self.slabs.append(&mut v.slabs);
+        self.structures.falling.append(&mut v.structures.falling);
+        self.structures.slabs.append(&mut v.structures.slabs);
         self.liq.drops.append(&mut v.liq.drops);
         later.extend(v.later.take().unwrap_or_default());
         self.zones.absorb(&v.zones);
@@ -332,17 +342,7 @@ impl World {
                 seen: Vec::new(),
                 ground: Vec::new(),
                 stack: Vec::new(),
-                falling: Vec::new(),
-                slabs: Vec::new(),
-                level: Vec::new(),
-                strain: share(&self.strain),
-                pushes: Vec::new(),
-                bodies: Vec::new(),
-                strain_key: self.strain_key,
-                stress_cache: Default::default(),
-                stress_plans: Default::default(),
-                stress_pos: Vec::new(),
-                stress_local: Vec::new(),
+                structures: self.structures.view(),
                 ticks: self.ticks,
                 log: share(&self.log),
                 paint_log: self.paint_log,

@@ -187,6 +187,71 @@ struct Part {
     states: (States, u16),
 }
 
+/// The state of the solids: the strain of the anchored ones, the bodies that came loose, and
+/// what the check of their sections keeps from one pass to the next.
+pub struct Structures {
+    pub(super) falling: Vec<Piece>,
+    /// Solid bodies tipping over or tumbling down as they fall.
+    pub slabs: Vec<Slab>,
+    /// Scratch for the supports: how many cells each one is from what holds it (u32::MAX: none).
+    pub(super) level: Vec<u32>,
+    /// Load on each anchored solid cell, as a share of what it can bear (0..255 for 0..2). For the
+    /// stress view.
+    pub strain: Vec<u8>,
+    /// The push of the liquids on each anchored solid body, as the last check of the solids found
+    /// it.
+    pub pushes: Vec<LiquidPush>,
+    /// The free bodies resting on something, with their centre of mass and what turns them (for
+    /// the stress view, see `tip_pass`).
+    pub bodies: Vec<FreeBody>,
+    /// A fingerprint of the anchored cells when their sections were last checked: they are only
+    /// checked again once something changed.
+    pub(super) strain_key: u64,
+    /// The sections of each anchored body by a fingerprint of its cells (see `stress_pass`).
+    pub(super) stress_cache: std::collections::HashMap<u64, std::sync::Arc<BodyStress>>,
+    /// The plan of each anchored body by a fingerprint of its shape, with what it gave last (see
+    /// `StressPlan`).
+    pub(super) stress_plans: std::collections::HashMap<u64, Worked>,
+    /// Scratch map of cells to their place in the order of the supports.
+    pub(super) stress_pos: Vec<u32>,
+    /// Where each place of the order comes in its body's list (the same reuse).
+    pub(super) stress_local: Vec<u32>,
+}
+
+impl Structures {
+    pub fn new() -> Self {
+        Structures { level: vec![u32::MAX; W() * H()], strain: vec![0; W() * H()], ..Self::empty() }
+    }
+
+    /// Nothing at all, not even the grids.
+    pub(super) fn empty() -> Self {
+        Structures {
+            falling: Vec::new(),
+            slabs: Vec::new(),
+            level: Vec::new(),
+            strain: Vec::new(),
+            pushes: Vec::new(),
+            bodies: Vec::new(),
+            strain_key: 0,
+            stress_cache: Default::default(),
+            stress_plans: Default::default(),
+            stress_pos: Vec::new(),
+            stress_local: Vec::new(),
+        }
+    }
+
+    /// Makes this a picture of `from` (see `World::copy_picture`): what is drawn, not the scratch.
+    pub fn copy_picture(&mut self, from: &Structures) {
+        let Structures { falling, slabs, level: _, strain, pushes, bodies, strain_key, stress_cache: _, stress_plans: _, stress_pos: _, stress_local: _ } = from;
+        self.falling.clone_from(falling);
+        self.slabs.clone_from(slabs);
+        self.strain.clone_from(strain);
+        self.pushes.clone_from(pushes);
+        self.bodies.clone_from(bodies);
+        self.strain_key = *strain_key;
+    }
+}
+
 /// A solid body tipping over or tumbling through the air.
 #[derive(Clone)]
 pub struct Slab {
@@ -357,19 +422,19 @@ impl World {
             .collect::<Vec<u64>>()
             .into_iter()
             .fold(order.len() as u64, |h, piece| (h ^ piece).wrapping_mul(0x100_0000_01b3));
-        if key == self.strain_key {
+        if key == self.structures.strain_key {
             return;
         }
-        self.strain_key = key;
-        self.strain.fill(0);
+        self.structures.strain_key = key;
+        self.structures.strain.fill(0);
         let n = order.len();
         if n == 0 {
-            self.stress_cache.clear();
-            self.stress_plans.clear();
+            self.structures.stress_cache.clear();
+            self.structures.stress_plans.clear();
             return;
         }
-        let level = std::mem::take(&mut self.level);
-        let mut pos = std::mem::take(&mut self.stress_pos);
+        let level = std::mem::take(&mut self.structures.level);
+        let mut pos = std::mem::take(&mut self.structures.stress_pos);
         pos.resize(W() * H(), u32::MAX);
         for (k, &i) in order.iter().enumerate() {
             pos[i] = k as u32;
@@ -433,10 +498,10 @@ impl World {
             })
             .unzip();
         // (Only the bodies that have to be worked out again.)
-        let mut local = std::mem::take(&mut self.stress_local);
+        let mut local = std::mem::take(&mut self.structures.stress_local);
         local.resize(n, 0);
         for (members, key) in bodies.iter().zip(&keys) {
-            if !self.stress_cache.contains_key(key) {
+            if !self.structures.stress_cache.contains_key(key) {
                 for (l, &k) in members.iter().enumerate() {
                     local[k as usize] = l as u32;
                 }
@@ -450,11 +515,11 @@ impl World {
                 .par_iter()
                 .zip(keys.par_iter().zip(shapes.par_iter()))
                 .map(|(members, (key, shape))| {
-                    if let Some(done) = this.stress_cache.get(key) {
+                    if let Some(done) = this.structures.stress_cache.get(key) {
                         return (done.clone(), None);
                     }
                     let now: Vec<(f32, f32)> = members.iter().map(|&k| push.get(k as usize).copied().unwrap_or((0.0, 0.0))).collect();
-                    let plan = match this.stress_plans.get(shape) {
+                    let plan = match this.structures.stress_plans.get(shape) {
                         Some(w) => {
                             if this.barely_moved(w, &now) {
                                 return (w.done.clone(), None);
@@ -477,7 +542,7 @@ impl World {
                 })
                 .collect()
         };
-        let mut plans = std::mem::take(&mut self.stress_plans);
+        let mut plans = std::mem::take(&mut self.structures.stress_plans);
         let mut results = Vec::with_capacity(worked.len());
         let mut kept = std::collections::HashMap::new();
         for ((done, fresh), shape) in worked.into_iter().zip(&shapes) {
@@ -486,12 +551,12 @@ impl World {
             }
             results.push(done);
         }
-        self.stress_plans = kept;
+        self.structures.stress_plans = kept;
         let mut cracks: Vec<Crack> = vec![];
-        self.pushes.clear();
+        self.structures.pushes.clear();
         for (members, done) in bodies.iter().zip(&results) {
             for (&k, &shown) in members.iter().zip(&done.strain) {
-                self.strain[order[k as usize]] = shown;
+                self.structures.strain[order[k as usize]] = shown;
             }
             cracks.extend(done.cracks.iter().cloned());
             // The push of the liquids on each wetted face of the body, at its centre of pressure
@@ -524,7 +589,7 @@ impl World {
                     }
                     let (across, along) = ((line / 2) as f32 + 0.5, along / f);
                     let f = f * super::units::cell_of_water_kn();
-                    self.pushes.push(if down {
+                    self.structures.pushes.push(if down {
                         LiquidPush { x: along, y: across, fx: 0.0, fy: f }
                     } else {
                         LiquidPush { x: across, y: along, fx: f, fy: 0.0 }
@@ -533,12 +598,12 @@ impl World {
                 }
             }
         }
-        self.stress_cache = keys.into_iter().zip(results).collect();
+        self.structures.stress_cache = keys.into_iter().zip(results).collect();
         for &i in order {
             pos[i] = u32::MAX;
         }
-        self.stress_pos = pos;
-        self.stress_local = local;
+        self.structures.stress_pos = pos;
+        self.structures.stress_local = local;
         // (The same order whatever the order of the bodies: the outermost section first, then
         // by place, among cracks under the same load.)
         cracks.sort_by(|a, b| b.level.cmp(&a.level).then(a.fibres[0].cmp(&b.fibres[0])));
@@ -601,7 +666,7 @@ impl World {
             self.loosen(region, Some(hinge), (0.0, 0.0), 0.0);
             tips += 1;
         }
-        self.level = level;
+        self.structures.level = level;
     }
 
     /// The plan of one anchored body (`members`: its places in `order`, rising; `local`: where
@@ -982,7 +1047,7 @@ impl World {
     /// their centre of mass beyond the cells they rest on tip over the last of them.
     pub(super) fn tip_pass(&mut self, free: Vec<Piece>) {
         let mut tips = 0;
-        self.bodies.clear();
+        self.structures.bodies.clear();
         // From the bottom up: a body holds what rests on it only once it is held itself.
         let mut free = free;
         free.sort_by_cached_key(|p| std::cmp::Reverse(p.cells.iter().copied().max().unwrap_or(0)));
@@ -993,7 +1058,7 @@ impl World {
                     // Through the air it falls as a rigid body: it lands on a corner, turns, rolls.
                     self.loosen(p.cells, None, (0.0, p.vy), 0.0);
                 } else {
-                    self.falling.push(p);
+                    self.structures.falling.push(p);
                 }
                 continue;
             }
@@ -1034,7 +1099,7 @@ impl World {
                 }
             }
             if lo.0 == i32::MAX {
-                self.falling.push(p);
+                self.structures.falling.push(p);
                 continue;
             }
             let (mass, (cx, cy)) = self.mass_centre(&p.cells);
@@ -1079,8 +1144,8 @@ impl World {
             } else {
                 Balance::Tips
             };
-            if self.bodies.len() < MAX_SHOWN {
-                self.bodies.push(FreeBody { c: (cx, cy), cells: p.cells.len(), weight: w, push: (push.0 * super::units::cell_of_water_kn(), push.1 * super::units::cell_of_water_kn()), span, base: base as f32, hinge, moment, state });
+            if self.structures.bodies.len() < MAX_SHOWN {
+                self.structures.bodies.push(FreeBody { c: (cx, cy), cells: p.cells.len(), weight: w, push: (push.0 * super::units::cell_of_water_kn(), push.1 * super::units::cell_of_water_kn()), span, base: base as f32, hinge, moment, state });
             }
             if state != Balance::Tips && firm {
                 self.spread_ground(false, &p.cells);
@@ -1094,7 +1159,7 @@ impl World {
                 Balance::Hangs => {}
                 Balance::Rests | Balance::Waits => {
                     if !firm {
-                        self.falling.push(p);
+                        self.structures.falling.push(p);
                     }
                 }
             }
@@ -1127,7 +1192,7 @@ impl World {
     /// Whether the falling body `p` falls as a slab that can turn and roll (see `step_slab`)
     /// rather than straight down: through open air, and not too large.
     fn tumbles(&self, p: &Piece) -> bool {
-        if !(MIN_TUMBLER..=MAX_TUMBLER).contains(&p.cells.len()) || self.slabs.len() >= MAX_FLYING {
+        if !(MIN_TUMBLER..=MAX_TUMBLER).contains(&p.cells.len()) || self.structures.slabs.len() >= MAX_FLYING {
             return false;
         }
         let in_piece = |i: usize| p.cells.binary_search_by(|q| i.cmp(q)).is_ok();
@@ -1157,18 +1222,18 @@ impl World {
             inertia += density(p.cell.m) * (r2 + 1.0 / 6.0);
             reach = reach.max(r2.sqrt());
         }
-        self.slabs.push(Slab { parts, home, c0, c: c0, v, angle: 0.0, spin, mass, inertia, reach: reach + 1.0, hinge, drawn, crushed: vec![], rest: 0, contact: 0 });
+        self.structures.slabs.push(Slab { parts, home, c0, c: c0, v, angle: 0.0, spin, mass, inertia, reach: reach + 1.0, hinge, drawn, crushed: vec![], rest: 0, contact: 0 });
     }
 
     /// Moves the bodies in flight; those that hit something come to rest there, broken or not.
     pub(super) fn step_slabs(&mut self) {
-        if self.slabs.is_empty() {
+        if self.structures.slabs.is_empty() {
             return;
         }
-        let mut slabs = std::mem::take(&mut self.slabs);
+        let mut slabs = std::mem::take(&mut self.structures.slabs);
         slabs.retain_mut(|s| self.step_slab(s));
-        slabs.append(&mut self.slabs);
-        self.slabs = slabs;
+        slabs.append(&mut self.structures.slabs);
+        self.structures.slabs = slabs;
     }
 
     /// One step of a body: false once it has landed (or left the world).
@@ -1536,7 +1601,7 @@ impl World {
         let cells: Vec<usize> = s.drawn.iter().map(|d| d.0).collect();
         let density = self.mean_density(&cells);
         let vy = s.velocity_at(s.c).1.clamp(0.0, 1.5);
-        self.falling.push(Piece { cells, vy, fallen: 0.0, density });
+        self.structures.falling.push(Piece { cells, vy, fallen: 0.0, density });
     }
 
     /// A turned body covers the grid with a cell or two fewer than it has (two parts fall on the
@@ -1741,7 +1806,7 @@ mod tests {
                 }
                 w.step();
             }
-            assert!(!w.stress_plans.is_empty(), "{name}: the anchored bodies have plans");
+            assert!(!w.structures.stress_plans.is_empty(), "{name}: the anchored bodies have plans");
         }
     }
 
@@ -1784,7 +1849,7 @@ mod tests {
         let mut tipped = false;
         for _ in 0..600 {
             w.step();
-            tipped |= w.slabs.iter().any(|s| s.angle > 0.3);
+            tipped |= w.structures.slabs.iter().any(|s| s.angle > 0.3);
         }
         assert!(tipped, "it turned over its foot");
         assert!((0..W() * H()).filter(|&i| w.cells[i].m == Mat::Ice).all(|i| i / W() > 400), "nothing is left standing in the air");
@@ -1858,7 +1923,7 @@ mod tests {
         }
         w.step();
         w.structure_pass();
-        assert!(w.strain[World::idx(262, 305)] < 128, "the short ledge is not overloaded");
+        assert!(w.structures.strain[World::idx(262, 305)] < 128, "the short ledge is not overloaded");
         run(&mut w, 300);
         assert_eq!(w.raw(285, 305), Mat::Stone, "the short ledge holds");
         assert_ne!(w.raw(900, 305), Mat::Stone, "the long one broke off");
@@ -1892,7 +1957,7 @@ mod tests {
         }
         let cells: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Ice).collect();
         w.loosen(cells, Some((100.0, 104.0)), (0.0, 0.0), 0.0);
-        let s = &w.slabs[0];
+        let s = &w.structures.slabs[0];
         assert!((s.mass - 40.0 * 0.92).abs() < 1e-3);
         assert!((s.c.0 - 105.0).abs() < 1e-3 && (s.c.1 - 102.0).abs() < 1e-3, "{:?}", s.c);
         // A 10 x 4 plate: I = m (a² + b²) / 12.
@@ -1920,7 +1985,7 @@ mod tests {
         }
         let cells: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Wood).collect();
         w.loosen(cells, None, (0.0, 2.0), 0.0);
-        let mut s = w.slabs.pop().unwrap();
+        let mut s = w.structures.slabs.pop().unwrap();
         let before = energy(&s);
         // It comes down on its right-hand corner, onto flat ground.
         let hit = Hit { soft: false, points: vec![((119.5, 306.0), (0.0, -1.0))], m: Mat::Stone };
@@ -1929,7 +1994,7 @@ mod tests {
         assert!(s.spin < -0.01, "pushed up at its right end, it turns anticlockwise: {}", s.spin);
         assert!(energy(&s) <= before, "a hit loses energy, it never makes any: {} > {before}", energy(&s));
         // Straight under its centre, the same blow does not turn it.
-        let mut s2 = { let mut w = world(450); for x in 100..120 { for y in 300..306 { w.set(x, y, Mat::Wood); } } let cells: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Wood).collect(); w.loosen(cells, None, (0.0, 2.0), 0.0); w.slabs.pop().unwrap() };
+        let mut s2 = { let mut w = world(450); for x in 100..120 { for y in 300..306 { w.set(x, y, Mat::Wood); } } let cells: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Wood).collect(); w.loosen(cells, None, (0.0, 2.0), 0.0); w.structures.slabs.pop().unwrap() };
         let mid = Hit { soft: false, points: vec![((s2.c.0, 306.0), (0.0, -1.0))], m: Mat::Stone };
         w.collide(&mut s2, &mid);
         assert!(s2.spin.abs() < 1e-4, "{}", s2.spin);
@@ -1955,7 +2020,7 @@ mod tests {
         let mut turned = 0.0f32;
         for _ in 0..900 {
             w.step();
-            for s in &w.slabs {
+            for s in &w.structures.slabs {
                 turned = turned.max(s.angle.abs());
             }
         }
@@ -1963,7 +2028,7 @@ mod tests {
         let wood = cells_of(&w, Mat::Wood);
         assert_eq!(wood.len(), 160, "nothing is lost");
         assert!(wood.iter().all(|c| c.0 >= 255 && c.1 > 400), "it fell off beside the ledge: {:?}", &wood[..4]);
-        assert!(w.slabs.is_empty(), "and came to rest");
+        assert!(w.structures.slabs.is_empty(), "and came to rest");
     }
 
     #[test]
@@ -1979,7 +2044,7 @@ mod tests {
         // (At 3 m/s.)
         w.loosen(cells, None, (super::super::units::cells_per_tick(3.0), 0.0), 0.0);
         run(&mut w, 600);
-        assert!(w.slabs.is_empty(), "it came to rest");
+        assert!(w.structures.slabs.is_empty(), "it came to rest");
         let wood = cells_of(&w, Mat::Wood);
         assert_eq!(wood.len(), 120);
         // Friction brakes it at μg: it slides v² / 2μg, some 17 cells.
@@ -2003,10 +2068,10 @@ mod tests {
         let mut spun = false;
         for _ in 0..900 {
             w.step();
-            spun |= w.slabs.iter().any(|s| s.angle.abs() > 0.3);
+            spun |= w.structures.slabs.iter().any(|s| s.angle.abs() > 0.3);
         }
         assert!(spun);
-        assert!(w.slabs.is_empty(), "it came to rest");
+        assert!(w.structures.slabs.is_empty(), "it came to rest");
         // Flat on the ground: the bottom row is nearly full, and it stands no higher than its
         // long side.
         let wood = cells_of(&w, Mat::Wood);
@@ -2051,10 +2116,10 @@ mod tests {
         for leaves in [false, true] {
             let mut w = ball_on_an_arm(leaves);
             // (The statics run every few steps.)
-            while w.bodies.is_empty() {
+            while w.structures.bodies.is_empty() {
                 w.step();
             }
-            let b = w.bodies.iter().find(|b| b.cells > 5000).expect("the ball and its arm are one free body");
+            let b = w.structures.bodies.iter().find(|b| b.cells > 5000).expect("the ball and its arm are one free body");
             assert!(b.c.0 < 400.0 && b.span.0 > 550.0, "its centre of mass is far beyond its foot: {b:?}");
             assert!(b.moment > 0.0 && matches!(b.state, Balance::Tips), "{b:?}");
             run(&mut w, 300);
@@ -2075,10 +2140,10 @@ mod tests {
                 w.set(x, y, Mat::Ice);
             }
         }
-        while w.bodies.is_empty() {
+        while w.structures.bodies.is_empty() {
             w.step();
         }
-        let b = w.bodies.iter().find(|b| b.cells == 200).expect("the block");
+        let b = w.structures.bodies.iter().find(|b| b.cells == 200).expect("the block");
         assert_eq!(b.state, Balance::Rests);
         assert!((b.c.0 - 120.0).abs() < 0.01 && (b.c.1 - 425.0).abs() < 0.01, "{b:?}");
         // 200 cells of ice of 5 cm: 0.46 t per metre, 4.5 kN/m; its centre of mass is 10 cells
@@ -2132,7 +2197,7 @@ mod tests {
         let mut spin = 0.0f32;
         for _ in 0..400 {
             w.step();
-            for s in &w.slabs {
+            for s in &w.structures.slabs {
                 spin = spin.max(s.spin);
             }
         }
