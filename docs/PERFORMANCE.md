@@ -41,3 +41,27 @@ Budget: 16.7 ms per step at 60 fps.
    skip `forces` on unchanged edges.
 
 Suggested order: cheap tier + viscosity + `structures` first (measurable with the bench), particle fallback after.
+
+## What was done (October 29)
+
+Measured on the cloud machine of the work (4 cores), `AWORLD_BENCH_TIER` setting the liquids' tier:
+
+| Scene | exact | cheap (tier 1) | drops (tier 2) |
+|---|---|---|---|
+| liquides | 75 ms | 50 ms | 43 ms |
+| déluge | 116 ms | 70 ms | 76 ms |
+| nuage | 59 ms | 49 ms | 40 ms |
+| orage | 30 ms | 25 ms | 21 ms |
+
+- **Quick wins** (the world comes out the same, `bench_fingerprint`): the viscosity sweeps only run over the thick
+  edges, on one core when there are few (scene `lave`, the game's demo: 3.4 → 0.9 ms a pass); the structures'
+  fingerprints and grouping on every core (−15 to −25 %, `structures_probe`); an edge at rest carries itself in
+  `forces`. The structures pass is lighter but not spread over steps: cut between two ticks it would read a stale
+  world.
+- **Load-driven liquid tiers** (`World::liq_tier`): when the game stays slow and the liquids are the bulk of the work
+  (`World::liq_work`, their spans over the sub-steps, above a fifth of the grid), the liquids are simplified before
+  the heat. Tier 1: `CHEAP_SUB` = 2 sub-steps a turn, `CHEAP_ITER` = 4 solver iterations. Tier 2: also, in each zone
+  where most of the running liquid is free (air under it, falling with air at the end of the liquid under it, or
+  spray thrown fast), the free cells go over to drops (`fall_to_drops`), which fly and land on their own; the solver
+  keeps the bodies at rest. Mass is conserved (tests). The smooth game brings the heat back first, then the liquids.
+  On the flood, tier 2 is no cheaper than tier 1: the landing drops wake the pool they fall in.
