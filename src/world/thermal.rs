@@ -762,15 +762,15 @@ impl World {
     /// never dead calm: the direction changes slowly but there is always a breeze. The player can
     /// cap its speed, make the direction change more or less often, and make the weather calmer.
     pub(super) fn update_wind(&mut self) {
-        self.wind_clock += self.wind_changes;
-        let t = self.wind_clock;
+        self.wind.clock += self.wind.changes;
+        let t = self.wind.clock;
         let tau = std::f32::consts::TAU;
         let base = 0.6 * (t * tau / 7200.0 + 1.3).sin() + 0.3 * (t * tau / 1900.0 + 0.4).sin() + 0.15 * (t / 300.0).sin();
         let base = base.clamp(-1.0, 1.0);
         let windy = 0.3 + 0.7 * base.abs();
         let calm = 0.04 + 0.12 * base.abs();
-        let mag = calm + (windy - calm) * self.windiness.clamp(0.0, 1.0);
-        self.wind = base.signum() * mag * self.wind_max.clamp(0.0, 1.0);
+        let mag = calm + (windy - calm) * self.wind.windiness.clamp(0.0, 1.0);
+        self.wind.now = base.signum() * mag * self.wind.max.clamp(0.0, 1.0);
     }
 
     // ----- heat flow --------------------------------------------------------

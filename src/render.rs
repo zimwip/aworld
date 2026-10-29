@@ -1015,7 +1015,7 @@ impl Renderer {
         self.veg_tick = tick;
         let px = self.veg_image.get_image_data_mut();
         px.fill([0; 4]);
-        let w = world.wind;
+        let w = world.wind.now;
         for &(x, y, h, col) in self.veg_zones.iter().flatten() {
             let hf = (h / 40.0).powf(1.4).min(2.5);
             let wave = (time * 1.9 + x as f32 * 0.07 + h * 0.03).sin() + 0.5 * (time * 3.3 + y as f32 * 0.11).sin();

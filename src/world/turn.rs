@@ -128,6 +128,16 @@ impl super::statics::Structures {
     }
 }
 
+impl super::pressure::Push {
+    /// The strip's view of the pushing pressure: the world's grids.
+    ///
+    /// # Safety
+    /// As `share`.
+    unsafe fn view(&self) -> Self {
+        Self { dp: share(&self.dp), slow: share(&self.slow), quick: share(&self.quick), on: self.on }
+    }
+}
+
 impl super::storm::Storm {
     /// The strip's view of the storms: the world's grids, its own bolts and draws.
     ///
@@ -358,10 +368,6 @@ impl World {
                 dried: 0,
                 gone: 0,
                 wind: self.wind,
-                wind_max: self.wind_max,
-                wind_changes: self.wind_changes,
-                windiness: self.windiness,
-                wind_clock: self.wind_clock,
                 biome: self.biome,
                 leaf_rgb: self.leaf_rgb,
                 autumn: self.autumn,
@@ -378,10 +384,7 @@ impl World {
                 thuds: Vec::new(),
                 water_flow: 0,
                 flow: share(&self.flow),
-                dp: share(&self.dp),
-                dp_slow: share(&self.dp_slow),
-                dpd: share(&self.dpd),
-                pressure_forces: self.pressure_forces,
+                push: self.push.view(),
                 lod: self.lod,
                 liq_tier: self.liq_tier,
                 liq_work: 0,

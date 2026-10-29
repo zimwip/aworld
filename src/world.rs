@@ -756,15 +756,8 @@ pub struct World {
     pub dried: u64,
     /// Liquid that left the world by its sides since the start, in units of fill.
     pub gone: u64,
-    /// Wind, -1 (left) to 1 (right).
-    pub wind: f32,
-    /// The player's wind controls: strongest wind (0..1), how fast the direction keeps changing
-    /// (0 = never, 1 = usual, up to 3), and how windy the weather is (0 calm .. 1 windy).
-    pub wind_max: f32,
-    pub wind_changes: f32,
-    pub windiness: f32,
-    /// Advances with `wind_changes`; the wind's direction follows it.
-    pub wind_clock: f32,
+    /// The wind: how strong it blows now, and the player's settings of the weather.
+    pub wind: flow::Wind,
     /// Landscape type this world was generated as (picks the backdrop).
     pub biome: Biome,
     /// Cached seasonal colours (leaf rgb, autumn amount, grass rgb).
@@ -793,13 +786,8 @@ pub struct World {
     pub water_flow: u32,
     /// The air's flow: layered winds, vortices, rising warm air. Gas rides it.
     pub flow: flow::Flow,
-    /// Excess pressure over the ambient one for each flow cell, in atmospheres (see `pressure.rs`).
-    dp: Vec<f32>,
-    /// Its slow average, and the quick part left when that is taken off: what pushes.
-    dp_slow: Vec<f32>,
-    dpd: Vec<f32>,
-    /// Whether the pressure pushes liquids and loose matter (for comparing in tests and demos).
-    pub pressure_forces: bool,
+    /// The excess pressure of the air, and what it pushes (see `pressure.rs`).
+    pub push: pressure::Push,
     /// How much the simulation is simplified to keep the game smooth: 0 = everything exact,
     /// 1 = the wind carries air heat in 2 x 2 blocks, 2 = the heat pass runs half as often (with
     /// doubled rates), 3 = same, and calm air next to air no longer conducts heat (it only relaxes).
@@ -897,11 +885,7 @@ impl World {
             revision: 1,
             dried: 0,
             gone: 0,
-            wind: 0.0,
-            wind_max: 1.0,
-            wind_changes: 1.0,
-            windiness: 1.0,
-            wind_clock: 0.0,
+            wind: flow::Wind { now: 0.0, max: 1.0, changes: 1.0, windiness: 1.0, clock: 0.0 },
             biome: Biome::Countryside,
             leaf_rgb: (52, 140, 60),
             autumn: 0.0,
@@ -918,10 +902,7 @@ impl World {
             thuds: Vec::new(),
             water_flow: 0,
             flow: flow::Flow::new(),
-            dp: vec![0.0; flow::FW() * flow::FH()],
-            dp_slow: vec![0.0; flow::FW() * flow::FH()],
-            dpd: vec![0.0; flow::FW() * flow::FH()],
-            pressure_forces: true,
+            push: pressure::Push::new(),
             lod: 0,
             liq_tier: 0,
             liq_work: 0,
@@ -997,9 +978,9 @@ impl World {
         let World {
             cells, frame, rng, seen: _, ground: _, stack: _, structures,
             ticks, log, paint_log, temp, clock, dt, tick_time, heat, day_cycle,
-            climate_fixed, climate, revision, wind, wind_max, wind_changes, windiness, wind_clock, biome, leaf_rgb, autumn, grass_rgb,
-            structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, dp,
-            dp_slow, dpd, pressure_forces, lod, liq_tier, liq_work, parallel_cells, liq, fill, pocket_of,
+            climate_fixed, climate, revision, wind, biome, leaf_rgb, autumn, grass_rgb,
+            structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, push,
+            lod, liq_tier, liq_work, parallel_cells, liq, fill, pocket_of,
             pockets, latent, vel, fall_at, moisture, fuel, growth, jet, liq_p, cls: _, liq_w: _, zones, bursts, storm,
             pressure_cache: _, prof: _, air_rows, air_sky, later: _, dried, gone,
         } = from;
@@ -1022,10 +1003,6 @@ impl World {
         self.climate.clone_from(climate);
         self.revision = *revision;
         self.wind = *wind;
-        self.wind_max = *wind_max;
-        self.wind_changes = *wind_changes;
-        self.windiness = *windiness;
-        self.wind_clock = *wind_clock;
         self.biome = *biome;
         self.leaf_rgb = *leaf_rgb;
         self.autumn = *autumn;
@@ -1041,10 +1018,7 @@ impl World {
         self.thuds.clone_from(thuds);
         self.water_flow = *water_flow;
         self.flow.clone_from(flow);
-        self.dp.clone_from(dp);
-        self.dp_slow.clone_from(dp_slow);
-        self.dpd.clone_from(dpd);
-        self.pressure_forces = *pressure_forces;
+        self.push.copy_picture(push);
         self.lod = *lod;
         self.liq_tier = *liq_tier;
         self.liq_work = *liq_work;
@@ -2444,8 +2418,8 @@ impl World {
     /// little, but a thin layer (one or two cells) stays where it fell instead of running off.
     /// (See `snow_creeps`.) Returns whether the wind took the flake.
     fn snow_drifts(&mut self, x: i32, y: i32) -> bool {
-        if self.at(x, y + 1) == Mat::Empty && self.wind.abs() > 0.1 && (self.rand() % 100) as f32 <= self.wind.abs() * 60.0 {
-            let w = if self.wind > 0.0 { 1 } else { -1 };
+        if self.at(x, y + 1) == Mat::Empty && self.wind.now.abs() > 0.1 && (self.rand() % 100) as f32 <= self.wind.now.abs() * 60.0 {
+            let w = if self.wind.now > 0.0 { 1 } else { -1 };
             if self.at(x + w, y + 1) == Mat::Empty {
                 self.swap((x, y), (x + w, y + 1));
                 return true;
@@ -3513,7 +3487,7 @@ impl World {
     /// How a flame moves (`Motion::Flame`): it licks upwards, and leans with the wind. Returns
     /// whether it moved.
     fn move_flame(&mut self, x: i32, y: i32) -> bool {
-        let d = if self.wind.abs() > 0.3 && self.chance(2) { self.wind.signum() as i32 } else { self.dir() };
+        let d = if self.wind.now.abs() > 0.3 && self.chance(2) { self.wind.now.signum() as i32 } else { self.dir() };
         let r = self.rand() % 10;
         let order: [(i32, i32); 2] = if r < 6 { [(0, -1), (d, -1)] } else if r < 8 { [(d, 0), (-d, 0)] } else { return false };
         for (dx, dy) in order {
@@ -6619,7 +6593,7 @@ mod tests {
         };
         let (smoke0, cloud0) = (mean_y(&w, true), mean_y(&w, false));
         for _ in 0..45 {
-            w.wind = 0.0;
+            w.wind.now = 0.0;
             w.step();
         }
         assert!(mean_y(&w, true) < smoke0 - 8.0, "hot gas should climb: {smoke0} -> {}", mean_y(&w, true));
@@ -6639,7 +6613,7 @@ mod tests {
         };
         let before = mean_x(&w);
         for _ in 0..300 {
-            w.wind = 0.5;
+            w.wind.now = 0.5;
             w.step();
         }
         let moved = mean_x(&w) - before;
@@ -6650,17 +6624,17 @@ mod tests {
     fn the_wind_can_be_tuned() {
         let run = |max: f32, changes: f32, windy: f32| {
             let mut w = World::new_static();
-            w.wind_max = max;
-            w.wind_changes = changes;
-            w.windiness = windy;
+            w.wind.max = max;
+            w.wind.changes = changes;
+            w.wind.windiness = windy;
             let (mut top, mut flips, mut last) = (0.0f32, 0, 0.0f32);
             for _ in 0..200_000u32 {
                 w.update_wind();
-                top = top.max(w.wind.abs());
-                if w.wind * last < 0.0 {
+                top = top.max(w.wind.now.abs());
+                if w.wind.now * last < 0.0 {
                     flips += 1;
                 }
-                last = w.wind;
+                last = w.wind.now;
             }
             (top, flips)
         };
@@ -6682,7 +6656,7 @@ mod tests {
         for t in 0..200_000u32 {
             w.ticks = t;
             w.update_wind();
-            calmest = calmest.min(w.wind.abs());
+            calmest = calmest.min(w.wind.now.abs());
         }
         assert!(calmest >= 0.29, "the wind should never die down completely: {calmest}");
     }
@@ -6690,7 +6664,7 @@ mod tests {
     #[test]
     fn rain_slants_with_the_wind() {
         let mut w = World::new_static();
-        w.wind = 0.9;
+        w.wind.now = 0.9;
         // (A drop is carried by the air's flow where it is: a wind to the right everywhere.)
         w.flow.pin_uniform(1.0, 0.0);
         let mut sx = 0.0;
@@ -6703,7 +6677,7 @@ mod tests {
         let mut positions: Vec<i32> = vec![];
         for _ in 0..40 {
             w.step();
-            w.wind = 0.9;
+            w.wind.now = 0.9;
         }
         for i in 0..W() * H() {
             if w.cells[i].m == Mat::Water {
@@ -7438,8 +7412,8 @@ mod science {
         w.reset_temps();
         w.flow.pin_uniform(0.0, 0.0);
         // (No wind: in the wind a flake drifts down a cell a tick, see `snow_drifts`.)
-        w.wind = 0.0;
-        w.wind_max = 0.0;
+        w.wind.now = 0.0;
+        w.wind.max = 0.0;
         w.set(400, 20, Mat::Snow);
         for _ in 0..40 {
             w.step();

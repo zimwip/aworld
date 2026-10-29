@@ -24,6 +24,30 @@ fn at(i: i32, j: i32) -> usize {
     j as usize * FW() + wrap_i(i, FW() as i32) as usize
 }
 
+/// The excess pressure of the air over the ambient one, for each flow cell, in atmospheres.
+pub struct Push {
+    pub(super) dp: Vec<f32>,
+    /// Its slow average, and the quick part left when that is taken off: what pushes.
+    pub(super) slow: Vec<f32>,
+    pub(super) quick: Vec<f32>,
+    /// Whether the pressure pushes liquids and loose matter (for comparing in tests and demos).
+    pub on: bool,
+}
+
+impl Push {
+    pub fn new() -> Self {
+        Push { dp: vec![0.0; FW() * FH()], slow: vec![0.0; FW() * FH()], quick: vec![0.0; FW() * FH()], on: true }
+    }
+
+    /// Makes this a picture of `from` (see `World::copy_picture`).
+    pub fn copy_picture(&mut self, from: &Push) {
+        self.dp.clone_from(&from.dp);
+        self.slow.clone_from(&from.slow);
+        self.quick.clone_from(&from.quick);
+        self.on = from.on;
+    }
+}
+
 impl World {
     /// Re-computes the excess pressure (atmospheres over the ambient one) of every flow cell:
     /// air takes the wind solver's value, liquid cells share the pressure of the air above them.
@@ -67,7 +91,7 @@ impl World {
         for j in 0..FH() {
             for i in 0..FW() {
                 let k = j * FW() + i;
-                self.dp[k] = if liquid[k] || solid[k] || stale[k] { 0.0 } else { self.flow.excess_at_cell(i, j) };
+                self.push.dp[k] = if liquid[k] || solid[k] || stale[k] { 0.0 } else { self.flow.excess_at_cell(i, j) };
             }
         }
         for j in 0..FH() as i32 {
@@ -81,7 +105,7 @@ impl World {
                     up -= 1;
                 }
                 let u = at(i, up);
-                self.dp[k] = if liquid[u] || solid[u] || stale[u] { 0.0 } else { self.dp[u] };
+                self.push.dp[k] = if liquid[u] || solid[u] || stale[u] { 0.0 } else { self.push.dp[u] };
             }
         }
         for _ in 0..24 {
@@ -99,12 +123,12 @@ impl World {
                         }
                         let q = at(i + di, nj);
                         if !solid[q] {
-                            sum += self.dp[q];
+                            sum += self.push.dp[q];
                             cnt += 1.0;
                         }
                     }
                     if cnt > 0.0 {
-                        self.dp[k] = sum / cnt;
+                        self.push.dp[k] = sum / cnt;
                     }
                 }
             }
@@ -122,24 +146,24 @@ impl World {
                 for (di, dj) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                     let nj = j + dj;
                     if nj >= 0 && nj < FH() as i32 && !solid[at(i + di, nj)] && !stale[at(i + di, nj)] {
-                        sum += self.dp[at(i + di, nj)];
+                        sum += self.push.dp[at(i + di, nj)];
                         cnt += 1.0;
                     }
                 }
-                self.dp[k] = if cnt > 0.0 { sum / cnt } else { self.dp_slow[k] };
+                self.push.dp[k] = if cnt > 0.0 { sum / cnt } else { self.push.slow[k] };
             }
         }
         // What pushes is the part that changes quickly (a blast wave, a surge): the slowly varying
         // part is the steady overpressure of a plume or a fire, which the air flows round.
         for k in 0..n {
-            self.dp_slow[k] += (self.dp[k] - self.dp_slow[k]) * 0.08;
-            self.dpd[k] = self.dp[k] - self.dp_slow[k];
+            self.push.slow[k] += (self.push.dp[k] - self.push.slow[k]) * 0.08;
+            self.push.quick[k] = self.push.dp[k] - self.push.slow[k];
         }
     }
 
     /// Excess pressure at a world position, in atmospheres (bilinear between flow cells).
     pub fn excess_pressure_at(&self, x: f32, y: f32) -> f32 {
-        Self::bilinear(&self.dp, x, y)
+        Self::bilinear(&self.push.dp, x, y)
     }
 
     fn bilinear(field: &[f32], x: f32, y: f32) -> f32 {
@@ -158,10 +182,10 @@ impl World {
     /// pressure. A weak one (the gusts, the breath of a fire) is left out, as `QUIET` leaves it
     /// out for the cells: still water stays still.
     pub(super) fn surge_pa(&self, x: i32, y: i32) -> f32 {
-        if !self.pressure_forces || self.dpd.is_empty() {
+        if !self.push.on || self.push.quick.is_empty() {
             return 0.0;
         }
-        let d = Self::bilinear(&self.dpd, x as f32 + 0.5, y as f32 + 0.5);
+        let d = Self::bilinear(&self.push.quick, x as f32 + 0.5, y as f32 + 0.5);
         if d.abs() < SURGE_QUIET {
             return 0.0;
         }
@@ -172,21 +196,21 @@ impl World {
     /// world cell: the part that pushes.
     pub fn pressure_gradient(&self, x: f32, y: f32) -> (f32, f32) {
         let h = CELL() as f32;
-        let gx = (Self::bilinear(&self.dpd, x + h, y) - Self::bilinear(&self.dpd, x - h, y)) / (2.0 * h);
-        let gy = (Self::bilinear(&self.dpd, x, y + h) - Self::bilinear(&self.dpd, x, y - h)) / (2.0 * h);
+        let gx = (Self::bilinear(&self.push.quick, x + h, y) - Self::bilinear(&self.push.quick, x - h, y)) / (2.0 * h);
+        let gy = (Self::bilinear(&self.push.quick, x, y + h) - Self::bilinear(&self.push.quick, x, y - h)) / (2.0 * h);
         (gx, gy)
     }
 
     /// The pressure pushes: liquids and loose matter at the edge of a gradient slide towards low
     /// pressure, the lighter the quicker. Only flow cells with a real gradient are visited.
     pub(super) fn pressure_push(&mut self) {
-        if !self.pressure_forces {
+        if !self.push.on {
             return;
         }
         for j in 1..FH() as i32 - 1 {
             for i in 0..FW() as i32 {
-                let gx = (self.dpd[at(i + 1, j)] - self.dpd[at(i - 1, j)]) / (2.0 * CELL() as f32);
-                let gy = (self.dpd[at(i, j + 1)] - self.dpd[at(i, j - 1)]) / (2.0 * CELL() as f32);
+                let gx = (self.push.quick[at(i + 1, j)] - self.push.quick[at(i - 1, j)]) / (2.0 * CELL() as f32);
+                let gy = (self.push.quick[at(i, j + 1)] - self.push.quick[at(i, j - 1)]) / (2.0 * CELL() as f32);
                 let g = (gx * gx + gy * gy).sqrt();
                 if g < QUIET {
                     continue;
@@ -290,15 +314,15 @@ mod tests {
             }
         }
         let before: Vec<_> = w.cells.iter().map(|c| c.m as u8).collect();
-        w.dpd.fill(0.0);
+        w.push.quick.fill(0.0);
         for _ in 0..50 {
             w.pressure_push();
         }
         let after: Vec<_> = w.cells.iter().map(|c| c.m as u8).collect();
         assert!(before == after, "nothing moves without a gradient");
         // And the quiet threshold ignores the ordinary breeze.
-        w.dp.fill(0.0);
-        w.dpd[49 * FW() + 63] = 0.01;
+        w.push.dp.fill(0.0);
+        w.push.quick[49 * FW() + 63] = 0.01;
         for _ in 0..50 {
             w.pressure_push();
         }
@@ -355,7 +379,7 @@ mod boom {
 
     fn pool(forces: bool) -> World {
         let mut w = World::new_static();
-        w.pressure_forces = forces;
+        w.push.on = forces;
         for x in 0..W() as i32 {
             for y in 400..420 {
                 w.set(x, y, Mat::Stone);
@@ -412,7 +436,7 @@ mod boom {
                     let top = (200..400).find(|&y| (300..660).any(|x| w.cells[y * W() + x].m == Mat::Water)).unwrap_or(0);
                     let total = (200..400).map(|y| (300..660).filter(|&x| w.cells[y * W() + x].m == Mat::Water).count()).sum::<usize>();
                     let sand_x = { let v: Vec<usize> = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Sand).map(|i| i % W()).collect(); v.iter().sum::<usize>() as f32 / v.len().max(1) as f32 };
-                    let maxdp = (0..FW() * FH()).map(|k| w.dpd[k].abs()).fold(0.0f32, f32::max);
+                    let maxdp = (0..FW() * FH()).map(|k| w.push.quick[k].abs()).fold(0.0f32, f32::max);
                     eprintln!("t={t:3} water {total} splash>y330 {splash} highest water y={top} sand mean x {sand_x:.1} quick-dp max {maxdp:.2}");
                 }
             }

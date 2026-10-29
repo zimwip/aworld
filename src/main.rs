@@ -1793,7 +1793,7 @@ impl Game {
             .fold(None, |a: Option<f32>, r| Some(a.map_or(r, |a| a.max(r))));
         self.update_lightning(dt);
         self.mix = Mix {
-            wind: ((self.world.wind.abs() - 0.55) / 0.45).clamp(0.0, 1.0),
+            wind: ((self.world.wind.now.abs() - 0.55) / 0.45).clamp(0.0, 1.0),
             water: (self.world.take_water_flow() as f32 / (dt * 3600.0 * self.speed as f32).max(1.0)).sqrt().min(1.0),
             fire: (self.heat_cells as f32 / 150.0).sqrt().min(1.0),
             rpm,
@@ -2337,7 +2337,7 @@ impl Game {
         };
         if !flat {
             let moon = backdrop::Moon { arc: self.world.moon_arc(), age: self.world.moon_age(), light: self.world.moon_light(), wink: self.wolves.wink() };
-            backdrop::draw_sky(view, self.world.biome, phase, self.world.year_phase(), self.world.wind, self.time, self.world.season(), moon);
+            backdrop::draw_sky(view, self.world.biome, phase, self.world.year_phase(), self.world.wind.now, self.time, self.world.season(), moon);
         }
         if self.mode == ViewMode::Simulation {
             self.simview.draw_back(&self.world, view);
@@ -2618,7 +2618,7 @@ impl Game {
         let r = view.visible();
         let w = &self.world;
         let night = w.sun() <= 0.0;
-        let arrow = if w.wind > 0.08 { "→" } else if w.wind < -0.08 { "←" } else { "·" };
+        let arrow = if w.wind.now > 0.08 { "→" } else if w.wind.now < -0.08 { "←" } else { "·" };
         let mut text = format!(
             "{}  jour {}  ·  {}  ·  {:.0} °C  ·  vent {} {:.0} km/h",
             w.clock_label(),
@@ -2626,7 +2626,7 @@ impl Game {
             w.season().name(),
             w.surface_temp_c(),
             arrow,
-            w.wind.abs() * 40.0
+            w.wind.now.abs() * 40.0
         );
         // At night, tonight's moon.
         if night {
@@ -2852,7 +2852,7 @@ impl Game {
         }
         let vy = sy + 84.0;
         ui.text("Vent", x, vy, 16, ACCENT);
-        let mut vals = [self.world.wind_max, self.world.wind_changes, self.world.windiness];
+        let mut vals = [self.world.wind.max, self.world.wind.changes, self.world.wind.windiness];
         let rows: [(&str, f32, f32, String); 3] = [
             ("Force max", 0.05, 1.0, format!("{:.0} km/h", vals[0] * 40.0)),
             ("Virages", 0.0, 3.0, if vals[1] < 0.05 { "jamais".to_string() } else { format!("x{:.1}", vals[1]) }),
@@ -2864,7 +2864,7 @@ impl Game {
             ui.slider(Rect::new(x + 96.0, y, w - 96.0 - 66.0, 18.0), &mut vals[k], *lo, *hi, BLUE);
             ui.text(shown, x + w - 58.0, y + 13.0, 12, DIM);
         }
-        (self.world.wind_max, self.world.wind_changes, self.world.windiness) = (vals[0], vals[1], vals[2]);
+        (self.world.wind.max, self.world.wind.changes, self.world.wind.windiness) = (vals[0], vals[1], vals[2]);
         self.draw_grid_size(ui, x, vy + 8.0 + 3.0 * 24.0 + 30.0, w);
     }
 
@@ -3748,9 +3748,9 @@ impl Game {
         }
         let iy = sy + 6.0 + 2.0 * 32.0 + 10.0;
         let w = &self.world;
-        ui.text(&format!("Air {:.0} °C · vent {:.0} km/h {}", w.surface_temp_c(), w.wind.abs() * 40.0, if w.wind > 0.0 { "→" } else { "←" }), 10.0, iy, 14, TEXT);
+        ui.text(&format!("Air {:.0} °C · vent {:.0} km/h {}", w.surface_temp_c(), w.wind.now.abs() * 40.0, if w.wind.now > 0.0 { "→" } else { "←" }), 10.0, iy, 14, TEXT);
         ui.text("Vent", 10.0, iy + 22.0, 16, ACCENT);
-        let (maxv, ch, windy) = (self.world.wind_max, self.world.wind_changes, self.world.windiness);
+        let (maxv, ch, windy) = (self.world.wind.max, self.world.wind.changes, self.world.wind.windiness);
         let rows: [(&str, f32, f32, f32, String); 3] = [
             ("Force max", maxv, 0.05, 1.0, format!("{:.0} km/h", maxv * 40.0)),
             ("Virages", ch, 0.0, 3.0, if ch < 0.05 { "jamais".to_string() } else { format!("x{ch:.1}") }),
@@ -3763,9 +3763,9 @@ impl Game {
             ui.slider(Rect::new(96.0, y, PANEL_W - 96.0 - 74.0, 18.0), &mut vals[k], *lo, *hi, BLUE);
             ui.text(shown, PANEL_W - 64.0, y + 13.0, 12, DIM);
         }
-        self.world.wind_max = vals[0];
-        self.world.wind_changes = vals[1];
-        self.world.windiness = vals[2];
+        self.world.wind.max = vals[0];
+        self.world.wind.changes = vals[1];
+        self.world.wind.windiness = vals[2];
         let cr = Rect::new(10.0, iy + 30.0 + 3.0 * 20.0 + 2.0, PANEL_W - 20.0, 24.0);
         if ui.checkbox(cr, "Air compressible (P V = n R T)", self.world.flow.compress, true) {
             self.world.flow.compress = !self.world.flow.compress;
@@ -3872,7 +3872,7 @@ impl Game {
             }
             ViewMode::Wind => {
                 let w = &self.world;
-                ui.text(&format!("{:.0} km/h {}", w.wind.abs() * 40.0, if w.wind > 0.0 { "→" } else { "←" }), bar.x, bar.y + 4.0, 14, TEXT);
+                ui.text(&format!("{:.0} km/h {}", w.wind.now.abs() * 40.0, if w.wind.now > 0.0 { "→" } else { "←" }), bar.x, bar.y + 4.0, 14, TEXT);
                 ui.wrapped("Couches de vent opposées et tourbillons : ils portent nuages, vapeur, fumée et pluie, et contournent le relief.", bar.x, bar.y + 22.0, bar.w, 11, DIM);
             }
             ViewMode::Pressure => {

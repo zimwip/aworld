@@ -58,7 +58,7 @@ impl Planes {
         if self.plane.is_some() {
             return;
         }
-        let dir = if world.wind >= 0.0 { 1.0 } else { -1.0 };
+        let dir = if world.wind.now >= 0.0 { 1.0 } else { -1.0 };
         let y = self.between(50.0, 190.0);
         let x = if dir > 0.0 { -LENGTH } else { W() as f32 + LENGTH };
         self.plane = Some(Plane { pos: vec2(x, y), heading: 0.0, dir, roll: 0.0, age: 0.0, turned: 0.0 });

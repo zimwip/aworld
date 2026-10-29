@@ -1475,7 +1475,7 @@ mod anvil_lab {
         w.structures_fall = false;
         w.set_phase(std::env::var("PHASE").map(|v| v.parse().unwrap()).unwrap_or(0.2));
         if let Ok(v) = std::env::var("WIND") {
-            w.wind_max = v.parse().unwrap();
+            w.wind.max = v.parse().unwrap();
         }
         let real = std::env::var("REAL").is_ok();
         if real {
@@ -1542,7 +1542,7 @@ mod anvil_lab {
                     let mean = anv.iter().sum::<usize>() as f32 / anv.len() as f32;
                     eprintln!("  anvil n {} mean x {mean:.0} from {} to {}", anv.len(), anv.iter().min().unwrap(), anv.iter().max().unwrap());
                 }
-                eprintln!("step {step}: wind {:.2}, clouds {n}, top row {top:?}, water {} steam {} snow {} ice {}", w.wind, c(Mat::Water), c(Mat::Steam), c(Mat::Snow), c(Mat::Ice));
+                eprintln!("step {step}: wind {:.2}, clouds {n}, top row {top:?}, water {} steam {} snow {} ice {}", w.wind.now, c(Mat::Water), c(Mat::Steam), c(Mat::Snow), c(Mat::Ice));
             }
         }
         dump(&w, &format!("{dir}/anvil_end.ppm"));

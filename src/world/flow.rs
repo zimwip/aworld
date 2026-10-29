@@ -86,6 +86,21 @@ struct Vortex {
     life: u32,
 }
 
+/// The wind, and the player's settings of the weather.
+#[derive(Clone, Copy, Debug)]
+pub struct Wind {
+    /// How it blows now, -1 (left) to 1 (right).
+    pub now: f32,
+    /// The strongest wind (0..1).
+    pub max: f32,
+    /// How fast the direction keeps changing (0 = never, 1 = usual, up to 3).
+    pub changes: f32,
+    /// How windy the weather is (0 calm .. 1 windy).
+    pub windiness: f32,
+    /// Advances with `changes`; the wind's direction follows it.
+    pub clock: f32,
+}
+
 #[derive(Clone)]
 pub struct Flow {
     vx: Vec<f32>,
@@ -817,7 +832,7 @@ impl World {
             self.flow.refresh_wet(&self.cells, |c| matches!(c.m, super::Mat::Water | super::Mat::Mud | super::Mat::Cloud | super::Mat::Steam));
         }
         if due(Pass::FlowStep, t) {
-            let wind = self.wind;
+            let wind = self.wind.now;
             self.flow.step(wind, t);
         }
         self.flow.wake_ponds(&mut self.zones);
