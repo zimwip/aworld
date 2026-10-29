@@ -971,7 +971,7 @@ impl World {
             if self.piece_can_move(&p, 1) {
                 if self.tumbles(&p) {
                     // Through the air it falls as a rigid body: it lands on a corner, turns, rolls.
-                    self.loosen(p.cells, None, (0.0, p.vy / 2.0), 0.0);
+                    self.loosen(p.cells, None, (0.0, p.vy), 0.0);
                 } else {
                     self.falling.push(p);
                 }
@@ -1017,11 +1017,7 @@ impl World {
                 self.falling.push(p);
                 continue;
             }
-            let (mass, mx, my) = p.cells.iter().fold((0.0f32, 0.0f32, 0.0f32), |(m, mx, my), &i| {
-                let rho = density(self.cells[i].m);
-                (m + rho, mx + rho * ((i % W()) as f32 + 0.5), my + rho * ((i / W()) as f32 + 0.5))
-            });
-            let (cx, cy) = (mx / mass.max(1e-6), my / mass.max(1e-6));
+            let (mass, (cx, cy)) = self.mass_centre(&p.cells);
             let base = p.cells.iter().map(|&i| i / W() + 1).max().unwrap_or(0);
             // (Only a body standing on firm ground turns over an edge of it. One that floats has
             // no edge to turn about: the liquid bears it wherever it dips in, and it rights itself
@@ -1085,6 +1081,29 @@ impl World {
         }
     }
 
+    /// The mass of the cells `cells` (Σ density relative to water) and their centre of mass
+    /// (cells): of a falling piece and of a slab alike.
+    fn mass_centre(&self, cells: &[usize]) -> (f32, (f32, f32)) {
+        let (mass, mx, my) = cells.iter().fold((0.0f32, 0.0f32, 0.0f32), |(m, mx, my), &i| {
+            let rho = density(self.cells[i].m);
+            (m + rho, mx + rho * ((i % W()) as f32 + 0.5), my + rho * ((i / W()) as f32 + 0.5))
+        });
+        (mass, (mx / mass.max(1e-6), my / mass.max(1e-6)))
+    }
+
+    /// The mean density of the cells `cells`, relative to water: a falling piece lighter than a
+    /// liquid floats on it.
+    pub(super) fn mean_density(&self, cells: &[usize]) -> f32 {
+        cells.iter().map(|&i| density(self.cells[i].m)).sum::<f32>() / cells.len().max(1) as f32
+    }
+
+    /// A heavy blow at (x, y), for the sound: `strength` from 0 to about 4 (a few a step at most).
+    pub(super) fn thud(&mut self, x: i32, y: i32, strength: f32) {
+        if self.thuds.len() < 8 {
+            self.thuds.push((x, y, strength));
+        }
+    }
+
     /// Whether the falling body `p` falls as a slab that can turn and roll (see `step_slab`)
     /// rather than straight down: through open air, and not too large.
     fn tumbles(&self, p: &Piece) -> bool {
@@ -1103,19 +1122,14 @@ impl World {
     fn loosen(&mut self, cells: Vec<usize>, hinge: Option<(f32, f32)>, v: (f32, f32), spin: f32) {
         let mut parts = Vec::with_capacity(cells.len());
         let mut home = HashMap::with_capacity(cells.len());
-        let (mut mass, mut mx, mut my) = (0.0f32, 0.0f32, 0.0f32);
+        let (mass, c0) = self.mass_centre(&cells);
         let mut drawn = Vec::with_capacity(cells.len());
         for (k, &i) in cells.iter().enumerate() {
             let (x, y) = xy_i32(i);
-            let rho = density(self.cells[i].m);
-            mass += rho;
-            mx += rho * (x as f32 + 0.5);
-            my += rho * (y as f32 + 0.5);
             parts.push(Part { x, y, cell: self.cells[i], temp: self.temp[i], states: self.take_states(i) });
             home.insert((x, y), k as u32);
             drawn.push((i, k as u32));
         }
-        let c0 = (mx / mass, my / mass);
         let (mut inertia, mut reach) = (0.0f32, 0.0f32);
         for p in &parts {
             let r2 = (p.x as f32 + 0.5 - c0.0).powi(2) + (p.y as f32 + 0.5 - c0.1).powi(2);
@@ -1271,8 +1285,8 @@ impl World {
                 (worst, at, n) = (vn, p, pn);
             }
         }
-        if worst * ms > 2.0 && self.thuds.len() < 8 {
-            self.thuds.push((at.0 as i32, at.1 as i32, (worst * ms / 3.0).min(4.0)));
+        if worst * ms > 2.0 {
+            self.thud(at.0 as i32, at.1 as i32, (worst * ms / 3.0).min(4.0));
         }
         let before = (s.v, s.spin);
         // A slow touch does not bounce (else a body at rest would hop under its own weight).
@@ -1500,8 +1514,8 @@ impl World {
             return;
         }
         let cells: Vec<usize> = s.drawn.iter().map(|d| d.0).collect();
-        let density = cells.iter().map(|&i| density(self.cells[i].m)).sum::<f32>() / cells.len() as f32;
-        let vy = (s.velocity_at(s.c).1 * 2.0).clamp(0.0, 3.0);
+        let density = self.mean_density(&cells);
+        let vy = s.velocity_at(s.c).1.clamp(0.0, 1.5);
         self.falling.push(Piece { cells, vy, fallen: 0.0, density });
     }
 

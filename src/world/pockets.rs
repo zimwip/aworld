@@ -464,8 +464,8 @@ impl World {
                 self.blasts.push((cx, cy, r));
             }
             self.shove_out(cx, cy, r);
-        } else if self.thuds.len() < 8 {
-            self.thuds.push((cx, cy, 1.5));
+        } else {
+            self.thud(cx, cy, 1.5);
         }
     }
 

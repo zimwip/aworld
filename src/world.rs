@@ -507,13 +507,14 @@ const WADE_BRAKE_MS: f32 = 0.375;
 /// The fastest a falling piece goes, m/s, and the speed past which it bounces as it lands.
 const PIECE_MAX_MS: f32 = 4.5;
 const PIECE_BOUNCE_MS: f32 = 2.1;
-/// The pieces drop every other tick (see `after_cells`): a speed in m/s in cells per drop.
-fn per_drop(v: f32) -> f32 {
-    2.0 * units::cells_per_tick(v)
+/// The pieces drop every few ticks (`cadence::Pass::Drops`): how many.
+fn drop_ticks() -> f32 {
+    cadence::every(Pass::Drops) as f32
 }
-/// What a falling piece gains in speed every drop, cells per drop: gravity over two ticks.
+/// What a falling piece gains in speed every drop, cells per tick: gravity over the ticks of a
+/// drop.
 fn piece_fall() -> f32 {
-    4.0 * units::g_tick()
+    drop_ticks() * units::g_tick()
 }
 /// The liquid a falling piece drives aside is looked for this many cells of liquid around it at
 /// most, on its way to the free surface.
@@ -674,7 +675,7 @@ const RAIN_MIN_WATER: f32 = 8.0;
 #[derive(Clone)]
 struct Piece {
     cells: Vec<usize>,
-    /// Downward speed in cells per drop (negative while bouncing up).
+    /// Downward speed, cells per tick as a slab's (negative while bouncing up).
     vy: f32,
     /// How far it has fallen since it last rested, cells: how hard it lands.
     fallen: f32,
@@ -3845,7 +3846,7 @@ impl World {
             }
             budget = budget.saturating_sub(cells.len());
             let (vy, fallen) = cells.iter().step_by(5).filter_map(|c| speeds.get(c)).fold((0.0f32, 0.0f32), |a, b| (a.0.max(b.0), a.1.max(b.1)));
-            let density = cells.iter().map(|&i| density(self.cells[i].m)).sum::<f32>() / cells.len().max(1) as f32;
+            let density = self.mean_density(&cells);
             free.push(Piece { cells, vy, fallen, density });
             if budget == 0 {
                 break;
@@ -3984,19 +3985,20 @@ impl World {
         for piece in &mut pieces {
             if piece.vy >= 0.0 {
                 // Falling: gravity builds up speed; move one cell at a time while it is free.
-                piece.vy = (piece.vy + piece_fall()).min(per_drop(PIECE_MAX_MS));
-                for _ in 0..(piece.vy.max(1.0) as i32) {
+                piece.vy = (piece.vy + piece_fall()).min(units::cells_per_tick(PIECE_MAX_MS));
+                // As many rows as it goes in the ticks of a drop.
+                for _ in 0..((piece.vy * drop_ticks()).max(1.0) as i32) {
                     if !self.piece_can_move(piece, 1) && !self.crush_foliage(piece) {
                         break;
                     }
                     // Ploughing into loose grains: pushing them aside takes its speed.
                     if self.ploughs(piece) {
-                        piece.vy -= per_drop(PLOUGH_BRAKE_MS);
+                        piece.vy -= units::cells_per_tick(PLOUGH_BRAKE_MS);
                     }
                     let wet = self.piece_move(piece, 1);
                     // Driving the liquid aside brakes it too, the more of its foot is in it.
                     if wet > 0 {
-                        piece.vy -= per_drop(WADE_BRAKE_MS) * wet as f32 / piece.foot().max(1) as f32;
+                        piece.vy -= units::cells_per_tick(WADE_BRAKE_MS) * wet as f32 / piece.foot().max(1) as f32;
                     }
                     piece.fallen += 1.0;
                 }
@@ -4015,11 +4017,9 @@ impl World {
                         continue;
                     }
                     piece.fallen = 0.0;
-                    if piece.vy > per_drop(PIECE_BOUNCE_MS) {
-                        if self.thuds.len() < 8 {
-                            let c = piece.cells[0];
-                            self.thuds.push(((c % W()) as i32, (c / W()) as i32, piece.vy));
-                        }
+                    if piece.vy > units::cells_per_tick(PIECE_BOUNCE_MS) {
+                        let c = piece.cells[0];
+                        self.thud((c % W()) as i32, (c / W()) as i32, piece.vy * drop_ticks());
                         piece.vy = -piece.vy * 0.34;
                         self.rise(piece);
                     } else {
@@ -4088,7 +4088,7 @@ impl World {
     }
 
     fn rise(&mut self, piece: &mut Piece) {
-        let up = (-piece.vy).max(1.0) as i32;
+        let up = (-piece.vy * drop_ticks()).max(1.0) as i32;
         for _ in 0..up {
             if !self.piece_can_move(piece, -1) {
                 piece.vy = 0.0;
@@ -4138,7 +4138,7 @@ impl World {
                             // (A film of liquid, under half a cell, never holds a piece up: one
                             // caught in a notch of a block of ice held the block up in the sky.)
                             let film = m.kind() == Kind::Liquid && self.liquid_fill(target) < field::FULL / liquid::HOLDS;
-                            if (heavier && (!bears || piece.vy >= per_drop(PLOUGH_MS))) || film {
+                            if (heavier && (!bears || piece.vy >= units::cells_per_tick(PLOUGH_MS))) || film {
                                 true
                             } else {
                                 // (A drop caught in a notch of the piece rests on the piece
@@ -4219,7 +4219,7 @@ impl World {
         let cx = piece.cells.iter().map(|&i| (i % W()) as f32).sum::<f32>() / piece.cells.len().max(1) as f32;
         // (Its speed as it was: a piece settling slowly onto a liquid, a block of ice coming to float,
         // moves a row at a time all the same, but throws nothing up.)
-        let speed = piece.vy.max(0.0) * cell_m() / (2.0 * STEP);
+        let speed = piece.vy.max(0.0) * cell_m() / STEP;
         self.wade(&in_piece, &moved, cx, speed);
     }
 

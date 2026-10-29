@@ -164,6 +164,14 @@ une traînée en carré de la vitesse réglée par leur vitesse limite (`pull` :
 15 m/s une tôle, 12 m/s un bâton ; le jet, un filet d'eau, sans traînée), et un trajet cellule par cellule qui
 s'arrête à la première qui bloque (`sweep`). Chacun garde ce qu'il fait en arrivant.
 
+**Morceaux qui tombent et dalles** : deux façons de faire tomber un corps détaché, gardées toutes deux. Un morceau
+(`Piece`) descend tout droit dans la grille, flotte ou coule dans les liquides en les écartant, s'enfonce dans le
+sable, casse les feuillages et peut être immense ; une dalle (`Slab`) est sortie de la grille et tourne, roule et
+rebondit dans l'air, et redevient un morceau dans un liquide. Ce qu'ils calculent tous deux l'est une fois : la
+vitesse en cellules par tick (un morceau passe à une dalle et revient sans conversion), la masse et le centre de
+masse, la densité moyenne, la casse à l'impact (`fracture`) et les chocs pour le son (`thud`) ; la cadence des
+chutes vient de l'ordonnanceur.
+
 **Les cadences** (`src/world/cadence.rs`) : chaque passe qui ne tourne pas à chaque tick (structures, chutes,
 poches, transformations lentes, pression de l'air, saison, orage, flux d'air) a sa période en secondes du monde et
 sa phase dans un seul tableau ; un test vérifie que les passes lourdes ne tombent jamais sur le même tick.
