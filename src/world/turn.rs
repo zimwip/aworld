@@ -135,7 +135,7 @@ fn mix(seed: u32, zx: u32) -> u32 {
 /// liquids, moved by their physics, do not take the cells' turn, which was what came out
 /// differently on every core.
 pub(super) fn parallel_by_default() -> bool {
-    std::env::var_os("AWORLD_CELLS_PAR").is_none_or(|v| v != "0")
+    crate::config::config().cells_par
 }
 
 #[cfg(debug_assertions)]

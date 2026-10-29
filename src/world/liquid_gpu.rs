@@ -454,7 +454,7 @@ mod native {
         /// threw, the classes and the pressure, into the world.
         pub(in super::super) fn collect_liquids(&mut self, liq: &mut Liquids, card: &mut LiquidGpu) {
             let Some(pend) = card.pending.take() else { return };
-            let audit = std::env::var_os("AWORLD_DEBUG_MASS").is_some();
+            let audit = crate::config::config().debug_mass;
             let units = |w: &World| (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Water).map(|i| w.liquid_fill(i) as u64).sum::<u64>();
             let before = if audit { units(self) + liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>() } else { 0 };
             let clock = self.prof.start();
@@ -907,7 +907,7 @@ mod native {
             card.read.slice(..total).map_async(wgpu::MapMode::Read, |_| {});
             t = tick(4, t);
             card.pending = Some(Pending { y0, rows, groups, throws_at, cells_at, partials_at, stamp, sc_at, stamps_at, marks, total });
-            if std::env::var_os("AWORLD_DEBUG_CARD").is_some() && stamp % 100 == 0 {
+            if crate::config::config().debug_card && stamp % 100 == 0 {
                 let ms = |k: usize| DBG[k].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / stamp as f64;
                 eprintln!("carte, ms/pas: bande {:.2}, différences {:.2} ({} cellules envoyées), écritures {:.2}, encodage {:.2}, soumission {:.2}, attente {:.2}, lecture {:.2} ({} cellules reçues)", ms(0), ms(1), sent.len(), ms(2), ms(3), ms(4), ms(5), ms(6), DBG[7].load(std::sync::atomic::Ordering::Relaxed));
                 if card.stamps.is_some() {

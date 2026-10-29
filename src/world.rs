@@ -1928,7 +1928,7 @@ impl World {
     fn step_ticks(&mut self, ticks: u32) {
         self.revision += 1;
         let clock = self.prof.start();
-        let audit = std::env::var_os("AWORLD_DEBUG_MASS").is_some();
+        let audit = crate::config::config().debug_mass;
         let mut marks: Vec<(&str, u64)> = Vec::new();
         if audit {
             marks.push(("début", self.water_units_audit()));

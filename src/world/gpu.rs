@@ -19,21 +19,13 @@ pub struct Gpu {
     pub timestamps: bool,
 }
 
-/// How the card is wanted: off, as the size of the work decides, or for everything.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Use {
-    Off,
-    Auto,
-    Always,
-}
+/// How the card is wanted: off, as the size of the work decides, or for everything
+/// (`AWORLD_GPU`, see `config`).
+pub use crate::config::Gpu as Use;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn wanted() -> Use {
-    match std::env::var("AWORLD_GPU").as_deref() {
-        Ok("1") => Use::Always,
-        Ok("auto") => Use::Auto,
-        _ => Use::Off,
-    }
+    crate::config::config().gpu
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -59,7 +51,7 @@ static CARD: OnceLock<Option<Gpu>> = OnceLock::new();
 pub async fn open(adapter: &wgpu::Adapter) -> Option<Gpu> {
     let info = adapter.get_info();
     let stamps = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
-    let timestamps = cfg!(not(target_arch = "wasm32")) && std::env::var_os("AWORLD_DEBUG_CARD").is_some() && adapter.features().contains(stamps);
+    let timestamps = cfg!(not(target_arch = "wasm32")) && crate::config::config().debug_card && adapter.features().contains(stamps);
     let (device, queue) = adapter
         .request_device(
             &wgpu::DeviceDescriptor { label: Some("aworld"), required_features: if timestamps { stamps } else { wgpu::Features::empty() }, required_limits: limits(adapter), memory_hints: wgpu::MemoryHints::Performance },
@@ -103,7 +95,7 @@ pub fn gpu() -> Option<&'static Gpu> {
     }
     let gpu = card()?;
     SAID.get_or_init(|| {
-        if std::env::var_os("AWORLD_PROFILE").is_some() || wanted() == Use::Always {
+        if crate::config::config().profile || wanted() == Use::Always {
             eprintln!("aworld: GPU: {}", gpu.name);
         }
     });
