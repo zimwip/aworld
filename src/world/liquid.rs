@@ -2816,11 +2816,11 @@ mod tests {
         for t in 0..180 {
             w.step();
             if t == 60 {
-                strain = w.strain[World::idx(200, b - 5)];
+                strain = w.structures.strain[World::idx(200, b - 5)];
             }
         }
         let stands = (b - 54..=b - 5).all(|y| w.raw(200, y) == m);
-        (strain, stands, w.pushes.clone())
+        (strain, stands, w.structures.pushes.clone())
     }
 
     #[test]

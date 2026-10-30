@@ -273,7 +273,7 @@ fn storm() -> World {
             let (x, y) = ((qx * QS()) as f32, (qy * QS()) as f32);
             if (280.0..680.0).contains(&x) && (70.0..200.0).contains(&y) {
                 let u = ((x - 480.0) / 200.0).powi(2);
-                w.charge[qy * QW() + qx] = (if y < 120.0 { 0.8 } else if y > 150.0 { -0.95 } else { 0.0 }) * (1.0 - u);
+                w.storm.charge[qy * QW() + qx] = (if y < 120.0 { 0.8 } else if y > 150.0 { -0.95 } else { 0.0 }) * (1.0 - u);
             }
         }
     }

@@ -118,6 +118,36 @@ unsafe fn share<T>(v: &T) -> T {
     std::ptr::read(v)
 }
 
+impl super::statics::Structures {
+    /// The strip's view of the solids: the world's strains, its own bodies that come loose.
+    ///
+    /// # Safety
+    /// As `share`.
+    unsafe fn view(&self) -> Self {
+        Self { strain: share(&self.strain), strain_key: self.strain_key, ..Self::empty() }
+    }
+}
+
+impl super::pressure::Push {
+    /// The strip's view of the pushing pressure: the world's grids.
+    ///
+    /// # Safety
+    /// As `share`.
+    unsafe fn view(&self) -> Self {
+        Self { dp: share(&self.dp), slow: share(&self.slow), quick: share(&self.quick), on: self.on }
+    }
+}
+
+impl super::storm::Storm {
+    /// The strip's view of the storms: the world's grids, its own bolts and draws.
+    ///
+    /// # Safety
+    /// As `share`.
+    unsafe fn view(&self) -> Self {
+        Self { charge: share(&self.charge), mcharge: share(&self.mcharge), magnet: share(&self.magnet), polar: share(&self.polar), bolts: Vec::new(), rng: self.rng.clone() }
+    }
+}
+
 /// The seed of strip `zx`'s draws this step. The draws are xorshift, which is linear: seeds that
 /// only differ by a constant, or follow one another in the world's stream, would give a strip
 /// nearly the same draws step after step (a heap of sand creeps to one side). Hence a hash.
@@ -298,9 +328,9 @@ impl World {
         self.ejecta.append(&mut v.ejecta);
         self.thuds.append(&mut v.thuds);
         self.bursts.append(&mut v.bursts);
-        self.bolts.append(&mut v.bolts);
-        self.falling.append(&mut v.falling);
-        self.slabs.append(&mut v.slabs);
+        self.storm.bolts.append(&mut v.storm.bolts);
+        self.structures.falling.append(&mut v.structures.falling);
+        self.structures.slabs.append(&mut v.structures.slabs);
         self.liq.drops.append(&mut v.liq.drops);
         later.extend(v.later.take().unwrap_or_default());
         self.zones.absorb(&v.zones);
@@ -322,17 +352,7 @@ impl World {
                 seen: Vec::new(),
                 ground: Vec::new(),
                 stack: Vec::new(),
-                falling: Vec::new(),
-                slabs: Vec::new(),
-                level: Vec::new(),
-                strain: share(&self.strain),
-                pushes: Vec::new(),
-                bodies: Vec::new(),
-                strain_key: self.strain_key,
-                stress_cache: Default::default(),
-                stress_plans: Default::default(),
-                stress_pos: Vec::new(),
-                stress_local: Vec::new(),
+                structures: self.structures.view(),
                 ticks: self.ticks,
                 log: share(&self.log),
                 paint_log: self.paint_log,
@@ -340,19 +360,14 @@ impl World {
                 clock: self.clock,
                 dt: self.dt,
                 tick_time: self.tick_time,
-                heat_stage: self.heat_stage,
+                heat: self.heat.view(),
                 day_cycle: self.day_cycle,
-                thermal_flip: self.thermal_flip,
                 climate_fixed: self.climate_fixed,
                 climate: self.climate.view(),
                 revision: self.revision,
                 dried: 0,
                 gone: 0,
                 wind: self.wind,
-                wind_max: self.wind_max,
-                wind_changes: self.wind_changes,
-                windiness: self.windiness,
-                wind_clock: self.wind_clock,
                 biome: self.biome,
                 leaf_rgb: self.leaf_rgb,
                 autumn: self.autumn,
@@ -369,10 +384,7 @@ impl World {
                 thuds: Vec::new(),
                 water_flow: 0,
                 flow: share(&self.flow),
-                dp: share(&self.dp),
-                dp_slow: share(&self.dp_slow),
-                dpd: share(&self.dpd),
-                pressure_forces: self.pressure_forces,
+                push: self.push.view(),
                 lod: self.lod,
                 liq_tier: self.liq_tier,
                 liq_work: 0,
@@ -394,19 +406,11 @@ impl World {
                 liq_w: share(&self.liq_w),
                 zones: self.zones.view(),
                 bursts: Vec::new(),
-                charge: share(&self.charge),
-                mcharge: share(&self.mcharge),
-                magnet: share(&self.magnet),
-                polar: share(&self.polar),
-                bolts: Vec::new(),
-                storm_rng: self.storm_rng.clone(),
+                storm: self.storm.view(),
                 pressure_cache: std::sync::Mutex::new(None),
                 prof: prof::Profile::default(),
                 air_rows: share(&self.air_rows),
                 air_sky: self.air_sky,
-                heat_carry: (0.0, 0.0),
-                temp_old: Vec::new(),
-                heat_took: Vec::new(),
                 later: Some(Vec::new()),
             }
         }

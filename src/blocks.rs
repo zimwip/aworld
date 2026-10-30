@@ -1891,7 +1891,7 @@ impl Physics {
             let s = b.spec();
             let half = b.half();
             // Wind pushes on whatever is in the open air, in proportion to the surface it offers.
-            let gust = world.wind * world.wind.abs() * (s.h.max(s.w) * s.w.min(s.h)) / (px_per_m() * px_per_m()) * g.abs() * 0.045 * dt;
+            let gust = world.wind.now * world.wind.now.abs() * (s.h.max(s.w) * s.w.min(s.h)) / (px_per_m() * px_per_m()) * g.abs() * 0.045 * dt;
             self.w.bodies[h].apply_impulse(Vector::new(gust, 0.0), false);
             // A difference of pressure across the block pushes it from high to low (a blast wave,
             // a surge of water). The still weight of the liquid is the buoyancy below.

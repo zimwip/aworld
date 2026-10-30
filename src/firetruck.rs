@@ -618,7 +618,7 @@ mod tests {
         }
         let t = trucks.truck.clone().unwrap();
         world.strike(t.x as i32, (t.y - 5.0) as i32);
-        let bolt = world.bolts.last().unwrap();
+        let bolt = world.storm.bolts.last().unwrap();
         assert!(bolt.ground && bolt.path.iter().any(|&(x, y)| t.touches(vec2(x, y), 2.0)), "the bolt goes through the engine");
     }
 }
