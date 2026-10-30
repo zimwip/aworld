@@ -349,6 +349,17 @@ impl World {
         (self.liq.p.len() == W() * H() && self.liq.class[i] & 3 == FULLISH && self.cells[i].m.kind() == Kind::Liquid).then(|| self.liq.p[i])
     }
 
+    /// Whether the liquids hold a pressure the bodies in them can feel (`liquid_pa`).
+    pub fn liquid_pressure_known(&self) -> bool {
+        self.liq.p.len() == W() * H()
+    }
+
+    /// The kinematic viscosity of the liquid at (x, y), m²/s (None where there is none).
+    pub fn liquid_viscosity(&self, x: usize, y: usize) -> Option<f32> {
+        let i = y * W() + x;
+        (self.cells[i].m.kind() == Kind::Liquid && self.mask[i] == 0).then(|| props(self.cells[i].m, self.temp[i]).1)
+    }
+
     /// The push of the liquids on the solid cell `i`, from the pressure on each of its wet sides,
     /// as a weight (x, y; down positive): in cells of water, the column of water that would press
     /// as hard (none unless the liquids run by their physics).
