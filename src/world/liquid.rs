@@ -164,6 +164,16 @@ pub const WET: u8 = 2;
 /// Liquid, at least half full: it holds a pressure.
 pub const FULLISH: u8 = 3;
 
+/// For a thick liquid, the temperature (°C) from which it thickens as it cools: e times for every
+/// 60 °C below it (see `props`). The others run like water whatever their heat.
+pub(super) fn thick_from(m: Mat) -> Option<f32> {
+    match m {
+        Mat::Lava => Some(1150.0),
+        Mat::MoltenGlass => Some(1100.0),
+        _ => None,
+    }
+}
+
 /// Density (kg/m³), kinematic viscosity (m²/s) and yield stress (Pa) of liquid `m` at `t` °C.
 pub(super) fn props(m: Mat, t: f32) -> (f32, f32, f32) {
     let rho = density(m) * 1000.0;
@@ -171,10 +181,12 @@ pub(super) fn props(m: Mat, t: f32) -> (f32, f32, f32) {
         Mat::Water => (rho, 1e-6, 0.0),
         Mat::Oil => (rho, 1e-4, 0.0),
         // Basalt at 1 150 °C: about 3 000 Pa·s; e times thicker for every 60 °C it cools, and a
-        // yield stress that grows as it cools too (a cooling flow stops, its crust holds).
-        Mat::Lava => {
-            let cool = ((1150.0 - t) / 60.0).clamp(0.0, 8.0);
-            (rho, (cool.exp()).min(50.0), 500.0 * ((1150.0 - t) / 150.0).clamp(0.0, 8.0).exp())
+        // yield stress that grows as it cools too (a cooling flow stops, its crust holds). Molten
+        // glass goes the same way, from a little cooler (see `thick_from`).
+        Mat::Lava | Mat::MoltenGlass => {
+            let hot = thick_from(m).unwrap_or(t);
+            let cool = ((hot - t) / 60.0).clamp(0.0, 8.0);
+            (rho, (cool.exp()).min(50.0), 500.0 * ((hot - t) / 150.0).clamp(0.0, 8.0).exp())
         }
         // Molten metal runs about like water.
         _ => (rho, 1e-6, 0.0),

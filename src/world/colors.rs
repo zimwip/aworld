@@ -227,7 +227,11 @@ impl World {
                 if seeds > 0 && (h >> 3) % 16 < 2 + seeds {
                     (184 + v, 150 + v, 96 + v / 2, 255)
                 } else {
-                    ((112 + v) * k / 256, (78 + v / 2) * k / 256, (52 + v / 2) * k / 256, 255)
+                    // Humus is what makes earth dark: as it burns away, the earth pales towards
+                    // the colour of the sand it is made of.
+                    let o = 256 - 256 * self.organic[y * W() + x].min(SOIL_ORGANIC) as i32 / SOIL_ORGANIC as i32;
+                    let mix = |a: i32, s: i32| a + (s - a) * o / 256;
+                    (mix(112 + v, 214 + v) * k / 256, mix(78 + v / 2, 186 + v) * k / 256, mix(52 + v / 2, 118 + v) * k / 256, 255)
                 }
             }
             Mat::Grass => {
@@ -269,6 +273,8 @@ impl World {
             Mat::Snow => (244 + v / 3, 247 + v / 3, 252, 255),
             Mat::Hail => (210 + v, 236 + v, 252, 255),
             Mat::Molten | Mat::MoltenSteel => (255, 196 + flick * 2 + v, 90 + flick, 255),
+            // Glowing orange, half see-through.
+            Mat::MoltenGlass => (255, 138 + flick * 2 + v, 52 + flick, 225),
             Mat::Oil => {
                 // Almost black with a rainbow sheen where it catches the light.
                 let sheen = if (x / 3 + y / 2) % 7 == 0 { 26 } else { 0 };

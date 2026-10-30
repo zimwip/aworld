@@ -400,6 +400,7 @@ impl World {
                 moisture: share(&self.moisture),
                 fuel: share(&self.fuel),
                 growth: share(&self.growth),
+                organic: share(&self.organic),
                 jet: share(&self.jet),
                 liq_p: share(&self.liq_p),
                 cls: share(&self.cls),

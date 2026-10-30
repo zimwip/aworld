@@ -26,7 +26,12 @@ cargo run --release
   turbulences de l'air, surtout près de l'horizon et par grand vent ; les planètes, elles, brillent sans scintiller) ; **saisons** : les feuilles
   rougissent, tombent, pourrissent en terre ; les arbres repoussent au printemps.
 - **Température** : l'air refroidit avec l'altitude ; l'eau bout à 100 °C et gèle à 0 °C, avec un palier (chaleur latente) ; la roche fond vers 540 °C ;
-  la lave refroidit très lentement ; le sable chauffé devient verre (et casse sous un choc thermique).
+  la lave refroidit très lentement ; le sable chauffé devient verre (et casse sous un choc thermique, sauf chaud et mou) ;
+  vers 850 °C le verre fond en verre liquide, épais, qui se fige en refroidissant et se mélange à la lave qu'il touche.
+- **La terre est un mélange** : du sable, de l'humus et de l'eau. Chauffée (contre de la lave), son eau bout d'abord et la
+  tient à 100 °C (la vapeur traverse le sol et sort à la surface) ; sèche, son humus brûle vers 250 °C en fumant et elle
+  pâlit ; sans humus il ne reste que le sable, qui s'écroule, devient verre puis fond dans la lave. Sèche et sans humus,
+  la terre tient moins bien (`--demo out.png --soil --advance 4000`).
 - **Cycle de l'eau** : évaporation → vapeur → nuage (que le vent pousse) → pluie, neige ou grêle selon le froid.
   Un nuage réchauffé par le soleil garde son eau. Les gaz qui sortent d'un côté reviennent de l'autre.
 - **Chimie** : bois + feu = cendre (carbone) ; fer + cendre + chaleur = acier ; l'eau rouille le fer ; rouille + feu = fer ;

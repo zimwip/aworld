@@ -400,6 +400,7 @@ impl World {
         self.moisture[i] = st.moisture;
         self.fuel[i] = st.fuel;
         self.growth[i] = st.growth;
+        self.organic[i] = st.organic;
         self.jet[i] = st.jet;
     }
 

@@ -679,7 +679,7 @@ impl Car {
                 let a = k as f32 / 8.0 * std::f32::consts::TAU;
                 let q = p + vec2(a.cos(), a.sin()) * (10.0 * S);
                 match world.at(q.x.floor() as i32, q.y.floor() as i32) {
-                    Mat::Lava | Mat::Molten | Mat::MoltenSteel => heat += 30,
+                    Mat::Lava | Mat::Molten | Mat::MoltenSteel | Mat::MoltenGlass => heat += 30,
                     Mat::Fire | Mat::Ember => heat += 3,
                     _ => {}
                 }

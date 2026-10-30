@@ -320,7 +320,8 @@ mod native {
                 };
                 table[64 + i] = density(m).to_bits();
                 table[128 + i] = props(m, 15.0).1.to_bits();
-                table[192 + i] = (m == Mat::Lava) as u32;
+                // (The temperature a thick liquid thickens from, 0 for the others.)
+                table[192 + i] = thick_from(m).map_or(0, f32::to_bits);
             }
             gpu.queue.write_buffer(&tables, 0, bytes(&table));
             fn entries<'a>(bufs: &[&'a wgpu::Buffer]) -> Vec<wgpu::BindGroupEntry<'a>> {
@@ -692,7 +693,7 @@ mod native {
                             fill[x] = f;
                             if run && world.mask[i] == 0 {
                                 fullish += (f >= field::FULL / HOLDS) as usize;
-                                thick |= m == Mat::Lava;
+                                thick |= thick_from(m).is_some();
                             }
                             if world.vel[i] != 0 && !world.lone_liquid(x as i32, y as i32) {
                                 fallen.push((i, world.vel[i] as f32 / FALL_UNIT as f32 * cell_m() / DT));
