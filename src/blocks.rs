@@ -35,6 +35,11 @@ const TILE: i32 = 16;
 /// Weld breaking limits (per step): force and torque impulses.
 const BREAK_FORCE: f32 = 1.3;
 const BREAK_TORQUE: f32 = 3.2;
+/// The push of a blast on a block (see `Physics::blast`): m/s per cell of reach of the charge, for a
+/// block of one cell of face per cell of area and of density 1.
+const BLAST_PUSH: f32 = 6.5;
+/// The fastest a blast throws a block, m/s: as fast as the fastest clods of a crater.
+const BLAST_MAX_MS: f32 = 18.0;
 /// Torque a driven axle puts in per radian per second it is short of its speed.
 const ARM_DAMPING: f32 = 200.0;
 
@@ -1869,19 +1874,52 @@ impl Physics {
         rb.apply_impulse_at_point(impulse, v2(point), true);
     }
 
-    /// Push bodies away from an explosion.
+    /// Throws bodies away from an explosion that reaches `r` cells from (cx, cy). The gas pushes
+    /// on the side a body turns to it, and its mass resists: a small light block flies farther than
+    /// a big heavy one, and a bigger charge (a longer reach) throws harder. The shock reflects off the
+    /// ground under a body, so one lying beside or below the charge is thrown up and out, like the
+    /// clods of a crater, rather than pressed into the ground; and pushed on its near side, it
+    /// tumbles.
     pub fn blast(&mut self, blocks: &[Block], cx: f32, cy: f32, r: f32) {
         let c = vec2(cx, cy);
+        let reach = r * 2.2;
+        // Metres in a unit of the blocks' physics.
+        let unit = crate::world::units::cell_m() * px_per_m();
         for b in blocks {
             let Some(h) = b.body else { continue };
-            let d = (b.pos - c).length();
-            let reach = r * 2.2;
-            if d < reach {
-                let dir = (b.pos - c).normalize_or_zero();
-                let rb = &mut self.w.bodies[h];
-                let strength = (1.0 - d / reach) * rb.mass() * 9.0;
-                rb.apply_impulse(Vector::new(dir.x, dir.y - 0.3) * strength, true);
+            let s = b.spec();
+            // The point of the block nearest the charge.
+            let half = b.half();
+            let local = rot(-b.angle, c - b.pos);
+            let near = if s.round { local.clamp_length_max(half.x) } else { vec2(local.x.clamp(-half.x, half.x), local.y.clamp(-half.y, half.y)) };
+            let near = b.pos + rot(b.angle, near);
+            let d = (near - c).length();
+            if d >= reach {
+                continue;
             }
+            let away = b.pos - c;
+            // Angle above the horizontal it is thrown at: as it is from the charge when well above
+            // it, about 35° when beside it, steeper and steeper below it (the ground throws it back).
+            let e = (-away.y).atan2(away.x.abs());
+            let e = if e > 0.9 {
+                e
+            } else if e >= 0.0 {
+                0.6 + e / 3.0
+            } else {
+                0.6 + 0.8 * (-e) / std::f32::consts::FRAC_PI_2
+            };
+            // Not all at the same angle: a little spread, the same for the same block.
+            let e = e + ((b.uid.wrapping_mul(0x9e37_79b9) >> 16) % 100) as f32 / 100.0 * 0.3 - 0.15;
+            let side = if away.x.abs() > 0.5 { away.x.signum() } else if b.uid % 2 == 0 { 1.0 } else { -1.0 };
+            let dir = vec2(side * e.cos(), -e.sin());
+            // The speed it takes, m/s: the push on its face over its mass, at most that of the
+            // fastest clods.
+            let face = if s.round { s.w } else { (s.w + s.h) / 2.0 };
+            let dv = (BLAST_PUSH * r * face / (s.w * s.h * s.density) * (1.0 - d / reach)).min(BLAST_MAX_MS) / unit;
+            let rb = &mut self.w.bodies[h];
+            let j = dir * (rb.mass() * dv);
+            let at = b.pos + (near - b.pos) * 0.4;
+            rb.apply_impulse_at_point(Vector::new(j.x, j.y), v2(at), true);
         }
     }
 

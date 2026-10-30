@@ -5441,4 +5441,39 @@ mod tests {
             assert_eq!(h % render::LS, 0, "{h}");
         }
     }
+
+    #[test]
+    fn dynamite_throws_the_blocks_around_it_up_and_away() {
+        let mut g = mech_game();
+        // Bricks on the floor on either side of a cube, a stick of dynamite on the cube.
+        for x in [240.0, 272.0, 328.0, 360.0] {
+            g.blocks.push(Block::new(BlockKind::Brick, vec2(x, 295.0), 0.0));
+        }
+        g.blocks.push(Block::new(BlockKind::Cube, vec2(300.0, 290.0), 0.0));
+        g.set_running(true);
+        for _ in 0..30 {
+            g.sim_step();
+        }
+        let start: Vec<(u32, Vec2)> = g.blocks.iter().map(|b| (b.uid, b.pos)).collect();
+        g.dynamite.drop(&g.world, vec2(300.0, 270.0));
+        let mut rise = vec![0.0f32; start.len()];
+        let mut away = vec![0.0f32; start.len()];
+        for _ in 0..dynamite::FUSE as usize + 120 {
+            g.sim_step();
+            for (k, &(uid, p)) in start.iter().enumerate() {
+                if let Some(b) = g.blocks.iter().find(|b| b.uid == uid) {
+                    rise[k] = rise[k].max(p.y - b.pos.y);
+                    away[k] = away[k].max((b.pos.x - 300.0).abs() - (p.x - 300.0).abs());
+                }
+            }
+        }
+        // The near bricks fly up and out (none is pressed into the floor), the far ones less.
+        for k in [1, 2] {
+            assert!(rise[k] > 30.0 && away[k] > 60.0, "a near brick is thrown: up {}, out {}", rise[k], away[k]);
+        }
+        for k in [0, 3] {
+            assert!(away[k] > 5.0 && away[k] < away[1].min(away[2]), "a far brick is pushed, less: {}", away[k]);
+        }
+        assert!(rise[4] > 30.0, "the cube under the stick is thrown up: {}", rise[4]);
+    }
 }
