@@ -24,7 +24,9 @@ Budget: 16.7 ms per step at 60 fps.
    sub-steps per step (cap `MAX_SUB` = 4), so the cost is nearly proportional to the sub-step count.
 3. **More threads do not help.** Liquid time: 142 ms on 1 thread, 59 ms on 4, 50 ms on 8.
 4. **The iGPU does not help.** `AWORLD_GPU=auto`: card kernels take 44 ms per step plus about 8 ms of transfers, the same
-   as the CPU. Keeping the GPU off by default is right for this machine.
+   as the CPU. Keeping the GPU off by default is right for this machine. *(Later, 30 October: after the liquids' work
+   on the CPU and the card changed, the same Arc B390 runs `déluge` in 23 ms on the card against 45 on the CPU, but
+   `orage` in 26 against 19. `auto`, now the default, measures both sides and keeps the liquids where they cost less.)*
 5. **The `lod` simplification levels (1–3) never touch liquids** (`main.rs` `update_world`; they only change heat in
    `thermal.rs`). In liquid-heavy scenes the only relief is lowering the game speed.
 6. **Viscosity is 23 % of the step in `--demo`** (10 ms, 2.4 ms per pass), probably lava. `VISCOUS_SWEEPS` = 12.

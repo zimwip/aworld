@@ -231,6 +231,13 @@ pub(super) struct Opened {
 }
 
 /// The liquids' grids: velocities on the edges, pressure in the cells.
+/// With `AWORLD_GPU=auto`, the ticks the liquids stay on the card, or off it, once they went
+/// over (a second: the time a trial is measured over), and the ticks before the side they are
+/// on is put on trial again: at first, and at most once the trials keep failing.
+const SWITCH_TICKS: u32 = 60;
+const PATIENCE: u32 = 600;
+const PATIENCE_MAX: u32 = 7200;
+
 #[derive(Default)]
 pub struct Liquids {
     /// Rightward velocity on the left edge of each cell, (W + 1) a row, m/s.
@@ -276,6 +283,23 @@ pub struct Liquids {
     pub(super) gpu: Option<Option<mgpcg_gpu::PressureGpu>>,
     /// The whole turn on the card (`None` until asked for, and where there is no card).
     pub(super) card: Option<Option<liquid_gpu::LiquidGpu>>,
+    /// Whether the liquids run on the card now (with `AWORLD_GPU=auto` they go over to it and
+    /// back, whichever costs less, see `card_pays`).
+    pub(super) on_card: bool,
+    /// What a step of the liquids costs the game lately on each side (CPU, card), in ms: the
+    /// CPU's turn, or what the card's turn holds the CPU up (sending, encoding, waiting for the
+    /// result). `None` until measured since the liquids last came to that side.
+    pub(super) cost: [Option<f32>; 2],
+    /// The tick the liquids last went over to the card or back, whether that was a trial of
+    /// the other side, and the ticks before the next trial.
+    pub(super) switched: Option<u32>,
+    pub(super) trial: bool,
+    pub(super) patience: u32,
+    /// What taking in the card's last step cost (ms), for the card's side of `cost`.
+    pub(super) collect_ms: f32,
+    /// In the tests: the side the liquids run on, whatever `card_pays` says.
+    #[cfg(test)]
+    pub(super) forced: Option<bool>,
     /// In a picture of the world (see `World::copy_picture`), the rows the card worked on.
     pub(super) card_rows: Option<(usize, usize)>,
     /// The cells of thin matter opened to the liquids this step, and what they were (see
@@ -321,7 +345,7 @@ impl Liquids {
         self.p.clone_from(&from.p);
         self.class.clone_from(&from.class);
         self.drops.clone_from(&from.drops);
-        self.card_rows = from.card.as_ref().and_then(|c| c.as_ref()).and_then(|c| c.rows()).or(from.card_rows);
+        self.card_rows = from.card.as_ref().and_then(|c| c.as_ref()).filter(|_| from.on_card).and_then(|c| c.rows()).or(from.card_rows);
     }
 
     fn ready(&mut self) {
@@ -345,6 +369,11 @@ impl Liquids {
             self.roofed = vec![false; W() * H()];
             self.lid = vec![0; W() * H()];
         }
+    }
+
+    /// The card, while the liquids run on it.
+    pub(super) fn active_card(&mut self) -> Option<&mut liquid_gpu::LiquidGpu> {
+        if self.on_card { self.card.as_mut().and_then(Option::as_mut) } else { None }
     }
 
     /// The drops in flight.
@@ -509,13 +538,13 @@ impl World {
 
     /// Whether the liquids run on a graphics card (one was opened and works).
     pub fn liquids_on_card(&self) -> bool {
-        self.liq.card.as_ref().is_some_and(Option::is_some)
+        self.liq.on_card && self.liq.card.as_ref().is_some_and(Option::is_some)
     }
 
     /// The rows the card works on (the band of the last step given to it), when the liquids
     /// run on a card.
     pub fn liquid_card_rows(&self) -> Option<(usize, usize)> {
-        self.liq.card.as_ref().and_then(|c| c.as_ref()).and_then(|c| c.rows()).or(self.liq.card_rows)
+        self.liq.card.as_ref().and_then(|c| c.as_ref()).filter(|_| self.liq.on_card).and_then(|c| c.rows()).or(self.liq.card_rows)
     }
 
     /// Units of water in the cells and the drops (the mass audit, `AWORLD_DEBUG_MASS`).
@@ -537,7 +566,9 @@ impl World {
         let mut liq = std::mem::take(&mut self.liq);
         let mut card = liq.card.take();
         if let Some(Some(c)) = card.as_mut() {
+            let t = std::time::Instant::now();
             self.collect_liquids(&mut liq, c);
+            liq.collect_ms = t.elapsed().as_secs_f32() * 1000.0;
             if let Some((y0, y1)) = c.rows() {
                 self.drain_sides(y0..=y1);
             }
@@ -577,26 +608,101 @@ impl World {
         if self.liq_tier >= 1 { CHEAP_ITER } else { MAX_ITER }
     }
 
+    /// Whether the liquids' turn goes to the card (`AWORLD_GPU=auto`). Which side is cheaper
+    /// depends on the card, the CPU and the scene (the trip costs about the same whatever the
+    /// card does: a lake pays for it, a little rain does not), so it is measured: every so
+    /// often the liquids go over to the other side for a second, and stay there if it costs at
+    /// least a tenth less; else they come back, and the next trial waits twice as long.
+    fn card_pays(&self, liq: &mut Liquids) -> bool {
+        let Some(at) = liq.switched else {
+            // (The first trial a second in.)
+            (liq.switched, liq.patience) = (Some(self.ticks), SWITCH_TICKS);
+            return liq.on_card;
+        };
+        let since = self.ticks.wrapping_sub(at);
+        if since < SWITCH_TICKS {
+            return liq.on_card;
+        }
+        let (here, there) = (liq.cost[liq.on_card as usize], liq.cost[!liq.on_card as usize]);
+        if liq.trial {
+            liq.trial = false;
+            if here.zip(there).is_some_and(|(new, old)| new < 0.9 * old) {
+                liq.patience = PATIENCE;
+                return liq.on_card;
+            }
+            liq.patience = (liq.patience * 2).clamp(PATIENCE, PATIENCE_MAX);
+            return !liq.on_card;
+        }
+        // (No trial while the liquids cost next to nothing: there is nothing to win.)
+        if since >= liq.patience && here.is_some_and(|ms| ms > 0.5) {
+            liq.trial = true;
+            return !liq.on_card;
+        }
+        liq.on_card
+    }
+
+    /// The liquids' turn (`liquids_turn`), timed for `card_pays` when the card is on trial.
+    pub(super) fn step_liquids(&mut self, step: f32) {
+        if gpu::wanted() != gpu::Use::Auto {
+            return self.liquids_turn(step);
+        }
+        let side = self.liq.on_card;
+        let t = std::time::Instant::now();
+        self.liquids_turn(step);
+        let mut ms = t.elapsed().as_secs_f32() * 1000.0;
+        let liq = &mut self.liq;
+        if liq.on_card {
+            ms += liq.collect_ms;
+        }
+        // (The step that went over is not counted, nor the next: the handing over, and the
+        // card's first step with every cell of the band sent.)
+        if liq.on_card == side && liq.switched.is_some_and(|at| self.ticks.wrapping_sub(at) > 2) {
+            let c = &mut liq.cost[side as usize];
+            *c = Some(c.map_or(ms, |c| 0.9 * c + 0.1 * ms));
+        }
+    }
+
     /// The liquids' turn, for `step` seconds (a whole number of `DT`, at most `MAX_DT`): a turn
     /// of `DT` for each, in as many sub-steps as the fastest liquid needs to cross at most a
     /// cell in each (`turns`).
-    pub(super) fn step_liquids(&mut self, step: f32) {
+    fn liquids_turn(&mut self, step: f32) {
         self.liq_work = 0;
         let mut liq = std::mem::take(&mut self.liq);
         liq.ready();
         let audit = crate::config::config().debug_mass;
         let units = |w: &World, liq: &Liquids| (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Water).map(|i| w.liquid_fill(i) as u64).sum::<u64>() + liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>();
         let before = if audit { units(self, &liq) } else { 0 };
-        // The whole turn on the card, where there is one (and it is wanted): the card works on
-        // the step while the CPU does the rest of it, and the CPU takes its result at the next.
-        // (The simple solver has no card version: it runs on the cores.)
-        if gpu::wanted() != gpu::Use::Off && !self.simple_liquids {
+        // The whole turn on the card, where there is one (and it is wanted, and pays): the card
+        // works on the step while the CPU does the rest of it, and the CPU takes its result at
+        // the next. (The simple solver has no card version: it runs on the cores, and the
+        // liquids come back from the card when it is chosen.)
+        let wanted = gpu::wanted();
+        if wanted != gpu::Use::Off {
             let mut card = liq.card.take().unwrap_or_else(liquid_gpu::LiquidGpu::new);
+            let pays = wanted == gpu::Use::Always || self.card_pays(&mut liq);
+            #[cfg(test)]
+            let pays = liq.forced.unwrap_or(pays);
+            let pays = pays && !self.simple_liquids;
             if let Some(c) = card.as_mut() {
-                self.step_liquids_on_card(&mut liq, c, step);
+                if pays != liq.on_card {
+                    // Over to the card or back: the velocities go with the liquids (the card's
+                    // last step was taken in before the cells' turn).
+                    if pays {
+                        c.take_over(&liq);
+                    } else {
+                        self.collect_liquids(&mut liq, c);
+                        c.hand_back(&mut liq);
+                    }
+                    liq.on_card = pays;
+                    liq.switched = Some(self.ticks);
+                    liq.cost[pays as usize] = None;
+                }
+                if pays {
+                    self.step_liquids_on_card(&mut liq, c, step);
+                }
             }
             liq.card = Some(card);
-            if liq.card.as_ref().is_some_and(Option::is_some) {
+            if liq.on_card && liq.card.as_ref().is_some_and(Option::is_some) {
                 if audit {
                     let after = units(self, &liq);
                     if after != before {
@@ -868,7 +974,7 @@ impl World {
     /// the graphics card if the liquids run there.
     fn kick_across(&mut self, i: usize, vx: f32, w: f32) {
         let (x, y) = xy(i);
-        if let Some(Some(card)) = self.liq.card.as_mut() {
+        if let Some(card) = self.liq.active_card() {
             for e in [ui(x, y), ui(x + 1, y)] {
                 card.patches_up.push(liquid_gpu::Patch { edge: e as u32, mode: 1, value: vx, weight: w });
             }
@@ -1190,7 +1296,7 @@ impl World {
         // Its speed goes to the edges of the cell, in proportion to what it brings.
         let w = d.q as f32 / q as f32;
         let (x, y) = xy(j);
-        if let Some(Some(card)) = liq.card.as_mut() {
+        if let Some(card) = liq.active_card() {
             for e in [ui(x, y), ui(x + 1, y)] {
                 card.patches_up.push(liquid_gpu::Patch { edge: e as u32, mode: 1, value: d.vx, weight: w });
             }
@@ -2948,11 +3054,12 @@ mod tests {
     /// Water in a U-tube (two columns 6 wide, joined by a bend 6 high), 20 cells higher on the
     /// left: the height of the left column, every step, for 8 s.
     fn u_tube(m: Mat, steps: usize) -> Vec<f32> {
-        u_tube_with(m, steps, false)
+        u_tube_with(m, steps, false, None)
     }
 
-    /// The same, on the simple solver or the detailed one.
-    fn u_tube_with(m: Mat, steps: usize, simple: bool) -> Vec<f32> {
+    /// The same, on the simple solver or the detailed one, the liquids going over to the card
+    /// and back every `every` steps.
+    fn u_tube_with(m: Mat, steps: usize, simple: bool, every: Option<usize>) -> Vec<f32> {
         let mut w = world();
         w.simple_liquids = simple;
         // Left column x 200..205, right 230..235, both open at the top; bend y 440..445.
@@ -2965,7 +3072,10 @@ mod tests {
         rect(&mut w, 230, 420, 235, 445, m);
         w.temp.fill(15.0);
         (0..steps)
-            .map(|_| {
+            .map(|k| {
+                if let Some(n) = every {
+                    w.liq.forced = Some(k / n % 2 == 1);
+                }
                 w.step();
                 let col = |x0: i32| -> f32 {
                     let units: u64 = (380..440).flat_map(|y| (x0..x0 + 6).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == m).map(|(x, y)| w.liquid_fill(World::idx(x, y)) as u64).sum();
@@ -2980,7 +3090,7 @@ mod tests {
     #[ignore]
     fn probe_u_tube() {
         // (AWORLD_BENCH_SIMPLE=1: on the simple solver.)
-        let h = u_tube_with(Mat::Water, 960, crate::config::bench().simple);
+        let h = u_tube_with(Mat::Water, 960, crate::config::bench().simple, None);
         for (t, q) in h.iter().enumerate().step_by(6) {
             println!("{:.1} s {:.1}", t as f32 / 60.0, q);
         }
@@ -3099,7 +3209,7 @@ mod tests {
 
     #[test]
     fn on_the_simple_solver_water_swings_in_a_u_tube_and_settles() {
-        let h = u_tube_with(Mat::Water, 420, true);
+        let h = u_tube_with(Mat::Water, 420, true, None);
         let (t_low, low) = h.iter().enumerate().take(300).fold((0, f32::MAX), |a, (t, &q)| if q < a.1 { (t, q) } else { a });
         let (t_high, high) = h.iter().enumerate().skip(t_low).fold((0, 0.0), |a, (t, &q)| if q > a.1 { (t, q) } else { a });
         // 2.85 s from low to high for real water, as on the detailed solver.
@@ -3157,12 +3267,12 @@ mod tests {
             format!("{:.1} m {:.1} ms", front(&w, Mat::Water, 100, 400, 339, 449) as f32 * cell_m() / model(), ms)
         });
         row("tube en U : demi-période", &|simple| {
-            let h = u_tube_with(Mat::Water, 420, simple);
+            let h = u_tube_with(Mat::Water, 420, simple, None);
             let (t_low, _) = h.iter().enumerate().take(300).fold((0, f32::MAX), |a, (t, &q)| if q < a.1 { (t, q) } else { a });
             let (t_high, _) = h.iter().enumerate().skip(t_low).fold((0, 0.0), |a, (t, &q)| if q > a.1 { (t, q) } else { a });
             format!("{:.2} s", (t_high - t_low) as f32 / 60.0 / model().sqrt())
         });
-        row("tube en U : niveau à 7 s", &|simple| format!("{:.1}", u_tube_with(Mat::Water, 420, simple)[419]));
+        row("tube en U : niveau à 7 s", &|simple| format!("{:.1}", u_tube_with(Mat::Water, 420, simple, None)[419]));
         for (m, t) in [(Mat::Water, 15.0), (Mat::Lava, 1150.0), (Mat::Molten, 1700.0)] {
             row(&format!("{m:?} : front à 4 s (cases)"), &|simple| format!("{}", spread_with(m, t, 4, simple).0));
         }
@@ -3206,6 +3316,30 @@ mod tests {
         assert!((2.3..3.4).contains(&half), "half period {half} s");
         // It swings past the middle (30) and back, a little less each time.
         assert!(low < 26.0 && high > 31.0 && high < 40.0, "{low} {high}");
+    }
+
+    #[test]
+    fn the_water_goes_over_to_the_card_and_back_and_keeps_its_flow_and_its_mass() {
+        // (Only with a card: `AWORLD_GPU=1 cargo test`.)
+        if gpu::gpu().is_none() {
+            return;
+        }
+        // The swing of a U-tube goes on across the handing over, both ways.
+        let h = u_tube_with(Mat::Water, 420, false, Some(25));
+        let (t_low, low) = h.iter().enumerate().take(300).fold((0, f32::MAX), |a, (t, &q)| if q < a.1 { (t, q) } else { a });
+        let (t_high, high) = h.iter().enumerate().skip(t_low).fold((0, 0.0), |a, (t, &q)| if q > a.1 { (t, q) } else { a });
+        let half = (t_high - t_low) as f32 / 60.0 / model().sqrt();
+        assert!((2.3..3.4).contains(&half), "half period {half} s");
+        assert!(low < 26.0 && high > 31.0 && high < 40.0, "{low} {high}");
+        // A breaking dam loses no water on the way.
+        let mut w = dam(Mat::Water);
+        let before = w.liquid_units(Mat::Water);
+        for k in 0..240 {
+            w.liq.forced = Some(k / 20 % 2 == 1);
+            w.step();
+        }
+        let after = w.liquid_units(Mat::Water) + w.gone + w.dried;
+        assert!(after <= before && before - after < before / 10_000, "{before} -> {after}");
     }
 
     #[test]
