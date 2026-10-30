@@ -686,46 +686,65 @@ impl World {
     /// comes down on it: a liquid goes through it sideways, and fills it as it fills the air.
     /// The grid has room for one matter a cell, so for the liquids' step each cell of thin
     /// matter in the zones that run is opened: it becomes the liquid it holds (`World::pore`),
-    /// or empty, and the edges over and under it are walls (`lid`): the top of a crown holds the
-    /// rain up, and what goes into it sideways goes on sideways, without dripping. The solver
+    /// or empty, and the edges over and under the opened matter are walls (`lid`): the top of a
+    /// crown holds the rain up, and what goes into it sideways stays in it, without dripping
+    /// out of its bottom. The solver
     /// is the same (the pressure on a grid of four neighbours); after the step each cell takes
     /// back its matter and its states, and keeps the liquid it was left with (`close_pores`).
     pub(super) fn open_pores(&mut self, liq: &mut Liquids) {
+        // How far along its row a liquid opens thin matter: as far as it goes in a step.
+        const REACH: usize = 2;
         liq.opened.clear();
-        for k in 0..sleep::CW() * sleep::CH() {
-            if !self.zones.awake.get(k).copied().unwrap_or(true) {
+        // Found on all the rows at once (it reads every cell of the zones that run), opened
+        // after.
+        let world: &World = self;
+        let (cw, cs) = (sleep::CW(), sleep::CS);
+        let found: Vec<(usize, bool)> = (0..H())
+            .into_par_iter()
+            .flat_map_iter(|y| {
+                let row = y * W();
+                let zones = (0..cw).filter(move |&zx| world.zones.awake.get((y / cs) * cw + zx).copied().unwrap_or(true));
+                zones.flat_map(move |zx| (zx * cs..(zx * cs + cs).min(W())).map(move |x| (x, row + x))).filter_map(move |(x, i)| {
+                    let m = world.cells[i].m;
+                    if !m.one_way() {
+                        // (What a cell that is no longer thin held is gone with it.)
+                        return (world.pore[i] != Mat::Empty).then_some((i, false));
+                    }
+                    // Only where a liquid is in it or near it on its row: a dry forest stays a
+                    // wall, and costs the solver nothing.
+                    let wet = |j: usize| world.pore[j] != Mat::Empty || world.cells[j].m.kind() == Kind::Liquid;
+                    (world.mask[i] == 0 && (x.saturating_sub(REACH)..=(x + REACH).min(W() - 1)).any(|nx| wet(row + nx))).then_some((i, true))
+                })
+            })
+            .collect();
+        for (i, open) in found {
+            if !open {
+                self.pore[i] = Mat::Empty;
+                self.pore_fill[i] = 0;
                 continue;
             }
-            let (zx, zy) = ((k % sleep::CW()) * sleep::CS, (k / sleep::CW()) * sleep::CS);
-            for y in zy..(zy + sleep::CS).min(H()) {
-                for i in y * W() + zx..y * W() + (zx + sleep::CS).min(W()) {
-                    let c = self.cells[i];
-                    if !c.m.one_way() || self.mask[i] != 0 {
-                        // (What a cell that is no longer thin held is gone with it.)
-                        if self.pore[i] != Mat::Empty && !c.m.one_way() {
-                            self.pore[i] = Mat::Empty;
-                            self.pore_fill[i] = 0;
-                        }
-                        continue;
-                    }
-                    liq.opened.push(Opened { i, cell: c, states: self.states(i), log: self.log[i], latent: self.latent[i], vel: self.vel[i] });
-                    liq.lid[i] = 1;
-                    let (held, q) = (self.pore[i], self.pore_fill[i]);
-                    if held != Mat::Empty && q > 0 {
-                        self.cells[i] = Cell { m: held, stamp: c.stamp };
-                        self.put_fill(i, q);
-                    } else {
-                        self.cells[i] = Cell { m: Mat::Empty, stamp: c.stamp };
-                        self.fill[i] = 0;
-                    }
-                    self.latent[i] = 0.0;
-                    self.vel[i] = 0;
-                }
+            let c = self.cells[i];
+            liq.opened.push(Opened { i, cell: c, states: self.states(i), log: self.log[i], latent: self.latent[i], vel: self.vel[i] });
+            liq.lid[i] = 1;
+            let (held, q) = (self.pore[i], self.pore_fill[i]);
+            if held != Mat::Empty && q > 0 {
+                self.cells[i] = Cell { m: held, stamp: c.stamp };
+                self.put_fill(i, q);
+            } else {
+                self.cells[i] = Cell { m: Mat::Empty, stamp: c.stamp };
+                self.fill[i] = 0;
             }
+            self.latent[i] = 0.0;
+            self.vel[i] = 0;
         }
+        // Walls between the opened cells and what is over and under them, not between two of
+        // them: inside, a submerged trunk is a column of the lake (the pressure solves as
+        // fast as without it), and what came in sideways settles to the bottom of the crown.
         for o in &liq.opened {
-            liq.lid[o.i] |= 2;
-            if o.i + W() < liq.lid.len() {
+            if o.i < W() || liq.lid[o.i - W()] & 1 == 0 {
+                liq.lid[o.i] |= 2;
+            }
+            if o.i + W() < liq.lid.len() && liq.lid[o.i + W()] & 1 == 0 {
                 liq.lid[o.i + W()] |= 2;
             }
         }
