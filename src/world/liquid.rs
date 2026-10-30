@@ -208,6 +208,16 @@ pub(super) fn props(m: Mat, t: f32) -> (f32, f32, f32) {
     }
 }
 
+/// A cell of thin matter opened to the liquids for a step, as it was (see `World::open_pores`).
+pub(super) struct Opened {
+    i: usize,
+    cell: Cell,
+    states: States,
+    log: u16,
+    latent: f32,
+    vel: u16,
+}
+
 /// The liquids' grids: velocities on the edges, pressure in the cells.
 #[derive(Default)]
 pub struct Liquids {
@@ -256,6 +266,12 @@ pub struct Liquids {
     pub(super) card: Option<Option<liquid_gpu::LiquidGpu>>,
     /// In a picture of the world (see `World::copy_picture`), the rows the card worked on.
     pub(super) card_rows: Option<(usize, usize)>,
+    /// The cells of thin matter opened to the liquids this step, and what they were (see
+    /// `World::open_pores`).
+    pub(super) opened: Vec<Opened>,
+    /// For each cell: 1 if it is thin matter opened to the liquids this step, + 2 if the edge
+    /// over it is a wall (the top of the thin matter: what comes down rests on it).
+    pub(super) lid: Vec<u8>,
     /// The step count (`Zones::stamp`) when each zone was last classed: a zone that has not
     /// changed since, asleep with its neighbours, keeps its classes (see `classify`).
     pub(super) classed: Vec<u64>,
@@ -315,6 +331,7 @@ impl Liquids {
             self.scale = vec![1.0; W() * H()];
             self.guess = vec![0.0; W() * H()];
             self.roofed = vec![false; W() * H()];
+            self.lid = vec![0; W() * H()];
         }
     }
 
@@ -491,7 +508,14 @@ impl World {
 
     /// Units of water in the cells and the drops (the mass audit, `AWORLD_DEBUG_MASS`).
     pub(super) fn water_units_audit(&self) -> u64 {
-        (0..W() * H()).filter(|&i| self.cells[i].m == Mat::Water).map(|i| self.liquid_fill(i) as u64).sum::<u64>() + self.liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>()
+        (0..W() * H()).filter(|&i| self.cells[i].m == Mat::Water).map(|i| self.liquid_fill(i) as u64).sum::<u64>()
+            + self.liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>()
+            + self.held_units(Mat::Water)
+    }
+
+    /// Units of liquid `m` held inside thin matter (see `open_pores`).
+    pub(super) fn held_units(&self, m: Mat) -> u64 {
+        (0..W() * H()).filter(|&i| self.pore[i] == m).map(|i| self.pore_fill[i] as u64).sum()
     }
 
     /// What the card did with the last step, into the world: before the cells' turn, so that
@@ -572,12 +596,20 @@ impl World {
             }
         }
         self.fly_drops(&mut liq, step);
+        self.open_pores(&mut liq);
+        self.run_liquids(&mut liq, step);
+        self.close_pores(&mut liq);
+        self.liq = liq;
+    }
+
+    /// The liquids' turn on the CPU (see `step_liquids`), with the thin matter open.
+    fn run_liquids(&mut self, liq: &mut Liquids, step: f32) {
+        let mut liq = liq;
         let clock = self.prof.start();
         self.classify(&mut liq, false);
         self.prof.stop(prof::LIQ_CLASSIFY, clock);
         if liq.rows.iter().all(Option::is_none) {
             // No liquid runs anywhere.
-            self.liq = liq;
             return;
         }
         // On the drops tier, the liquid that flies or falls freely goes over to drops: they fly
@@ -585,7 +617,6 @@ impl World {
         if self.liq_tier >= 2 && self.fall_to_drops(&mut liq) {
             self.classify(&mut liq, true);
             if liq.rows.iter().all(Option::is_none) {
-                self.liq = liq;
                 return;
             }
         }
@@ -649,12 +680,105 @@ impl World {
             self.prof.stop(prof::LIQ_CARRY, clock);
             self.drain_sides((0..H()).filter(|&y| liq.rows[y].is_some()));
         }
-        self.liq = liq;
     }
 
-    /// Thin matter (`Mat::one_way`: a tree, ash, dead leaves) holds a liquid up but does not
-    /// hold it back: the grid has no room for both in a cell, so the liquid beside it passes
-    /// through as through communicating vessels. Each row where liquid lies against a run of
+    /// Thin matter (`Mat::one_way`: a tree, ash, charcoal, dead leaves) holds back only what
+    /// comes down on it: a liquid goes through it sideways, and fills it as it fills the air.
+    /// The grid has room for one matter a cell, so for the liquids' step each cell of thin
+    /// matter in the zones that run is opened: it becomes the liquid it holds (`World::pore`),
+    /// or empty, and the edges over and under the opened matter are walls (`lid`): the top of a
+    /// crown holds the rain up, and what goes into it sideways stays in it, without dripping
+    /// out of its bottom. The solver
+    /// is the same (the pressure on a grid of four neighbours); after the step each cell takes
+    /// back its matter and its states, and keeps the liquid it was left with (`close_pores`).
+    pub(super) fn open_pores(&mut self, liq: &mut Liquids) {
+        // How far along its row a liquid opens thin matter: as far as it goes in a step.
+        const REACH: usize = 2;
+        liq.opened.clear();
+        // Found on all the rows at once (it reads every cell of the zones that run), opened
+        // after.
+        let world: &World = self;
+        let (cw, cs) = (sleep::CW(), sleep::CS);
+        let found: Vec<(usize, bool)> = (0..H())
+            .into_par_iter()
+            .flat_map_iter(|y| {
+                let row = y * W();
+                let zones = (0..cw).filter(move |&zx| world.zones.awake.get((y / cs) * cw + zx).copied().unwrap_or(true));
+                zones.flat_map(move |zx| (zx * cs..(zx * cs + cs).min(W())).map(move |x| (x, row + x))).filter_map(move |(x, i)| {
+                    let m = world.cells[i].m;
+                    if !m.one_way() {
+                        // (What a cell that is no longer thin held is gone with it.)
+                        return (world.pore[i] != Mat::Empty).then_some((i, false));
+                    }
+                    // Only where a liquid is in it or near it on its row: a dry forest stays a
+                    // wall, and costs the solver nothing.
+                    let wet = |j: usize| world.pore[j] != Mat::Empty || world.cells[j].m.kind() == Kind::Liquid;
+                    (world.mask[i] == 0 && (x.saturating_sub(REACH)..=(x + REACH).min(W() - 1)).any(|nx| wet(row + nx))).then_some((i, true))
+                })
+            })
+            .collect();
+        for (i, open) in found {
+            if !open {
+                self.pore[i] = Mat::Empty;
+                self.pore_fill[i] = 0;
+                continue;
+            }
+            let c = self.cells[i];
+            liq.opened.push(Opened { i, cell: c, states: self.states(i), log: self.log[i], latent: self.latent[i], vel: self.vel[i] });
+            liq.lid[i] = 1;
+            let (held, q) = (self.pore[i], self.pore_fill[i]);
+            if held != Mat::Empty && q > 0 {
+                self.cells[i] = Cell { m: held, stamp: c.stamp };
+                self.put_fill(i, q);
+            } else {
+                self.cells[i] = Cell { m: Mat::Empty, stamp: c.stamp };
+                self.fill[i] = 0;
+            }
+            self.latent[i] = 0.0;
+            self.vel[i] = 0;
+        }
+        // Walls between the opened cells and what is over and under them, not between two of
+        // them: inside, a submerged trunk is a column of the lake (the pressure solves as
+        // fast as without it), and what came in sideways settles to the bottom of the crown.
+        for o in &liq.opened {
+            if o.i < W() || liq.lid[o.i - W()] & 1 == 0 {
+                liq.lid[o.i] |= 2;
+            }
+            if o.i + W() < liq.lid.len() && liq.lid[o.i + W()] & 1 == 0 {
+                liq.lid[o.i + W()] |= 2;
+            }
+        }
+    }
+
+    /// The end of the liquids' step (see `open_pores`): each opened cell takes back its thin
+    /// matter and states, and holds the liquid the step left in it.
+    pub(super) fn close_pores(&mut self, liq: &mut Liquids) {
+        for o in liq.opened.drain(..) {
+            let i = o.i;
+            let c = self.cells[i];
+            if c.m.kind() == Kind::Liquid {
+                self.pore[i] = c.m;
+                self.pore_fill[i] = self.liquid_fill(i);
+            } else {
+                self.pore[i] = Mat::Empty;
+                self.pore_fill[i] = 0;
+            }
+            self.cells[i] = o.cell;
+            self.fill[i] = 0;
+            (self.moisture[i], self.fuel[i], self.growth[i], self.jet[i]) = (o.states.moisture, o.states.fuel, o.states.growth, o.states.jet);
+            self.log[i] = o.log;
+            self.latent[i] = o.latent;
+            self.vel[i] = o.vel;
+            liq.lid[i] = 0;
+            if i + W() < liq.lid.len() {
+                liq.lid[i + W()] = 0;
+            }
+        }
+    }
+
+    /// When the liquids run on the graphics card, which sees thin matter (`Mat::one_way`) as a
+    /// wall (the CPU opens it instead, see `open_pores`): the liquid beside it passes through
+    /// as through communicating vessels. Each row where liquid lies against a run of
     /// thin matter joins the column on each side of it: the liquid goes from the top of the
     /// column that stands higher to the top of the other (or into the open cell just past the
     /// run), half the gap between their levels a step and at most half a cell. A lake rises
@@ -807,7 +931,7 @@ impl World {
     /// grows with the speed, all of it when it falls into the air, and so do the crumbs left
     /// alone in the air (a thin film with air under it and no body beside it).
     fn throw_drops(&mut self, liq: &mut Liquids) {
-        let (class, rows, u, v) = (&liq.class, &liq.rows, &liq.u, &liq.v);
+        let (class, rows, u, v, lid) = (&liq.class, &liq.rows, &liq.u, &liq.v, &liq.lid);
         let world: &World = self;
         let throws: Vec<(usize, u32, f32, f32, f32, f32)> = (0..H())
             .into_par_iter()
@@ -830,11 +954,13 @@ impl World {
                         }
                     };
                     // The speed out of the cell into the air on each side: right, left, down, up.
+                    // (Not through the top of thin matter: it is a wall, see `open_pores`.)
+                    let (lid_under, lid_over) = (y + 1 < H() && lid[i + W()] & 2 != 0, lid[i] & 2 != 0);
                     let outs = [
                         (if air(x + 1, y) { u[ui(x + 1, y)] } else { 0.0 }, 0.5, 0.0),
                         (if air(x.wrapping_sub(1), y) { -u[ui(x, y)] } else { 0.0 }, -0.5, 0.0),
-                        (if air(x, y + 1) { v[vi(x, y + 1)] } else { 0.0 }, 0.0, 0.5),
-                        (if air(x, y.wrapping_sub(1)) { -v[vi(x, y)] } else { 0.0 }, 0.0, -0.5),
+                        (if air(x, y + 1) && !lid_under { v[vi(x, y + 1)] } else { 0.0 }, 0.0, 0.5),
+                        (if air(x, y.wrapping_sub(1)) && !lid_over { -v[vi(x, y)] } else { 0.0 }, 0.0, -0.5),
                     ];
                     let (k, &(speed, ox, oy)): (usize, &(f32, f32, f32)) = outs.iter().enumerate().max_by(|a, b| a.1 .0.total_cmp(&b.1 .0))?;
                     let fill = world.liquid_fill(i).min(field::FULL);
@@ -853,6 +979,7 @@ impl World {
                     }
                     let lone = fill < field::FULL / 4
                         && air(x, y + 1)
+                        && !lid_under
                         && [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)].iter().all(|&(nx, ny)| nx >= W() || ny >= H() || class[ny * W() + nx] & 3 != FULLISH);
                     if lone && vx.hypot(vy) > 0.5 {
                         share = 1.0;
@@ -1022,6 +1149,17 @@ impl World {
 
     /// Drop `d` lands in cell `j` (liquid of its own, or a free cell).
     fn land_drop(&mut self, liq: &mut Liquids, d: &Drop, j: usize) {
+        // Into thin matter (a drop thrown from the liquid inside a crown): it joins what the
+        // matter holds.
+        if self.cells[j].m.one_way() && self.mask[j] == 0 && matches!(self.pore[j], m if m == Mat::Empty || m == d.m) {
+            let had = if self.pore[j] == d.m { self.pore_fill[j] } else { 0 };
+            self.temp[j] = (self.temp[j] * had as f32 + d.t * d.q as f32) / (had + d.q) as f32;
+            self.pore[j] = d.m;
+            self.pore_fill[j] = had + d.q;
+            self.revision += 1;
+            self.zones.wake(j);
+            return;
+        }
         let had = if self.cells[j].m == d.m { self.liquid_fill(j) } else { 0 };
         if had == 0 {
             if !matches!(self.cells[j].m.kind(), Kind::Empty | Kind::Gas) || self.mask[j] != 0 {
@@ -1171,6 +1309,7 @@ impl World {
     /// velocities out, so that waves die and splashes never rise.
     fn forces(&self, liq: &mut Liquids, dt: f32) {
         let class = &liq.class;
+        let lid = &liq.lid;
         let kind = |x: i32, y: i32| if x < 0 || y < 0 || x >= W() as i32 || y >= H() as i32 { SOLID } else { class[y as usize * W() + x as usize] & 3 };
         let runs = |x: i32, y: i32| (0..W() as i32).contains(&x) && (0..H() as i32).contains(&y) && class[y as usize * W() + x as usize] & 4 != 0;
         let wet = |c: u8| c >= WET;
@@ -1203,7 +1342,7 @@ impl World {
             let (xi, yi) = (x as i32, y as i32);
             let (a, b) = (kind(xi, yi - 1), kind(xi, yi));
             let here = v[vi(x, y)];
-            if a == SOLID || b == SOLID {
+            if a == SOLID || b == SOLID || (y < H() && lid[y * W() + x] & 2 != 0) {
                 Err(0.0)
             } else if !(wet(a) || wet(b)) || !(runs(xi, yi - 1) || runs(xi, yi)) {
                 Err(if wet(a) || wet(b) { here } else { 0.0 })
@@ -1507,7 +1646,7 @@ impl World {
     /// And a cell that holds more than full (or less, inside the body) is given the pressure that
     /// brings it back (`SQUEEZE`). The full cells over the spans keep their last pressure.
     fn hydrostatic(&self, liq: &mut Liquids, dt: f32) {
-        let (class, rows, p_old) = (&liq.class, &liq.rows, &liq.p);
+        let (class, rows, p_old, lid) = (&liq.class, &liq.rows, &liq.p, &liq.lid);
         let roofed = Shared::new(&mut liq.roofed);
         let in_span = |x: usize, y: usize| rows[y].is_some_and(|(a, b)| a <= x && x <= b);
         let rho = |i: usize| density(self.cells[i].m) * 1000.0;
@@ -1529,7 +1668,7 @@ impl World {
                         SOLID => true,
                         FULLISH => held[y - y0] || !in_span(x, y),
                         _ => false,
-                    };
+                    } || lid[i] & 2 != 0;
                 }
                 // From the top down: the pressure.
                 let mut roof = false;
@@ -1539,7 +1678,8 @@ impl World {
                         roof = false;
                         continue;
                     }
-                    let over = if y == 0 { SOLID } else { class[i - W()] & 3 };
+                    // (The wall over thin matter opened for the step is a roof: `open_pores`.)
+                    let over = if y == 0 || lid[i] & 2 != 0 { SOLID } else { class[i - W()] & 3 };
                     let p = match over {
                         FULLISH => {
                             // SAFETY: this band alone writes its columns.
@@ -1642,7 +1782,7 @@ impl World {
         if self.simple_liquids {
             self.hydrostatic(liq, dt);
         }
-        let (class, rows) = (&liq.class, &liq.rows);
+        let (class, rows, lid) = (&liq.class, &liq.rows, &liq.lid);
         let rho = |i: usize| density(self.cells[i].m) * 1000.0;
         // The divergence of each full cell that runs, times dx / dt.
         let k = cell_m() / dt;
@@ -1741,7 +1881,7 @@ impl World {
             let Some((x0, x1)) = span else { return };
             for x in x0..=x1 {
                 let (a, b) = ((y - 1) * W() + x, y * W() + x);
-                row[x] = cond(a, b, kind[a], kind[b]);
+                row[x] = if lid[b] & 2 != 0 { 0.0 } else { cond(a, b, kind[a], kind[b]) };
             }
         });
         let (ax, ay) = (&f.ax, &f.ay);
@@ -1889,6 +2029,10 @@ impl World {
             for x in x0..=x1 {
                 let (a, b) = ((y - 1) * W() + x, y * W() + x);
                 let (ca, cb) = (class[a], class[b]);
+                if lid[b] & 2 != 0 {
+                    row[x] = 0.0;
+                    continue;
+                }
                 if ca & 3 == SOLID || cb & 3 == SOLID || !(ca == FULLISH | 4 || cb == FULLISH | 4) {
                     continue;
                 }
@@ -1907,7 +2051,7 @@ impl World {
     /// Moves the liquid along the edges: each edge passes velocity × dt × the liquid of the cell
     /// upstream, into air or the same liquid, never more than the cell holds.
     fn carry_liquids(&mut self, liq: &mut Liquids, dt: f32) {
-        let (class, rows) = (&liq.class, &liq.rows);
+        let (class, rows, lid) = (&liq.class, &liq.rows, &liq.lid);
         let s = dt / cell_m();
         let m = |i: usize| self.cells[i].m;
         // What each edge passes (units of fill, from the upstream cell), before the limits.
@@ -1949,7 +2093,7 @@ impl World {
             }
             if y > 0 {
                 for x in x0..=x1 {
-                    vrow[x] = flow(liq.v[vi(x, y)], (y - 1) * W() + x, y * W() + x);
+                    vrow[x] = if lid[y * W() + x] & 2 != 0 { 0 } else { flow(liq.v[vi(x, y)], (y - 1) * W() + x, y * W() + x) };
                 }
             }
         });
@@ -2162,7 +2306,9 @@ impl World {
         let full = field::FULL;
         let frame = self.frame;
         let (cells, fill, temp, vel) = (Shared::new(&mut self.cells), Shared::new(&mut self.fill), Shared::new(&mut self.temp), Shared::new(&mut self.vel));
-        let (mask, awake) = (&self.mask, &self.zones.awake);
+        let (mask, awake, lid) = (&self.mask, &self.zones.awake, &liq.lid);
+        // (The top of thin matter is a wall: nothing goes through it, see `open_pores`.)
+        let walled = |i: usize| lid[i] & 2 != 0;
         // SAFETY (every `cells`, `fill`, `temp` and `vel` below): a band only reaches the cells
         // of its own columns.
         let cell = |i: usize| unsafe { cells.get(i) };
@@ -2207,7 +2353,7 @@ impl World {
                         x += k;
                         let i = base + x;
                         x += 1;
-                        if cell(i).m.kind() != Kind::Liquid {
+                        if cell(i).m.kind() != Kind::Liquid || walled(i) {
                             continue;
                         }
                         let j = i - W();
@@ -2296,9 +2442,9 @@ impl World {
                         let runs = |yy: usize| awake[yy / sleep::CS * sleep::CW() + xc / sleep::CS];
                         let have = liquid_fill(i);
                         let same = |j: usize| cell(j).m == m && mask[j] == 0;
-                        let below = (y + 1 < H() && same(i + W())).then_some(i + W());
+                        let below = (y + 1 < H() && same(i + W()) && !walled(i + W())).then_some(i + W());
                         let to = if have <= CRUMB {
-                            match below.or((y > 0 && same(i - W())).then_some(i - W())) {
+                            match below.or((y > 0 && same(i - W()) && !walled(i)).then_some(i - W())) {
                                 Some(j) => j,
                                 None => {
                                     unsafe {
@@ -2388,7 +2534,7 @@ impl World {
     #[cfg(test)]
     pub(super) fn liquid_units(&self, m: Mat) -> u64 {
         let flying: u64 = self.liq.drops.iter().filter(|d| d.m == m).map(|d| d.q as u64).sum();
-        (0..W() * H()).filter(|&i| self.cells[i].m == m).map(|i| self.liquid_fill(i) as u64).sum::<u64>() + flying
+        (0..W() * H()).filter(|&i| self.cells[i].m == m).map(|i| self.liquid_fill(i) as u64).sum::<u64>() + flying + self.held_units(m)
     }
 }
 
@@ -2547,7 +2693,7 @@ mod tests {
     }
 
     /// A pool on a hillside, held by the trunk of a tree on its downhill side: thin matter does
-    /// not hold a liquid back (`seep_through_thin`), the pool runs through the trunk and down
+    /// not hold a liquid back (`open_pores`), the pool runs through the trunk and down
     /// the hill until it is a film on the slope.
     #[test]
     fn a_pool_on_a_hillside_runs_through_a_tree() {
@@ -2601,9 +2747,10 @@ mod tests {
         (cells + flying) as f64 / all as f64
     }
 
-    /// A tree does not dam a flood (`Holds::FromAbove`): the water levels through its trunk and
-    /// its crown, nearly as fast as it spreads with no tree (it was a little over a quarter
-    /// after twelve seconds when only the surface seeped through).
+    /// A tree does not dam a flood (`Holds::FromAbove`): the water runs through its trunk and
+    /// its crown (`open_pores`) nearly as fast as it spreads with no tree, half of it past the
+    /// trunk in three seconds. (A sixth when it passed beside the solver, row by row; a
+    /// twentieth when only the surface seeped through.)
     #[test]
     fn a_flood_levels_through_a_tree() {
         let past = past_an_obstacle(
@@ -2611,10 +2758,37 @@ mod tests {
                 rect(w, 230, 400, 231, 449, Mat::Trunk);
                 rect(w, 215, 395, 246, 415, Mat::Leaf);
             },
-            12,
+            3,
         );
-        // (Level, 45 % of the water is past the trunk.)
-        assert!(past > 0.38, "only {:.0} % of the water got past the tree", past * 100.0);
+        assert!(past > 0.35, "only {:.0} % of the water got past the tree", past * 100.0);
+    }
+
+    /// Rain that falls on a crown stays on it (the top of thin matter is a wall, `lid`): it
+    /// spreads over the crown and runs off its edges, it does not fall through.
+    #[test]
+    fn water_poured_on_a_crown_rests_on_it_and_runs_off_its_edges() {
+        let mut w = world();
+        rect(&mut w, 200, 400, 260, 410, Mat::Leaf);
+        rect(&mut w, 99, 449, 340, 450, Mat::Brick);
+        rect(&mut w, 220, 380, 240, 399, Mat::Water);
+        w.temp.fill(5.0);
+        let all = w.liquid_units(Mat::Water);
+        let units = |w: &World, x0: i32, x1: i32, y0: i32, y1: i32| -> u64 {
+            (x0..=x1).flat_map(|x| (y0..=y1).map(move |y| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water).map(|(x, y)| w.liquid_fill(World::idx(x, y)) as u64).sum()
+        };
+        for _ in 0..30 {
+            w.step();
+        }
+        // Half a second: it has spread over the top, none got under the crown.
+        assert!(units(&w, 190, 270, 300, 399) > all * 9 / 10, "the water should lie on the crown");
+        assert_eq!(units(&w, 205, 255, 411, 448), 0, "the water fell through the crown");
+        for _ in 0..150 {
+            w.step();
+        }
+        // It ran off the edges onto the ground, and the crown holds next to none of it.
+        assert!(units(&w, 100, 340, 411, 448) > all / 2, "the water should run off the crown");
+        assert!(w.held_units(Mat::Water) < all / 20, "the crown soaked up the water: {} of {all}", w.held_units(Mat::Water));
+        assert!(w.liquid_units(Mat::Water) + w.gone + w.dried >= all - field::FULL as u64, "water was lost");
     }
 
     /// A wall of light grains that float (ash, charcoal) does not dam the water either: it lets
