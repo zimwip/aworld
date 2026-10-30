@@ -165,6 +165,9 @@ pub fn setup(game: &mut Game, args: &[String]) {
     if args.iter().any(|a| a == "--logs") {
         demo_logs(game);
     }
+    if args.iter().any(|a| a == "--soil") {
+        demo_soil(game);
+    }
     if args.iter().any(|a| a == "--lava") {
         demo_lava(game);
         // A bolt is only drawn while the world runs.
@@ -684,6 +687,41 @@ fn demo_lava(g: &mut Game) {
                 if (x - cx).pow(2) + (y - cy).pow(2) <= r * r {
                     g.world.set(x, y, Mat::Lava);
                 }
+            }
+        }
+    }
+}
+
+/// `--demo --soil`: a bank of wet earth (sand, humus and water) with grass on top, right against a
+/// pool of fresh lava in a basin of rock. With `--advance n` the earth boils dry, its humus burns
+/// off, the sand left slumps into the lava, fuses into glass and melts into it.
+fn demo_soil(g: &mut Game) {
+    g.empty_world();
+    let floor = 360;
+    for x in 0..W() as i32 {
+        for y in floor..H() as i32 {
+            g.world.set(x, y, Mat::Stone);
+        }
+    }
+    for x in 360..560 {
+        let top = if x < 470 { floor - 70 } else { floor - 70 + (x - 470) / 3 };
+        for y in top..floor {
+            g.world.set(x, y, if y == top { Mat::Grass } else { Mat::Dirt });
+            g.world.moisture[y as usize * W() + x as usize] = 150;
+        }
+    }
+    // The basin: a thick wall of terracotta (it does not melt), the lava poured in against the
+    // earth up to the top of the bank.
+    for y in floor - 80..floor {
+        for x in 680..700 {
+            g.world.set(x, y, Mat::Terracotta);
+        }
+    }
+    for x in 480..680 {
+        for y in floor - 66..floor {
+            if g.world.raw(x, y) == Mat::Empty {
+                g.world.set(x, y, Mat::Lava);
+                g.world.temp[y as usize * W() + x as usize] = 1150.0;
             }
         }
     }
