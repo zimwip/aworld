@@ -87,6 +87,33 @@ pub(super) const MAX_TURNS: usize = MAX_SUB_ALL / MAX_SUB;
 /// more out of a cell than it holds), and a splash is a little less incompressible.
 pub(super) const CHEAP_SUB: usize = 2;
 pub(super) const CHEAP_ITER: u32 = 4;
+/// The simple solver (`World::simple_liquids`, for every liquid): the same grids, classes,
+/// transport, drops and sleep as the detailed one, but each costly part made cheap.
+/// - At most `SIMPLE_SUB` sub-steps a turn of `DT` (the detailed one takes up to `MAX_SUB`).
+/// - The velocities are carried once back along the flow (plain semi-Lagrangian), without the
+///   step forward and the correction that keep a wave sharp.
+/// - The pressure starts from a guess from the depth (`hydrostatic`: under an open surface, the
+///   weight of the liquid over each cell plus the gas on it; nothing in a column that falls
+///   freely; under a roof, a straight line between the open cells on each side), exact for a body
+///   at rest, then takes `SIMPLE_ITER` iterations of the solver (the detailed one: up to
+///   `MAX_ITER`, to convergence).
+/// - Thick liquids are smoothed by `SIMPLE_VISCOUS_SWEEPS` sweeps (`VISCOUS_SWEEPS`).
+pub(super) const SIMPLE_SUB: usize = 2;
+pub(super) const SIMPLE_ITER: u32 = 1;
+pub(super) const SIMPLE_VISCOUS_SWEEPS: usize = 3;
+/// With `SIMPLE_ITER` at 0, the cheapest: no multigrid at all, `SIMPLE_LINES` rounds of line
+/// solves (`Solver::lines`: each column, then each row, exactly) and `SIMPLE_SWEEPS` sweeps of
+/// Gauss-Seidel. Right for a U-tube or a dam break, but a deep body that lands squeezes by a
+/// third (the flood of the bench), its pressure being a matter of the whole body.
+pub(super) const SIMPLE_LINES: usize = 2;
+pub(super) const SIMPLE_SWEEPS: usize = 2;
+/// What the simple solver adds to the guess of a cell that holds more than full (or less, inside
+/// the body), as a share of the pressure that would bring it back to full in a sub-step: the guess
+/// alone left the bend of a U-tube to squeeze up by half as much again as it holds.
+pub(super) const SQUEEZE: f32 = 1.0;
+/// The part of its gap to full that a cell inside a body makes up a solve, on the simple solver
+/// (`REFILL` on the detailed one): it squeezes more where it lands, and is brought back faster.
+pub(super) const SIMPLE_REFILL: f32 = 0.5;
 /// On the drops tier (`World::liq_tier` 2), liquid falling faster than this (m/s), or with air
 /// under it, is free: it goes over to drops in a zone where most of the liquid is free.
 pub(super) const FREE_FALL: f32 = 1.0;
@@ -218,6 +245,10 @@ pub struct Liquids {
     pub(super) fv: Vec<i64>,
     pub(super) want: Vec<Mat>,
     pub(super) scale: Vec<f64>,
+    /// The pressure the simple solver starts from, and whether each cell lies under a roof (see
+    /// `hydrostatic`).
+    pub(super) guess: Vec<f32>,
+    pub(super) roofed: Vec<bool>,
     /// The drops in flight.
     pub(super) drops: Vec<Drop>,
     /// The last pressure solve: when it began, and how many iterations it took (for the profile).
@@ -306,6 +337,8 @@ impl Liquids {
             self.fv = vec![0; W() * (H() + 1)];
             self.want = vec![Mat::Empty; W() * H()];
             self.scale = vec![1.0; W() * H()];
+            self.guess = vec![0.0; W() * H()];
+            self.roofed = vec![false; W() * H()];
         }
     }
 
@@ -530,7 +563,8 @@ impl World {
 
     /// The most sub-steps of the liquids in a turn of `DT`, at their tier.
     pub(super) fn liquid_sub_steps(&self) -> usize {
-        if self.liq_tier >= 1 { CHEAP_SUB } else { MAX_SUB }
+        let most = if self.liq_tier >= 1 { CHEAP_SUB } else { MAX_SUB };
+        if self.simple_liquids { most.min(SIMPLE_SUB) } else { most }
     }
 
     /// The most iterations of the pressure solver, at the liquids' tier.
@@ -604,13 +638,15 @@ impl World {
         let before = if audit { units(self, &liq) } else { 0 };
         // The whole turn on the card, where there is one (and it is wanted, and pays): the card
         // works on the step while the CPU does the rest of it, and the CPU takes its result at
-        // the next.
+        // the next. (The simple solver has no card version: it runs on the cores, and the
+        // liquids come back from the card when it is chosen.)
         let wanted = gpu::wanted();
         if wanted != gpu::Use::Off {
             let mut card = liq.card.take().unwrap_or_else(liquid_gpu::LiquidGpu::new);
             let pays = wanted == gpu::Use::Always || self.card_pays(&mut liq);
             #[cfg(test)]
             let pays = liq.forced.unwrap_or(pays);
+            let pays = pays && !self.simple_liquids;
             if let Some(c) = card.as_mut() {
                 if pays != liq.on_card {
                     // Over to the card or back: the velocities go with the liquids (the card's
@@ -1247,6 +1283,8 @@ impl World {
         let step = dt / cell_m();
         let rows = &liq.rows;
         let (u, v) = (&liq.u, &liq.v);
+        // The simple solver carries the velocities once (see `SIMPLE_SUB`).
+        let once = self.simple_liquids;
         // An edge in the air (air on both sides), read as the edge carried (see `nodes`).
         let air_u = |x: usize, y: usize| kind(x as i32 - 1, y as i32) == AIR && kind(x as i32, y as i32) == AIR;
         let air_v = |x: usize, y: usize| kind(x as i32, y as i32 - 1) == AIR && kind(x as i32, y as i32) == AIR;
@@ -1329,7 +1367,7 @@ impl World {
             for x in x0..=(x1 + 1).min(W()) {
                 let Ok((vx, vy)) = u_vel(x, y) else { continue };
                 // (At rest, carried forward and back it is itself, within what is around it.)
-                let to = if vx == 0.0 && vy == 0.0 && x < W() && y < H() - 1 {
+                let to = if once || (vx == 0.0 && vy == 0.0 && x < W() && y < H() - 1) {
                     uf[ui(x, y)] + 0.0
                 } else {
                     let (px, py) = (x as f32 - vx * step, y as f32 - vy * step);
@@ -1358,7 +1396,7 @@ impl World {
             row[x0..=x1].copy_from_slice(&vf[vi(x0, y)..=vi(x1, y)]);
             for x in x0..=x1 {
                 let Ok((vx, vy)) = v_vel(x, y) else { continue };
-                let was = if vx == 0.0 && vy == 0.0 && x < W() - 1 && y < H() {
+                let was = if once || (vx == 0.0 && vy == 0.0 && x < W() - 1 && y < H()) {
                     vf[vi(x, y)] + 0.0
                 } else {
                     let (px, py) = (x as f32 - vx * step, y as f32 - vy * step);
@@ -1441,6 +1479,7 @@ impl World {
             return;
         }
         let c = dt / (cell_m() * cell_m());
+        let sweeps = if self.simple_liquids { SIMPLE_VISCOUS_SWEEPS } else { VISCOUS_SWEEPS };
         let join = |a: Option<(usize, usize)>, b: Option<(usize, usize)>| match (a, b) {
             (Some((a0, a1)), Some((b0, b1))) => Some((a0.min(b0), a1.max(b1))),
             (a, b) => a.or(b),
@@ -1476,7 +1515,7 @@ impl World {
         // Rightward edges.
         liq.u2.copy_from_slice(&liq.u);
         let before = std::mem::take(&mut liq.u2);
-        for sweep in 0..2 * VISCOUS_SWEEPS {
+        for sweep in 0..2 * sweeps {
             let colour = sweep % 2;
             let us = Shared::new(&mut liq.u);
             each(&u_rows, &|&(y, a, b)| {
@@ -1520,7 +1559,7 @@ impl World {
         // Downward edges.
         liq.v2.copy_from_slice(&liq.v);
         let before = std::mem::take(&mut liq.v2);
-        for sweep in 0..2 * VISCOUS_SWEEPS {
+        for sweep in 0..2 * sweeps {
             let colour = sweep % 2;
             let vs = Shared::new(&mut liq.v);
             each(&v_rows, &|&(y, a, b)| {
@@ -1561,6 +1600,124 @@ impl World {
         liq.v2 = before;
     }
 
+    /// The simple solver's guess of the pressure of each full cell in the spans (`Liquids::guess`),
+    /// column by column, without a solve:
+    /// - under an open surface (air or a film over the cell at the top of the run), the gas on the
+    ///   surface and the weight of each cell down to this one, half of each of the two cells an
+    ///   edge joins (as the edge's push weighs it): what the solve gives a body at rest;
+    /// - a run that does not stand on anything (air or a film under its lowest cell) falls freely
+    ///   and holds the pressure of the gas over it alone;
+    /// - under a roof (a pipe, the bend of a U-tube), along the row from the nearest cells on each
+    ///   side that are not, in a straight line between them (the drop of a steady flow down a
+    ///   pipe); with none, the last pressure of the top cell and the weight below it.
+    /// And a cell that holds more than full (or less, inside the body) is given the pressure that
+    /// brings it back (`SQUEEZE`). The full cells over the spans keep their last pressure.
+    fn hydrostatic(&self, liq: &mut Liquids, dt: f32) {
+        let (class, rows, p_old) = (&liq.class, &liq.rows, &liq.p);
+        let roofed = Shared::new(&mut liq.roofed);
+        let in_span = |x: usize, y: usize| rows[y].is_some_and(|(a, b)| a <= x && x <= b);
+        let rho = |i: usize| density(self.cells[i].m) * 1000.0;
+        let fullish = |i: usize| class[i] & 3 == FULLISH;
+        let Some(y0) = rows[..H()].iter().position(Option::is_some) else { return };
+        let y1 = H() - 1 - rows[..H()].iter().rev().position(Option::is_some).unwrap_or(0);
+        let wg = G * cell_m();
+        let guess = Shared::new(&mut liq.guess);
+        (0..W().div_ceil(super::par::COLUMN_BAND)).into_par_iter().for_each(|band| {
+            let mut held = vec![false; y1 + 1 - y0];
+            for x in band * super::par::COLUMN_BAND..((band + 1) * super::par::COLUMN_BAND).min(W()) {
+                // From the bottom up: whether each full cell stands on something (the ground, or
+                // full liquid that does).
+                let mut under = y1 + 1 >= H() || !in_span(x, y1 + 1) || matches!(class[(y1 + 1) * W() + x] & 3, SOLID | FULLISH);
+                for y in (y0..=y1).rev() {
+                    let i = y * W() + x;
+                    held[y - y0] = under && fullish(i);
+                    under = match class[i] & 3 {
+                        SOLID => true,
+                        FULLISH => held[y - y0] || !in_span(x, y),
+                        _ => false,
+                    };
+                }
+                // From the top down: the pressure.
+                let mut roof = false;
+                for y in y0..=y1 {
+                    let i = y * W() + x;
+                    if !in_span(x, y) || !fullish(i) {
+                        roof = false;
+                        continue;
+                    }
+                    let over = if y == 0 { SOLID } else { class[i - W()] & 3 };
+                    let p = match over {
+                        FULLISH => {
+                            // SAFETY: this band alone writes its columns.
+                            let above = if in_span(x, y - 1) { unsafe { guess.get(i - W()) } } else { p_old[i - W()] };
+                            if held[y - y0] { above + wg * 0.5 * (rho(i) + rho(i - W())) } else { above }
+                        }
+                        SOLID => {
+                            roof = true;
+                            p_old[i]
+                        }
+                        _ => {
+                            roof = false;
+                            let gas = self.gas_pa_over(x as i32, y as i32 - 1);
+                            if held[y - y0] { gas + wg * rho(i) } else { gas }
+                        }
+                    };
+                    // SAFETY: as above.
+                    unsafe {
+                        *guess.at(i) = p;
+                        *roofed.at(i) = roof;
+                    }
+                }
+            }
+        });
+        // Under a roof, along the rows (each row on its own).
+        let roofed = &liq.roofed;
+        liq.guess.par_chunks_mut(W()).enumerate().for_each(|(y, row)| {
+            let Some((x0, x1)) = rows[y] else { return };
+            let mut x = x0;
+            while x <= x1 {
+                let i = y * W() + x;
+                if !fullish(i) || !roofed[i] {
+                    x += 1;
+                    continue;
+                }
+                // A run of roofed full cells, x..end, and the open full cells just beside it.
+                let mut end = x;
+                while end < x1 && fullish(i + end + 1 - x) && roofed[i + end + 1 - x] {
+                    end += 1;
+                }
+                let left = (x > x0 && fullish(i - 1)).then(|| row[x - 1]);
+                let right = (end < x1 && fullish(y * W() + end + 1)).then(|| row[end + 1]);
+                for k in x..=end {
+                    row[k] = match (left, right) {
+                        (Some(a), Some(b)) => a + (b - a) * (k + 1 - x) as f32 / (end + 2 - x) as f32,
+                        (Some(a), None) => a,
+                        (None, Some(b)) => b,
+                        (None, None) => row[k],
+                    };
+                }
+                x = end + 1;
+            }
+            // The cells too full, or not full enough inside the body.
+            let squeeze = SQUEEZE * (cell_m() / dt) * (cell_m() / dt);
+            for x in x0..=x1 {
+                let i = y * W() + x;
+                if !fullish(i) {
+                    continue;
+                }
+                let err = (self.liquid_fill(i) as f32 / field::FULL as f32 - 1.0).clamp(-1.0, 1.0);
+                let inside = || {
+                    [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)]
+                        .iter()
+                        .all(|&(nx, ny)| nx >= W() || ny >= H() || matches!(class[ny * W() + nx] & 3, SOLID | FULLISH))
+                };
+                if err > 0.0 || (err < 0.0 && inside()) {
+                    row[x] += squeeze * rho(i) * err;
+                }
+            }
+        });
+    }
+
     /// Pressure of the gas over the ambient one at (x, y), Pa: a closed pocket's, and the surge
     /// of a blast wave in the air (`surge_pa`); 0 in still open air.
     fn gas_pa(&self, x: i32, y: i32) -> f32 {
@@ -1588,12 +1745,16 @@ impl World {
     /// Solves the pressure that keeps the full cells of the zones that run from filling or
     /// emptying, then takes its push off the velocities.
     fn pressure(&self, liq: &mut Liquids, dt: f32) {
+        if self.simple_liquids {
+            self.hydrostatic(liq, dt);
+        }
         let (class, rows) = (&liq.class, &liq.rows);
         let rho = |i: usize| density(self.cells[i].m) * 1000.0;
         // The divergence of each full cell that runs, times dx / dt.
         let k = cell_m() / dt;
         let (u, v) = (&liq.u, &liq.v);
         let mut rhs_buf = std::mem::take(&mut liq.rhs);
+        let refill = if self.simple_liquids { SIMPLE_REFILL } else { REFILL };
         rhs_buf.par_chunks_mut(W()).enumerate().for_each(|(y, row)| {
             let Some((x0, x1)) = rows[y] else { return };
             for x in x0..=x1 {
@@ -1612,7 +1773,7 @@ impl World {
                 let inside = [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)]
                     .iter()
                     .all(|&(nx, ny)| nx >= W() || ny >= H() || matches!(class[ny * W() + nx] & 3, SOLID | FULLISH));
-                let fix = if inside { REFILL * (self.liquid_fill(i) as f32 / field::FULL as f32 - 1.0).clamp(-1.0, 1.0) } else { 0.0 };
+                let fix = if inside { refill * (self.liquid_fill(i) as f32 / field::FULL as f32 - 1.0).clamp(-1.0, 1.0) } else { 0.0 };
                 row[x] = (u[ui(x + 1, y)] - u[ui(x, y)] + v[vi(x, y + 1)] - v[vi(x, y)]) * k - fix * cell_m() / dt * k;
             }
         });
@@ -1627,7 +1788,10 @@ impl World {
         // would leave a pool of running liquid shut in by sleeping liquid and walls with no
         // pressure to hang from, a singular system that the conjugate gradients cannot take.)
         let solve_clock = self.prof.start();
+        let simple = self.simple_liquids;
         let rhs = &rhs_buf;
+        // Where the solve starts: the last pressure, or the simple solver's guess.
+        let start = if simple { &liq.guess } else { &liq.p };
         let p_old = &liq.p;
         let solver = &mut liq.solver;
         solver.ready(W(), H());
@@ -1734,13 +1898,20 @@ impl World {
                 }
                 diag[i] = d;
                 b[i] = rhs_i;
-                x[i] = p_old[c];
+                x[i] = start[c];
                 n += 1;
             }
             n
         }).sum();
-        let gpu = if unknowns >= mgpcg_gpu::threshold() { liq.gpu.get_or_insert_with(|| mgpcg_gpu::PressureGpu::new(W(), H())).as_mut() } else { None };
-        let iterations = if let Some(gpu) = gpu {
+        let gpu = if !simple && unknowns >= mgpcg_gpu::threshold() { liq.gpu.get_or_insert_with(|| mgpcg_gpu::PressureGpu::new(W(), H())).as_mut() } else { None };
+        let iterations = if simple && SIMPLE_ITER == 0 {
+            solver.lines(SIMPLE_LINES);
+            solver.sweep(SIMPLE_SWEEPS);
+            (SIMPLE_LINES + SIMPLE_SWEEPS) as u32
+        } else if simple {
+            solver.coarsen();
+            solver.solve(SETTLED, RELATIVE, SIMPLE_ITER)
+        } else if let Some(gpu) = gpu {
             gpu.solve(solver.fine(), SETTLED, RELATIVE, self.liquid_iterations())
         } else {
             solver.coarsen();
@@ -2697,12 +2868,14 @@ mod tests {
     /// Water in a U-tube (two columns 6 wide, joined by a bend 6 high), 20 cells higher on the
     /// left: the height of the left column, every step, for 8 s.
     fn u_tube(m: Mat, steps: usize) -> Vec<f32> {
-        u_tube_switching(m, steps, None)
+        u_tube_with(m, steps, false, None)
     }
 
-    /// The same, the liquids going over to the card and back every `every` steps.
-    fn u_tube_switching(m: Mat, steps: usize, every: Option<usize>) -> Vec<f32> {
+    /// The same, on the simple solver or the detailed one, the liquids going over to the card
+    /// and back every `every` steps.
+    fn u_tube_with(m: Mat, steps: usize, simple: bool, every: Option<usize>) -> Vec<f32> {
         let mut w = world();
+        w.simple_liquids = simple;
         // Left column x 200..205, right 230..235, both open at the top; bend y 440..445.
         rect(&mut w, 190, 370, 245, 455, Mat::Brick);
         rect(&mut w, 200, 360, 205, 445, Mat::Empty);
@@ -2730,7 +2903,8 @@ mod tests {
     #[test]
     #[ignore]
     fn probe_u_tube() {
-        let h = u_tube(Mat::Water, 960);
+        // (AWORLD_BENCH_SIMPLE=1: on the simple solver.)
+        let h = u_tube_with(Mat::Water, 960, crate::config::bench().simple, None);
         for (t, q) in h.iter().enumerate().step_by(6) {
             println!("{:.1} s {:.1}", t as f32 / 60.0, q);
         }
@@ -2739,7 +2913,12 @@ mod tests {
     /// Liquid `m` at `t` °C, 30 wide and 20 high, let go on a flat floor 240 long: its front after
     /// `secs` seconds, in cells.
     fn spread(m: Mat, t: f32, secs: usize) -> (i32, World) {
+        spread_with(m, t, secs, false)
+    }
+
+    fn spread_with(m: Mat, t: f32, secs: usize, simple: bool) -> (i32, World) {
         let mut w = world();
+        w.simple_liquids = simple;
         tank(&mut w, 100, 400, 339, 449);
         rect(&mut w, 100, 430, 129, 449, m);
         w.temp.fill(15.0);
@@ -2804,6 +2983,115 @@ mod tests {
         assert!(after <= before && before - after < before / 10_000, "{before} -> {after}");
     }
 
+    // The simple solver (`World::simple_liquids`), on the scenes of the detailed one.
+
+    #[test]
+    fn on_the_simple_solver_a_dam_breaks_and_none_is_lost() {
+        for m in [Mat::Water, Mat::Oil] {
+            let mut w = dam(m);
+            w.simple_liquids = true;
+            let before = w.liquid_units(m);
+            for _ in 0..(60.0 * model().sqrt()).round() as usize {
+                w.step();
+            }
+            // About as far as the detailed solver (13 m for real water).
+            let f = front(&w, m, 100, 400, 339, 449) as f32 * cell_m() / model();
+            assert!((7.0..17.0).contains(&f), "{m:?}: {f} m");
+            let after = w.liquid_units(m) + w.gone + if m == Mat::Water { w.dried } else { 0 };
+            assert!(after <= before && before - after < before / 10_000, "{m:?}: {before} -> {after}");
+        }
+    }
+
+    #[test]
+    fn on_the_simple_solver_a_still_pool_stays_still_and_falls_asleep() {
+        let mut w = world();
+        w.simple_liquids = true;
+        tank(&mut w, 100, 400, 339, 449);
+        rect(&mut w, 100, 430, 339, 449, Mat::Water);
+        w.temp.fill(15.0);
+        let before = w.liquid_units(Mat::Water);
+        for _ in 0..240 {
+            w.step();
+        }
+        let fastest = w.liq.u.iter().chain(w.liq.v.iter()).fold(0.0f32, |a, v| a.max(v.abs()));
+        assert!(fastest < 0.05, "{fastest} m/s");
+        let after = w.liquid_units(Mat::Water);
+        assert!(after <= before && before - after < before / 1_000, "{before} -> {after}");
+        let awake = (0..sleep::CW() * sleep::CH()).filter(|&z| w.zones.awake[z]).count();
+        assert!(awake <= 10, "{awake} zones awake");
+    }
+
+    #[test]
+    fn on_the_simple_solver_water_swings_in_a_u_tube_and_settles() {
+        let h = u_tube_with(Mat::Water, 420, true, None);
+        let (t_low, low) = h.iter().enumerate().take(300).fold((0, f32::MAX), |a, (t, &q)| if q < a.1 { (t, q) } else { a });
+        let (t_high, high) = h.iter().enumerate().skip(t_low).fold((0, 0.0), |a, (t, &q)| if q > a.1 { (t, q) } else { a });
+        // 2.85 s from low to high for real water, as on the detailed solver.
+        let half = (t_high - t_low) as f32 / 60.0 / model().sqrt();
+        assert!((2.3..3.4).contains(&half), "half period {half} s");
+        assert!(low < 28.0 && high > 30.0 && high < 40.0, "{low} {high}");
+        // And it comes to rest at the middle.
+        let last = h[h.len() - 1];
+        assert!((26.0..34.0).contains(&last), "{last}");
+    }
+
+    #[test]
+    fn on_the_simple_solver_lava_creeps_where_water_runs() {
+        let (water, _) = spread_with(Mat::Water, 15.0, 4, true);
+        let (hot, _) = spread_with(Mat::Lava, 1150.0, 4, true);
+        let (glass, _) = spread_with(Mat::Molten, 1700.0, 4, true);
+        assert!(hot * 2 < water, "{hot} {water}");
+        assert!(glass > 0 && water > 0, "{glass} {water}");
+    }
+
+    #[test]
+    fn on_the_simple_solver_the_liquids_take_the_same_turn_on_one_core_and_on_four() {
+        let run = |cores: usize| {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(cores).build().unwrap();
+            pool.install(|| {
+                let mut w = dam(Mat::Water);
+                w.simple_liquids = true;
+                for _ in 0..30 {
+                    w.step();
+                }
+                (0..W() * H()).map(|i| (w.cells[i].m, w.liquid_fill(i))).collect::<Vec<_>>()
+            })
+        };
+        assert!(run(1) == run(4));
+    }
+
+    /// The two solvers side by side on the same scenes: what each gives and what it costs.
+    /// `cargo test --release --bin aworld simple_beside_detailed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn simple_beside_detailed() {
+        println!("{:<34} {:>12} {:>12}", "", "détaillé", "simplifié");
+        let row = |label: &str, f: &dyn Fn(bool) -> String| {
+            let (a, b) = (f(false), f(true));
+            println!("{label:<34} {a:>12} {b:>12}");
+        };
+        row("rupture de barrage : front à 1 s", &|simple| {
+            let mut w = dam(Mat::Water);
+            w.simple_liquids = simple;
+            w.prof.on = true;
+            for _ in 0..(60.0 * model().sqrt()).round() as usize {
+                w.step();
+            }
+            let ms = w.prof.ms_per_step(prof::LIQUIDS);
+            format!("{:.1} m {:.1} ms", front(&w, Mat::Water, 100, 400, 339, 449) as f32 * cell_m() / model(), ms)
+        });
+        row("tube en U : demi-période", &|simple| {
+            let h = u_tube_with(Mat::Water, 420, simple, None);
+            let (t_low, _) = h.iter().enumerate().take(300).fold((0, f32::MAX), |a, (t, &q)| if q < a.1 { (t, q) } else { a });
+            let (t_high, _) = h.iter().enumerate().skip(t_low).fold((0, 0.0), |a, (t, &q)| if q > a.1 { (t, q) } else { a });
+            format!("{:.2} s", (t_high - t_low) as f32 / 60.0 / model().sqrt())
+        });
+        row("tube en U : niveau à 7 s", &|simple| format!("{:.1}", u_tube_with(Mat::Water, 420, simple, None)[419]));
+        for (m, t) in [(Mat::Water, 15.0), (Mat::Lava, 1150.0), (Mat::Molten, 1700.0)] {
+            row(&format!("{m:?} : front à 4 s (cases)"), &|simple| format!("{}", spread_with(m, t, 4, simple).0));
+        }
+    }
+
     #[test]
     fn on_the_drops_tier_a_falling_block_goes_over_to_drops_and_lands_whole() {
         let mut w = world();
@@ -2851,7 +3139,7 @@ mod tests {
             return;
         }
         // The swing of a U-tube goes on across the handing over, both ways.
-        let h = u_tube_switching(Mat::Water, 420, Some(25));
+        let h = u_tube_with(Mat::Water, 420, false, Some(25));
         let (t_low, low) = h.iter().enumerate().take(300).fold((0, f32::MAX), |a, (t, &q)| if q < a.1 { (t, q) } else { a });
         let (t_high, high) = h.iter().enumerate().skip(t_low).fold((0, 0.0), |a, (t, &q)| if q > a.1 { (t, q) } else { a });
         let half = (t_high - t_low) as f32 / 60.0 / model().sqrt();

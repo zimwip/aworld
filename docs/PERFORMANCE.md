@@ -67,3 +67,42 @@ Measured on the cloud machine of the work (4 cores), `AWORLD_BENCH_TIER` setting
   spray thrown fast), the free cells go over to drops (`fall_to_drops`), which fly and land on their own; the solver
   keeps the bodies at rest. Mass is conserved (tests). The smooth game brings the heat back first, then the liquids.
   On the flood, tier 2 is no cheaper than tier 1: the landing drops wake the pool they fall in.
+
+## The simple liquid solver (October 30)
+
+A second solver for every liquid (water, oil, lava, the molten metals), switched on by the « Liquides simplifiés » box of
+the Monde tab (`World::simple_liquids`), to set beside the detailed one and tune. It keeps the grids, the classes, the
+transport (mass exact), the drops and the sleep of the zones, and makes each costly part cheap (`liquid.rs`,
+`SIMPLE_*`):
+
+- at most 2 sub-steps a turn (`SIMPLE_SUB`, 4 for the detailed one);
+- the velocities carried once (plain semi-Lagrangian, no forward-back correction);
+- the pressure starts from a guess from the depth (`hydrostatic`: the weight over each cell under an open surface,
+  the gas alone in a column that falls freely, a straight line along a roofed pipe between its open ends) and takes
+  one iteration of the multigrid solver (`SIMPLE_ITER`, up to 12 for the detailed one);
+- 3 viscosity sweeps instead of 12.
+
+With `SIMPLE_ITER = 0` there is no multigrid at all (`Solver::lines`, then Gauss-Seidel): cheaper again, right for a
+U-tube or a dam, but the bench's flood squeezes by a third where it lands.
+
+Side by side (`cargo test --release --bin aworld simple_beside_detailed -- --ignored --nocapture`):
+
+| | detailed | simple |
+|---|---|---|
+| dam break, front after 1 s | 11.3 m | 11.3 m |
+| U-tube, half period | 2.80 s | 2.80 s |
+| water, front after 4 s | 192 cells | 169 cells |
+| lava, front after 4 s | 58 cells | 76 cells |
+| molten metal, front after 4 s | 170 cells | 141 cells |
+
+Bench (`AWORLD_BENCH_SIMPLE=1`), liquids' ms a step on the cloud machine (4 cores):
+
+| Scene | detailed | simple |
+|---|---|---|
+| liquides | 58 | 30 |
+| déluge | 84 | 45 |
+| nuage | 40 | 24 |
+| orage | 17 | 11 |
+| lave | 7.0 | 5.8 |
+
+`flood_probe` takes `AWORLD_BENCH_SIMPLE=1` too, for pictures of the flood on either solver.
