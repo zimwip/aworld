@@ -230,8 +230,9 @@ impl World {
                     || free(self.at(x + 1, y + 1))
                     || free(self.at(x - 1, y))
                     || free(self.at(x + 1, y))
-                    // Thin matter beside it with room past it: it runs through (`step_liquid`).
-                    || [-1, 1].iter().any(|&d| self.past_thin(x, y, d).is_some_and(|px| self.at(px, y) == Mat::Empty))
+                    // Thin matter beside it with room in it: it runs in (see
+                    // `World::open_pores`).
+                    || [(x - 1, y), (x + 1, y)].iter().any(|&(nx, ny)| self.thin_has_room(nx, ny))
             }
             _ => true,
         }
