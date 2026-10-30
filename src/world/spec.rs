@@ -50,7 +50,7 @@ pub enum Holds {
     /// of its own; ash, charcoal and dead leaves are light, open flakes that a flow runs through
     /// and under (they float on it, see `World::float_on`). The kid and the cars walk and drive
     /// through it and stand on it (`World::bears`); a liquid runs through it sideways but does
-    /// not go down through it (`World::seep_through_thin`).
+    /// not go down through it, and fills it (`World::open_pores`).
     FromAbove,
 }
 
