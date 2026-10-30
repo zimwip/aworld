@@ -327,6 +327,10 @@ struct Game {
 impl Game {
     fn new() -> Self {
         let mut world = World::new();
+        // The game takes the simple solver of the liquids (`liquid::SIMPLE_SUB`), about twice as
+        // cheap; the Monde tab switches back to the detailed one. (The worlds of the tests keep
+        // the detailed one.)
+        world.simple_liquids = true;
         let (entry, exit) = world.generate_biome(1, Biome::Countryside);
         Self::with_world(world, entry, exit)
     }
