@@ -479,8 +479,8 @@ impl World {
             return false;
         }
         let m = self.cells[i].m;
-        // Lava and molten metal are far too thick to spurt.
-        if matches!(m, Mat::Lava | Mat::Molten | Mat::MoltenSteel) {
+        // Lava, molten glass and molten metal are far too thick to spurt.
+        if m.is_melt() {
             return false;
         }
         let rho = density(m).max(0.3);

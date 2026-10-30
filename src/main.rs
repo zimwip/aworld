@@ -3235,7 +3235,7 @@ impl Game {
                 }
                 rrect(s, 7.0, col);
                 rrect(Rect::new(s.x, s.y, s.w, s.h * 0.4), 7.0, Color::new(1.0, 1.0, 1.0, 0.18));
-                if matches!(m, Mat::Lava | Mat::Molten | Mat::MoltenSteel) {
+                if matches!(m, Mat::Lava | Mat::Molten | Mat::MoltenSteel | Mat::MoltenGlass) {
                     draw_circle(s.x + s.w * 0.5, s.y + s.h * 0.5, s.h * 0.32, Color::new(1.0, 0.9, 0.3, 0.55));
                 }
             });

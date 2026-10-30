@@ -623,7 +623,7 @@ impl Kids {
                 let (x, y) = (c.x as i32 + dx, c.y as i32 + dy);
                 let m = world.at(x, y);
                 match m {
-                    Mat::Fire | Mat::Lava | Mat::Ember | Mat::Molten | Mat::MoltenSteel => hot += 1,
+                    Mat::Fire | Mat::Lava | Mat::Ember | Mat::Molten | Mat::MoltenSteel | Mat::MoltenGlass => hot += 1,
                     Mat::Hail => hail += 1,
                     Mat::Sand | Mat::Gunpowder | Mat::Ash | Mat::Rust | Mat::Charcoal | Mat::Saltpeter | Mat::Shard if dy < -4 => grit += 1,
                     Mat::Water if dy < -4 => wet += 1,
@@ -691,7 +691,7 @@ impl Kids {
             }
         };
         add(Topic::Fire, 4.0, n(&[Mat::Fire, Mat::Ember]) > 6);
-        add(Topic::Lava, 4.0, n(&[Mat::Lava, Mat::Molten, Mat::MoltenSteel]) > 10);
+        add(Topic::Lava, 4.0, n(&[Mat::Lava, Mat::Molten, Mat::MoltenSteel, Mat::MoltenGlass]) > 10);
         add(Topic::Water, 2.0, n(&[Mat::Water]) > 200);
         add(Topic::Snow, 2.5, n(&[Mat::Snow]) > 30);
         add(Topic::Ice, 1.5, n(&[Mat::Ice]) > 20);
