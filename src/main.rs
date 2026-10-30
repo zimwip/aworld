@@ -41,7 +41,7 @@ use mech::{GearSize, Mechanism};
 use mechgame::MechDraft;
 use sound::{Ev, Mix, Sounds};
 use ui::{draw_icon, rrect, Drawer, Icon, Ui, ACCENT, BG, BLUE, DIM, GREEN, PANEL, RED, TEXT, TILE, TILE_HOT};
-use world::{Balance, Biome, Mat, PaintRule, Season, World, H, W};
+use world::{Balance, Biome, Mat, PaintRule, Season, Stroke, World, H, W};
 
 /// Simulation steps per second at speed x1 (the rigid bodies use the same 1/60 s step).
 const STEPS_PER_SECOND: f32 = 60.0;
@@ -279,6 +279,13 @@ struct Game {
     /// How the brush treats existing material, and the material "only" mode targets.
     paint_mode: PaintMode,
     only_target: Mat,
+    /// A stroke of the brush is going on: the button went down on the world with a brush tool
+    /// (matter, eraser, tunnel) and is still held.
+    stroking: bool,
+    /// On a frame that shows a picture of the world (see `simthread.rs`), the strokes of the brush
+    /// held down wait here for the simulation thread, which paints them into the real world.
+    defer_strokes: bool,
+    strokes: Vec<Stroke>,
     /// The state each matter of the palette paints (an index into its states), and the matter
     /// whose states are shown under its button (the little arrow).
     matter_state: [usize; MATTERS.len()],
@@ -420,6 +427,9 @@ impl Game {
             mode: ViewMode::Normal,
             paint_mode: PaintMode::Add,
             only_target: Mat::Empty,
+            stroking: false,
+            defer_strokes: false,
+            strokes: vec![],
             matter_state: MATTERS.map(|m| m.default),
             matter_menu: None,
             beam_role: [MemberRole::Deck; MemberMat::ALL.len()],
@@ -1455,6 +1465,18 @@ impl Game {
         }
     }
 
+    /// A stroke of the brush: into the world, or, on a frame that only has a picture of it, onto
+    /// the picture (to be seen at once) and into the queue for the simulation thread.
+    fn stroke(&mut self, s: Stroke) {
+        self.stroking = true;
+        if self.defer_strokes {
+            self.world.stroke_preview(&s);
+            self.strokes.push(s);
+        } else {
+            self.world.stroke(&s);
+        }
+    }
+
     fn handle_mouse(&mut self, view: View, ui: &Ui) {
         if self.show_science || self.quit_modal {
             return;
@@ -1462,6 +1484,7 @@ impl Game {
         // Ctrl belongs to the camera: no painting or building while zooming or moving the view.
         if ctrl_down() || self.camera.dragging() {
             self.last = None;
+            self.stroking = false;
             return;
         }
         let over_ui = ui.over_ui();
@@ -1482,6 +1505,7 @@ impl Game {
                 self.shovel_charge = None;
                 self.last = None;
                 self.drag = None;
+                self.stroking = false;
             }
             return;
         }
@@ -1551,7 +1575,7 @@ impl Game {
                     return;
                 }
             }
-            self.world.line(from, g, self.brush.max(2), Mat::Empty);
+            self.stroke(Stroke::Line { a: from, b: g, r: self.brush.max(2), m: Mat::Empty, rule: PaintRule::Fill });
             return;
         }
         match self.tool {
@@ -1571,7 +1595,7 @@ impl Game {
                     // Each stroke of wood is a log of its own.
                     self.world.new_log();
                 }
-                self.world.line_rule(from, g, self.brush, m, rule);
+                self.stroke(Stroke::Line { a: from, b: g, r: self.brush, m, rule });
             }
             Tool::Tree if click => {
                 if !self.world.plant_tree(g.0, g.1, self.brush as f32 / 20.0) {
@@ -1586,7 +1610,7 @@ impl Game {
             Tool::Pipe | Tool::Valve | Tool::Pump if click => self.fluid_click(at),
             Tool::Shovel => self.shovel_mouse(at, click, left),
             Tool::Select => self.select_mouse(at, click, left, is_key_down(KeyCode::LeftShift)),
-            Tool::Tunnel => self.world.tunnel_line(from, g, self.brush.max(2)),
+            Tool::Tunnel => self.stroke(Stroke::Tunnel { a: from, b: g, r: self.brush.max(2) }),
             Tool::Dynamite if click => self.drop_dynamite(at),
             Tool::Flame => {
                 self.world.flamethrower(g.0, g.1, self.brush.max(3));
@@ -4316,6 +4340,9 @@ async fn game() {
             let edit = simthread::input_may_edit(&game, &ui);
             s.frame(&mut game, edit)
         });
+        // A brush held down paints on the picture, and the strokes go to the world's thread
+        // after the frame: the screen does not wait for a step at every frame.
+        game.defer_strokes = sim.is_some() && lent.is_none();
         game.handle_keys();
         game.handle_camera(base, &ui);
         // `--zoom n,x,y`: n wheel notches in, on the screen point x, y.
@@ -4360,6 +4387,9 @@ async fn game() {
         // The metrics panel (Ctrl+D), over everything: what it reads is the frame just drawn.
         draw_ms = (draw_ms.0 * 0.9 + (t1 - t0) as f32 * 100.0, draw_ms.1 * 0.9 + (t2 - t1) as f32 * 100.0);
         game.draw_metrics(&ui, sw, sh, draw_ms);
+        if let Some(s) = sim.as_mut() {
+            s.send_strokes(&mut game);
+        }
         if let (Some(s), Some(world)) = (sim.as_mut(), lent) {
             s.give_back(&mut game, world);
         }

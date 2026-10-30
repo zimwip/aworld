@@ -23,7 +23,7 @@ use crate::gfx::*;
 
 use crate::sound::{Ev, Sounds};
 use crate::ui::Ui;
-use crate::world::World;
+use crate::world::{Stroke, World};
 use crate::{ctrl_down, Game};
 
 /// The part of a `Game` that lives in the simulation thread and that the screen reads: copied into
@@ -110,11 +110,13 @@ enum ToSim {
     /// The world, back from the screen; and an old picture to fill again.
     Back(Box<Game>),
     Recycle(Box<Game>),
+    /// Strokes of a brush held down, to paint into the world, numbered up to the last one.
+    Strokes(Vec<Stroke>, u64),
 }
 
 enum ToScreen {
-    /// A picture, numbered by the lends it follows.
-    Picture(Box<Game>, News, u64),
+    /// A picture, numbered by the lends it follows, and the last stroke painted into it.
+    Picture(Box<Game>, News, u64, u64),
     Lent(Box<Game>, News),
 }
 
@@ -126,6 +128,10 @@ pub struct SimThread {
     /// for a picture that shows its edits rather than going back to an older one.
     lends: u64,
     shown: u64,
+    /// The strokes sent but not yet in a picture, with their numbers: painted again onto each
+    /// picture that comes before them, so the brush's trail does not flicker.
+    pending: Vec<(u64, Stroke)>,
+    strokes: u64,
 }
 
 impl SimThread {
@@ -149,10 +155,10 @@ impl SimThread {
                 // behind the steps, and the images a second would drop with the steps.
                 let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
                 let pool = rayon::ThreadPoolBuilder::new().num_threads(cores.saturating_sub(1).max(1)).thread_name(|i| format!("simulation-{i}")).build().expect("simulation pool");
-                pool.install(move || Worker { game: Some(sim), spare, rx, tx, lends: 0, dirty: true, last: Instant::now(), busy: 0.016, lent_for: 0.0 }.run())
+                pool.install(move || Worker { game: Some(sim), spare, rx, tx, lends: 0, strokes: 0, dirty: true, last: Instant::now(), busy: 0.016, lent_for: 0.0 }.run())
             })
             .expect("simulation thread");
-        SimThread { to, from, lends: 0, shown: 0 }
+        SimThread { to, from, lends: 0, shown: 0, pending: vec![], strokes: 0 }
     }
 
     /// At the start of a frame: the latest picture into `game`, or, when `borrow`, the real world
@@ -162,8 +168,10 @@ impl SimThread {
             let _ = self.to.send(ToSim::Lend);
             loop {
                 match self.from.recv() {
-                    Ok(ToScreen::Picture(pic, news, n)) => self.show(game, pic, news, n),
+                    Ok(ToScreen::Picture(pic, news, n, done)) => self.show(game, pic, news, n, done),
                     Ok(ToScreen::Lent(mut sim, news)) => {
+                        // The strokes went before the lend: the world has them all.
+                        self.pending.clear();
                         news.tell(game);
                         swap_living(game, &mut sim);
                         return Some(sim);
@@ -175,7 +183,7 @@ impl SimThread {
         loop {
             let next = if self.shown < self.lends { self.from.recv().ok() } else { self.from.try_recv().ok() };
             match next {
-                Some(ToScreen::Picture(pic, news, n)) => self.show(game, pic, news, n),
+                Some(ToScreen::Picture(pic, news, n, done)) => self.show(game, pic, news, n, done),
                 Some(ToScreen::Lent(..)) => unreachable!("lent without being asked"),
                 None => return None,
             }
@@ -190,8 +198,24 @@ impl SimThread {
         let _ = self.to.send(ToSim::Back(sim));
     }
 
-    fn show(&mut self, game: &mut Game, mut pic: Box<Game>, news: News, n: u64) {
+    /// The strokes of this frame go to the world's thread (see `Game::stroke`).
+    pub fn send_strokes(&mut self, game: &mut Game) {
+        if game.strokes.is_empty() {
+            return;
+        }
+        for s in &game.strokes {
+            self.strokes += 1;
+            self.pending.push((self.strokes, *s));
+        }
+        let _ = self.to.send(ToSim::Strokes(std::mem::take(&mut game.strokes), self.strokes));
+    }
+
+    fn show(&mut self, game: &mut Game, mut pic: Box<Game>, news: News, n: u64, done: u64) {
         std::mem::swap(&mut game.world, &mut pic.world);
+        self.pending.retain(|&(k, _)| k > done);
+        for (_, s) in &self.pending {
+            game.world.stroke_preview(s);
+        }
         shown!(swap, game, pic);
         std::mem::swap(&mut game.stress_seen, &mut pic.stress_seen);
         news.tell(game);
@@ -205,6 +229,12 @@ impl SimThread {
 /// or the menus does not.
 pub fn input_may_edit(game: &Game, ui: &Ui) -> bool {
     let buttons = [MouseButton::Left, MouseButton::Right, MouseButton::Middle];
+    // A stroke of the brush that goes on: its strokes are sent to the world (see `Game::stroke`).
+    let changed = buttons.iter().any(|&b| is_mouse_button_pressed(b) || is_mouse_button_released(b));
+    let held = is_mouse_button_down(MouseButton::Left) || is_mouse_button_down(MouseButton::Right);
+    if game.stroking && held && !changed && mouse_wheel() == (0.0, 0.0) && get_keys_pressed().is_empty() {
+        return false;
+    }
     let mouse = buttons.iter().any(|&b| is_mouse_button_down(b) || is_mouse_button_pressed(b) || is_mouse_button_released(b));
     let wheel = mouse_wheel() != (0.0, 0.0);
     // Ctrl + drag and Ctrl + wheel only move the camera (see `handle_camera`).
@@ -224,6 +254,8 @@ struct Worker {
     rx: Receiver<ToSim>,
     tx: Sender<ToScreen>,
     lends: u64,
+    /// The last stroke painted into the world.
+    strokes: u64,
     /// The world changed since the last picture.
     dirty: bool,
     /// When the last update began, and how long its work took.
@@ -274,7 +306,7 @@ impl Worker {
         copy_picture(game, &mut pic);
         let news = News::take(game);
         self.dirty = false;
-        let _ = self.tx.send(ToScreen::Picture(pic, news, self.lends));
+        let _ = self.tx.send(ToScreen::Picture(pic, news, self.lends, self.strokes));
     }
 
     /// One update of the world, as long as the time since the last one, its steps stopping for a
@@ -329,6 +361,14 @@ impl Worker {
     fn handle(&mut self, m: ToSim) {
         match m {
             ToSim::Recycle(pic) => self.spare.push(pic),
+            ToSim::Strokes(strokes, last) => {
+                let world = &mut self.game.as_mut().expect("the world").world;
+                for s in &strokes {
+                    world.stroke(s);
+                }
+                self.strokes = last;
+                self.dirty = true;
+            }
             ToSim::Back(_) => unreachable!("given back without being lent"),
             ToSim::Lend => {
                 let since = Instant::now();
@@ -388,6 +428,26 @@ mod tests {
         assert_eq!(g.speed, 1);
         assert!(g.world.clock >= clock);
     }
+
+    #[test]
+    fn a_brush_held_down_paints_the_world_without_borrowing_it() {
+        let mut g = Game::new();
+        g.set_running(false);
+        let mut sim = SimThread::start(&mut g);
+        sim.frame(&mut g, false);
+        g.defer_strokes = true;
+        g.stroke(crate::Stroke::Line { a: (100, 40), b: (140, 40), r: 3, m: crate::Mat::Stone, rule: crate::PaintRule::Replace });
+        // At once on the picture...
+        assert_eq!(g.world.raw(120, 40), crate::Mat::Stone);
+        sim.send_strokes(&mut g);
+        assert!(g.strokes.is_empty());
+        // ...and in the real world, which a lend brings back.
+        let lent = sim.frame(&mut g, true).expect("lent");
+        assert_eq!(g.world.raw(120, 40), crate::Mat::Stone);
+        assert_eq!(g.world.raw(100, 40), crate::Mat::Stone);
+        assert!(sim.pending.is_empty());
+        sim.give_back(&mut g, lent);
+    }
 }
 
 #[cfg(test)]
@@ -424,8 +484,8 @@ mod frame_bench {
     use super::*;
 
     /// `cargo test --release frame_cost -- --ignored --nocapture`: the screen's parallel work while
-    /// the world runs in its thread; with `PAINT=1`, every frame borrows the world (a brush held
-    /// down) and the world must still step.
+    /// the world runs in its thread; with `PAINT=1`, a brush held down (its strokes sent to the
+    /// world), and with `PAINT=lend`, every frame borrowing the world as the brush once did.
     #[test]
     #[ignore]
     fn frame_cost() {
@@ -437,15 +497,22 @@ mod frame_bench {
         let t = Instant::now();
         let n = 300;
         let mut worst = 0.0f64;
-        let paint = std::env::var_os("PAINT").is_some();
-        for _ in 0..n {
+        let paint = std::env::var("PAINT").ok();
+        let lend = paint.as_deref() == Some("lend");
+        for k in 0..n {
             let f = Instant::now();
-            // Painting: every frame borrows the world.
-            if let Some(lent) = sim.frame(&mut g, paint) {
+            // Painting the old way: every frame borrows the world.
+            if let Some(lent) = sim.frame(&mut g, lend) {
                 g.world.paint(480, 100, 4, crate::Mat::Water);
                 crate::render::light_map(&g.world, &mut buf);
                 sim.give_back(&mut g, lent);
             } else {
+                if paint.is_some() {
+                    g.defer_strokes = true;
+                    let x = 400 + (k as i32 % 160);
+                    g.stroke(crate::Stroke::Line { a: (x, 100), b: (x + 1, 100), r: 4, m: crate::Mat::Water, rule: crate::PaintRule::Fill });
+                    sim.send_strokes(&mut g);
+                }
                 crate::render::light_map(&g.world, &mut buf);
             }
             worst = worst.max(f.elapsed().as_secs_f64());

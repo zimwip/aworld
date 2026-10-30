@@ -57,6 +57,13 @@ pub const MAX_DT: f32 = 3.0 * STEP;
 use thermal::adiabatic_cooling_c;
 use cadence::Pass;
 
+/// A stroke of the brush between two points, of radius `r`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stroke {
+    Line { a: (i32, i32), b: (i32, i32), r: i32, m: Mat, rule: PaintRule },
+    Tunnel { a: (i32, i32), b: (i32, i32), r: i32 },
+}
+
 /// How the brush treats what is already there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaintRule {
@@ -1627,6 +1634,24 @@ impl World {
         }
         for &(x, y) in &centres {
             self.line_roof(x, y, r);
+        }
+    }
+
+    /// A stroke of the brush held down, which the screen hands to the simulation thread instead of
+    /// borrowing the world for it (see `simthread.rs`).
+    pub fn stroke(&mut self, s: &Stroke) {
+        match *s {
+            Stroke::Line { a, b, r, m, rule } => self.line_rule(a, b, r, m, rule),
+            Stroke::Tunnel { a, b, r } => self.tunnel_line(a, b, r),
+        }
+    }
+
+    /// The same stroke on a picture of the world, for the screen to show it at once: a tunnel
+    /// only empties, its roof comes with the next picture.
+    pub fn stroke_preview(&mut self, s: &Stroke) {
+        match *s {
+            Stroke::Line { .. } => self.stroke(s),
+            Stroke::Tunnel { a, b, r } => self.line_rule(a, b, r, Mat::Empty, PaintRule::Fill),
         }
     }
 

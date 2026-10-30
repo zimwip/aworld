@@ -106,3 +106,18 @@ Bench (`AWORLD_BENCH_SIMPLE=1`), liquids' ms a step on the cloud machine (4 core
 | lave | 7.0 | 5.8 |
 
 `flood_probe` takes `AWORLD_BENCH_SIMPLE=1` too, for pictures of the flood on either solver.
+
+## The brush held down (October 30)
+
+Painting brought the images a second down to the steps a second: every frame with a button held borrowed the real world
+from the simulation thread, and the thread hands it over only after a whole step (`simthread.rs`). With steps of 30–50 ms
+the screen fell to 20–30 images a second as soon as the brush was down.
+
+Now only the click that starts a stroke borrows the world. While the button stays down with a brush tool (matter, eraser
+on either button, tunnel), the frame keeps the picture: the stroke is painted onto it at once to be seen, and queued
+(`Game::stroke`, `World::Stroke`) for the simulation thread, which paints it into the real world between two steps. The
+strokes are numbered; a picture made before a stroke reached the world gets it painted again, so the trail never
+flickers. The flamethrower and the shovel still borrow (they touch the trucks and the shovel's load).
+
+`PAINT=1 cargo test --release frame_cost -- --ignored --nocapture` (cloud machine, 4 cores): 52 ms a frame with the old
+lend at every frame (`PAINT=lend`), 2 ms with the strokes sent.
