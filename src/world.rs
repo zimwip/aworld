@@ -689,6 +689,8 @@ pub struct World {
     block_mat: Vec<Mat>,
     /// Per mask id: true for load-bearing parts (trusses) that a car drives through.
     mask_pass: Vec<bool>,
+    /// Per mask id: its velocity (m/s, down positive), for the liquid it drives aside.
+    mask_vel: Vec<(f32, f32)>,
     /// Block ids (index into the block list) touched by flames this step.
     pub touched: Vec<u16>,
     /// Explosions this step: (x, y, radius).
@@ -823,6 +825,7 @@ impl World {
             mask_prev: vec![0; W() * H()],
             block_mat: Vec::new(),
             mask_pass: Vec::new(),
+            mask_vel: Vec::new(),
             touched: Vec::new(),
             blasts: Vec::new(),
             powder_booms: Vec::new(),
@@ -911,7 +914,7 @@ impl World {
             cells, frame, rng, seen: _, ground: _, stack: _, structures,
             ticks, log, paint_log, temp, clock, dt, tick_time, heat, day_cycle,
             climate_fixed, climate, revision, wind, biome, leaf_rgb, autumn, grass_rgb,
-            structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, push,
+            structures_fall, mask, mask_prev: _, block_mat, mask_pass, mask_vel: _, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, push,
             lod, liq_tier, simple_liquids, liq_work, parallel_cells, liq, fill, pore, pore_fill, pocket_of,
             pockets, latent, vel, fall_at, moisture, fuel, growth, organic, jet, liq_p, cls: _, liq_w: _, zones, bursts, storm,
             pressure_cache: _, prof: _, air_rows, air_sky, later: _, dried, gone,
@@ -1424,6 +1427,13 @@ impl World {
         std::mem::swap(&mut self.mask, &mut self.mask_prev);
         self.mask.fill(0);
         self.block_mat = mats;
+        self.mask_vel.clear();
+    }
+
+    /// The velocity of each mask id (m/s, down positive) as the blocks were stamped: the liquid
+    /// they drive aside is thrown at that speed (see `end_blocks`). None given: at rest.
+    pub fn block_speeds(&mut self, vel: Vec<(f32, f32)>) {
+        self.mask_vel = vel;
     }
 
     pub fn mark_block(&mut self, x: i32, y: i32, id: usize) {
@@ -1432,12 +1442,37 @@ impl World {
         }
     }
 
-    /// Pushes loose matter out of cells newly covered by a block.
+    /// Pushes loose matter out of cells newly covered by a block. The liquid it covers goes first
+    /// to the cells it has just left under the liquid (a block sinking through a pond: the water
+    /// under it closes over it, as for a falling piece), and what is left to the free surface it
+    /// reaches through the liquid round the block, as for a solid body (see `spill`): a block
+    /// dropped into a pond raises it and splashes, instead of the water running up over it.
     pub fn end_blocks(&mut self) {
+        #[derive(Default)]
+        struct Moved {
+            /// The liquid it covers now.
+            wet: Vec<(usize, usize)>,
+            /// The cells it left, empty.
+            left: Vec<usize>,
+            /// The sum of the columns of its cells, and how many.
+            sx: f64,
+            n: usize,
+        }
+        // (By mask id, from 1: a block gone since, whose id is past the end, left nothing to fill.)
+        let mut by_id: Vec<Moved> = (0..=self.block_mat.len()).map(|_| Moved::default()).collect();
         for i in 0..W() * H() {
             if (self.mask[i] != 0) != (self.mask_prev[i] != 0) {
                 // A block moved here or away: what is around may move now.
                 self.zones.wake(i);
+            }
+            if self.mask[i] != 0 {
+                let e = &mut by_id[self.mask[i] as usize];
+                e.sx += (i % W()) as f64;
+                e.n += 1;
+            } else if self.mask_prev[i] != 0 && self.cells[i].m == Mat::Empty {
+                if let Some(e) = by_id.get_mut(self.mask_prev[i] as usize) {
+                    e.left.push(i);
+                }
             }
             if self.mask[i] == 0 || self.mask_prev[i] != 0 {
                 continue;
@@ -1446,26 +1481,63 @@ impl World {
             if !matches!(c.m.kind(), Kind::Powder | Kind::Liquid | Kind::Gas | Kind::Flame) {
                 continue;
             }
-            let (x, y) = xy_i32(i);
-            let mut moved = false;
-            for dy in 1..=30 {
-                if y - dy < 0 {
-                    break;
-                }
-                let j = (y - dy) as usize * W() + x as usize;
-                if self.mask[j] == 0 && self.cells[j].m == Mat::Empty {
-                    self.carry(i, j);
-                    self.cells[j].stamp = self.frame;
-                    self.zones.wake(j);
-                    moved = true;
-                    break;
-                }
+            if c.m.kind() == Kind::Liquid {
+                by_id[self.mask[i] as usize].wet.push((i, i));
+                continue;
             }
-            if !moved {
-                self.cells[i] = EMPTY;
-                self.clear_states(i);
+            self.lift_out(i);
+        }
+        let frame = self.frame;
+        for (id, moved) in by_id.into_iter().enumerate() {
+            if moved.wet.is_empty() {
+                continue;
+            }
+            let Moved { mut wet, left, sx, n } = moved;
+            // Into the room it left where that is under the liquid (liquid over it or beside it),
+            // from the top down (a row filled is liquid over the next).
+            let liquid = |w: &World, x: i32, y: i32| Self::inb(x, y) && w.mask[Self::idx(x, y)] == 0 && w.cells[Self::idx(x, y)].m.kind() == Kind::Liquid;
+            for v in left {
+                let Some((i, _)) = wet.last().copied() else { break };
+                let (x, y) = xy_i32(v);
+                if self.mask[v] != 0 || self.cells[v].m != Mat::Empty || !(liquid(self, x, y - 1) || liquid(self, x - 1, y) || liquid(self, x + 1, y)) {
+                    continue;
+                }
+                wet.pop();
+                self.carry(i, v);
+                self.cells[v].stamp = frame;
+                self.zones.wake(v);
+            }
+            if wet.is_empty() {
+                continue;
+            }
+            let (vx, vy) = self.mask_vel.get(id.wrapping_sub(1)).copied().unwrap_or((0.0, 0.0));
+            let speed = (vx * vx + vy * vy).sqrt();
+            // (The blocks are walls to the liquid already: no body to add.)
+            let left = self.spill(&|_| false, wet, (sx / n.max(1) as f64) as f32, speed, true);
+            for (i, _) in left {
+                self.lift_out(i);
             }
         }
+    }
+
+    /// What a block has just covered at `i` goes up the column to the first empty cell over it,
+    /// or is lost.
+    fn lift_out(&mut self, i: usize) {
+        let (x, y) = xy_i32(i);
+        for dy in 1..=30 {
+            if y - dy < 0 {
+                break;
+            }
+            let j = (y - dy) as usize * W() + x as usize;
+            if self.mask[j] == 0 && self.cells[j].m == Mat::Empty {
+                self.carry(i, j);
+                self.cells[j].stamp = self.frame;
+                self.zones.wake(j);
+                return;
+            }
+        }
+        self.cells[i] = EMPTY;
+        self.clear_states(i);
     }
 
     // ----- painting ---------------------------------------------------------
@@ -4176,10 +4248,19 @@ impl World {
     /// `speed` (m/s), a splash.
     fn wade(&mut self, body: &dyn Fn(usize) -> bool, moved: &[(usize, usize)], cx: f32, speed: f32) {
         let liquid = |w: &World, i: usize| w.mask[i] == 0 && w.cells[i].m.kind() == Kind::Liquid;
-        let mut out: Vec<(usize, usize)> = moved.iter().copied().filter(|&(p, _)| !body(p) && liquid(self, p) && (p < W() || !liquid(self, p - W()))).collect();
-        if out.is_empty() {
-            return;
+        let out: Vec<(usize, usize)> = moved.iter().copied().filter(|&(p, _)| !body(p) && liquid(self, p) && (p < W() || !liquid(self, p - W()))).collect();
+        if !out.is_empty() {
+            self.spill(body, out, cx, speed, false);
         }
+    }
+
+    /// Puts the liquid of the cells `out` (where each is now, where it was) on the free surface
+    /// it reaches through the liquid from where it was, round the body (`body`, and the blocks),
+    /// the lowest of it first, thrown up and out from the column `cx` at `speed` (m/s). Not
+    /// `forced`, liquid lower than the surface stays where it is; `forced` (a block has taken its
+    /// place), it goes up to it. Returns what found no room.
+    fn spill(&mut self, body: &dyn Fn(usize) -> bool, mut out: Vec<(usize, usize)>, cx: f32, speed: f32, forced: bool) -> Vec<(usize, usize)> {
+        let liquid = |w: &World, i: usize| w.mask[i] == 0 && w.cells[i].m.kind() == Kind::Liquid;
         let tops: std::collections::HashSet<usize> = out.iter().map(|o| o.0).collect();
         // Through the liquid from where it was (not through the body, nor through what is to
         // move) to the free cells over or beside it, lying on something.
@@ -4233,11 +4314,16 @@ impl World {
         let frame = self.frame;
         let mut next = 0;
         for (&j, &(p, _)) in slots.iter().zip(&out) {
-            if j / W() < p / W() {
+            if !forced && j / W() < p / W() {
                 break;
             }
             next += 1;
             self.carry(p, j);
+            // (A block's cell keeps nothing: the gas swapped into it is gone.)
+            if self.mask[p] != 0 && self.cells[p].m != Mat::Empty {
+                self.cells[p] = EMPTY;
+                self.clear_states(p);
+            }
             for c in [p, j] {
                 self.cells[c].stamp = frame;
                 self.zones.wake(c);
@@ -4250,6 +4336,13 @@ impl World {
         if next > 0 {
             self.revision += 1;
         }
+        let left = out.split_off(next);
+        // The surface takes a row at a time: forced, what found no room goes on the row put on
+        // it, as long as there is room.
+        if forced && next > 0 && !left.is_empty() {
+            return self.spill(body, left, cx, speed, true);
+        }
+        left
     }
 
     /// Sets the velocity (m/s, down positive) of the edges of cell `i` that the liquids carry

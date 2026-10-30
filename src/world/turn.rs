@@ -377,6 +377,7 @@ impl World {
                 mask_prev: share(&self.mask_prev),
                 block_mat: share(&self.block_mat),
                 mask_pass: share(&self.mask_pass),
+                mask_vel: share(&self.mask_vel),
                 touched: Vec::new(),
                 blasts: Vec::new(),
                 powder_booms: Vec::new(),
