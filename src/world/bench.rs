@@ -101,9 +101,9 @@ fn cloud_probe() {
         }
     }
     w.prof.on = true;
-    let dt: f32 = std::env::var("AWORLD_PROBE_DT").ok().and_then(|s| s.parse().ok()).unwrap_or(STEP);
+    let dt: f32 = crate::config::bench().probe_dt.unwrap_or(STEP);
     let mut spent = 0.0;
-    let steps: usize = std::env::var("AWORLD_PROBE_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    let steps: usize = crate::config::bench().probe_steps.unwrap_or(300);
     for k in 0..=steps {
         if k % 60 == 0 {
             let (mut water, mut over_gas, mut walls, mut rain, mut rows, mut still) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
@@ -178,10 +178,10 @@ fn slab_probe() {
 #[test]
 #[ignore]
 fn flame_probe() {
-    let steps: u32 = std::env::var("AWORLD_BENCH_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
-    let only = std::env::var("AWORLD_BENCH_SCENE").ok();
-    let ticks: f32 = std::env::var("AWORLD_BENCH_DT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
-    let dir = std::env::var("AWORLD_FLAME_DIR").unwrap_or_else(|_| ".".into());
+    let steps: u32 = crate::config::bench().steps.unwrap_or(300);
+    let only = crate::config::bench().scene.clone();
+    let ticks: f32 = crate::config::bench().ticks.unwrap_or(1.0);
+    let dir = crate::config::bench().flame_dir.clone().unwrap_or_else(|| ".".into());
     let dt = ticks * super::STEP;
     for (name, make, each) in scenes() {
         if only.as_deref().is_some_and(|o| o != name) {
@@ -273,7 +273,7 @@ fn storm() -> World {
             let (x, y) = ((qx * QS()) as f32, (qy * QS()) as f32);
             if (280.0..680.0).contains(&x) && (70.0..200.0).contains(&y) {
                 let u = ((x - 480.0) / 200.0).powi(2);
-                w.charge[qy * QW() + qx] = (if y < 120.0 { 0.8 } else if y > 150.0 { -0.95 } else { 0.0 }) * (1.0 - u);
+                w.storm.charge[qy * QW() + qx] = (if y < 120.0 { 0.8 } else if y > 150.0 { -0.95 } else { 0.0 }) * (1.0 - u);
             }
         }
     }
@@ -310,14 +310,14 @@ pub(super) fn scenes() -> Vec<(&'static str, fn() -> World, Option<fn(&mut World
 #[test]
 #[ignore]
 fn bench_scenes() {
-    let steps: u32 = std::env::var("AWORLD_BENCH_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
-    let only = std::env::var("AWORLD_BENCH_SCENE").ok();
+    let steps: u32 = crate::config::bench().steps.unwrap_or(300);
+    let only = crate::config::bench().scene.clone();
     // The liquids' tier (`World::liq_tier`: AWORLD_BENCH_TIER=1 the cheap one, 2 the drops).
-    let tier: u8 = std::env::var("AWORLD_BENCH_TIER").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let tier: u8 = crate::config::bench().tier.unwrap_or(0);
     // The simple solver of the liquids (`World::simple_liquids`: AWORLD_BENCH_SIMPLE=1).
-    let simple = std::env::var("AWORLD_BENCH_SIMPLE").is_ok_and(|v| v == "1");
+    let simple = crate::config::bench().simple;
     // The length of a step, in ticks of 1/60 s (AWORLD_BENCH_DT=2: steps of 1/30 s).
-    let ticks: f32 = std::env::var("AWORLD_BENCH_DT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    let ticks: f32 = crate::config::bench().ticks.unwrap_or(1.0);
     let dt = ticks * super::STEP;
     let steps = (steps as f32 / ticks).round() as u32;
     for (name, make, each) in scenes() {
@@ -361,7 +361,7 @@ fn bench_scenes() {
             w.zones.awake.len()
         );
         eprintln!("travail des liquides : {:.2} grille par pas (cases de leurs bandes, sous-pas compris)", work as f64 / steps as f64 / (W() * H()) as f64);
-        if std::env::var_os("AWORLD_BENCH_SERIES").is_some() {
+        if crate::config::bench().series {
             eprintln!("{series}");
         }
         eprint!("{}", w.prof.report());
@@ -446,13 +446,13 @@ fn summary(w: &World) -> (f64, f64, f64, usize) {
 fn same_seconds_at_any_step() {
     let seconds = 3.0;
     for (name, make, _) in scenes() {
-        if !matches!(name, "liquides" | "incendie" | "démo") || std::env::var("AWORLD_BENCH_SCENE").is_ok_and(|o| o != name) {
+        if !matches!(name, "liquides" | "incendie" | "démo") || crate::config::bench().scene.as_deref().is_some_and(|o| o != name) {
             continue;
         }
         let w0 = make();
         let (_, _, t0, _) = summary(&w0);
         eprintln!("{name:>9} au départ : {t0:.2} °C en moyenne");
-        let seeds: u32 = std::env::var("AWORLD_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let seeds: u32 = crate::config::bench().seeds.unwrap_or(1);
         for (ticks, seed) in [0.5f32, 1.0, 2.0, 3.0].into_iter().flat_map(|t| (0..seeds).map(move |s| (t, s))) {
             let mut w = make();
             // (Other lots for the same scene.)
@@ -568,11 +568,11 @@ fn a_block_of_sand_falls_by_gravity_at_any_step() {
 fn flood_probe() {
     let mut w = deluge();
     // (AWORLD_BENCH_SIMPLE=1: on the simple solver of the liquids.)
-    w.simple_liquids = std::env::var("AWORLD_BENCH_SIMPLE").is_ok_and(|v| v == "1");
-    let ticks: f32 = std::env::var("AWORLD_BENCH_DT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
-    let steps: usize = std::env::var("AWORLD_PROBE_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+    w.simple_liquids = crate::config::bench().simple;
+    let ticks: f32 = crate::config::bench().ticks.unwrap_or(1.0);
+    let steps: usize = crate::config::bench().probe_steps.unwrap_or(600);
     let every = (60.0 / ticks).round() as usize;
-    let dir = std::env::var("AWORLD_FLOOD_DIR").ok();
+    let dir = crate::config::bench().flood_dir.clone();
     w.prof.on = true;
     let mut spent = 0.0;
     for k in 0..=steps {
@@ -640,7 +640,7 @@ fn flood_probe() {
 #[test]
 #[ignore]
 fn grids_probe() {
-    if let Some((w, h)) = std::env::var("AWORLD_TEST_GRID").ok().and_then(|v| v.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))) {
+    if let Some((w, h)) = crate::config::bench().test_grid.as_deref().and_then(crate::config::parse_size) {
         set_grid(w, h);
     }
     let c = |m: f32| (m / cell_m()).round() as i32;

@@ -548,7 +548,7 @@ impl World {
         self.liq_work = 0;
         let mut liq = std::mem::take(&mut self.liq);
         liq.ready();
-        let audit = std::env::var_os("AWORLD_DEBUG_MASS").is_some();
+        let audit = crate::config::config().debug_mass;
         let units = |w: &World, liq: &Liquids| (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Water).map(|i| w.liquid_fill(i) as u64).sum::<u64>() + liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>();
         let before = if audit { units(self, &liq) } else { 0 };
         // The whole turn on the card, where there is one (and it is wanted): the card works on
@@ -2793,8 +2793,8 @@ mod tests {
     #[test]
     #[ignore]
     fn probe_u_tube() {
-        // (AWORLD_PROBE_SIMPLE=1: on the simple solver.)
-        let h = u_tube_with(Mat::Water, 960, std::env::var_os("AWORLD_PROBE_SIMPLE").is_some());
+        // (AWORLD_BENCH_SIMPLE=1: on the simple solver.)
+        let h = u_tube_with(Mat::Water, 960, crate::config::bench().simple);
         for (t, q) in h.iter().enumerate().step_by(6) {
             println!("{:.1} s {:.1}", t as f32 / 60.0, q);
         }
@@ -3107,11 +3107,11 @@ mod tests {
         for t in 0..180 {
             w.step();
             if t == 60 {
-                strain = w.strain[World::idx(200, b - 5)];
+                strain = w.structures.strain[World::idx(200, b - 5)];
             }
         }
         let stands = (b - 54..=b - 5).all(|y| w.raw(200, y) == m);
-        (strain, stands, w.pushes.clone())
+        (strain, stands, w.structures.pushes.clone())
     }
 
     #[test]

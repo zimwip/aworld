@@ -102,7 +102,7 @@ impl Metrics {
     pub fn new() -> Self {
         Metrics {
             shown: false,
-            log: std::env::var_os("AWORLD_PROFILE").is_some_and(|v| v != "0"),
+            log: crate::config::config().profile,
             log_acc: Window::default(),
             acc: Window::default(),
             last: Window::default(),

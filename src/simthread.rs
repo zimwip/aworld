@@ -379,12 +379,12 @@ mod tests {
         let lent = sim.frame(&mut g, true).expect("lent");
         assert!(g.phys.is_some());
         let clock = g.world.clock;
-        g.world.wind_max = 0.123;
+        g.world.wind.max = 0.123;
         g.speed = 1;
         sim.give_back(&mut g, lent);
         // The next frame waits for a picture made after the lend: it shows the edits.
         sim.frame(&mut g, false);
-        assert_eq!(g.world.wind_max, 0.123);
+        assert_eq!(g.world.wind.max, 0.123);
         assert_eq!(g.speed, 1);
         assert!(g.world.clock >= clock);
     }

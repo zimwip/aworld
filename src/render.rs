@@ -923,7 +923,7 @@ impl Renderer {
         use crate::world::{GROUND_BREAKDOWN, QH, QS, QW};
         for qy in 1..QH() {
             for qx in 0..QW() {
-                let q = world.mcharge[qy * QW() + qx].abs() / GROUND_BREAKDOWN;
+                let q = world.storm.mcharge[qy * QW() + qx].abs() / GROUND_BREAKDOWN;
                 if q < 0.45 {
                     continue;
                 }
@@ -1015,7 +1015,7 @@ impl Renderer {
         self.veg_tick = tick;
         let px = self.veg_image.get_image_data_mut();
         px.fill([0; 4]);
-        let w = world.wind;
+        let w = world.wind.now;
         for &(x, y, h, col) in self.veg_zones.iter().flatten() {
             let hf = (h / 40.0).powf(1.4).min(2.5);
             let wave = (time * 1.9 + x as f32 * 0.07 + h * 0.03).sin() + 0.5 * (time * 3.3 + y as f32 * 0.11).sin();
@@ -1254,7 +1254,7 @@ fn stress_color(world: &World, x: usize, y: usize) -> [u8; 4] {
     if m.kind() != Kind::Static || matches!(m, Mat::Dirt | Mat::Grass) {
         return [c[0] / 3, c[1] / 3, c[2] / 3, c[3] / 2];
     }
-    let (r, g, b) = stress_rgb(world.strain[y * W() + x] as f32 / 127.5);
+    let (r, g, b) = stress_rgb(world.structures.strain[y * W() + x] as f32 / 127.5);
     let a = c[3] as f32 / 255.0;
     let mix = |k: f32, base: u8| ((k * 255.0 * 0.75 + base as f32 * 0.25) * a) as u8;
     [mix(r, c[0]), mix(g, c[1]), mix(b, c[2]), c[3]]

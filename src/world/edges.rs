@@ -64,10 +64,10 @@ fn scene(m: Mat, hot: bool) -> World {
             }
         }
     }
-    for q in w.charge.iter_mut() {
+    for q in w.storm.charge.iter_mut() {
         *q = 0.8;
     }
-    for q in w.mcharge.iter_mut() {
+    for q in w.storm.mcharge.iter_mut() {
         *q = -1.2;
     }
     w

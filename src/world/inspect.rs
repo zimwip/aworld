@@ -86,13 +86,13 @@ impl World {
     /// (m/s, down positive): what `cell_motion` reads for a solid. Built once for a picture.
     pub fn solid_motions(&self) -> HashMap<usize, Motion> {
         let mut out = HashMap::new();
-        for p in &self.falling {
+        for p in &self.structures.falling {
             let m = Motion { vx: 0.0, vy: p.vy * cell_step_ms(), source: Source::Piece };
             for &i in &p.cells {
                 out.insert(i, m);
             }
         }
-        for s in &self.slabs {
+        for s in &self.structures.slabs {
             for &i in s.cells() {
                 let (vx, vy) = s.velocity_at({ let (x, y) = xy(i); (x as f32 + 0.5, y as f32 + 0.5) });
                 out.insert(i, Motion { vx: vx * cell_step_ms(), vy: vy * cell_step_ms(), source: Source::Slab });

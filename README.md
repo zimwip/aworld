@@ -176,6 +176,16 @@ chutes vient de l'ordonnanceur.
 poches, transformations lentes, pression de l'air, saison, orage, flux d'air) a sa période en secondes du monde et
 sa phase dans un seul tableau ; un test vérifie que les passes lourdes ne tombent jamais sur le même tick.
 
+**Les réglages par l'environnement** (`src/config.rs`) : toutes les variables `AWORLD_*` sont lues une fois, au même
+endroit. Le jeu : `AWORLD_GRID=LxH` (taille du monde, après `--grid`), `AWORLD_GPU=1|auto` (la pression des liquides
+sur la carte), `AWORLD_GPU_MIN` (inconnues qu'il faut pour aller sur la carte), `AWORLD_GPU_FUSE` (niveau du
+multigrille fait en un seul lancement), `AWORLD_CELLS_PAR=0` (le tour des cellules sur un seul cœur),
+`AWORLD_PROFILE` (le temps de chaque partie d'un pas, au journal ; `0` l'éteint), `AWORLD_DEBUG_MASS` (les liquides
+vérifient qu'ils ne gagnent ni ne perdent rien), `AWORLD_DEBUG_CARD` (ce que fait la carte, et ses passes chronométrées).
+Les bancs et sondes des tests : `AWORLD_BENCH_STEPS`, `AWORLD_BENCH_SCENE`, `AWORLD_BENCH_DT`, `AWORLD_BENCH_TIER`, `AWORLD_BENCH_SERIES`,
+`AWORLD_BENCH_GRID`, `AWORLD_FLAME_DIR`, `AWORLD_SEEDS`, `AWORLD_PROBE_DT`, `AWORLD_PROBE_STEPS`, `AWORLD_FLOOD_DIR`,
+`AWORLD_TEST_GRID`, `AWORLD_SNAP`. Quelques sondes de laboratoire gardent leurs propres boutons (`WIND`, `PHASE`, `DAYS`…).
+
 
 ## Son
 
@@ -285,7 +295,9 @@ Touche **V** pour voir les flèches.
   tours puis le moteur cale ou repart — ou par un rail), **pompes** (poussent du 1er bout vers le 2e, clic pour inverser
   ou arrêter ; menées par un engrenage, la poussée suit la vitesse et freine le moteur). Chaque bout libre est ouvert :
   il aspire le liquide où il plonge ou le rejette. Le liquide suit la charge hydraulique : vases communicants, **siphon**
-  (limité par la hauteur que l'air peut soutenir, ce que la pompe dépasse), **écluse** (deux bassins et une vanne).
+  (limité par la hauteur que l'air peut soutenir, une dizaine de mètres d'eau quelle que soit la grille, ce que la pompe
+  dépasse), **écluse** (deux bassins et une vanne). La pression du gaz sur l'eau compte dans la charge : une chaudière
+  ou un réservoir fermé sous pression pousse son eau dans un tuyau plus haut que sa surface.
 - **Vue Pression** (touche P) : pression de l'air (plus mince en altitude, courants), poids des colonnes de liquide,
   poids au-dessus des solides, frontières gaz / liquide / solide ; les tuyaux sont colorés par leur pression.
 - **Argile / terre cuite** : l'argile cuit vers 550 °C. Un feu de bois sous un creuset de terre cuite (braises couvertes :

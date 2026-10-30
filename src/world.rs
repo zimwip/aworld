@@ -4,6 +4,8 @@
 
 mod blast;
 pub mod cadence;
+mod colors;
+pub use colors::*;
 pub mod ballistic;
 pub mod matter;
 pub use blast::Ejecta;
@@ -42,7 +44,7 @@ pub mod inspect;
 mod bench;
 #[cfg(test)]
 mod edges;
-pub use statics::{Balance, Slab};
+pub use statics::Balance;
 pub use storm::{Bolt, BREAKDOWN, GROUND_BREAKDOWN, QS, QW, QH};
 pub use thermal::{air_pressure_atm, Season, DAY_STEPS};
 
@@ -372,100 +374,6 @@ pub fn upsample(coarse: &[f32], bw: usize, bh: usize, b: usize) -> Vec<f32> {
     out
 }
 
-/// A pressure (atmospheres, absolute) as a colour: violet for thin air and suction, blue and green
-/// around one atmosphere, yellow, orange and red under load, white under crushing weight.
-pub fn pressure_rgb(atm: f32) -> (u8, u8, u8) {
-    const STOPS: [(f32, [f32; 3]); 8] = [
-        (0.0, [90.0, 40.0, 190.0]),
-        (0.45, [100.0, 70.0, 220.0]),
-        (0.75, [50.0, 110.0, 235.0]),
-        (1.05, [50.0, 190.0, 150.0]),
-        (1.7, [235.0, 225.0, 70.0]),
-        (3.0, [245.0, 130.0, 40.0]),
-        (6.0, [230.0, 50.0, 40.0]),
-        (12.0, [255.0, 245.0, 245.0]),
-    ];
-    let p = atm.clamp(0.0, 12.0);
-    let k = STOPS.iter().position(|s| s.0 >= p).unwrap_or(STOPS.len() - 1).max(1);
-    let ((p0, c0), (p1, c1)) = (STOPS[k - 1], STOPS[k]);
-    let f = ((p - p0) / (p1 - p0)).clamp(0.0, 1.0);
-    let m = |a: f32, b: f32| (a + (b - a) * f) as u8;
-    (m(c0[0], c1[0]), m(c0[1], c1[1]), m(c0[2], c1[2]))
-}
-
-fn ramp(stops: &[(f32, [f32; 3])], v: f32) -> (u8, u8, u8) {
-    let v = v.clamp(stops[0].0, stops[stops.len() - 1].0);
-    let k = stops.iter().position(|s| s.0 >= v).unwrap_or(stops.len() - 1).max(1);
-    let ((p0, c0), (p1, c1)) = (stops[k - 1], stops[k]);
-    let f = ((v - p0) / (p1 - p0)).clamp(0.0, 1.0);
-    let m = |a: f32, b: f32| (a + (b - a) * f) as u8;
-    (m(c0[0], c1[0]), m(c0[1], c1[1]), m(c0[2], c1[2]))
-}
-
-/// The pressure view's scale for gas (atmospheres, logarithmic): the air thins tenfold and more
-/// from the valley to the top of the sky, and a boiler holds a few atmospheres. Violet and blue for
-/// thin air, green at 1 atm, yellow to red for a pocket under pressure, white about to burst.
-pub fn air_pressure_rgb(atm: f32) -> (u8, u8, u8) {
-    const STOPS: [(f32, [f32; 3]); 9] = [
-        (0.0, [40.0, 20.0, 90.0]),
-        (0.3, [80.0, 45.0, 170.0]),
-        (0.5, [60.0, 90.0, 230.0]),
-        (0.62, [40.0, 165.0, 215.0]),
-        (0.69, [60.0, 200.0, 120.0]),
-        (0.76, [230.0, 225.0, 70.0]),
-        (0.85, [245.0, 140.0, 40.0]),
-        (0.95, [225.0, 45.0, 40.0]),
-        (1.0, [255.0, 235.0, 235.0]),
-    ];
-    ramp(&STOPS, air_scale(atm))
-}
-
-/// Where a pressure sits on the air scale (0 at `AIR_LOW_ATM`, 1 at `AIR_TOP_ATM`).
-pub fn air_scale(atm: f32) -> f32 {
-    ((atm.max(AIR_LOW_ATM) / AIR_LOW_ATM).ln() / (AIR_TOP_ATM / AIR_LOW_ATM).ln()).clamp(0.0, 1.0)
-}
-
-/// The ends of the air pressure scale.
-pub const AIR_LOW_ATM: f32 = 0.02;
-pub const AIR_TOP_ATM: f32 = 6.0;
-
-/// The pressure view's scale for liquids and the ground (atmospheres, logarithmic): from about
-/// 1 atm at the surface to tens of atmospheres deep down, in colours of their own (dark plum,
-/// through crimson and orange, to pale yellow) so that they never read as air.
-pub fn ground_pressure_rgb(atm: f32) -> (u8, u8, u8) {
-    const STOPS: [(f32, [f32; 3]); 6] = [
-        (0.0, [45.0, 30.0, 70.0]),
-        (0.2, [95.0, 40.0, 115.0]),
-        (0.4, [165.0, 50.0, 110.0]),
-        (0.6, [225.0, 85.0, 60.0]),
-        (0.8, [250.0, 165.0, 50.0]),
-        (1.0, [255.0, 245.0, 190.0]),
-    ];
-    ramp(&STOPS, ground_scale(atm))
-}
-
-/// Where a pressure sits on the ground scale (0 at 1 atm, 1 at `GROUND_TOP_ATM`).
-pub fn ground_scale(atm: f32) -> f32 {
-    (atm.max(1.0).ln() / GROUND_TOP_ATM.ln()).clamp(0.0, 1.0)
-}
-
-/// The top of the ground pressure scale.
-pub const GROUND_TOP_ATM: f32 = 30.0;
-
-/// Hot metal glows: dull red from about 500 °C, then orange, then yellow-white as it nears its
-/// melting point (the colours a smith reads off the iron in the forge).
-fn glow((r, g, b): (i32, i32, i32), t: f32) -> (i32, i32, i32, i32) {
-    let k = ((t - 480.0) / (thermal::METAL_MELT_C - 480.0)).clamp(0.0, 1.0);
-    if k == 0.0 {
-        return (r, g, b, 255);
-    }
-    // Red first, then the green comes in (orange, yellow), the blue last.
-    let (hr, hg, hb) = (255.0, 250.0 * k * k, 160.0 * k.powi(4));
-    let mix = (k * 2.0).min(1.0);
-    let m = |a: i32, h: f32| (a as f32 + (h - a as f32) * mix) as i32;
-    (m(r, hr), m(g, hg), m(b, hb), 255)
-}
-
 /// Weight of a cell of this material, relative to water (see `spec.rs`).
 fn density(m: Mat) -> f32 {
     MatSpec::of(m).density / units::RHO_WATER
@@ -721,32 +629,8 @@ pub struct World {
     /// Scratch of `structure_pass`: the cells a chain of matter joins to the base of the world.
     ground: Vec<bool>,
     stack: Vec<usize>,
-    falling: Vec<Piece>,
-    /// Solid bodies tipping over or tumbling down as they fall (see `statics.rs`).
-    pub slabs: Vec<Slab>,
-    /// Scratch for the supports: how many cells each one is from what holds it (u32::MAX: none).
-    level: Vec<u32>,
-    /// Load on each anchored solid cell, as a share of what it can bear (0..255 for 0..2). For the
-    /// stress view.
-    pub strain: Vec<u8>,
-    /// The push of the liquids on each anchored solid body, as the last check of the solids found
-    /// it (see `statics.rs`; only while the liquids run by their physics).
-    pub pushes: Vec<statics::LiquidPush>,
-    /// The free bodies resting on something, with their centre of mass and what turns them (for
-    /// the stress view, see `statics::tip_pass`).
-    pub bodies: Vec<statics::FreeBody>,
-    /// A fingerprint of the anchored cells when their sections were last checked: they are only
-    /// checked again once something changed.
-    strain_key: u64,
-    /// The sections of each anchored body by a fingerprint of its cells, and a scratch map of
-    /// cells to their place in the order of the supports (see `statics::stress_pass`).
-    stress_cache: std::collections::HashMap<u64, std::sync::Arc<statics::BodyStress>>,
-    /// The plan of each anchored body by a fingerprint of its shape, with what it gave last (see
-    /// `statics::StressPlan`).
-    stress_plans: std::collections::HashMap<u64, statics::Worked>,
-    stress_pos: Vec<u32>,
-    /// Where each place of the order comes in its body's list (the same reuse).
-    stress_local: Vec<u32>,
+    /// The solids: their sections and strains, and the bodies that come loose (see `statics.rs`).
+    pub structures: statics::Structures,
     ticks: u32,
     /// Which log each cell of wood belongs to: every stroke of the wood brush is one log, a rigid
     /// body of its own that rests on what is under it but never sticks to anything else (see
@@ -762,18 +646,11 @@ pub struct World {
     pub dt: f32,
     /// The time the world has gone through that the cells have not ticked yet, in seconds.
     tick_time: f32,
-    /// The heat passes since the world began: which part of its cycle comes next.
-    heat_stage: u32,
+    /// Where the heat pass is in its cycle, and what it keeps from one part to the next (see
+    /// `thermal.rs`).
+    heat: thermal::HeatPass,
     /// When false the sun stands still.
     pub day_cycle: bool,
-    thermal_flip: bool,
-    /// What part 2 of the heat pass hands part 3 (heat the open air took from the sky, heat the
-    /// flames gave off), when the pass is spread over the steps of its cycle.
-    heat_carry: (f32, f32),
-    /// Scratch of the wind carrying the air's warmth: the temperatures as they were.
-    temp_old: Vec<f32>,
-    /// The heat the air took from the sky in the last heat pass, per cell (see `heat_air_and_reactions`).
-    heat_took: Vec<f32>,
     /// Tests (and calm sandboxes) can pin the air temperature everywhere.
     pub climate_fixed: Option<f32>,
     /// The energy budget of the world: the sun in, the sky out to space (see `thermal.rs`).
@@ -784,15 +661,8 @@ pub struct World {
     pub dried: u64,
     /// Liquid that left the world by its sides since the start, in units of fill.
     pub gone: u64,
-    /// Wind, -1 (left) to 1 (right).
-    pub wind: f32,
-    /// The player's wind controls: strongest wind (0..1), how fast the direction keeps changing
-    /// (0 = never, 1 = usual, up to 3), and how windy the weather is (0 calm .. 1 windy).
-    pub wind_max: f32,
-    pub wind_changes: f32,
-    pub windiness: f32,
-    /// Advances with `wind_changes`; the wind's direction follows it.
-    pub wind_clock: f32,
+    /// The wind: how strong it blows now, and the player's settings of the weather.
+    pub wind: flow::Wind,
     /// Landscape type this world was generated as (picks the backdrop).
     pub biome: Biome,
     /// Cached seasonal colours (leaf rgb, autumn amount, grass rgb).
@@ -821,13 +691,8 @@ pub struct World {
     pub water_flow: u32,
     /// The air's flow: layered winds, vortices, rising warm air. Gas rides it.
     pub flow: flow::Flow,
-    /// Excess pressure over the ambient one for each flow cell, in atmospheres (see `pressure.rs`).
-    dp: Vec<f32>,
-    /// Its slow average, and the quick part left when that is taken off: what pushes.
-    dp_slow: Vec<f32>,
-    dpd: Vec<f32>,
-    /// Whether the pressure pushes liquids and loose matter (for comparing in tests and demos).
-    pub pressure_forces: bool,
+    /// The excess pressure of the air, and what it pushes (see `pressure.rs`).
+    pub push: pressure::Push,
     /// How much the simulation is simplified to keep the game smooth: 0 = everything exact,
     /// 1 = the wind carries air heat in 2 x 2 blocks, 2 = the heat pass runs half as often (with
     /// doubled rates), 3 = same, and calm air next to air no longer conducts heat (it only relaxes).
@@ -876,19 +741,8 @@ pub struct World {
     pub zones: sleep::Zones,
     /// Walls that gave way under the pressure of a pocket this step: (x, y, pressure in atm).
     pub bursts: Vec<(i32, i32, f32)>,
-    /// Electric charge of the clouds, one value per `QS`×`QS` square (see `storm.rs`).
-    pub charge: Vec<f32>,
-    /// Electric charge held in the ground and the things on it, one value per `QS`×`QS` square:
-    /// what a charged cloud draws up under it, and what a bolt leaves behind (see `storm.rs`).
-    pub mcharge: Vec<f32>,
-    /// How strongly the iron of each `QS`×`QS` square is magnetised (by the current of a bolt).
-    pub magnet: Vec<f32>,
-    /// The opposite charge a charged square draws into the matter round it (influence), worked
-    /// out afresh each storm step from `mcharge`.
-    pub polar: Vec<f32>,
-    /// Bolts of lightning since they were last read. For the picture and the thunder.
-    pub bolts: Vec<Bolt>,
-    storm_rng: storm::StormRng,
+    /// The storms: the charge of the clouds and of the ground, the bolts (see `storm.rs`).
+    pub storm: storm::Storm,
     /// The last pressure field read through `pressure_at_cell` (the loupe): (revision, tick, field).
     pressure_cache: std::sync::Mutex<Option<(u64, u32, Vec<f32>)>>,
     /// Time spent in each phase of a step, when switched on (see `prof.rs`).
@@ -924,17 +778,7 @@ impl World {
             seen: vec![false; W() * H()],
             ground: vec![false; W() * H()],
             stack: Vec::new(),
-            falling: Vec::new(),
-            slabs: Vec::new(),
-            level: vec![u32::MAX; W() * H()],
-            strain: vec![0; W() * H()],
-            pushes: Vec::new(),
-            bodies: Vec::new(),
-            strain_key: 0,
-            stress_cache: std::collections::HashMap::new(),
-            stress_plans: std::collections::HashMap::new(),
-            stress_pos: Vec::new(),
-            stress_local: Vec::new(),
+            structures: statics::Structures::new(),
             ticks: 0,
             log: vec![0; W() * H()],
             paint_log: 0,
@@ -942,22 +786,14 @@ impl World {
             clock: DAY_STEPS / 5,
             dt: STEP,
             tick_time: 0.0,
-            heat_stage: 0,
+            heat: Default::default(),
             day_cycle: true,
-            thermal_flip: false,
-            heat_carry: (0.0, 0.0),
-            temp_old: Vec::new(),
-            heat_took: Vec::new(),
             climate_fixed: None,
             climate: thermal::Climate::default(),
             revision: 1,
             dried: 0,
             gone: 0,
-            wind: 0.0,
-            wind_max: 1.0,
-            wind_changes: 1.0,
-            windiness: 1.0,
-            wind_clock: 0.0,
+            wind: flow::Wind { now: 0.0, max: 1.0, changes: 1.0, windiness: 1.0, clock: 0.0 },
             biome: Biome::Countryside,
             leaf_rgb: (52, 140, 60),
             autumn: 0.0,
@@ -974,10 +810,7 @@ impl World {
             thuds: Vec::new(),
             water_flow: 0,
             flow: flow::Flow::new(),
-            dp: vec![0.0; flow::FW() * flow::FH()],
-            dp_slow: vec![0.0; flow::FW() * flow::FH()],
-            dpd: vec![0.0; flow::FW() * flow::FH()],
-            pressure_forces: true,
+            push: pressure::Push::new(),
             lod: 0,
             liq_tier: 0,
             simple_liquids: false,
@@ -999,12 +832,7 @@ impl World {
             liq_w: vec![0.0; W() * H()],
             bursts: Vec::new(),
             zones: sleep::Zones::new(),
-            charge: vec![0.0; QW() * QH()],
-            mcharge: vec![0.0; QW() * QH()],
-            magnet: vec![0.0; QW() * QH()],
-            polar: vec![0.0; QW() * QH()],
-            bolts: Vec::new(),
-            storm_rng: storm::StormRng(0x9e37_79b9),
+            storm: storm::Storm::new(),
             prof: prof::Profile::default(),
             air_rows: Vec::new(),
             air_sky: 0.0,
@@ -1024,17 +852,14 @@ impl World {
 
     pub fn clear(&mut self) {
         self.revision += 1;
-        self.charge.fill(0.0);
-        self.mcharge.fill(0.0);
-        self.magnet.fill(0.0);
-        self.polar.fill(0.0);
+        self.storm.clear();
         self.cells.fill(EMPTY);
         self.fill.fill(0);
         self.liq.clear();
         self.log.fill(0);
         self.ejecta.clear();
-        self.slabs.clear();
-        self.falling.clear();
+        self.structures.slabs.clear();
+        self.structures.falling.clear();
         self.latent.fill(0.0);
         self.vel.fill(0);
         self.zones.wake_all();
@@ -1060,25 +885,20 @@ impl World {
     /// copy is never stepped. Every field is named, so that a new one has to be sorted here.
     pub fn copy_picture(&mut self, from: &World) {
         let World {
-            cells, frame, rng, seen: _, ground: _, stack: _, falling, slabs, level: _, strain, pushes, bodies, strain_key, stress_cache: _, stress_plans: _,
-            stress_pos: _, stress_local: _, ticks, log, paint_log, temp, clock, dt, tick_time, heat_stage, day_cycle, thermal_flip, heat_carry, temp_old: _, heat_took: _,
-            climate_fixed, climate, revision, wind, wind_max, wind_changes, windiness, wind_clock, biome, leaf_rgb, autumn, grass_rgb,
-            structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, dp,
-            dp_slow, dpd, pressure_forces, lod, liq_tier, simple_liquids, liq_work, parallel_cells, liq, fill, pocket_of,
-            pockets, latent, vel, fall_at, moisture, fuel, growth, jet, liq_p, cls: _, liq_w: _, zones, bursts, charge, mcharge, magnet, polar,
-            bolts, storm_rng, pressure_cache: _, prof: _, air_rows, air_sky, later: _, dried, gone,
+            cells, frame, rng, seen: _, ground: _, stack: _, structures,
+            ticks, log, paint_log, temp, clock, dt, tick_time, heat, day_cycle,
+            climate_fixed, climate, revision, wind, biome, leaf_rgb, autumn, grass_rgb,
+            structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, push,
+            lod, liq_tier, simple_liquids, liq_work, parallel_cells, liq, fill, pocket_of,
+            pockets, latent, vel, fall_at, moisture, fuel, growth, jet, liq_p, cls: _, liq_w: _, zones, bursts, storm,
+            pressure_cache: _, prof: _, air_rows, air_sky, later: _, dried, gone,
         } = from;
         self.dried = *dried;
         self.gone = *gone;
         self.cells.clone_from(cells);
         self.frame = *frame;
         self.rng = *rng;
-        self.falling.clone_from(falling);
-        self.slabs.clone_from(slabs);
-        self.strain.clone_from(strain);
-        self.pushes.clone_from(pushes);
-        self.bodies.clone_from(bodies);
-        self.strain_key = *strain_key;
+        self.structures.copy_picture(structures);
         self.ticks = *ticks;
         self.log.clone_from(log);
         self.paint_log = *paint_log;
@@ -1086,18 +906,12 @@ impl World {
         self.clock = *clock;
         self.dt = *dt;
         self.tick_time = *tick_time;
-        self.heat_stage = *heat_stage;
+        self.heat.copy_picture(heat);
         self.day_cycle = *day_cycle;
-        self.thermal_flip = *thermal_flip;
-        self.heat_carry = *heat_carry;
         self.climate_fixed = *climate_fixed;
         self.climate.clone_from(climate);
         self.revision = *revision;
         self.wind = *wind;
-        self.wind_max = *wind_max;
-        self.wind_changes = *wind_changes;
-        self.windiness = *windiness;
-        self.wind_clock = *wind_clock;
         self.biome = *biome;
         self.leaf_rgb = *leaf_rgb;
         self.autumn = *autumn;
@@ -1113,10 +927,7 @@ impl World {
         self.thuds.clone_from(thuds);
         self.water_flow = *water_flow;
         self.flow.clone_from(flow);
-        self.dp.clone_from(dp);
-        self.dp_slow.clone_from(dp_slow);
-        self.dpd.clone_from(dpd);
-        self.pressure_forces = *pressure_forces;
+        self.push.copy_picture(push);
         self.lod = *lod;
         self.liq_tier = *liq_tier;
         self.simple_liquids = *simple_liquids;
@@ -1137,12 +948,7 @@ impl World {
         self.liq_p.clone_from(liq_p);
         self.zones.clone_from(zones);
         self.bursts.clone_from(bursts);
-        self.charge.clone_from(charge);
-        self.mcharge.clone_from(mcharge);
-        self.magnet.clone_from(magnet);
-        self.polar.clone_from(polar);
-        self.bolts.clone_from(bolts);
-        self.storm_rng.clone_from(storm_rng);
+        self.storm.copy_picture(storm);
         self.air_rows.clone_from(air_rows);
         self.air_sky = *air_sky;
     }
@@ -1155,8 +961,8 @@ impl World {
         self.restore(&st.matter);
         self.temp.copy_from_slice(&st.temp);
         self.clock = st.clock;
-        self.falling.clear();
-        self.slabs.clear();
+        self.structures.falling.clear();
+        self.structures.slabs.clear();
         self.touched.clear();
         self.blasts.clear();
         self.powder_booms.clear();
@@ -1942,7 +1748,7 @@ impl World {
     fn step_ticks(&mut self, ticks: u32) {
         self.revision += 1;
         let clock = self.prof.start();
-        let audit = std::env::var_os("AWORLD_DEBUG_MASS").is_some();
+        let audit = crate::config::config().debug_mass;
         let mut marks: Vec<(&str, u64)> = Vec::new();
         if audit {
             marks.push(("début", self.water_units_audit()));
@@ -2006,9 +1812,9 @@ impl World {
 
     /// The next part of the heat pass, over the step's `dt` (see `thermal_stage`).
     fn heat_turn(&mut self) {
-        self.heat_stage = self.heat_stage.wrapping_add(1);
+        self.heat.stage = self.heat.stage.wrapping_add(1);
         let cycle = thermal::THERMAL_EVERY * self.thermal_lod_scale() as u32;
-        timed!(self, 12, self.thermal_stage(self.heat_stage % cycle));
+        timed!(self, 12, self.thermal_stage(self.heat.stage % cycle));
     }
 
     /// The turn of the cell at (x, y), in zone `zone` (see `turn.rs` for the order).
@@ -2585,8 +2391,8 @@ impl World {
     /// little, but a thin layer (one or two cells) stays where it fell instead of running off.
     /// (See `snow_creeps`.) Returns whether the wind took the flake.
     fn snow_drifts(&mut self, x: i32, y: i32) -> bool {
-        if self.at(x, y + 1) == Mat::Empty && self.wind.abs() > 0.1 && (self.rand() % 100) as f32 <= self.wind.abs() * 60.0 {
-            let w = if self.wind > 0.0 { 1 } else { -1 };
+        if self.at(x, y + 1) == Mat::Empty && self.wind.now.abs() > 0.1 && (self.rand() % 100) as f32 <= self.wind.now.abs() * 60.0 {
+            let w = if self.wind.now > 0.0 { 1 } else { -1 };
             if self.at(x + w, y + 1) == Mat::Empty {
                 self.swap((x, y), (x + w, y + 1));
                 return true;
@@ -3654,7 +3460,7 @@ impl World {
     /// How a flame moves (`Motion::Flame`): it licks upwards, and leans with the wind. Returns
     /// whether it moved.
     fn move_flame(&mut self, x: i32, y: i32) -> bool {
-        let d = if self.wind.abs() > 0.3 && self.chance(2) { self.wind.signum() as i32 } else { self.dir() };
+        let d = if self.wind.now.abs() > 0.3 && self.chance(2) { self.wind.now.signum() as i32 } else { self.dir() };
         let r = self.rand() % 10;
         let order: [(i32, i32); 2] = if r < 6 { [(0, -1), (d, -1)] } else if r < 8 { [(d, 0), (-d, 0)] } else { return false };
         for (dx, dy) in order {
@@ -3844,13 +3650,13 @@ impl World {
     pub(super) fn structure_pass(&mut self) {
         let mut seen = std::mem::take(&mut self.seen);
         let mut stack = std::mem::take(&mut self.stack);
-        let mut level = std::mem::take(&mut self.level);
+        let mut level = std::mem::take(&mut self.structures.level);
         seen.fill(false);
         level.fill(u32::MAX);
         // What a chain of matter joins to the base of the world (see `anchors`).
         self.spread_ground(true, &[]);
         // Bodies in flight are moved by their own physics.
-        for s in &self.slabs {
+        for s in &self.structures.slabs {
             for &i in s.cells() {
                 seen[i] = true;
             }
@@ -3884,7 +3690,7 @@ impl World {
                 }
             }
         }
-        self.level = level;
+        self.structures.level = level;
         // Now without the free bodies: what they can rest on (see `tip_pass`).
         self.spread_ground_without_free_bodies();
         self.stress_pass(&order, &mut seen);
@@ -3892,13 +3698,13 @@ impl World {
         // of a small one, else a crumb whose sampled cell is not the one sampled again lost its
         // speed at every pass and never fell faster than a cell a drop).
         let mut speeds: std::collections::HashMap<usize, (f32, f32)> = std::collections::HashMap::new();
-        for p in &self.falling {
+        for p in &self.structures.falling {
             for c in p.cells.iter().step_by(p.cells.len().div_ceil(400).max(1)) {
                 speeds.insert(*c, (p.vy, p.fallen));
             }
         }
         // Group what is left into bodies.
-        self.falling.clear();
+        self.structures.falling.clear();
         let mut free = vec![];
         let mut budget = 300_000usize;
         for start in 0..W() * H() {
@@ -3941,7 +3747,7 @@ impl World {
         if self.mask[i] != 0 {
             return true;
         }
-        matches!(m.kind(), Kind::Static | Kind::Powder | Kind::Liquid) && (free || !Self::structural(m) || self.level[i] != u32::MAX)
+        matches!(m.kind(), Kind::Static | Kind::Powder | Kind::Liquid) && (free || !Self::structural(m) || self.structures.level[i] != u32::MAX)
     }
 
     /// Marks in `ground` the cells a chain of matter that carries (see `carries`) joins to the
@@ -3982,7 +3788,7 @@ impl World {
     /// body: then it stands as it is (the ground without the cells that are not in it is the same).
     fn spread_ground_without_free_bodies(&mut self) {
         use rayon::prelude::*;
-        let leans = self.ground.par_iter().enumerate().any(|(i, &g)| g && self.mask[i] == 0 && Self::structural(self.cells[i].m) && self.level[i] == u32::MAX);
+        let leans = self.ground.par_iter().enumerate().any(|(i, &g)| g && self.mask[i] == 0 && Self::structural(self.cells[i].m) && self.structures.level[i] == u32::MAX);
         if leans {
             self.spread_ground(false, &[]);
         }
@@ -4053,7 +3859,7 @@ impl World {
     /// Moves every unsupported piece down (accelerating) as a rigid whole. A fast
     /// landing bounces a little. Ice pieces float on liquids instead of sinking.
     fn drop_structures(&mut self) {
-        let mut pieces = std::mem::take(&mut self.falling);
+        let mut pieces = std::mem::take(&mut self.structures.falling);
         for piece in &mut pieces {
             piece.cells.sort_unstable_by(|a, b| b.cmp(a));
         }
@@ -4108,7 +3914,7 @@ impl World {
             }
         }
         pieces.retain(|p| !p.cells.is_empty());
-        self.falling = pieces;
+        self.structures.falling = pieces;
     }
 
     /// A falling piece held up only by leaves, twigs or saplings breaks them: they fall as dead
@@ -4579,29 +4385,6 @@ impl World {
         out
     }
 
-    /// The pressure view's colour of a cell, with the borders between gas, liquid and solid marked.
-    pub fn pressure_color(&self, field: &[f32], x: usize, y: usize) -> [u8; 4] {
-        let m = self.at(x as i32, y as i32);
-        // Two scales: the air's changes are a few hundredths of an atmosphere, the ground's tens of
-        // atmospheres; on one scale either the sky or the ground would be a flat colour.
-        let (r, g, b) = if matches!(m.kind(), Kind::Empty | Kind::Gas | Kind::Flame) { air_pressure_rgb(field[y * W() + x]) } else { ground_pressure_rgb(field[y * W() + x]) };
-        if gas_grain(m) {
-            // A grain of gas is at the pressure of the air around it (mechanical equilibrium): it
-            // shows where it is, without a pressure of its own.
-            return grain_dot([r, g, b]);
-        }
-        let here = m.kind();
-        let edge = [(1i32, 0i32), (0, 1)].iter().any(|&(dx, dy)| {
-            let (nx, ny) = (x as i32 + dx, y as i32 + dy);
-            Self::inb(nx, ny) && self.at(nx, ny).kind() != here && !(matches!(here, Kind::Empty | Kind::Gas) && matches!(self.at(nx, ny).kind(), Kind::Empty | Kind::Gas))
-        });
-        if edge {
-            [(r as f32 * 0.45) as u8, (g as f32 * 0.45) as u8, (b as f32 * 0.45) as u8, 255]
-        } else {
-            [r, g, b, 255]
-        }
-    }
-
     /// Relative humidity of the air at every cell (0..1). Water vapour and clouds count toward it, set
     /// against how much the air can hold at its temperature (cold air holds little), and the air
     /// over and around water is damper to begin with. Water itself is always 1; other liquids (lava,
@@ -4662,177 +4445,10 @@ impl World {
         upsample(&rh, bw, bh, b)
     }
 
-    /// Colour of a cell in the humidity view: dry tan, through green, to wet blue.
-    pub fn humidity_color(&self, field: &[f32], x: usize, y: usize) -> [u8; 4] {
-        let m = self.at(x as i32, y as i32);
-        let rh = match m.kind() {
-            // Humidity is water: lava, oil and molten metal are liquids without any.
-            Kind::Liquid => (m == Mat::Water).then_some(1.0),
-            // Steam and cloud are air saturated with water: 100 % on the grain itself.
-            Kind::Empty | Kind::Gas => Some(if matches!(m, Mat::Cloud | Mat::Steam) { 1.0 } else { field[y * W() + x] }),
-            _ => match m {
-                // Soil holds moisture of its own.
-                Mat::Mud => Some(1.0),
-                Mat::Dirt | Mat::Grass => Some((self.moisture[y * W() + x] as f32 / SOIL_FULL as f32).clamp(0.0, 1.0) * 0.8 + 0.1),
-                _ => None,
-            },
-        };
-        let Some(rh) = rh else {
-            // Dry solids: dim, so that the picture reads as shapes.
-            return [58, 62, 74, 255];
-        };
-        const STOPS: [(f32, [f32; 3]); 4] = [(0.0, [186.0, 134.0, 66.0]), (0.35, [214.0, 196.0, 96.0]), (0.65, [90.0, 180.0, 140.0]), (1.0, [40.0, 100.0, 235.0])];
-        let k = STOPS.iter().position(|s| s.0 >= rh).unwrap_or(STOPS.len() - 1).max(1);
-        let ((p0, c0), (p1, c1)) = (STOPS[k - 1], STOPS[k]);
-        let f = ((rh - p0) / (p1 - p0)).clamp(0.0, 1.0);
-        let c = |a: f32, b: f32| (a + (b - a) * f) as u8;
-        if gas_grain(m) {
-            return grain_dot([c(c0[0], c1[0]), c(c0[1], c1[1]), c(c0[2], c1[2])]);
-        }
-        let tint = if matches!(m, Mat::Dirt | Mat::Grass) { 0.7 } else { 1.0 };
-        [(c(c0[0], c1[0]) as f32 * tint) as u8, (c(c0[1], c1[1]) as f32 * tint) as u8, (c(c0[2], c1[2]) as f32 * tint) as u8, 255]
-    }
-
     pub fn cell_mat(&self, x: usize, y: usize) -> Mat {
         self.cells[y * W() + x].m
     }
 
-    /// Everything but the trees, which are drawn as a separate swaying layer.
-    pub fn color_without_trees(&self, x: usize, y: usize) -> [u8; 4] {
-        if self.cells[y * W() + x].m.is_vegetation() {
-            return [0, 0, 0, 0];
-        }
-        self.color(x, y)
-    }
-
-    pub fn color(&self, x: usize, y: usize) -> [u8; 4] {
-        let c = self.cells[y * W() + x];
-        if c.m == Mat::Empty {
-            return [0, 0, 0, 0];
-        }
-        let h = (x as u32).wrapping_mul(73856093) ^ (y as u32).wrapping_mul(19349663);
-        let v = ((h >> 7) & 15) as i32 - 8;
-        // A fixed speckle per cell; the shimmer of water and the flicker of embers and lava move
-        // in the shader (render.rs), so a cell that does not change keeps its colour.
-        let flick = (h >> 11 & 31) as i32;
-        let t = self.temp[y * W() + x];
-        let (r, g, b, a): (i32, i32, i32, i32) = match c.m {
-            Mat::Empty => (0, 0, 0, 0),
-            Mat::Sand => (226 + v, 200 + v, 124 + v, 255),
-            Mat::Water => {
-                // Warm water shifts toward a pale, reddish tone just before it boils.
-                let warm = ((t - 30.0).max(0.0) * 1.3) as i32;
-                let (r, g, b) = (44 + v / 2 + warm, 124 + v + flick / 4 + warm / 3, (224 + v - warm).max(0));
-                // A cell of the field that is not full is water mixed with air: the less water,
-                // the clearer it shows, and the paler (spray and the froth of a splash are
-                // whitish, not a deeper blue).
-                let q = self.water_fill(y * W() + x).min(field::FULL) as i32 * 256 / field::FULL as i32;
-                let pale = |c: i32, to: i32| c + (to - c) * (256 - q) / 256;
-                (pale(r, 200), pale(g, 222), pale(b, 240), 205 * q / 256)
-            }
-            Mat::Fire => (255, (80 + self.fuel[y * W() + x].left as i32 * 3).min(235), 30, 235),
-            Mat::Steam | Mat::Cloud => (0, 0, 0, 0),
-            Mat::Iron => glow((146 + v, 156 + v, 174 + v), t),
-            Mat::Wood => (146 + v / 2 + (y as i32 % 3) * 6, 98 + v / 2, 54, 255),
-            Mat::Stone => {
-                // Darker with depth, with soft mineral patches.
-                let patch = (((x / 7) as u32).wrapping_mul(2654435761) ^ ((y / 7) as u32).wrapping_mul(40503)) >> 13 & 7;
-                let depth = 1.0 - (y as f32 / H() as f32) * 0.35;
-                let base = (108 + patch as i32 * 2) as f32 * depth;
-                // Hot rock glows red before it melts.
-                let heat = (((t - 300.0) / 2.5).clamp(0.0, 150.0)) as i32;
-                (base as i32 + v + heat, base as i32 + v - heat / 3, (base * 1.1) as i32 + v - heat / 2, 255)
-            }
-            Mat::Brick => (184 + v, 72 + v / 2, 56, 255),
-            Mat::Clay => (168 + v, 124 + v / 2, 98 + v / 2, 255),
-            Mat::Terracotta => (196 + v, 98 + v / 2, 60 + v / 3, 255),
-            Mat::Vault => {
-                // Courses of bricks (3 cells high, 6 long, staggered) with pale mortar joints.
-                let row = y / 3;
-                let joint = y % 3 == 2 || (x + row * 3) % 6 == 5;
-                if joint { (196 + v / 2, 188 + v / 2, 172 + v / 2, 255) } else { (170 + v, 86 + v / 2, 58 + v / 3, 255) }
-            }
-            Mat::Rust => (156 + v, 84 + v / 2, 42, 255),
-            Mat::Ash => (100 + v, 100 + v, 106 + v, 255),
-            Mat::Charcoal => (34 + v / 2, 32 + v / 2, 34 + v / 2, 255),
-            Mat::Saltpeter => (236 + v / 2, 238 + v / 2, 230 + v / 2, 255),
-            Mat::Ember => (255, 110 + flick * 3, 24, 255),
-            Mat::Lava => (255, 78 + flick * 3 + v, 12, 255),
-            Mat::Ice => (176 + v, 226 + v, 248, 225),
-            Mat::Gunpowder => (62 + v, 58 + v, 66 + v + (flick / 8) * 6, 255),
-            // Clear, with the odd cell that catches the light.
-            Mat::Diamond => if flick > 28 { (255, 255, 255, 255) } else { (196 + v, 236 + v / 2, 246, 235) },
-            // Red sticks with a pale band of paper.
-            Mat::Dynamite => if y % 6 == 0 { (226 + v / 2, 214 + v / 2, 190, 255) } else { (196 + v, 46 + v / 2, 38, 255) },
-            Mat::Dirt => {
-                // Wet earth is darker.
-                let k = 256 - 96 * (self.moisture[y * W() + x].min(SOIL_FULL) as i32) / SOIL_FULL as i32;
-                // Fertile earth shows its seeds: pale specks, more of them the more it holds.
-                let seeds = self.growth[y * W() + x] as u32;
-                if seeds > 0 && (h >> 3) % 16 < 2 + seeds {
-                    (184 + v, 150 + v, 96 + v / 2, 255)
-                } else {
-                    ((112 + v) * k / 256, (78 + v / 2) * k / 256, (52 + v / 2) * k / 256, 255)
-                }
-            }
-            Mat::Grass => {
-                // Green on moist soil, turning straw yellow as the soil dries.
-                let d = ((GRASS_GREEN as i32 - self.moisture[y * W() + x] as i32) * 256 / (GRASS_GREEN - GRASS_DRY) as i32).clamp(0, 256);
-                let (r, g, b) = self.grass_rgb;
-                let mix = |a: i32, s: i32| a + (s - a) * d / 256;
-                (mix(r, 200) + v / 2, mix(g, 178) + v, mix(b, 84) + v / 2, 255)
-            }
-            Mat::Leaf => {
-                // In autumn each leaf takes its own colour: red, orange or yellow.
-                let (r, g, b) = self.leaf_rgb;
-                if self.autumn > 0.25 {
-                    let tone = ((h >> 5) & 3) as i32;
-                    let (tr, tg, tb) = match tone {
-                        0 => (196, 64, 32),
-                        1 => (220, 130, 30),
-                        2 => (224, 190, 52),
-                        _ => (172, 98, 36),
-                    };
-                    let k = self.autumn;
-                    (
-                        (r as f32 + (tr - r) as f32 * k) as i32 + v,
-                        (g as f32 + (tg - g) as f32 * k) as i32 + v,
-                        (b as f32 + (tb - b) as f32 * k) as i32 + v / 2,
-                        255,
-                    )
-                } else {
-                    (r + v / 2, g + v * 2, b + v / 2, 255)
-                }
-            }
-            Mat::DeadLeaf => {
-                let tone = ((h >> 5) & 3) as i32;
-                (170 + tone * 12 + v, 100 + tone * 14 + v, 40 + v / 2, 255)
-            }
-            Mat::Branch => (104 + v / 2, 70 + v / 2, 40, 255),
-            Mat::Trunk => (112 + v / 2 + (x as i32 % 2) * 8, 78 + v / 2, 46, 255),
-            Mat::Steel => glow((112 + v, 134 + v, 168 + v), t),
-            Mat::Snow => (244 + v / 3, 247 + v / 3, 252, 255),
-            Mat::Hail => (210 + v, 236 + v, 252, 255),
-            Mat::Molten | Mat::MoltenSteel => (255, 196 + flick * 2 + v, 90 + flick, 255),
-            Mat::Oil => {
-                // Almost black with a rainbow sheen where it catches the light.
-                let sheen = if (x / 3 + y / 2) % 7 == 0 { 26 } else { 0 };
-                (30 + v / 2 + sheen / 2, 26 + v / 2 + sheen, 28 + v / 2 + sheen * 2, 245)
-            }
-            Mat::Smoke => (0, 0, 0, 0),
-            Mat::Shard => (196 + v, 230 + v, 246, 170 + flick),
-            Mat::Seed => (138 + v, 96 + v, 50 + v / 2, 255),
-            Mat::Sapling => (110 + v, 206 + v, 84 + v, 255),
-            Mat::Mud => (88 + v, 62 + v / 2, 42 + v / 2, 255),
-            Mat::Glass => {
-                // Translucent, with a bright streak across it.
-                let streak = if (x + y) % 11 < 2 { 40 } else { 0 };
-                (190 + v + streak, 226 + v + streak / 2, 246, 120 + streak)
-            }
-        };
-        let (r, g, b, a) = (r.clamp(0, 255), g.clamp(0, 255), b.clamp(0, 255), a.clamp(0, 255));
-        [(r * a / 255) as u8, (g * a / 255) as u8, (b * a / 255) as u8, a as u8]
-    }
 }
 
 #[cfg(test)]
@@ -6760,7 +6376,7 @@ mod tests {
         };
         let (smoke0, cloud0) = (mean_y(&w, true), mean_y(&w, false));
         for _ in 0..45 {
-            w.wind = 0.0;
+            w.wind.now = 0.0;
             w.step();
         }
         assert!(mean_y(&w, true) < smoke0 - 8.0, "hot gas should climb: {smoke0} -> {}", mean_y(&w, true));
@@ -6780,7 +6396,7 @@ mod tests {
         };
         let before = mean_x(&w);
         for _ in 0..300 {
-            w.wind = 0.5;
+            w.wind.now = 0.5;
             w.step();
         }
         let moved = mean_x(&w) - before;
@@ -6791,17 +6407,17 @@ mod tests {
     fn the_wind_can_be_tuned() {
         let run = |max: f32, changes: f32, windy: f32| {
             let mut w = World::new_static();
-            w.wind_max = max;
-            w.wind_changes = changes;
-            w.windiness = windy;
+            w.wind.max = max;
+            w.wind.changes = changes;
+            w.wind.windiness = windy;
             let (mut top, mut flips, mut last) = (0.0f32, 0, 0.0f32);
             for _ in 0..200_000u32 {
                 w.update_wind();
-                top = top.max(w.wind.abs());
-                if w.wind * last < 0.0 {
+                top = top.max(w.wind.now.abs());
+                if w.wind.now * last < 0.0 {
                     flips += 1;
                 }
-                last = w.wind;
+                last = w.wind.now;
             }
             (top, flips)
         };
@@ -6823,7 +6439,7 @@ mod tests {
         for t in 0..200_000u32 {
             w.ticks = t;
             w.update_wind();
-            calmest = calmest.min(w.wind.abs());
+            calmest = calmest.min(w.wind.now.abs());
         }
         assert!(calmest >= 0.29, "the wind should never die down completely: {calmest}");
     }
@@ -6831,7 +6447,7 @@ mod tests {
     #[test]
     fn rain_slants_with_the_wind() {
         let mut w = World::new_static();
-        w.wind = 0.9;
+        w.wind.now = 0.9;
         // (A drop is carried by the air's flow where it is: a wind to the right everywhere.)
         w.flow.pin_uniform(1.0, 0.0);
         let mut sx = 0.0;
@@ -6844,7 +6460,7 @@ mod tests {
         let mut positions: Vec<i32> = vec![];
         for _ in 0..40 {
             w.step();
-            w.wind = 0.9;
+            w.wind.now = 0.9;
         }
         for i in 0..W() * H() {
             if w.cells[i].m == Mat::Water {
@@ -7579,8 +7195,8 @@ mod science {
         w.reset_temps();
         w.flow.pin_uniform(0.0, 0.0);
         // (No wind: in the wind a flake drifts down a cell a tick, see `snow_drifts`.)
-        w.wind = 0.0;
-        w.wind_max = 0.0;
+        w.wind.now = 0.0;
+        w.wind.max = 0.0;
         w.set(400, 20, Mat::Snow);
         for _ in 0..40 {
             w.step();
