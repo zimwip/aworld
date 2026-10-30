@@ -3771,21 +3771,23 @@ impl Game {
         if ui.checkbox(cr, "Air compressible (P V = n R T)", self.world.flow.compress, true) {
             self.world.flow.compress = !self.world.flow.compress;
         }
-        // The simple solver of the liquids, to set beside the detailed one (`liquid::SIMPLE_SUB`).
-        let lr = Rect::new(10.0, cr.y + 27.0, PANEL_W - 20.0, 24.0);
-        if ui.checkbox(lr, "Liquides simplifiés", self.world.simple_liquids, true) {
+        // On one row, so that both stay clear of the buttons at the foot of the palette on a
+        // window 768 high: the simple solver of the liquids, to set beside the detailed one
+        // (`liquid::SIMPLE_SUB`), and the cells' turn on every core, about twice as fast when much
+        // is moving, but not quite the same turn (see `world/turn.rs`).
+        let half = (PANEL_W - 18.0) / 2.0;
+        let lr = Rect::new(6.0, cr.y + 27.0, half, 26.0);
+        if ui.button(lr, "Liquides simplifiés", Icon::Drop, self.world.simple_liquids, true, BLUE) {
             self.world.simple_liquids = !self.world.simple_liquids;
             self.say(if self.world.simple_liquids { "Liquides : solveur simplifié" } else { "Liquides : solveur détaillé" });
         }
         if ui.hover(lr) {
             self.hover_info = Some((
                 "Solveur simplifié des liquides".to_string(),
-                "Eau, lave, verre fondu... : pression devinée d'après la profondeur puis retouchée sur place, au plus deux sous-pas, vitesses portées une fois. Moins cher, un peu moins exact : à comparer avec le solveur détaillé.".to_string(),
+                "Pour tous les liquides (eau, huile, lave, métal fondu) : pression devinée d'après la profondeur puis une seule itération du solveur, au plus deux sous-pas, vitesses portées une fois. Environ deux fois moins cher, un peu moins exact : à comparer avec le solveur détaillé.".to_string(),
             ));
         }
-        // The cells' turn on every core, about twice as fast when much is moving, but not quite the
-        // same turn (see `world/turn.rs`).
-        let pr = Rect::new(6.0, lr.y + 27.0, PANEL_W - 12.0, 24.0);
+        let pr = Rect::new(12.0 + half, lr.y, half, 26.0);
         if ui.button(pr, "Tous les cœurs", Icon::None, self.world.parallel_cells, true, GREEN) {
             self.world.parallel_cells = !self.world.parallel_cells;
         }
