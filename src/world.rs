@@ -1756,7 +1756,10 @@ impl World {
         // cells go to it: a cell it changed after they went would be a cell the card has wrong,
         // and what the card did to it would be lost at the next step.)
         self.take_liquids_from_card();
-        if self.liquids_on_card() {
+        // (Where the liquids run when the step begins: they may go over to the card or back
+        // in it.)
+        let carded = self.liquids_on_card();
+        if carded {
             self.seep_through_thin();
         }
         if audit {
@@ -1777,7 +1780,7 @@ impl World {
                 // as it does the cells.)
                 timed!(self, prof::LIQUIDS, self.step_liquids(ticks as f32 * STEP));
             }
-            if !self.liquids_on_card() {
+            if !carded {
                 self.seep_through_thin();
             }
             if audit {
@@ -4191,7 +4194,7 @@ impl World {
     fn push_liquid(&mut self, i: usize, (vx, vy): (f32, f32)) {
         let (x, y) = xy(i);
         let liq = &mut self.liq;
-        if let Some(Some(card)) = liq.card.as_mut() {
+        if let Some(card) = liq.active_card() {
             for e in [liquid::ui(x, y), liquid::ui(x + 1, y)] {
                 card.patches_up.push(liquid_gpu::Patch { edge: e as u32, mode: 1, value: vx, weight: 1.0 });
             }

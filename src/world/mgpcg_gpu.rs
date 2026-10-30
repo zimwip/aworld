@@ -6,9 +6,10 @@
 //! the edges, the diagonal, the right side and the start) and sent to the card whole; the coarse
 //! levels are built there, the iterations run there, and the pressure comes back. A handful of
 //! puddles is not worth the trip, and stays on the CPU (`GPU_MIN` unknowns, `AWORLD_GPU_MIN` to
-//! change it); and the card is off unless asked for (`AWORLD_GPU=auto`, see `gpu.rs`): on an
-//! integrated card (an Intel Arc B390) a solve of the big tank takes 22 ms against the CPU's 31,
-//! and in the game, where a solve is a few iterations, the trip costs more than it saves. The
+//! change it). Where the whole turn of the liquids runs on the card (`liquid_gpu.rs`), its
+//! pressure is solved there; this is for the CPU's turn. On an integrated card (an Intel Arc
+//! B390) a solve of the big tank takes 22 ms against the CPU's 31, and in the game, where a
+//! solve is a few iterations, the trip costs more than it saves. The
 //! cost is not the computing (a sweep over the whole world takes 64 µs there) but the hundred
 //! dependent kernel launches of a V-cycle, each ten to thirty microseconds (`bench_gpu`).
 //!

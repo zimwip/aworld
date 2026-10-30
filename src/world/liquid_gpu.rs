@@ -26,6 +26,10 @@ impl LiquidGpu {
     pub fn rows(&self) -> Option<(usize, usize)> {
         None
     }
+
+    pub fn take_over(&mut self, _liq: &super::liquid::Liquids) {}
+
+    pub fn hand_back(&mut self, _liq: &mut super::liquid::Liquids) {}
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -378,6 +382,44 @@ mod native {
                 iters: 4,
                 patches_up: Vec::new(),
             })
+        }
+
+        /// The liquids come over from the CPU: their velocities go to the card, and every cell
+        /// of the next band goes up again (what the card held is from before it gave them back).
+        pub fn take_over(&mut self, liq: &Liquids) {
+            if liq.u.len() == (W() + 1) * H() {
+                self.gpu.queue.write_buffer(&self.u, 0, bytes(&liq.u));
+                self.gpu.queue.write_buffer(&self.v, 0, bytes(&liq.v));
+                self.gpu.queue.write_buffer(&self.p, 0, bytes(&liq.p));
+            }
+            self.fastest = liq.u.iter().chain(&liq.v).fold(0.0f32, |a, v| a.max(v.abs()));
+            (self.sent, self.held, self.pending) = (None, None, None);
+            self.patches_up.clear();
+        }
+
+        /// The liquids go back to the CPU (the card's last step was taken in): their velocities
+        /// come back from the card.
+        pub fn hand_back(&mut self, liq: &mut Liquids) {
+            let d = &self.gpu.device;
+            let (nu_, nv) = ((W() + 1) * H(), W() * (H() + 1));
+            let back = d.create_buffer(&wgpu::BufferDescriptor { label: Some("liquid velocities back"), size: ((nu_ + nv) * 4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            let mut enc = self.encoder();
+            enc.copy_buffer_to_buffer(&self.u, 0, &back, 0, (nu_ * 4) as u64);
+            enc.copy_buffer_to_buffer(&self.v, 0, &back, (nu_ * 4) as u64, (nv * 4) as u64);
+            self.gpu.queue.submit([enc.finish()]);
+            let slice = back.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            d.poll(wgpu::Maintain::Wait);
+            {
+                let data = slice.get_mapped_range();
+                let word = |k: usize| f32::from_le_bytes([data[k * 4], data[k * 4 + 1], data[k * 4 + 2], data[k * 4 + 3]]);
+                liq.u = (0..nu_).map(word).collect();
+                liq.v = (nu_..nu_ + nv).map(word).collect();
+            }
+            back.unmap();
+            (self.sent, self.held, self.pending) = (None, None, None);
+            // (The classes of the zones at rest were the card's: all are worked out again.)
+            liq.classed.clear();
         }
 
         /// The rows of the last step given to the card.

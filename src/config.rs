@@ -3,12 +3,12 @@
 
 use std::sync::OnceLock;
 
-/// Whether the liquids' pressure goes to the graphics card (`AWORLD_GPU`).
+/// Whether the liquids go to the graphics card (`AWORLD_GPU`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Gpu {
-    /// Never (unset, or any other value).
+    /// Never (`0`; and in the tests, unless asked for).
     Off,
-    /// When the system is large enough to pay for the trip (`auto`).
+    /// Where it costs less than the CPU, as measured (unset, `auto`, or any other value).
     Auto,
     /// Always (`1`).
     Always,
@@ -50,8 +50,11 @@ pub fn config() -> &'static Config {
         grid: var("AWORLD_GRID"),
         gpu: match var("AWORLD_GPU").as_deref() {
             Some("1") => Gpu::Always,
-            Some("auto") => Gpu::Auto,
-            _ => Gpu::Off,
+            Some("0") => Gpu::Off,
+            // (The tests stay on the CPU unless asked: a trial of the card would change their
+            // liquids by when it comes.)
+            None if cfg!(test) => Gpu::Off,
+            _ => Gpu::Auto,
         },
         gpu_min: number("AWORLD_GPU_MIN"),
         gpu_fuse: number("AWORLD_GPU_FUSE"),

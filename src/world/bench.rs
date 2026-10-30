@@ -335,6 +335,7 @@ fn bench_scenes() {
         w.prof.reset();
         let mut worst = 0f64;
         let mut work = 0u64;
+        let mut carded = 0u32;
         let mut series = String::new();
         let t = Instant::now();
         for i in 0..steps {
@@ -344,6 +345,7 @@ fn bench_scenes() {
             let s = Instant::now();
             w.step_dt(dt);
             work += w.liq_work;
+            carded += w.liquids_on_card() as u32;
             let ms = s.elapsed().as_secs_f64() * 1000.0;
             worst = worst.max(ms);
             if i < 96 {
@@ -358,6 +360,10 @@ fn bench_scenes() {
             w.zones.awake.len()
         );
         eprintln!("travail des liquides : {:.2} grille par pas (cases de leurs bandes, sous-pas compris)", work as f64 / steps as f64 / (W() * H()) as f64);
+        if super::gpu::wanted() != super::gpu::Use::Off {
+            let ms = |c: Option<f32>| c.map_or("?".to_string(), |c| format!("{c:.1} ms"));
+            eprintln!("liquides sur la carte {:.0} % des pas (coût d'un pas : CPU {}, carte {})", carded as f32 * 100.0 / steps as f32, ms(w.liq.cost[0]), ms(w.liq.cost[1]));
+        }
         if crate::config::bench().series {
             eprintln!("{series}");
         }
