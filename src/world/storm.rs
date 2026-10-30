@@ -41,6 +41,10 @@ const CHANNEL_C: f32 = 2500.0;
 pub const GROUND_BREAKDOWN: f32 = 1.0;
 /// How strongly a charged cloud draws the opposite charge up into what lies under it.
 const INDUCE: f32 = 0.6;
+/// How much more a conductor takes for each side of it open to the air (a point, a mast).
+const POINT: f32 = 0.3;
+/// Most charge a conductor passes to a neighbouring square in one pass of its sharing.
+const FLOW_MAX: f32 = 0.003;
 /// A charged square of ground draws at most this share of its charge, the other way, into the
 /// matter within `INFLUENCE_R` squares round it.
 const INFLUENCE: f32 = 1.0;
@@ -679,7 +683,37 @@ impl World {
             self.storm.polar.fill(0.0);
             return exposed;
         }
-        // Conductors share their charge with their neighbours, quickly (several passes).
+        // What the clouds draw into each square: the opposite of the charge over it, nearer
+        // charge counting much more. Only the surface feels it (the ground screens what lies
+        // under it), most of all a good conductor, and a point standing up into the air more still
+        // (the field crowds round it: lightning rods). The depth holds none of its own.
+        let mut target = vec![0.0f32; QW() * QH()];
+        for qy in 0..QH() {
+            for qx in 0..QW() {
+                let k = qy * QW() + qx;
+                if !exposed[k] {
+                    continue;
+                }
+                let mut field = 0.0;
+                for &(cx, cy, q) in &clouds {
+                    let (dx, dy) = (cx - qx as i32, cy - qy as i32);
+                    if dy >= 0 || dx.abs() > 12 {
+                        continue;
+                    }
+                    let d2 = (dx * dx + dy * dy) as f32;
+                    field += q / (1.0 + d2 / 16.0);
+                }
+                let air = |x: i32, y: i32| x >= 0 && y >= 0 && x < QW() as i32 && y < QH() as i32 && cond[y as usize * QW() + x as usize] < 0.0;
+                let (x, y) = (qx as i32, qy as i32);
+                let point = [(x - 1, y), (x + 1, y), (x, y - 1)].iter().filter(|&&(a, b)| air(a, b)).count() as f32;
+                target[k] = -INDUCE * field * (0.3 + 1.2 * cond[k]) * (1.0 + POINT * cond[k] * point);
+            }
+        }
+        // Conductors share their charge with their neighbours, quickly (several passes): what
+        // flows is the charge beyond what the clouds draw there (a conductor evens out its
+        // potential, not its charge). So the earth under a charged cloud is a reservoir that feeds
+        // its surface, and the more it conducts the sooner, rather than a sink that soaks it up;
+        // the charge it gives up is pushed down into the depth, and drains there.
         for _ in 0..4 {
             let m = self.storm.mcharge.clone();
             for qy in 0..QH() {
@@ -695,7 +729,9 @@ impl World {
                         }
                         let n = ny as usize * QW() + nx as usize;
                         if cond[n] > 0.0 {
-                            flow += 0.22 * cond[k].min(cond[n]) * (m[n] - m[k]);
+                            // (Through a poor conductor it takes a while: the current is limited.)
+                            let c = cond[k].min(cond[n]);
+                            flow += (0.22 * c * ((m[n] - target[n]) - (m[k] - target[k]))).clamp(-FLOW_MAX * c, FLOW_MAX * c);
                         }
                     }
                     self.storm.mcharge[k] += flow;
@@ -745,31 +781,22 @@ impl World {
         self.storm.polar = influence;
         let m = &self.storm.mcharge;
         let mut next = m.clone();
-        for qy in 0..QH() {
-            for qx in 0..QW() {
-                let k = qy * QW() + qx;
-                if cond[k] < 0.0 {
-                    next[k] = 0.0;
-                    continue;
-                }
-                // The field of the cloud charge over it: nearer charge counts much more.
-                let mut target = 0.0;
-                if exposed[k] {
-                    let mut field = 0.0;
-                    for &(cx, cy, q) in &clouds {
-                        let (dx, dy) = (cx - qx as i32, cy - qy as i32);
-                        if dy >= 0 || dx.abs() > 12 {
-                            continue;
-                        }
-                        let d2 = (dx * dx + dy * dy) as f32;
-                        field += q / (1.0 + d2 / 16.0);
-                    }
-                    target = -INDUCE * field * (0.5 + cond[k]);
-                }
-                // It follows the cloud's pull (or drains away without one), quicker in a conductor.
-                let rate = 0.002 + 0.006 * cond[k];
-                next[k] = m[k] + (target - m[k]) * rate;
+        for k in 0..QW() * QH() {
+            if cond[k] < 0.0 {
+                next[k] = 0.0;
+                continue;
             }
+            if !exposed[k] {
+                // Out of reach of the air, what conducts is the earth itself: what the surface
+                // pushed down into it, or what a bolt left there, goes on into the planet.
+                next[k] = m[k] * (1.0 - 0.002 - 0.25 * cond[k]);
+                continue;
+            }
+            // It follows the cloud's pull (or drains away without one), quicker in a conductor,
+            // but it takes a little while to come.
+            let rate = 0.002 + 0.006 * cond[k];
+            let most = 0.001 + 0.004 * cond[k];
+            next[k] = m[k] + ((target[k] - m[k]) * rate).clamp(-most, most);
         }
         self.storm.mcharge = next;
         exposed
@@ -1305,6 +1332,34 @@ mod tests {
         let end = w.storm.bolts[0].path.last().unwrap();
         assert!((end.0 - 450.0).abs() < 4.0 && (end.1 - 380.0).abs() < 6.0, "the bolt leaves for the mast: {end:?}");
         assert!(w.mcharge_at(450, 381).abs() < GROUND_BREAKDOWN * 0.5, "the strike drains the mast");
+    }
+
+    #[test]
+    fn conducting_ground_takes_more_charge_from_the_cloud_than_rock_and_keeps_it_at_the_surface() {
+        // Under the same charged cloud, a plain of earth (which conducts) and one of rock.
+        let surface = |m: Mat| {
+            let mut w = World::new_static();
+            for x in 0..W() as i32 {
+                for y in 470..H() as i32 {
+                    w.set(x, y, m);
+                }
+            }
+            for qy in 0..QH() {
+                for qx in 0..QW() {
+                    let (x, y) = (qx * QS(), qy * QS());
+                    if (300..600).contains(&x) {
+                        w.storm.charge[qy * QW() + qx] = if (120..170).contains(&y) { 0.5 } else if (200..260).contains(&y) { -0.6 } else { 0.0 };
+                    }
+                }
+            }
+            w.settle_ground_charge(300);
+            (w.mcharge_at(450, 471), w.mcharge_at(450, 520))
+        };
+        let (earth, earth_deep) = surface(Mat::Dirt);
+        let (rock, _) = surface(Mat::Stone);
+        assert!(earth > 0.2, "the earth under the cloud's negative base turns positive: {earth}");
+        assert!(earth > 1.5 * rock, "the more it conducts, the more it takes: earth {earth}, rock {rock}");
+        assert!(earth_deep.abs() < earth * 0.2, "the depth does not soak it up: {earth_deep}");
     }
 
     #[test]
