@@ -387,6 +387,7 @@ impl World {
                 push: self.push.view(),
                 lod: self.lod,
                 liq_tier: self.liq_tier,
+                simple_liquids: self.simple_liquids,
                 liq_work: 0,
                 parallel_cells: true,
                 // (The drops the cells make in the turn, the rain sweeping a cloud, `absorb` takes.)

@@ -648,6 +648,122 @@ impl Solver {
         &mut self.levels[0]
     }
 
+    /// `n` red-black Gauss-Seidel sweeps of the finest level (after it has been filled in) from
+    /// the `x` it holds, without the coarse levels nor the conjugate gradients: what the simple
+    /// solver of the liquids does, from a guess already close.
+    pub fn sweep(&mut self, n: usize) {
+        self.used = 1;
+        self.levels[0].prepare();
+        self.levels[0].smooth(n, false, false, None, false);
+    }
+
+    /// `n` rounds of line relaxation of the finest level (after it has been filled in) from the
+    /// `x` it holds: every column of fluid solved exactly with the columns beside it held (even
+    /// columns, then odd ones), then every row the same way. A tall body or a long pipe takes its
+    /// pressure in one line, where a sweep of cells moves it a cell. For the simple solver.
+    pub fn lines(&mut self, n: usize) {
+        let f = &mut self.levels[0];
+        let (w, h) = (f.w, f.h);
+        let Some(y0) = f.rows.iter().position(Option::is_some) else { return };
+        let y1 = h - 1 - f.rows.iter().rev().position(Option::is_some).unwrap_or(0);
+        let (kind, ax, ay, diag, b) = (&f.kind, &f.ax, &f.ay, &f.diag, &f.b);
+        let fluid = |c: usize| kind[c] == FLUID && diag[c] > 0.0;
+        // Scratch of the tridiagonal solves, one a thread.
+        let line = |len: usize| (vec![0.0f32; len], vec![0.0f32; len]);
+        for _ in 0..n {
+            for parity in 0..2 {
+                let xs = Shared::new(&mut f.x);
+                // SAFETY: a column of this parity writes its own cells, and reads the columns
+                // beside it, of the other parity, which nobody writes now.
+                (parity..w).step_by(2).collect::<Vec<_>>().par_iter().for_each_init(
+                    || line(h),
+                    |(cp, dp), &x| {
+                        let mut y = y0;
+                        while y <= y1 {
+                            if !fluid(y * w + x) {
+                                y += 1;
+                                continue;
+                            }
+                            let start = y;
+                            while y + 1 <= y1 && fluid((y + 1) * w + x) {
+                                y += 1;
+                            }
+                            // Thomas over start..=y: diag x_k - ay_k x_(k-1) - ay_(k+1) x_(k+1) = r_k.
+                            for k in start..=y {
+                                let c = k * w + x;
+                                let mut r = b[c];
+                                if x > 0 && fluid(c - 1) {
+                                    r += ax[k * (w + 1) + x] * unsafe { xs.get(c - 1) };
+                                }
+                                if x + 1 < w && fluid(c + 1) {
+                                    r += ax[k * (w + 1) + x + 1] * unsafe { xs.get(c + 1) };
+                                }
+                                let a = if k > start { ay[c] } else { 0.0 };
+                                let cc = if k < y { ay[c + w] } else { 0.0 };
+                                let (pc, pd) = if k > start { (cp[k - 1], dp[k - 1]) } else { (0.0, 0.0) };
+                                let m = diag[c] - a * pc;
+                                cp[k] = cc / m;
+                                dp[k] = (r + a * pd) / m;
+                            }
+                            let mut next = 0.0;
+                            for k in (start..=y).rev() {
+                                let v = dp[k] + if k < y { cp[k] * next } else { 0.0 };
+                                unsafe { *xs.at(k * w + x) = v };
+                                next = v;
+                            }
+                            y += 1;
+                        }
+                    },
+                );
+            }
+            for parity in 0..2 {
+                let xs = Shared::new(&mut f.x);
+                let rows = &f.rows;
+                // SAFETY: as for the columns, by rows.
+                (y0..=y1).filter(|y| y % 2 == parity).collect::<Vec<_>>().par_iter().for_each_init(
+                    || line(w),
+                    |(cp, dp), &y| {
+                        let Some((x0, x1)) = rows[y] else { return };
+                        let mut x = x0;
+                        while x <= x1 {
+                            if !fluid(y * w + x) {
+                                x += 1;
+                                continue;
+                            }
+                            let start = x;
+                            while x < x1 && fluid(y * w + x + 1) {
+                                x += 1;
+                            }
+                            for k in start..=x {
+                                let c = y * w + k;
+                                let mut r = b[c];
+                                if y > 0 && fluid(c - w) {
+                                    r += ay[c] * unsafe { xs.get(c - w) };
+                                }
+                                if y + 1 < h && fluid(c + w) {
+                                    r += ay[c + w] * unsafe { xs.get(c + w) };
+                                }
+                                let a = if k > start { ax[y * (w + 1) + k] } else { 0.0 };
+                                let cc = if k < x { ax[y * (w + 1) + k + 1] } else { 0.0 };
+                                let (pc, pd) = if k > start { (cp[k - 1], dp[k - 1]) } else { (0.0, 0.0) };
+                                let m = diag[c] - a * pc;
+                                cp[k] = cc / m;
+                                dp[k] = (r + a * pd) / m;
+                            }
+                            let mut next = 0.0;
+                            for k in (start..=x).rev() {
+                                let v = dp[k] + if k < x { cp[k] * next } else { 0.0 };
+                                unsafe { *xs.at(y * w + k) = v };
+                                next = v;
+                            }
+                            x += 1;
+                        }
+                    },
+                );
+            }
+        }
+    }
+
     /// Builds the coarse levels from the finest one (after it has been filled in).
     pub fn coarsen(&mut self) {
         self.levels[0].prepare();
