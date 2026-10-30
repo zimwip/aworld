@@ -716,6 +716,12 @@ pub struct World {
     /// Units of water in each cell of water, `field::FULL` for a full one (stored as 0, so that a
     /// cell painted water is full).
     fill: Vec<u32>,
+    /// The liquid held inside each cell of thin matter (`Mat::one_way`: a tree, ash), and how
+    /// much of it (units of fill, `field::FULL` a full cell): the matter lets the liquid through
+    /// sideways, so a flood fills it as it fills the air (`Mat::Empty`: none; see
+    /// `World::open_pores`).
+    pore: Vec<Mat>,
+    pore_fill: Vec<u32>,
     /// Closed pockets of gas (see `pockets.rs`): for each cell its pocket id + 1 (0: not gas).
     pocket_of: Vec<u32>,
     pockets: Vec<pockets::Pocket>,
@@ -818,6 +824,8 @@ impl World {
             parallel_cells: turn::parallel_by_default(),
             liq: liquid::Liquids::default(),
             fill: vec![0; W() * H()],
+            pore: vec![Mat::Empty; W() * H()],
+            pore_fill: vec![0; W() * H()],
             pocket_of: vec![0; W() * H()],
             pockets: Vec::new(),
             liq_p: vec![1.0; W() * H()],
@@ -889,7 +897,7 @@ impl World {
             ticks, log, paint_log, temp, clock, dt, tick_time, heat, day_cycle,
             climate_fixed, climate, revision, wind, biome, leaf_rgb, autumn, grass_rgb,
             structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, push,
-            lod, liq_tier, simple_liquids, liq_work, parallel_cells, liq, fill, pocket_of,
+            lod, liq_tier, simple_liquids, liq_work, parallel_cells, liq, fill, pore, pore_fill, pocket_of,
             pockets, latent, vel, fall_at, moisture, fuel, growth, jet, liq_p, cls: _, liq_w: _, zones, bursts, storm,
             pressure_cache: _, prof: _, air_rows, air_sky, later: _, dried, gone,
         } = from;
@@ -935,6 +943,8 @@ impl World {
         self.parallel_cells = *parallel_cells;
         self.liq.copy_picture(liq);
         self.fill.clone_from(fill);
+        self.pore.clone_from(pore);
+        self.pore_fill.clone_from(pore_fill);
         // The grains' falling speed, for the simulation view.
         self.vel.clone_from(vel);
         self.fall_at.clone_from(fall_at);
@@ -1212,6 +1222,14 @@ impl World {
         row >= feet || (row >= feet - climb && !self.at(x, y - 1).one_way() && !self.hard_for_car(x, y - 1))
     }
 
+    /// Whether (x, y) is thin matter (`Mat::one_way`) with room in it for more liquid.
+    pub(super) fn thin_has_room(&self, x: i32, y: i32) -> bool {
+        Self::inb(x, y) && {
+            let i = Self::idx(x, y);
+            self.cells[i].m.one_way() && self.mask[i] == 0 && (self.pore[i] == Mat::Empty || self.pore_fill[i] < field::FULL)
+        }
+    }
+
     /// The column just past the thin matter (`Mat::one_way`) beside (x, y) on side `dir`, if
     /// there is some (at most `THIN_RUN` cells of it): where a liquid that passes through it
     /// comes out.
@@ -1253,10 +1271,16 @@ impl World {
         };
         let frame = self.frame;
         let i = Self::idx(x, y);
+        let held = if self.pore[i] == Mat::Water { self.pore_fill[i] } else { 0 };
         self.cells[i] = Cell { m, stamp: frame };
         self.latent[i] = 0.0;
         self.vel[i] = 0;
         self.clear_states(i);
+        // The water thin matter held soaks the soil it turns into (ash into earth); otherwise
+        // it goes with the matter.
+        if held > 0 && m.carries(Aspect::Water) {
+            self.moisture[i] = (held as u64 * WATER_UNITS as u64 / field::FULL as u64).min(SOIL_FULL as u64) as u16;
+        }
         self.fuel[i].left = left;
         self.zones.wake(i);
         match m {
@@ -1318,6 +1342,8 @@ impl World {
         self.growth.swap(i, j);
         self.jet.swap(i, j);
         self.log.swap(i, j);
+        self.pore.swap(i, j);
+        self.pore_fill.swap(i, j);
     }
 
     /// Clears the states of cell `i` that only some matters carry (heat stays: every matter has one).
@@ -1328,6 +1354,8 @@ impl World {
         self.growth[i] = 0;
         self.jet[i] = 0;
         self.log[i] = 0;
+        self.pore[i] = Mat::Empty;
+        self.pore_fill[i] = 0;
     }
 
     fn states(&self, i: usize) -> States {
@@ -1784,9 +1812,6 @@ impl World {
                 // `liquid::turns`; a step shorter than a tick leaves them where they are,
                 // as it does the cells.)
                 timed!(self, prof::LIQUIDS, self.step_liquids(ticks as f32 * STEP));
-            }
-            if !carded {
-                self.seep_through_thin();
             }
             if audit {
                 marks.push(("liquides", self.water_units_audit()));

@@ -393,6 +393,8 @@ impl World {
                 // (The drops the cells make in the turn, the rain sweeping a cloud, `absorb` takes.)
                 liq: Default::default(),
                 fill: share(&self.fill),
+                pore: share(&self.pore),
+                pore_fill: share(&self.pore_fill),
                 pocket_of: share(&self.pocket_of),
                 pockets: share(&self.pockets),
                 latent: share(&self.latent),
