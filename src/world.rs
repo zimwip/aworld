@@ -7730,7 +7730,9 @@ fn flowing_water_erodes_bare_soil() {
             w.step();
         }
         assert_eq!(count(&w, Mat::Grass), 0, "the grass burnt");
-        assert!(count(&w, Mat::Dirt) > 90, "the earth stays: {}", count(&w, Mat::Dirt));
+        // (Kept at 400 °C, the earth's humus burns too: some of it is already only sand.)
+        let earth = count(&w, Mat::Dirt) + count(&w, Mat::Sand);
+        assert!(earth > 90, "the earth stays: {earth}");
     }
 
     #[test]
