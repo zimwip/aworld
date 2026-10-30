@@ -398,6 +398,33 @@ impl World {
         [(x - 1, y), (x + 1, y), (x, y - 1)].iter().all(|&(nx, ny)| self.at(nx, ny).kind() != Kind::Liquid)
     }
 
+    /// The push of the liquid along x on what lies at (x, y), Pa: the pressure on its left side
+    /// less the pressure on its right (positive: it is pushed to the right), with liquid on at
+    /// least one side and liquid or open air on both; 0 otherwise, or before the first step.
+    pub(super) fn side_push(&self, x: i32, y: i32) -> f32 {
+        if self.liq.p.len() != W() * H() {
+            return 0.0;
+        }
+        let side = |nx: i32| -> Option<(f32, bool)> {
+            if !Self::inb(nx, y) {
+                return None;
+            }
+            let j = Self::idx(nx, y);
+            if self.mask[j] != 0 {
+                return None;
+            }
+            match self.cells[j].m.kind() {
+                Kind::Liquid if self.liquid_fill(j) >= field::FULL / HOLDS => Some((self.liq.p[j], true)),
+                Kind::Liquid | Kind::Empty => Some((self.gas_pa(nx, y), false)),
+                _ => None,
+            }
+        };
+        match (side(x - 1), side(x + 1)) {
+            (Some((a, wa)), Some((b, wb))) if wa || wb => a - b,
+            _ => 0.0,
+        }
+    }
+
     /// The class of cell (x, y) as the liquids last saw it (`SOLID`, `AIR`, `WET`, `FULLISH`,
     /// with bit 4 set where its zone runs), for the simulation view; None before the first step.
     pub fn liquid_class(&self, x: usize, y: usize) -> Option<u8> {
@@ -590,16 +617,20 @@ impl World {
         self.liq = liq;
     }
 
-    /// Thin matter (a tree, `Mat::one_way`) holds a liquid up but does not hold it back: the
-    /// grid has no room for both in a cell, so the liquid beside it seeps through, levelling the
-    /// cell on each side of it by half its gap each step (into air, or into the same liquid). A
-    /// lake rises through a trunk; a flood runs through a crown. Liquid falling through the air
-    /// falls on.
+    /// Thin matter (`Mat::one_way`: a tree, ash, dead leaves) holds a liquid up but does not
+    /// hold it back: the grid has no room for both in a cell, so the liquid beside it passes
+    /// through as through communicating vessels. Each row where liquid lies against a run of
+    /// thin matter joins the column on each side of it: the liquid goes from the top of the
+    /// column that stands higher to the top of the other (or into the open cell just past the
+    /// run), half the gap between their levels a step and at most half a cell. A lake rises
+    /// through a trunk from the bottom up as fast as from its surface, a flood runs through a
+    /// crown. Liquid falling through the air falls on.
     ///
     /// It reads only the cells (not the classes or spans of the step, which the step on the
     /// graphics card does not keep), in the zones that run.
     pub(super) fn seep_through_thin(&mut self) {
         let sides = if self.frame & 1 == 0 { [1, -1] } else { [-1, 1] };
+        let full = field::FULL as f32;
         for k in 0..sleep::CW() * sleep::CH() {
             if !self.zones.awake.get(k).copied().unwrap_or(true) {
                 continue;
@@ -612,40 +643,127 @@ impl World {
                     continue;
                 }
                 for dir in sides {
+                    if self.cells[i].m != m {
+                        break;
+                    }
                     let Some(px) = self.past_thin(x as i32, y as i32, dir) else { continue };
-                    let j = y * W() + px as usize;
-                    let had = match self.cells[j].m {
-                        Mat::Empty if self.mask[j] == 0 => 0,
-                        n if n == m => self.liquid_fill(j),
-                        _ => continue,
-                    };
-                    let f = if self.cells[i].m == m { self.liquid_fill(i) } else { 0 };
-                    let q = f.saturating_sub(had) / 2;
+                    let Some((to, there)) = self.thin_outlet(px as usize, y, m) else { continue };
+                    let from = self.liquid_top(i, m);
+                    // (Levels in rows, down positive.)
+                    let gap = there - self.column_level(x, y, m);
+                    let f = self.liquid_fill(from);
+                    let q = ((gap * 0.5).min(1.0) * full).max(0.0) as u32;
+                    let q = q.min(f);
                     if q == 0 {
                         continue;
                     }
-                    let t = self.temp[i];
-                    if had == 0 {
-                        self.cells[j] = Cell { m, stamp: self.frame };
-                        self.clear_states(j);
-                        self.latent[j] = 0.0;
-                        self.vel[j] = 0;
-                        self.temp[j] = t;
+                    let t = self.temp[from];
+                    // It comes out at the speed its fall from the higher level gives it
+                    // (Torricelli): into the open as a jet of drops, into liquid as a push on
+                    // the edges of the cell it joins, in proportion to what it brings.
+                    let speed = (2.0 * G * gap * cell_m()).sqrt().min(LAUNCH);
+                    if to == y * W() + px as usize && self.cells[to].m == Mat::Empty && !(y > 0 && self.cells[to - W()].m == m) {
+                        self.liq.drops.push(Drop { x: px as f32 + 0.5, y: y as f32 + 0.5, vx: dir as f32 * speed, vy: 0.0, m, q, t });
                     } else {
-                        self.temp[j] = (self.temp[j] * had as f32 + t * q as f32) / (had + q) as f32;
+                        let had = if self.cells[to].m == m { self.liquid_fill(to) } else { 0 };
+                        if had == 0 {
+                            self.cells[to] = Cell { m, stamp: self.frame };
+                            self.clear_states(to);
+                            self.latent[to] = 0.0;
+                            self.vel[to] = 0;
+                            self.temp[to] = t;
+                        } else {
+                            self.temp[to] = (self.temp[to] * had as f32 + t * q as f32) / (had + q) as f32;
+                        }
+                        self.put_fill(to, had + q);
+                        self.kick_across(to, dir as f32 * speed, q as f32 / (had + q) as f32);
                     }
-                    self.put_fill(j, had + q);
                     if f == q {
-                        self.cells[i] = Cell { m: Mat::Empty, stamp: self.frame };
-                        self.clear_states(i);
-                        self.vel[i] = 0;
+                        self.cells[from] = Cell { m: Mat::Empty, stamp: self.frame };
+                        self.clear_states(from);
+                        self.vel[from] = 0;
                     } else {
-                        self.put_fill(i, f - q);
+                        self.put_fill(from, f - q);
                     }
                     self.revision += 1;
-                    self.zones.wake(i);
-                    self.zones.wake(j);
+                    self.zones.wake(from);
+                    self.zones.wake(to);
                 }
+            }
+        }
+    }
+
+    /// Brings the speed of the two side edges of cell `i` to `vx` (m/s) by the share `w`, on
+    /// the graphics card if the liquids run there.
+    fn kick_across(&mut self, i: usize, vx: f32, w: f32) {
+        let (x, y) = xy(i);
+        if let Some(Some(card)) = self.liq.card.as_mut() {
+            for e in [ui(x, y), ui(x + 1, y)] {
+                card.patches_up.push(liquid_gpu::Patch { edge: e as u32, mode: 1, value: vx, weight: w });
+            }
+        } else if self.liq.u.len() == (W() + 1) * H() {
+            for e in [ui(x, y), ui(x + 1, y)] {
+                self.liq.u[e] += w * (vx - self.liq.u[e]);
+            }
+        }
+    }
+
+    /// The top cell of the liquid `m` that stands over cell `i` (`i` itself if nothing of it
+    /// lies on it).
+    fn liquid_top(&self, mut i: usize, m: Mat) -> usize {
+        while i >= W() && self.cells[i - W()].m == m && self.mask[i - W()] == 0 {
+            i -= W();
+        }
+        i
+    }
+
+    /// The level (row, down positive) of the liquid `m` in the run of it in column `x` that
+    /// holds row `y`: the run's floor less all it holds, as if it settled (a cell inside a body
+    /// is seldom quite full, and a film running down the side of a wall stands no higher than
+    /// the little it holds).
+    fn column_level(&self, x: usize, y: usize, m: Mat) -> f32 {
+        let of = |r: usize| self.cells[r * W() + x].m == m && self.mask[r * W() + x] == 0;
+        let (mut top, mut bottom) = (y, y);
+        while top > 0 && of(top - 1) {
+            top -= 1;
+        }
+        while bottom + 1 < H() && of(bottom + 1) {
+            bottom += 1;
+        }
+        let held: u64 = (top..=bottom).map(|r| self.liquid_fill(r * W() + x) as u64).sum();
+        (bottom + 1) as f32 - held as f32 / field::FULL as f32
+    }
+
+    /// Where liquid `m` passing through thin matter comes out in column `x` at row `y`, and
+    /// the level it has to rise to there (`column_level`; the floor of an open cell with none
+    /// over it): the cell itself if it is open air or not full, else the first cell over it
+    /// that is; none if something else is in the way.
+    fn thin_outlet(&self, x: usize, y: usize, m: Mat) -> Option<(usize, f32)> {
+        let mut c = y * W() + x;
+        if self.mask[c] != 0 {
+            return None;
+        }
+        if self.cells[c].m == Mat::Empty {
+            // (A hole under the liquid takes the level of the liquid over it.)
+            let level = if y > 0 && self.cells[c - W()].m == m && self.mask[c - W()] == 0 { self.column_level(x, y - 1, m) } else { (y + 1) as f32 };
+            return Some((c, level));
+        }
+        if self.cells[c].m != m {
+            return None;
+        }
+        let level = self.column_level(x, y, m);
+        loop {
+            if self.liquid_fill(c) < field::FULL {
+                return Some((c, level));
+            }
+            if c < W() || self.mask[c - W()] != 0 {
+                return None;
+            }
+            c -= W();
+            match self.cells[c].m {
+                Mat::Empty => return Some((c, level)),
+                n if n == m => {}
+                _ => return None,
             }
         }
     }
@@ -2291,7 +2409,53 @@ mod tests {
         }
         let left = |w: &World| (0..290).flat_map(|x| (300..470).map(move |y| (x, y))).filter(|&(x, y)| w.at(x, y) == Mat::Water).map(|(x, y)| w.liquid_fill(World::idx(x, y)) as u64).sum::<u64>();
         let pool = (291..340).flat_map(|x| (370..400).map(move |y| (x, y))).filter(|&(x, y)| w.at(x, y) == Mat::Water).count();
-        assert!(left(&w) > before as u64 / 2, "the trunk held the pool back: {} of {before} units got past it, {pool} cells left in the pool, {} units in all", left(&w), w.liquid_units(Mat::Water));
+        // (What got past it runs down the hill, and some of it off the edge of the world.)
+        let past = left(&w) + w.gone;
+        assert!(past > before as u64 / 2, "the trunk held the pool back: {past} of {before} units got past it, {pool} cells left in the pool, {} units in all", w.liquid_units(Mat::Water));
+    }
+
+    /// A tank 240 wide with water 100 wide and 45 deep at its left end, `obstacle` drawn in it,
+    /// run for `secs` seconds: the share of the water (drops in flight too) past column 232.
+    fn past_an_obstacle(obstacle: impl Fn(&mut World), secs: usize) -> f64 {
+        let mut w = world();
+        tank(&mut w, 100, 360, 339, 449);
+        rect(&mut w, 100, 405, 199, 449, Mat::Water);
+        obstacle(&mut w);
+        w.temp.fill(0.0);
+        let all = w.liquid_units(Mat::Water);
+        for _ in 0..secs * 60 {
+            w.step();
+        }
+        let cells: u64 = (232..340).flat_map(|x| (360..450).map(move |y| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water).map(|(x, y)| w.liquid_fill(World::idx(x, y)) as u64).sum();
+        let flying: u64 = w.liquid_drops().iter().filter(|d| d.x >= 232.0).map(|d| d.q as u64).sum();
+        (cells + flying) as f64 / all as f64
+    }
+
+    /// A tree does not dam a flood (`Holds::FromAbove`): the water levels through its trunk and
+    /// its crown, nearly as fast as it spreads with no tree (it was a little over a quarter
+    /// after twelve seconds when only the surface seeped through).
+    #[test]
+    fn a_flood_levels_through_a_tree() {
+        let past = past_an_obstacle(
+            |w| {
+                rect(w, 230, 400, 231, 449, Mat::Trunk);
+                rect(w, 215, 395, 246, 415, Mat::Leaf);
+            },
+            12,
+        );
+        // (Level, 45 % of the water is past the trunk.)
+        assert!(past > 0.38, "only {:.0} % of the water got past the tree", past * 100.0);
+    }
+
+    /// A wall of light grains that float (ash, charcoal) does not dam the water either: it lets
+    /// the water through (`Holds::FromAbove`), and the water lifts it and pushes it aside
+    /// (`World::float_on`). It held all of it back when it stood as a heap.
+    #[test]
+    fn a_wall_of_ash_or_charcoal_does_not_dam_the_water() {
+        for m in [Mat::Ash, Mat::Charcoal] {
+            let past = past_an_obstacle(|w| rect(w, 200, 395, 207, 449, m), 5);
+            assert!(past > 0.3, "{m:?}: only {:.0} % of the water got past", past * 100.0);
+        }
     }
 
     /// A bubble of gas shut in a pool rises to its surface (Archimedes), where the cells'
@@ -2869,4 +3033,3 @@ mod tests {
         }
     }
 }
-
