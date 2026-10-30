@@ -87,6 +87,33 @@ pub(super) const MAX_TURNS: usize = MAX_SUB_ALL / MAX_SUB;
 /// more out of a cell than it holds), and a splash is a little less incompressible.
 pub(super) const CHEAP_SUB: usize = 2;
 pub(super) const CHEAP_ITER: u32 = 4;
+/// The simple solver (`World::simple_liquids`, for every liquid): the same grids, classes,
+/// transport, drops and sleep as the detailed one, but each costly part made cheap.
+/// - At most `SIMPLE_SUB` sub-steps a turn of `DT` (the detailed one takes up to `MAX_SUB`).
+/// - The velocities are carried once back along the flow (plain semi-Lagrangian), without the
+///   step forward and the correction that keep a wave sharp.
+/// - The pressure starts from a guess from the depth (`hydrostatic`: under an open surface, the
+///   weight of the liquid over each cell plus the gas on it; nothing in a column that falls
+///   freely; under a roof, a straight line between the open cells on each side), exact for a body
+///   at rest, then takes `SIMPLE_ITER` iterations of the solver (the detailed one: up to
+///   `MAX_ITER`, to convergence).
+/// - Thick liquids are smoothed by `SIMPLE_VISCOUS_SWEEPS` sweeps (`VISCOUS_SWEEPS`).
+pub(super) const SIMPLE_SUB: usize = 2;
+pub(super) const SIMPLE_ITER: u32 = 1;
+pub(super) const SIMPLE_VISCOUS_SWEEPS: usize = 3;
+/// With `SIMPLE_ITER` at 0, the cheapest: no multigrid at all, `SIMPLE_LINES` rounds of line
+/// solves (`Solver::lines`: each column, then each row, exactly) and `SIMPLE_SWEEPS` sweeps of
+/// Gauss-Seidel. Right for a U-tube or a dam break, but a deep body that lands squeezes by a
+/// third (the flood of the bench), its pressure being a matter of the whole body.
+pub(super) const SIMPLE_LINES: usize = 2;
+pub(super) const SIMPLE_SWEEPS: usize = 2;
+/// What the simple solver adds to the guess of a cell that holds more than full (or less, inside
+/// the body), as a share of the pressure that would bring it back to full in a sub-step: the guess
+/// alone left the bend of a U-tube to squeeze up by half as much again as it holds.
+pub(super) const SQUEEZE: f32 = 1.0;
+/// The part of its gap to full that a cell inside a body makes up a solve, on the simple solver
+/// (`REFILL` on the detailed one): it squeezes more where it lands, and is brought back faster.
+pub(super) const SIMPLE_REFILL: f32 = 0.5;
 /// On the drops tier (`World::liq_tier` 2), liquid falling faster than this (m/s), or with air
 /// under it, is free: it goes over to drops in a zone where most of the liquid is free.
 pub(super) const FREE_FALL: f32 = 1.0;
@@ -164,6 +191,16 @@ pub const WET: u8 = 2;
 /// Liquid, at least half full: it holds a pressure.
 pub const FULLISH: u8 = 3;
 
+/// For a thick liquid, the temperature (°C) from which it thickens as it cools: e times for every
+/// 60 °C below it (see `props`). The others run like water whatever their heat.
+pub(super) fn thick_from(m: Mat) -> Option<f32> {
+    match m {
+        Mat::Lava => Some(1150.0),
+        Mat::MoltenGlass => Some(1100.0),
+        _ => None,
+    }
+}
+
 /// Density (kg/m³), kinematic viscosity (m²/s) and yield stress (Pa) of liquid `m` at `t` °C.
 pub(super) fn props(m: Mat, t: f32) -> (f32, f32, f32) {
     let rho = density(m) * 1000.0;
@@ -171,17 +208,36 @@ pub(super) fn props(m: Mat, t: f32) -> (f32, f32, f32) {
         Mat::Water => (rho, 1e-6, 0.0),
         Mat::Oil => (rho, 1e-4, 0.0),
         // Basalt at 1 150 °C: about 3 000 Pa·s; e times thicker for every 60 °C it cools, and a
-        // yield stress that grows as it cools too (a cooling flow stops, its crust holds).
-        Mat::Lava => {
-            let cool = ((1150.0 - t) / 60.0).clamp(0.0, 8.0);
-            (rho, (cool.exp()).min(50.0), 500.0 * ((1150.0 - t) / 150.0).clamp(0.0, 8.0).exp())
+        // yield stress that grows as it cools too (a cooling flow stops, its crust holds). Molten
+        // glass goes the same way, from a little cooler (see `thick_from`).
+        Mat::Lava | Mat::MoltenGlass => {
+            let hot = thick_from(m).unwrap_or(t);
+            let cool = ((hot - t) / 60.0).clamp(0.0, 8.0);
+            (rho, (cool.exp()).min(50.0), 500.0 * ((hot - t) / 150.0).clamp(0.0, 8.0).exp())
         }
         // Molten metal runs about like water.
         _ => (rho, 1e-6, 0.0),
     }
 }
 
+/// A cell of thin matter opened to the liquids for a step, as it was (see `World::open_pores`).
+pub(super) struct Opened {
+    i: usize,
+    cell: Cell,
+    states: States,
+    log: u16,
+    latent: f32,
+    vel: u16,
+}
+
 /// The liquids' grids: velocities on the edges, pressure in the cells.
+/// With `AWORLD_GPU=auto`, the ticks the liquids stay on the card, or off it, once they went
+/// over (a second: the time a trial is measured over), and the ticks before the side they are
+/// on is put on trial again: at first, and at most once the trials keep failing.
+const SWITCH_TICKS: u32 = 60;
+const PATIENCE: u32 = 600;
+const PATIENCE_MAX: u32 = 7200;
+
 #[derive(Default)]
 pub struct Liquids {
     /// Rightward velocity on the left edge of each cell, (W + 1) a row, m/s.
@@ -211,6 +267,10 @@ pub struct Liquids {
     pub(super) fv: Vec<i64>,
     pub(super) want: Vec<Mat>,
     pub(super) scale: Vec<f64>,
+    /// The pressure the simple solver starts from, and whether each cell lies under a roof (see
+    /// `hydrostatic`).
+    pub(super) guess: Vec<f32>,
+    pub(super) roofed: Vec<bool>,
     /// The drops in flight.
     pub(super) drops: Vec<Drop>,
     /// The last pressure solve: when it began, and how many iterations it took (for the profile).
@@ -223,8 +283,31 @@ pub struct Liquids {
     pub(super) gpu: Option<Option<mgpcg_gpu::PressureGpu>>,
     /// The whole turn on the card (`None` until asked for, and where there is no card).
     pub(super) card: Option<Option<liquid_gpu::LiquidGpu>>,
+    /// Whether the liquids run on the card now (with `AWORLD_GPU=auto` they go over to it and
+    /// back, whichever costs less, see `card_pays`).
+    pub(super) on_card: bool,
+    /// What a step of the liquids costs the game lately on each side (CPU, card), in ms: the
+    /// CPU's turn, or what the card's turn holds the CPU up (sending, encoding, waiting for the
+    /// result). `None` until measured since the liquids last came to that side.
+    pub(super) cost: [Option<f32>; 2],
+    /// The tick the liquids last went over to the card or back, whether that was a trial of
+    /// the other side, and the ticks before the next trial.
+    pub(super) switched: Option<u32>,
+    pub(super) trial: bool,
+    pub(super) patience: u32,
+    /// What taking in the card's last step cost (ms), for the card's side of `cost`.
+    pub(super) collect_ms: f32,
+    /// In the tests: the side the liquids run on, whatever `card_pays` says.
+    #[cfg(test)]
+    pub(super) forced: Option<bool>,
     /// In a picture of the world (see `World::copy_picture`), the rows the card worked on.
     pub(super) card_rows: Option<(usize, usize)>,
+    /// The cells of thin matter opened to the liquids this step, and what they were (see
+    /// `World::open_pores`).
+    pub(super) opened: Vec<Opened>,
+    /// For each cell: 1 if it is thin matter opened to the liquids this step, + 2 if the edge
+    /// over it is a wall (the top of the thin matter: what comes down rests on it).
+    pub(super) lid: Vec<u8>,
     /// The step count (`Zones::stamp`) when each zone was last classed: a zone that has not
     /// changed since, asleep with its neighbours, keeps its classes (see `classify`).
     pub(super) classed: Vec<u64>,
@@ -262,7 +345,7 @@ impl Liquids {
         self.p.clone_from(&from.p);
         self.class.clone_from(&from.class);
         self.drops.clone_from(&from.drops);
-        self.card_rows = from.card.as_ref().and_then(|c| c.as_ref()).and_then(|c| c.rows()).or(from.card_rows);
+        self.card_rows = from.card.as_ref().and_then(|c| c.as_ref()).filter(|_| from.on_card).and_then(|c| c.rows()).or(from.card_rows);
     }
 
     fn ready(&mut self) {
@@ -282,7 +365,15 @@ impl Liquids {
             self.fv = vec![0; W() * (H() + 1)];
             self.want = vec![Mat::Empty; W() * H()];
             self.scale = vec![1.0; W() * H()];
+            self.guess = vec![0.0; W() * H()];
+            self.roofed = vec![false; W() * H()];
+            self.lid = vec![0; W() * H()];
         }
+    }
+
+    /// The card, while the liquids run on it.
+    pub(super) fn active_card(&mut self) -> Option<&mut liquid_gpu::LiquidGpu> {
+        if self.on_card { self.card.as_mut().and_then(Option::as_mut) } else { None }
     }
 
     /// The drops in flight.
@@ -447,18 +538,25 @@ impl World {
 
     /// Whether the liquids run on a graphics card (one was opened and works).
     pub fn liquids_on_card(&self) -> bool {
-        self.liq.card.as_ref().is_some_and(Option::is_some)
+        self.liq.on_card && self.liq.card.as_ref().is_some_and(Option::is_some)
     }
 
     /// The rows the card works on (the band of the last step given to it), when the liquids
     /// run on a card.
     pub fn liquid_card_rows(&self) -> Option<(usize, usize)> {
-        self.liq.card.as_ref().and_then(|c| c.as_ref()).and_then(|c| c.rows()).or(self.liq.card_rows)
+        self.liq.card.as_ref().and_then(|c| c.as_ref()).filter(|_| self.liq.on_card).and_then(|c| c.rows()).or(self.liq.card_rows)
     }
 
     /// Units of water in the cells and the drops (the mass audit, `AWORLD_DEBUG_MASS`).
     pub(super) fn water_units_audit(&self) -> u64 {
-        (0..W() * H()).filter(|&i| self.cells[i].m == Mat::Water).map(|i| self.liquid_fill(i) as u64).sum::<u64>() + self.liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>()
+        (0..W() * H()).filter(|&i| self.cells[i].m == Mat::Water).map(|i| self.liquid_fill(i) as u64).sum::<u64>()
+            + self.liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>()
+            + self.held_units(Mat::Water)
+    }
+
+    /// Units of liquid `m` held inside thin matter (see `open_pores`).
+    pub(super) fn held_units(&self, m: Mat) -> u64 {
+        (0..W() * H()).filter(|&i| self.pore[i] == m).map(|i| self.pore_fill[i] as u64).sum()
     }
 
     /// What the card did with the last step, into the world: before the cells' turn, so that
@@ -468,7 +566,9 @@ impl World {
         let mut liq = std::mem::take(&mut self.liq);
         let mut card = liq.card.take();
         if let Some(Some(c)) = card.as_mut() {
+            let t = std::time::Instant::now();
             self.collect_liquids(&mut liq, c);
+            liq.collect_ms = t.elapsed().as_secs_f32() * 1000.0;
             if let Some((y0, y1)) = c.rows() {
                 self.drain_sides(y0..=y1);
             }
@@ -499,7 +599,8 @@ impl World {
 
     /// The most sub-steps of the liquids in a turn of `DT`, at their tier.
     pub(super) fn liquid_sub_steps(&self) -> usize {
-        if self.liq_tier >= 1 { CHEAP_SUB } else { MAX_SUB }
+        let most = if self.liq_tier >= 1 { CHEAP_SUB } else { MAX_SUB };
+        if self.simple_liquids { most.min(SIMPLE_SUB) } else { most }
     }
 
     /// The most iterations of the pressure solver, at the liquids' tier.
@@ -507,25 +608,101 @@ impl World {
         if self.liq_tier >= 1 { CHEAP_ITER } else { MAX_ITER }
     }
 
+    /// Whether the liquids' turn goes to the card (`AWORLD_GPU=auto`). Which side is cheaper
+    /// depends on the card, the CPU and the scene (the trip costs about the same whatever the
+    /// card does: a lake pays for it, a little rain does not), so it is measured: every so
+    /// often the liquids go over to the other side for a second, and stay there if it costs at
+    /// least a tenth less; else they come back, and the next trial waits twice as long.
+    fn card_pays(&self, liq: &mut Liquids) -> bool {
+        let Some(at) = liq.switched else {
+            // (The first trial a second in.)
+            (liq.switched, liq.patience) = (Some(self.ticks), SWITCH_TICKS);
+            return liq.on_card;
+        };
+        let since = self.ticks.wrapping_sub(at);
+        if since < SWITCH_TICKS {
+            return liq.on_card;
+        }
+        let (here, there) = (liq.cost[liq.on_card as usize], liq.cost[!liq.on_card as usize]);
+        if liq.trial {
+            liq.trial = false;
+            if here.zip(there).is_some_and(|(new, old)| new < 0.9 * old) {
+                liq.patience = PATIENCE;
+                return liq.on_card;
+            }
+            liq.patience = (liq.patience * 2).clamp(PATIENCE, PATIENCE_MAX);
+            return !liq.on_card;
+        }
+        // (No trial while the liquids cost next to nothing: there is nothing to win.)
+        if since >= liq.patience && here.is_some_and(|ms| ms > 0.5) {
+            liq.trial = true;
+            return !liq.on_card;
+        }
+        liq.on_card
+    }
+
+    /// The liquids' turn (`liquids_turn`), timed for `card_pays` when the card is on trial.
+    pub(super) fn step_liquids(&mut self, step: f32) {
+        if gpu::wanted() != gpu::Use::Auto {
+            return self.liquids_turn(step);
+        }
+        let side = self.liq.on_card;
+        let t = std::time::Instant::now();
+        self.liquids_turn(step);
+        let mut ms = t.elapsed().as_secs_f32() * 1000.0;
+        let liq = &mut self.liq;
+        if liq.on_card {
+            ms += liq.collect_ms;
+        }
+        // (The step that went over is not counted, nor the next: the handing over, and the
+        // card's first step with every cell of the band sent.)
+        if liq.on_card == side && liq.switched.is_some_and(|at| self.ticks.wrapping_sub(at) > 2) {
+            let c = &mut liq.cost[side as usize];
+            *c = Some(c.map_or(ms, |c| 0.9 * c + 0.1 * ms));
+        }
+    }
+
     /// The liquids' turn, for `step` seconds (a whole number of `DT`, at most `MAX_DT`): a turn
     /// of `DT` for each, in as many sub-steps as the fastest liquid needs to cross at most a
     /// cell in each (`turns`).
-    pub(super) fn step_liquids(&mut self, step: f32) {
+    fn liquids_turn(&mut self, step: f32) {
         self.liq_work = 0;
         let mut liq = std::mem::take(&mut self.liq);
         liq.ready();
         let audit = crate::config::config().debug_mass;
         let units = |w: &World, liq: &Liquids| (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Water).map(|i| w.liquid_fill(i) as u64).sum::<u64>() + liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>();
         let before = if audit { units(self, &liq) } else { 0 };
-        // The whole turn on the card, where there is one (and it is wanted): the card works on
-        // the step while the CPU does the rest of it, and the CPU takes its result at the next.
-        if gpu::wanted() != gpu::Use::Off {
+        // The whole turn on the card, where there is one (and it is wanted, and pays): the card
+        // works on the step while the CPU does the rest of it, and the CPU takes its result at
+        // the next. (The simple solver has no card version: it runs on the cores, and the
+        // liquids come back from the card when it is chosen.)
+        let wanted = gpu::wanted();
+        if wanted != gpu::Use::Off {
             let mut card = liq.card.take().unwrap_or_else(liquid_gpu::LiquidGpu::new);
+            let pays = wanted == gpu::Use::Always || self.card_pays(&mut liq);
+            #[cfg(test)]
+            let pays = liq.forced.unwrap_or(pays);
+            let pays = pays && !self.simple_liquids;
             if let Some(c) = card.as_mut() {
-                self.step_liquids_on_card(&mut liq, c, step);
+                if pays != liq.on_card {
+                    // Over to the card or back: the velocities go with the liquids (the card's
+                    // last step was taken in before the cells' turn).
+                    if pays {
+                        c.take_over(&liq);
+                    } else {
+                        self.collect_liquids(&mut liq, c);
+                        c.hand_back(&mut liq);
+                    }
+                    liq.on_card = pays;
+                    liq.switched = Some(self.ticks);
+                    liq.cost[pays as usize] = None;
+                }
+                if pays {
+                    self.step_liquids_on_card(&mut liq, c, step);
+                }
             }
             liq.card = Some(card);
-            if liq.card.as_ref().is_some_and(Option::is_some) {
+            if liq.on_card && liq.card.as_ref().is_some_and(Option::is_some) {
                 if audit {
                     let after = units(self, &liq);
                     if after != before {
@@ -537,12 +714,20 @@ impl World {
             }
         }
         self.fly_drops(&mut liq, step);
+        self.open_pores(&mut liq);
+        self.run_liquids(&mut liq, step);
+        self.close_pores(&mut liq);
+        self.liq = liq;
+    }
+
+    /// The liquids' turn on the CPU (see `step_liquids`), with the thin matter open.
+    fn run_liquids(&mut self, liq: &mut Liquids, step: f32) {
+        let mut liq = liq;
         let clock = self.prof.start();
         self.classify(&mut liq, false);
         self.prof.stop(prof::LIQ_CLASSIFY, clock);
         if liq.rows.iter().all(Option::is_none) {
             // No liquid runs anywhere.
-            self.liq = liq;
             return;
         }
         // On the drops tier, the liquid that flies or falls freely goes over to drops: they fly
@@ -550,7 +735,6 @@ impl World {
         if self.liq_tier >= 2 && self.fall_to_drops(&mut liq) {
             self.classify(&mut liq, true);
             if liq.rows.iter().all(Option::is_none) {
-                self.liq = liq;
                 return;
             }
         }
@@ -614,12 +798,105 @@ impl World {
             self.prof.stop(prof::LIQ_CARRY, clock);
             self.drain_sides((0..H()).filter(|&y| liq.rows[y].is_some()));
         }
-        self.liq = liq;
     }
 
-    /// Thin matter (`Mat::one_way`: a tree, ash, dead leaves) holds a liquid up but does not
-    /// hold it back: the grid has no room for both in a cell, so the liquid beside it passes
-    /// through as through communicating vessels. Each row where liquid lies against a run of
+    /// Thin matter (`Mat::one_way`: a tree, ash, charcoal, dead leaves) holds back only what
+    /// comes down on it: a liquid goes through it sideways, and fills it as it fills the air.
+    /// The grid has room for one matter a cell, so for the liquids' step each cell of thin
+    /// matter in the zones that run is opened: it becomes the liquid it holds (`World::pore`),
+    /// or empty, and the edges over and under the opened matter are walls (`lid`): the top of a
+    /// crown holds the rain up, and what goes into it sideways stays in it, without dripping
+    /// out of its bottom. The solver
+    /// is the same (the pressure on a grid of four neighbours); after the step each cell takes
+    /// back its matter and its states, and keeps the liquid it was left with (`close_pores`).
+    pub(super) fn open_pores(&mut self, liq: &mut Liquids) {
+        // How far along its row a liquid opens thin matter: as far as it goes in a step.
+        const REACH: usize = 2;
+        liq.opened.clear();
+        // Found on all the rows at once (it reads every cell of the zones that run), opened
+        // after.
+        let world: &World = self;
+        let (cw, cs) = (sleep::CW(), sleep::CS);
+        let found: Vec<(usize, bool)> = (0..H())
+            .into_par_iter()
+            .flat_map_iter(|y| {
+                let row = y * W();
+                let zones = (0..cw).filter(move |&zx| world.zones.awake.get((y / cs) * cw + zx).copied().unwrap_or(true));
+                zones.flat_map(move |zx| (zx * cs..(zx * cs + cs).min(W())).map(move |x| (x, row + x))).filter_map(move |(x, i)| {
+                    let m = world.cells[i].m;
+                    if !m.one_way() {
+                        // (What a cell that is no longer thin held is gone with it.)
+                        return (world.pore[i] != Mat::Empty).then_some((i, false));
+                    }
+                    // Only where a liquid is in it or near it on its row: a dry forest stays a
+                    // wall, and costs the solver nothing.
+                    let wet = |j: usize| world.pore[j] != Mat::Empty || world.cells[j].m.kind() == Kind::Liquid;
+                    (world.mask[i] == 0 && (x.saturating_sub(REACH)..=(x + REACH).min(W() - 1)).any(|nx| wet(row + nx))).then_some((i, true))
+                })
+            })
+            .collect();
+        for (i, open) in found {
+            if !open {
+                self.pore[i] = Mat::Empty;
+                self.pore_fill[i] = 0;
+                continue;
+            }
+            let c = self.cells[i];
+            liq.opened.push(Opened { i, cell: c, states: self.states(i), log: self.log[i], latent: self.latent[i], vel: self.vel[i] });
+            liq.lid[i] = 1;
+            let (held, q) = (self.pore[i], self.pore_fill[i]);
+            if held != Mat::Empty && q > 0 {
+                self.cells[i] = Cell { m: held, stamp: c.stamp };
+                self.put_fill(i, q);
+            } else {
+                self.cells[i] = Cell { m: Mat::Empty, stamp: c.stamp };
+                self.fill[i] = 0;
+            }
+            self.latent[i] = 0.0;
+            self.vel[i] = 0;
+        }
+        // Walls between the opened cells and what is over and under them, not between two of
+        // them: inside, a submerged trunk is a column of the lake (the pressure solves as
+        // fast as without it), and what came in sideways settles to the bottom of the crown.
+        for o in &liq.opened {
+            if o.i < W() || liq.lid[o.i - W()] & 1 == 0 {
+                liq.lid[o.i] |= 2;
+            }
+            if o.i + W() < liq.lid.len() && liq.lid[o.i + W()] & 1 == 0 {
+                liq.lid[o.i + W()] |= 2;
+            }
+        }
+    }
+
+    /// The end of the liquids' step (see `open_pores`): each opened cell takes back its thin
+    /// matter and states, and holds the liquid the step left in it.
+    pub(super) fn close_pores(&mut self, liq: &mut Liquids) {
+        for o in liq.opened.drain(..) {
+            let i = o.i;
+            let c = self.cells[i];
+            if c.m.kind() == Kind::Liquid {
+                self.pore[i] = c.m;
+                self.pore_fill[i] = self.liquid_fill(i);
+            } else {
+                self.pore[i] = Mat::Empty;
+                self.pore_fill[i] = 0;
+            }
+            self.cells[i] = o.cell;
+            self.fill[i] = 0;
+            (self.moisture[i], self.fuel[i], self.growth[i], self.jet[i]) = (o.states.moisture, o.states.fuel, o.states.growth, o.states.jet);
+            self.log[i] = o.log;
+            self.latent[i] = o.latent;
+            self.vel[i] = o.vel;
+            liq.lid[i] = 0;
+            if i + W() < liq.lid.len() {
+                liq.lid[i + W()] = 0;
+            }
+        }
+    }
+
+    /// When the liquids run on the graphics card, which sees thin matter (`Mat::one_way`) as a
+    /// wall (the CPU opens it instead, see `open_pores`): the liquid beside it passes through
+    /// as through communicating vessels. Each row where liquid lies against a run of
     /// thin matter joins the column on each side of it: the liquid goes from the top of the
     /// column that stands higher to the top of the other (or into the open cell just past the
     /// run), half the gap between their levels a step and at most half a cell. A lake rises
@@ -697,7 +974,7 @@ impl World {
     /// the graphics card if the liquids run there.
     fn kick_across(&mut self, i: usize, vx: f32, w: f32) {
         let (x, y) = xy(i);
-        if let Some(Some(card)) = self.liq.card.as_mut() {
+        if let Some(card) = self.liq.active_card() {
             for e in [ui(x, y), ui(x + 1, y)] {
                 card.patches_up.push(liquid_gpu::Patch { edge: e as u32, mode: 1, value: vx, weight: w });
             }
@@ -772,7 +1049,7 @@ impl World {
     /// grows with the speed, all of it when it falls into the air, and so do the crumbs left
     /// alone in the air (a thin film with air under it and no body beside it).
     fn throw_drops(&mut self, liq: &mut Liquids) {
-        let (class, rows, u, v) = (&liq.class, &liq.rows, &liq.u, &liq.v);
+        let (class, rows, u, v, lid) = (&liq.class, &liq.rows, &liq.u, &liq.v, &liq.lid);
         let world: &World = self;
         let throws: Vec<(usize, u32, f32, f32, f32, f32)> = (0..H())
             .into_par_iter()
@@ -795,11 +1072,13 @@ impl World {
                         }
                     };
                     // The speed out of the cell into the air on each side: right, left, down, up.
+                    // (Not through the top of thin matter: it is a wall, see `open_pores`.)
+                    let (lid_under, lid_over) = (y + 1 < H() && lid[i + W()] & 2 != 0, lid[i] & 2 != 0);
                     let outs = [
                         (if air(x + 1, y) { u[ui(x + 1, y)] } else { 0.0 }, 0.5, 0.0),
                         (if air(x.wrapping_sub(1), y) { -u[ui(x, y)] } else { 0.0 }, -0.5, 0.0),
-                        (if air(x, y + 1) { v[vi(x, y + 1)] } else { 0.0 }, 0.0, 0.5),
-                        (if air(x, y.wrapping_sub(1)) { -v[vi(x, y)] } else { 0.0 }, 0.0, -0.5),
+                        (if air(x, y + 1) && !lid_under { v[vi(x, y + 1)] } else { 0.0 }, 0.0, 0.5),
+                        (if air(x, y.wrapping_sub(1)) && !lid_over { -v[vi(x, y)] } else { 0.0 }, 0.0, -0.5),
                     ];
                     let (k, &(speed, ox, oy)): (usize, &(f32, f32, f32)) = outs.iter().enumerate().max_by(|a, b| a.1 .0.total_cmp(&b.1 .0))?;
                     let fill = world.liquid_fill(i).min(field::FULL);
@@ -818,6 +1097,7 @@ impl World {
                     }
                     let lone = fill < field::FULL / 4
                         && air(x, y + 1)
+                        && !lid_under
                         && [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)].iter().all(|&(nx, ny)| nx >= W() || ny >= H() || class[ny * W() + nx] & 3 != FULLISH);
                     if lone && vx.hypot(vy) > 0.5 {
                         share = 1.0;
@@ -987,6 +1267,17 @@ impl World {
 
     /// Drop `d` lands in cell `j` (liquid of its own, or a free cell).
     fn land_drop(&mut self, liq: &mut Liquids, d: &Drop, j: usize) {
+        // Into thin matter (a drop thrown from the liquid inside a crown): it joins what the
+        // matter holds.
+        if self.cells[j].m.one_way() && self.mask[j] == 0 && matches!(self.pore[j], m if m == Mat::Empty || m == d.m) {
+            let had = if self.pore[j] == d.m { self.pore_fill[j] } else { 0 };
+            self.temp[j] = (self.temp[j] * had as f32 + d.t * d.q as f32) / (had + d.q) as f32;
+            self.pore[j] = d.m;
+            self.pore_fill[j] = had + d.q;
+            self.revision += 1;
+            self.zones.wake(j);
+            return;
+        }
         let had = if self.cells[j].m == d.m { self.liquid_fill(j) } else { 0 };
         if had == 0 {
             if !matches!(self.cells[j].m.kind(), Kind::Empty | Kind::Gas) || self.mask[j] != 0 {
@@ -1005,7 +1296,7 @@ impl World {
         // Its speed goes to the edges of the cell, in proportion to what it brings.
         let w = d.q as f32 / q as f32;
         let (x, y) = xy(j);
-        if let Some(Some(card)) = liq.card.as_mut() {
+        if let Some(card) = liq.active_card() {
             for e in [ui(x, y), ui(x + 1, y)] {
                 card.patches_up.push(liquid_gpu::Patch { edge: e as u32, mode: 1, value: d.vx, weight: w });
             }
@@ -1136,12 +1427,15 @@ impl World {
     /// velocities out, so that waves die and splashes never rise.
     fn forces(&self, liq: &mut Liquids, dt: f32) {
         let class = &liq.class;
+        let lid = &liq.lid;
         let kind = |x: i32, y: i32| if x < 0 || y < 0 || x >= W() as i32 || y >= H() as i32 { SOLID } else { class[y as usize * W() + x as usize] & 3 };
         let runs = |x: i32, y: i32| (0..W() as i32).contains(&x) && (0..H() as i32).contains(&y) && class[y as usize * W() + x as usize] & 4 != 0;
         let wet = |c: u8| c >= WET;
         let step = dt / cell_m();
         let rows = &liq.rows;
         let (u, v) = (&liq.u, &liq.v);
+        // The simple solver carries the velocities once (see `SIMPLE_SUB`).
+        let once = self.simple_liquids;
         // An edge in the air (air on both sides), read as the edge carried (see `nodes`).
         let air_u = |x: usize, y: usize| kind(x as i32 - 1, y as i32) == AIR && kind(x as i32, y as i32) == AIR;
         let air_v = |x: usize, y: usize| kind(x as i32, y as i32 - 1) == AIR && kind(x as i32, y as i32) == AIR;
@@ -1166,7 +1460,7 @@ impl World {
             let (xi, yi) = (x as i32, y as i32);
             let (a, b) = (kind(xi, yi - 1), kind(xi, yi));
             let here = v[vi(x, y)];
-            if a == SOLID || b == SOLID {
+            if a == SOLID || b == SOLID || (y < H() && lid[y * W() + x] & 2 != 0) {
                 Err(0.0)
             } else if !(wet(a) || wet(b)) || !(runs(xi, yi - 1) || runs(xi, yi)) {
                 Err(if wet(a) || wet(b) { here } else { 0.0 })
@@ -1224,7 +1518,7 @@ impl World {
             for x in x0..=(x1 + 1).min(W()) {
                 let Ok((vx, vy)) = u_vel(x, y) else { continue };
                 // (At rest, carried forward and back it is itself, within what is around it.)
-                let to = if vx == 0.0 && vy == 0.0 && x < W() && y < H() - 1 {
+                let to = if once || (vx == 0.0 && vy == 0.0 && x < W() && y < H() - 1) {
                     uf[ui(x, y)] + 0.0
                 } else {
                     let (px, py) = (x as f32 - vx * step, y as f32 - vy * step);
@@ -1253,7 +1547,7 @@ impl World {
             row[x0..=x1].copy_from_slice(&vf[vi(x0, y)..=vi(x1, y)]);
             for x in x0..=x1 {
                 let Ok((vx, vy)) = v_vel(x, y) else { continue };
-                let was = if vx == 0.0 && vy == 0.0 && x < W() - 1 && y < H() {
+                let was = if once || (vx == 0.0 && vy == 0.0 && x < W() - 1 && y < H()) {
                     vf[vi(x, y)] + 0.0
                 } else {
                     let (px, py) = (x as f32 - vx * step, y as f32 - vy * step);
@@ -1336,6 +1630,7 @@ impl World {
             return;
         }
         let c = dt / (cell_m() * cell_m());
+        let sweeps = if self.simple_liquids { SIMPLE_VISCOUS_SWEEPS } else { VISCOUS_SWEEPS };
         let join = |a: Option<(usize, usize)>, b: Option<(usize, usize)>| match (a, b) {
             (Some((a0, a1)), Some((b0, b1))) => Some((a0.min(b0), a1.max(b1))),
             (a, b) => a.or(b),
@@ -1371,7 +1666,7 @@ impl World {
         // Rightward edges.
         liq.u2.copy_from_slice(&liq.u);
         let before = std::mem::take(&mut liq.u2);
-        for sweep in 0..2 * VISCOUS_SWEEPS {
+        for sweep in 0..2 * sweeps {
             let colour = sweep % 2;
             let us = Shared::new(&mut liq.u);
             each(&u_rows, &|&(y, a, b)| {
@@ -1415,7 +1710,7 @@ impl World {
         // Downward edges.
         liq.v2.copy_from_slice(&liq.v);
         let before = std::mem::take(&mut liq.v2);
-        for sweep in 0..2 * VISCOUS_SWEEPS {
+        for sweep in 0..2 * sweeps {
             let colour = sweep % 2;
             let vs = Shared::new(&mut liq.v);
             each(&v_rows, &|&(y, a, b)| {
@@ -1456,6 +1751,125 @@ impl World {
         liq.v2 = before;
     }
 
+    /// The simple solver's guess of the pressure of each full cell in the spans (`Liquids::guess`),
+    /// column by column, without a solve:
+    /// - under an open surface (air or a film over the cell at the top of the run), the gas on the
+    ///   surface and the weight of each cell down to this one, half of each of the two cells an
+    ///   edge joins (as the edge's push weighs it): what the solve gives a body at rest;
+    /// - a run that does not stand on anything (air or a film under its lowest cell) falls freely
+    ///   and holds the pressure of the gas over it alone;
+    /// - under a roof (a pipe, the bend of a U-tube), along the row from the nearest cells on each
+    ///   side that are not, in a straight line between them (the drop of a steady flow down a
+    ///   pipe); with none, the last pressure of the top cell and the weight below it.
+    /// And a cell that holds more than full (or less, inside the body) is given the pressure that
+    /// brings it back (`SQUEEZE`). The full cells over the spans keep their last pressure.
+    fn hydrostatic(&self, liq: &mut Liquids, dt: f32) {
+        let (class, rows, p_old, lid) = (&liq.class, &liq.rows, &liq.p, &liq.lid);
+        let roofed = Shared::new(&mut liq.roofed);
+        let in_span = |x: usize, y: usize| rows[y].is_some_and(|(a, b)| a <= x && x <= b);
+        let rho = |i: usize| density(self.cells[i].m) * 1000.0;
+        let fullish = |i: usize| class[i] & 3 == FULLISH;
+        let Some(y0) = rows[..H()].iter().position(Option::is_some) else { return };
+        let y1 = H() - 1 - rows[..H()].iter().rev().position(Option::is_some).unwrap_or(0);
+        let wg = G * cell_m();
+        let guess = Shared::new(&mut liq.guess);
+        (0..W().div_ceil(super::par::COLUMN_BAND)).into_par_iter().for_each(|band| {
+            let mut held = vec![false; y1 + 1 - y0];
+            for x in band * super::par::COLUMN_BAND..((band + 1) * super::par::COLUMN_BAND).min(W()) {
+                // From the bottom up: whether each full cell stands on something (the ground, or
+                // full liquid that does).
+                let mut under = y1 + 1 >= H() || !in_span(x, y1 + 1) || matches!(class[(y1 + 1) * W() + x] & 3, SOLID | FULLISH);
+                for y in (y0..=y1).rev() {
+                    let i = y * W() + x;
+                    held[y - y0] = under && fullish(i);
+                    under = match class[i] & 3 {
+                        SOLID => true,
+                        FULLISH => held[y - y0] || !in_span(x, y),
+                        _ => false,
+                    } || lid[i] & 2 != 0;
+                }
+                // From the top down: the pressure.
+                let mut roof = false;
+                for y in y0..=y1 {
+                    let i = y * W() + x;
+                    if !in_span(x, y) || !fullish(i) {
+                        roof = false;
+                        continue;
+                    }
+                    // (The wall over thin matter opened for the step is a roof: `open_pores`.)
+                    let over = if y == 0 || lid[i] & 2 != 0 { SOLID } else { class[i - W()] & 3 };
+                    let p = match over {
+                        FULLISH => {
+                            // SAFETY: this band alone writes its columns.
+                            let above = if in_span(x, y - 1) { unsafe { guess.get(i - W()) } } else { p_old[i - W()] };
+                            if held[y - y0] { above + wg * 0.5 * (rho(i) + rho(i - W())) } else { above }
+                        }
+                        SOLID => {
+                            roof = true;
+                            p_old[i]
+                        }
+                        _ => {
+                            roof = false;
+                            let gas = self.gas_pa_over(x as i32, y as i32 - 1);
+                            if held[y - y0] { gas + wg * rho(i) } else { gas }
+                        }
+                    };
+                    // SAFETY: as above.
+                    unsafe {
+                        *guess.at(i) = p;
+                        *roofed.at(i) = roof;
+                    }
+                }
+            }
+        });
+        // Under a roof, along the rows (each row on its own).
+        let roofed = &liq.roofed;
+        liq.guess.par_chunks_mut(W()).enumerate().for_each(|(y, row)| {
+            let Some((x0, x1)) = rows[y] else { return };
+            let mut x = x0;
+            while x <= x1 {
+                let i = y * W() + x;
+                if !fullish(i) || !roofed[i] {
+                    x += 1;
+                    continue;
+                }
+                // A run of roofed full cells, x..end, and the open full cells just beside it.
+                let mut end = x;
+                while end < x1 && fullish(i + end + 1 - x) && roofed[i + end + 1 - x] {
+                    end += 1;
+                }
+                let left = (x > x0 && fullish(i - 1)).then(|| row[x - 1]);
+                let right = (end < x1 && fullish(y * W() + end + 1)).then(|| row[end + 1]);
+                for k in x..=end {
+                    row[k] = match (left, right) {
+                        (Some(a), Some(b)) => a + (b - a) * (k + 1 - x) as f32 / (end + 2 - x) as f32,
+                        (Some(a), None) => a,
+                        (None, Some(b)) => b,
+                        (None, None) => row[k],
+                    };
+                }
+                x = end + 1;
+            }
+            // The cells too full, or not full enough inside the body.
+            let squeeze = SQUEEZE * (cell_m() / dt) * (cell_m() / dt);
+            for x in x0..=x1 {
+                let i = y * W() + x;
+                if !fullish(i) {
+                    continue;
+                }
+                let err = (self.liquid_fill(i) as f32 / field::FULL as f32 - 1.0).clamp(-1.0, 1.0);
+                let inside = || {
+                    [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)]
+                        .iter()
+                        .all(|&(nx, ny)| nx >= W() || ny >= H() || matches!(class[ny * W() + nx] & 3, SOLID | FULLISH))
+                };
+                if err > 0.0 || (err < 0.0 && inside()) {
+                    row[x] += squeeze * rho(i) * err;
+                }
+            }
+        });
+    }
+
     /// Pressure of the gas over the ambient one at (x, y), Pa: a closed pocket's, and the surge
     /// of a blast wave in the air (`surge_pa`); 0 in still open air.
     fn gas_pa(&self, x: i32, y: i32) -> f32 {
@@ -1483,12 +1897,16 @@ impl World {
     /// Solves the pressure that keeps the full cells of the zones that run from filling or
     /// emptying, then takes its push off the velocities.
     fn pressure(&self, liq: &mut Liquids, dt: f32) {
-        let (class, rows) = (&liq.class, &liq.rows);
+        if self.simple_liquids {
+            self.hydrostatic(liq, dt);
+        }
+        let (class, rows, lid) = (&liq.class, &liq.rows, &liq.lid);
         let rho = |i: usize| density(self.cells[i].m) * 1000.0;
         // The divergence of each full cell that runs, times dx / dt.
         let k = cell_m() / dt;
         let (u, v) = (&liq.u, &liq.v);
         let mut rhs_buf = std::mem::take(&mut liq.rhs);
+        let refill = if self.simple_liquids { SIMPLE_REFILL } else { REFILL };
         rhs_buf.par_chunks_mut(W()).enumerate().for_each(|(y, row)| {
             let Some((x0, x1)) = rows[y] else { return };
             for x in x0..=x1 {
@@ -1507,7 +1925,7 @@ impl World {
                 let inside = [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)]
                     .iter()
                     .all(|&(nx, ny)| nx >= W() || ny >= H() || matches!(class[ny * W() + nx] & 3, SOLID | FULLISH));
-                let fix = if inside { REFILL * (self.liquid_fill(i) as f32 / field::FULL as f32 - 1.0).clamp(-1.0, 1.0) } else { 0.0 };
+                let fix = if inside { refill * (self.liquid_fill(i) as f32 / field::FULL as f32 - 1.0).clamp(-1.0, 1.0) } else { 0.0 };
                 row[x] = (u[ui(x + 1, y)] - u[ui(x, y)] + v[vi(x, y + 1)] - v[vi(x, y)]) * k - fix * cell_m() / dt * k;
             }
         });
@@ -1522,7 +1940,10 @@ impl World {
         // would leave a pool of running liquid shut in by sleeping liquid and walls with no
         // pressure to hang from, a singular system that the conjugate gradients cannot take.)
         let solve_clock = self.prof.start();
+        let simple = self.simple_liquids;
         let rhs = &rhs_buf;
+        // Where the solve starts: the last pressure, or the simple solver's guess.
+        let start = if simple { &liq.guess } else { &liq.p };
         let p_old = &liq.p;
         let solver = &mut liq.solver;
         solver.ready(W(), H());
@@ -1578,7 +1999,7 @@ impl World {
             let Some((x0, x1)) = span else { return };
             for x in x0..=x1 {
                 let (a, b) = ((y - 1) * W() + x, y * W() + x);
-                row[x] = cond(a, b, kind[a], kind[b]);
+                row[x] = if lid[b] & 2 != 0 { 0.0 } else { cond(a, b, kind[a], kind[b]) };
             }
         });
         let (ax, ay) = (&f.ax, &f.ay);
@@ -1629,13 +2050,20 @@ impl World {
                 }
                 diag[i] = d;
                 b[i] = rhs_i;
-                x[i] = p_old[c];
+                x[i] = start[c];
                 n += 1;
             }
             n
         }).sum();
-        let gpu = if unknowns >= mgpcg_gpu::threshold() { liq.gpu.get_or_insert_with(|| mgpcg_gpu::PressureGpu::new(W(), H())).as_mut() } else { None };
-        let iterations = if let Some(gpu) = gpu {
+        let gpu = if !simple && unknowns >= mgpcg_gpu::threshold() { liq.gpu.get_or_insert_with(|| mgpcg_gpu::PressureGpu::new(W(), H())).as_mut() } else { None };
+        let iterations = if simple && SIMPLE_ITER == 0 {
+            solver.lines(SIMPLE_LINES);
+            solver.sweep(SIMPLE_SWEEPS);
+            (SIMPLE_LINES + SIMPLE_SWEEPS) as u32
+        } else if simple {
+            solver.coarsen();
+            solver.solve(SETTLED, RELATIVE, SIMPLE_ITER)
+        } else if let Some(gpu) = gpu {
             gpu.solve(solver.fine(), SETTLED, RELATIVE, self.liquid_iterations())
         } else {
             solver.coarsen();
@@ -1719,6 +2147,10 @@ impl World {
             for x in x0..=x1 {
                 let (a, b) = ((y - 1) * W() + x, y * W() + x);
                 let (ca, cb) = (class[a], class[b]);
+                if lid[b] & 2 != 0 {
+                    row[x] = 0.0;
+                    continue;
+                }
                 if ca & 3 == SOLID || cb & 3 == SOLID || !(ca == FULLISH | 4 || cb == FULLISH | 4) {
                     continue;
                 }
@@ -1737,7 +2169,7 @@ impl World {
     /// Moves the liquid along the edges: each edge passes velocity × dt × the liquid of the cell
     /// upstream, into air or the same liquid, never more than the cell holds.
     fn carry_liquids(&mut self, liq: &mut Liquids, dt: f32) {
-        let (class, rows) = (&liq.class, &liq.rows);
+        let (class, rows, lid) = (&liq.class, &liq.rows, &liq.lid);
         let s = dt / cell_m();
         let m = |i: usize| self.cells[i].m;
         // What each edge passes (units of fill, from the upstream cell), before the limits.
@@ -1779,7 +2211,7 @@ impl World {
             }
             if y > 0 {
                 for x in x0..=x1 {
-                    vrow[x] = flow(liq.v[vi(x, y)], (y - 1) * W() + x, y * W() + x);
+                    vrow[x] = if lid[y * W() + x] & 2 != 0 { 0 } else { flow(liq.v[vi(x, y)], (y - 1) * W() + x, y * W() + x) };
                 }
             }
         });
@@ -1992,7 +2424,9 @@ impl World {
         let full = field::FULL;
         let frame = self.frame;
         let (cells, fill, temp, vel) = (Shared::new(&mut self.cells), Shared::new(&mut self.fill), Shared::new(&mut self.temp), Shared::new(&mut self.vel));
-        let (mask, awake) = (&self.mask, &self.zones.awake);
+        let (mask, awake, lid) = (&self.mask, &self.zones.awake, &liq.lid);
+        // (The top of thin matter is a wall: nothing goes through it, see `open_pores`.)
+        let walled = |i: usize| lid[i] & 2 != 0;
         // SAFETY (every `cells`, `fill`, `temp` and `vel` below): a band only reaches the cells
         // of its own columns.
         let cell = |i: usize| unsafe { cells.get(i) };
@@ -2037,7 +2471,7 @@ impl World {
                         x += k;
                         let i = base + x;
                         x += 1;
-                        if cell(i).m.kind() != Kind::Liquid {
+                        if cell(i).m.kind() != Kind::Liquid || walled(i) {
                             continue;
                         }
                         let j = i - W();
@@ -2126,9 +2560,9 @@ impl World {
                         let runs = |yy: usize| awake[yy / sleep::CS * sleep::CW() + xc / sleep::CS];
                         let have = liquid_fill(i);
                         let same = |j: usize| cell(j).m == m && mask[j] == 0;
-                        let below = (y + 1 < H() && same(i + W())).then_some(i + W());
+                        let below = (y + 1 < H() && same(i + W()) && !walled(i + W())).then_some(i + W());
                         let to = if have <= CRUMB {
-                            match below.or((y > 0 && same(i - W())).then_some(i - W())) {
+                            match below.or((y > 0 && same(i - W()) && !walled(i)).then_some(i - W())) {
                                 Some(j) => j,
                                 None => {
                                     unsafe {
@@ -2218,7 +2652,7 @@ impl World {
     #[cfg(test)]
     pub(super) fn liquid_units(&self, m: Mat) -> u64 {
         let flying: u64 = self.liq.drops.iter().filter(|d| d.m == m).map(|d| d.q as u64).sum();
-        (0..W() * H()).filter(|&i| self.cells[i].m == m).map(|i| self.liquid_fill(i) as u64).sum::<u64>() + flying
+        (0..W() * H()).filter(|&i| self.cells[i].m == m).map(|i| self.liquid_fill(i) as u64).sum::<u64>() + flying + self.held_units(m)
     }
 }
 
@@ -2377,7 +2811,7 @@ mod tests {
     }
 
     /// A pool on a hillside, held by the trunk of a tree on its downhill side: thin matter does
-    /// not hold a liquid back (`seep_through_thin`), the pool runs through the trunk and down
+    /// not hold a liquid back (`open_pores`), the pool runs through the trunk and down
     /// the hill until it is a film on the slope.
     #[test]
     fn a_pool_on_a_hillside_runs_through_a_tree() {
@@ -2431,9 +2865,10 @@ mod tests {
         (cells + flying) as f64 / all as f64
     }
 
-    /// A tree does not dam a flood (`Holds::FromAbove`): the water levels through its trunk and
-    /// its crown, nearly as fast as it spreads with no tree (it was a little over a quarter
-    /// after twelve seconds when only the surface seeped through).
+    /// A tree does not dam a flood (`Holds::FromAbove`): the water runs through its trunk and
+    /// its crown (`open_pores`) nearly as fast as it spreads with no tree, half of it past the
+    /// trunk in three seconds. (A sixth when it passed beside the solver, row by row; a
+    /// twentieth when only the surface seeped through.)
     #[test]
     fn a_flood_levels_through_a_tree() {
         let past = past_an_obstacle(
@@ -2441,10 +2876,37 @@ mod tests {
                 rect(w, 230, 400, 231, 449, Mat::Trunk);
                 rect(w, 215, 395, 246, 415, Mat::Leaf);
             },
-            12,
+            3,
         );
-        // (Level, 45 % of the water is past the trunk.)
-        assert!(past > 0.38, "only {:.0} % of the water got past the tree", past * 100.0);
+        assert!(past > 0.35, "only {:.0} % of the water got past the tree", past * 100.0);
+    }
+
+    /// Rain that falls on a crown stays on it (the top of thin matter is a wall, `lid`): it
+    /// spreads over the crown and runs off its edges, it does not fall through.
+    #[test]
+    fn water_poured_on_a_crown_rests_on_it_and_runs_off_its_edges() {
+        let mut w = world();
+        rect(&mut w, 200, 400, 260, 410, Mat::Leaf);
+        rect(&mut w, 99, 449, 340, 450, Mat::Brick);
+        rect(&mut w, 220, 380, 240, 399, Mat::Water);
+        w.temp.fill(5.0);
+        let all = w.liquid_units(Mat::Water);
+        let units = |w: &World, x0: i32, x1: i32, y0: i32, y1: i32| -> u64 {
+            (x0..=x1).flat_map(|x| (y0..=y1).map(move |y| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water).map(|(x, y)| w.liquid_fill(World::idx(x, y)) as u64).sum()
+        };
+        for _ in 0..30 {
+            w.step();
+        }
+        // Half a second: it has spread over the top, none got under the crown.
+        assert!(units(&w, 190, 270, 300, 399) > all * 9 / 10, "the water should lie on the crown");
+        assert_eq!(units(&w, 205, 255, 411, 448), 0, "the water fell through the crown");
+        for _ in 0..150 {
+            w.step();
+        }
+        // It ran off the edges onto the ground, and the crown holds next to none of it.
+        assert!(units(&w, 100, 340, 411, 448) > all / 2, "the water should run off the crown");
+        assert!(w.held_units(Mat::Water) < all / 20, "the crown soaked up the water: {} of {all}", w.held_units(Mat::Water));
+        assert!(w.liquid_units(Mat::Water) + w.gone + w.dried >= all - field::FULL as u64, "water was lost");
     }
 
     /// A wall of light grains that float (ash, charcoal) does not dam the water either: it lets
@@ -2592,7 +3054,14 @@ mod tests {
     /// Water in a U-tube (two columns 6 wide, joined by a bend 6 high), 20 cells higher on the
     /// left: the height of the left column, every step, for 8 s.
     fn u_tube(m: Mat, steps: usize) -> Vec<f32> {
+        u_tube_with(m, steps, false, None)
+    }
+
+    /// The same, on the simple solver or the detailed one, the liquids going over to the card
+    /// and back every `every` steps.
+    fn u_tube_with(m: Mat, steps: usize, simple: bool, every: Option<usize>) -> Vec<f32> {
         let mut w = world();
+        w.simple_liquids = simple;
         // Left column x 200..205, right 230..235, both open at the top; bend y 440..445.
         rect(&mut w, 190, 370, 245, 455, Mat::Brick);
         rect(&mut w, 200, 360, 205, 445, Mat::Empty);
@@ -2603,7 +3072,10 @@ mod tests {
         rect(&mut w, 230, 420, 235, 445, m);
         w.temp.fill(15.0);
         (0..steps)
-            .map(|_| {
+            .map(|k| {
+                if let Some(n) = every {
+                    w.liq.forced = Some(k / n % 2 == 1);
+                }
                 w.step();
                 let col = |x0: i32| -> f32 {
                     let units: u64 = (380..440).flat_map(|y| (x0..x0 + 6).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == m).map(|(x, y)| w.liquid_fill(World::idx(x, y)) as u64).sum();
@@ -2617,7 +3089,8 @@ mod tests {
     #[test]
     #[ignore]
     fn probe_u_tube() {
-        let h = u_tube(Mat::Water, 960);
+        // (AWORLD_BENCH_SIMPLE=1: on the simple solver.)
+        let h = u_tube_with(Mat::Water, 960, crate::config::bench().simple, None);
         for (t, q) in h.iter().enumerate().step_by(6) {
             println!("{:.1} s {:.1}", t as f32 / 60.0, q);
         }
@@ -2626,7 +3099,12 @@ mod tests {
     /// Liquid `m` at `t` °C, 30 wide and 20 high, let go on a flat floor 240 long: its front after
     /// `secs` seconds, in cells.
     fn spread(m: Mat, t: f32, secs: usize) -> (i32, World) {
+        spread_with(m, t, secs, false)
+    }
+
+    fn spread_with(m: Mat, t: f32, secs: usize, simple: bool) -> (i32, World) {
         let mut w = world();
+        w.simple_liquids = simple;
         tank(&mut w, 100, 400, 339, 449);
         rect(&mut w, 100, 430, 129, 449, m);
         w.temp.fill(15.0);
@@ -2691,6 +3169,115 @@ mod tests {
         assert!(after <= before && before - after < before / 10_000, "{before} -> {after}");
     }
 
+    // The simple solver (`World::simple_liquids`), on the scenes of the detailed one.
+
+    #[test]
+    fn on_the_simple_solver_a_dam_breaks_and_none_is_lost() {
+        for m in [Mat::Water, Mat::Oil] {
+            let mut w = dam(m);
+            w.simple_liquids = true;
+            let before = w.liquid_units(m);
+            for _ in 0..(60.0 * model().sqrt()).round() as usize {
+                w.step();
+            }
+            // About as far as the detailed solver (13 m for real water).
+            let f = front(&w, m, 100, 400, 339, 449) as f32 * cell_m() / model();
+            assert!((7.0..17.0).contains(&f), "{m:?}: {f} m");
+            let after = w.liquid_units(m) + w.gone + if m == Mat::Water { w.dried } else { 0 };
+            assert!(after <= before && before - after < before / 10_000, "{m:?}: {before} -> {after}");
+        }
+    }
+
+    #[test]
+    fn on_the_simple_solver_a_still_pool_stays_still_and_falls_asleep() {
+        let mut w = world();
+        w.simple_liquids = true;
+        tank(&mut w, 100, 400, 339, 449);
+        rect(&mut w, 100, 430, 339, 449, Mat::Water);
+        w.temp.fill(15.0);
+        let before = w.liquid_units(Mat::Water);
+        for _ in 0..240 {
+            w.step();
+        }
+        let fastest = w.liq.u.iter().chain(w.liq.v.iter()).fold(0.0f32, |a, v| a.max(v.abs()));
+        assert!(fastest < 0.05, "{fastest} m/s");
+        let after = w.liquid_units(Mat::Water);
+        assert!(after <= before && before - after < before / 1_000, "{before} -> {after}");
+        let awake = (0..sleep::CW() * sleep::CH()).filter(|&z| w.zones.awake[z]).count();
+        assert!(awake <= 10, "{awake} zones awake");
+    }
+
+    #[test]
+    fn on_the_simple_solver_water_swings_in_a_u_tube_and_settles() {
+        let h = u_tube_with(Mat::Water, 420, true, None);
+        let (t_low, low) = h.iter().enumerate().take(300).fold((0, f32::MAX), |a, (t, &q)| if q < a.1 { (t, q) } else { a });
+        let (t_high, high) = h.iter().enumerate().skip(t_low).fold((0, 0.0), |a, (t, &q)| if q > a.1 { (t, q) } else { a });
+        // 2.85 s from low to high for real water, as on the detailed solver.
+        let half = (t_high - t_low) as f32 / 60.0 / model().sqrt();
+        assert!((2.3..3.4).contains(&half), "half period {half} s");
+        assert!(low < 28.0 && high > 30.0 && high < 40.0, "{low} {high}");
+        // And it comes to rest at the middle.
+        let last = h[h.len() - 1];
+        assert!((26.0..34.0).contains(&last), "{last}");
+    }
+
+    #[test]
+    fn on_the_simple_solver_lava_creeps_where_water_runs() {
+        let (water, _) = spread_with(Mat::Water, 15.0, 4, true);
+        let (hot, _) = spread_with(Mat::Lava, 1150.0, 4, true);
+        let (glass, _) = spread_with(Mat::Molten, 1700.0, 4, true);
+        assert!(hot * 2 < water, "{hot} {water}");
+        assert!(glass > 0 && water > 0, "{glass} {water}");
+    }
+
+    #[test]
+    fn on_the_simple_solver_the_liquids_take_the_same_turn_on_one_core_and_on_four() {
+        let run = |cores: usize| {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(cores).build().unwrap();
+            pool.install(|| {
+                let mut w = dam(Mat::Water);
+                w.simple_liquids = true;
+                for _ in 0..30 {
+                    w.step();
+                }
+                (0..W() * H()).map(|i| (w.cells[i].m, w.liquid_fill(i))).collect::<Vec<_>>()
+            })
+        };
+        assert!(run(1) == run(4));
+    }
+
+    /// The two solvers side by side on the same scenes: what each gives and what it costs.
+    /// `cargo test --release --bin aworld simple_beside_detailed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn simple_beside_detailed() {
+        println!("{:<34} {:>12} {:>12}", "", "détaillé", "simplifié");
+        let row = |label: &str, f: &dyn Fn(bool) -> String| {
+            let (a, b) = (f(false), f(true));
+            println!("{label:<34} {a:>12} {b:>12}");
+        };
+        row("rupture de barrage : front à 1 s", &|simple| {
+            let mut w = dam(Mat::Water);
+            w.simple_liquids = simple;
+            w.prof.on = true;
+            for _ in 0..(60.0 * model().sqrt()).round() as usize {
+                w.step();
+            }
+            let ms = w.prof.ms_per_step(prof::LIQUIDS);
+            format!("{:.1} m {:.1} ms", front(&w, Mat::Water, 100, 400, 339, 449) as f32 * cell_m() / model(), ms)
+        });
+        row("tube en U : demi-période", &|simple| {
+            let h = u_tube_with(Mat::Water, 420, simple, None);
+            let (t_low, _) = h.iter().enumerate().take(300).fold((0, f32::MAX), |a, (t, &q)| if q < a.1 { (t, q) } else { a });
+            let (t_high, _) = h.iter().enumerate().skip(t_low).fold((0, 0.0), |a, (t, &q)| if q > a.1 { (t, q) } else { a });
+            format!("{:.2} s", (t_high - t_low) as f32 / 60.0 / model().sqrt())
+        });
+        row("tube en U : niveau à 7 s", &|simple| format!("{:.1}", u_tube_with(Mat::Water, 420, simple, None)[419]));
+        for (m, t) in [(Mat::Water, 15.0), (Mat::Lava, 1150.0), (Mat::Molten, 1700.0)] {
+            row(&format!("{m:?} : front à 4 s (cases)"), &|simple| format!("{}", spread_with(m, t, 4, simple).0));
+        }
+    }
+
     #[test]
     fn on_the_drops_tier_a_falling_block_goes_over_to_drops_and_lands_whole() {
         let mut w = world();
@@ -2729,6 +3316,30 @@ mod tests {
         assert!((2.3..3.4).contains(&half), "half period {half} s");
         // It swings past the middle (30) and back, a little less each time.
         assert!(low < 26.0 && high > 31.0 && high < 40.0, "{low} {high}");
+    }
+
+    #[test]
+    fn the_water_goes_over_to_the_card_and_back_and_keeps_its_flow_and_its_mass() {
+        // (Only with a card: `AWORLD_GPU=1 cargo test`.)
+        if gpu::gpu().is_none() {
+            return;
+        }
+        // The swing of a U-tube goes on across the handing over, both ways.
+        let h = u_tube_with(Mat::Water, 420, false, Some(25));
+        let (t_low, low) = h.iter().enumerate().take(300).fold((0, f32::MAX), |a, (t, &q)| if q < a.1 { (t, q) } else { a });
+        let (t_high, high) = h.iter().enumerate().skip(t_low).fold((0, 0.0), |a, (t, &q)| if q > a.1 { (t, q) } else { a });
+        let half = (t_high - t_low) as f32 / 60.0 / model().sqrt();
+        assert!((2.3..3.4).contains(&half), "half period {half} s");
+        assert!(low < 26.0 && high > 31.0 && high < 40.0, "{low} {high}");
+        // A breaking dam loses no water on the way.
+        let mut w = dam(Mat::Water);
+        let before = w.liquid_units(Mat::Water);
+        for k in 0..240 {
+            w.liq.forced = Some(k / 20 % 2 == 1);
+            w.step();
+        }
+        let after = w.liquid_units(Mat::Water) + w.gone + w.dried;
+        assert!(after <= before && before - after < before / 10_000, "{before} -> {after}");
     }
 
     #[test]

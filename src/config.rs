@@ -3,12 +3,12 @@
 
 use std::sync::OnceLock;
 
-/// Whether the liquids' pressure goes to the graphics card (`AWORLD_GPU`).
+/// Whether the liquids go to the graphics card (`AWORLD_GPU`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Gpu {
-    /// Never (unset, or any other value).
+    /// Never (`0`; and in the tests, unless asked for).
     Off,
-    /// When the system is large enough to pay for the trip (`auto`).
+    /// Where it costs less than the CPU, as measured (unset, `auto`, or any other value).
     Auto,
     /// Always (`1`).
     Always,
@@ -50,8 +50,11 @@ pub fn config() -> &'static Config {
         grid: var("AWORLD_GRID"),
         gpu: match var("AWORLD_GPU").as_deref() {
             Some("1") => Gpu::Always,
-            Some("auto") => Gpu::Auto,
-            _ => Gpu::Off,
+            Some("0") => Gpu::Off,
+            // (The tests stay on the CPU unless asked: a trial of the card would change their
+            // liquids by when it comes.)
+            None if cfg!(test) => Gpu::Off,
+            _ => Gpu::Auto,
         },
         gpu_min: number("AWORLD_GPU_MIN"),
         gpu_fuse: number("AWORLD_GPU_FUSE"),
@@ -73,6 +76,8 @@ pub struct Bench {
     /// `AWORLD_BENCH_TIER`: the liquids' tier of the scenes (`World::liq_tier`; 1 the cheap one, 2
     /// the drops).
     pub tier: Option<u8>,
+    /// `AWORLD_BENCH_SIMPLE=1`: the liquids on the simple solver (`World::simple_liquids`).
+    pub simple: bool,
     /// `AWORLD_BENCH_DT`: the length of a step, in ticks of 1/60 s.
     pub ticks: Option<f32>,
     /// `AWORLD_BENCH_SERIES`: print the time of the first steps one by one.
@@ -102,6 +107,7 @@ pub fn bench() -> &'static Bench {
         steps: number("AWORLD_BENCH_STEPS"),
         scene: var("AWORLD_BENCH_SCENE"),
         tier: number("AWORLD_BENCH_TIER"),
+        simple: var("AWORLD_BENCH_SIMPLE").is_some_and(|v| v == "1"),
         ticks: number("AWORLD_BENCH_DT"),
         series: var("AWORLD_BENCH_SERIES").is_some(),
         grid: var("AWORLD_BENCH_GRID"),

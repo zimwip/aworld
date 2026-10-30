@@ -18,7 +18,7 @@
 //! turns into diamond, which is how detonations make real nanodiamonds. Black powder only burns
 //! (it peaks at a few thousand atmospheres): it neither packs the soil nor makes diamond.
 
-use super::thermal::{cap, heat_of, latent0, GLASS_C, KILN_C, LATENT_FUSION, LATENT_METAL, LATENT_ROCK, MELT_C, METAL_MELT_C, ROCK_MELT_C, WOOD_IGNITE_C};
+use super::thermal::{cap, heat_of, latent0, GLASS_C, GLASS_MELT_C, KILN_C, LATENT_FUSION, LATENT_METAL, LATENT_ROCK, MELT_C, METAL_MELT_C, ROCK_MELT_C, WOOD_IGNITE_C};
 use super::{xy_i32, Kind, Mat, World, H, W};
 
 /// A condition a change needs; all the conditions of a change must hold.
@@ -64,7 +64,7 @@ const fn heat(from: Mat, to: Mat, when: &'static [Cond], every: u32) -> Transiti
 /// of the cell (and the air around it) is looked at by the heat pass, the others by the slow pass
 /// (`settle_matter`) or by the shock of a blast (`shock_cell`).
 pub const TRANSITIONS: &[Transition] = &[
-    // Heat. Sand fuses into glass (which does not melt back in a fire); clay is fired into
+    // Heat. Sand fuses into glass (which melts much hotter, see `FUSIONS`); clay is fired into
     // terracotta.
     heat(Mat::Sand, Mat::Glass, &[TempAbove(GLASS_C)], 15),
     heat(Mat::Shard, Mat::Glass, &[TempAbove(GLASS_C)], 15),
@@ -120,6 +120,7 @@ pub const FUSIONS: &[Fusion] = &[
     Fusion { solid: Mat::Stone, liquid: Mat::Lava, at: ROCK_MELT_C, latent: LATENT_ROCK },
     Fusion { solid: Mat::Iron, liquid: Mat::Molten, at: METAL_MELT_C, latent: LATENT_METAL },
     Fusion { solid: Mat::Steel, liquid: Mat::MoltenSteel, at: METAL_MELT_C, latent: LATENT_METAL },
+    Fusion { solid: Mat::Glass, liquid: Mat::MoltenGlass, at: GLASS_MELT_C, latent: LATENT_ROCK },
 ];
 
 /// The change of state `m` takes part in, if any: the one it melts by, or for a liquid the one

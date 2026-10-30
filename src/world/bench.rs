@@ -6,7 +6,7 @@
 //! ```
 //!
 //! `AWORLD_BENCH_STEPS` sets how many steps each scene is measured over (300 by default),
-//! `AWORLD_BENCH_SCENE` runs only the scene of that name, `AWORLD_BENCH_TIER` simplifies the liquids (see `World::liq_tier`), `AWORLD_BENCH_SERIES=1` also prints
+//! `AWORLD_BENCH_SCENE` runs only the scene of that name, `AWORLD_BENCH_TIER` simplifies the liquids (see `World::liq_tier`), `AWORLD_BENCH_SIMPLE=1` gives them the simple solver (`World::simple_liquids`), `AWORLD_BENCH_SERIES=1` also prints
 //! the time of the first 96 measured steps one by one (to see the steps that stick out).
 
 use super::*;
@@ -314,6 +314,8 @@ fn bench_scenes() {
     let only = crate::config::bench().scene.clone();
     // The liquids' tier (`World::liq_tier`: AWORLD_BENCH_TIER=1 the cheap one, 2 the drops).
     let tier: u8 = crate::config::bench().tier.unwrap_or(0);
+    // The simple solver of the liquids (`World::simple_liquids`: AWORLD_BENCH_SIMPLE=1).
+    let simple = crate::config::bench().simple;
     // The length of a step, in ticks of 1/60 s (AWORLD_BENCH_DT=2: steps of 1/30 s).
     let ticks: f32 = crate::config::bench().ticks.unwrap_or(1.0);
     let dt = ticks * super::STEP;
@@ -324,6 +326,7 @@ fn bench_scenes() {
         }
         let mut w = make();
         w.liq_tier = tier;
+        w.simple_liquids = simple;
         // A short warm-up so that the first explosions and flows get going.
         for i in 0..30 {
             if let Some(f) = each {
@@ -335,6 +338,7 @@ fn bench_scenes() {
         w.prof.reset();
         let mut worst = 0f64;
         let mut work = 0u64;
+        let mut carded = 0u32;
         let mut series = String::new();
         let t = Instant::now();
         for i in 0..steps {
@@ -344,6 +348,7 @@ fn bench_scenes() {
             let s = Instant::now();
             w.step_dt(dt);
             work += w.liq_work;
+            carded += w.liquids_on_card() as u32;
             let ms = s.elapsed().as_secs_f64() * 1000.0;
             worst = worst.max(ms);
             if i < 96 {
@@ -358,6 +363,10 @@ fn bench_scenes() {
             w.zones.awake.len()
         );
         eprintln!("travail des liquides : {:.2} grille par pas (cases de leurs bandes, sous-pas compris)", work as f64 / steps as f64 / (W() * H()) as f64);
+        if super::gpu::wanted() != super::gpu::Use::Off {
+            let ms = |c: Option<f32>| c.map_or("?".to_string(), |c| format!("{c:.1} ms"));
+            eprintln!("liquides sur la carte {:.0} % des pas (coût d'un pas : CPU {}, carte {})", carded as f32 * 100.0 / steps as f32, ms(w.liq.cost[0]), ms(w.liq.cost[1]));
+        }
         if crate::config::bench().series {
             eprintln!("{series}");
         }
@@ -564,6 +573,8 @@ fn a_block_of_sand_falls_by_gravity_at_any_step() {
 #[ignore]
 fn flood_probe() {
     let mut w = deluge();
+    // (AWORLD_BENCH_SIMPLE=1: on the simple solver of the liquids.)
+    w.simple_liquids = crate::config::bench().simple;
     let ticks: f32 = crate::config::bench().ticks.unwrap_or(1.0);
     let steps: usize = crate::config::bench().probe_steps.unwrap_or(600);
     let every = (60.0 / ticks).round() as usize;
@@ -574,8 +585,9 @@ fn flood_probe() {
         if k % every == 0 {
             let water = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Water).count();
             eprintln!(
-                "{:.1} s : {water} cellules d'eau, {} gouttes, {}/{} zones éveillées, {:.1} ms/pas",
+                "{:.1} s : {water} cellules d'eau ({:.0} pleines), {} gouttes, {}/{} zones éveillées, {:.1} ms/pas",
                 k as f32 * STEP * ticks,
+                w.water_units_audit() as f64 / field::FULL as f64,
                 w.liq.drops.len(),
                 w.zones.awake_count(),
                 CW() * CH(),

@@ -108,6 +108,18 @@ pub const LATENT_METAL: f32 = 750.0;
 /// Rock melts into lava and lava sets into rock at this one temperature.
 pub const ROCK_MELT_C: f32 = 540.0;
 pub const GLASS_C: f32 = 600.0;
+/// Glass softens and melts into a thick liquid at this temperature, below the heat of fresh lava,
+/// and sets again at the same one. (Real soda glass flows around 1000 °C; squeezed like rock.)
+pub const GLASS_MELT_C: f32 = 850.0;
+/// Glass this hot is soft: it gives instead of cracking under a difference of heat.
+const GLASS_SOFT_C: f32 = 500.0;
+/// The humus of dry earth chars and burns away from this temperature.
+pub const HUMUS_BURN_C: f32 = 250.0;
+/// How far (cells) steam boiled in the earth seeps through it to reach the air.
+const STEAM_SEEP: i32 = 24;
+/// Heat one unit of humus gives off as it burns (in the units of the heat flow): earth holds a
+/// few percent of it, so a burning soil only warms itself a little.
+const HUMUS_HEAT: f32 = 4.0;
 /// Metal melts in fresh lava or at the heart of a closed charcoal forge, and sets again at the
 /// same temperature. (Real iron melts at 1538 °C; the game squeezes the hot end of the
 /// scale the same way for rock and sand, so that a forge can get there.)
@@ -286,6 +298,9 @@ fn props(m: Mat) -> (f32, f32) {
         Mat::Terracotta | Mat::Vault => (0.14, 1.5),
         Mat::Iron | Mat::Steel => (0.5, C_METAL),
         Mat::Glass | Mat::Shard => (0.08, 1.5),
+        // Molten glass holds about as much heat as lava, so that one dissolves in the other at the
+        // same temperature.
+        Mat::MoltenGlass => (0.2, C_ROCK),
         // Molten rock and metal hold about as much heat as when they are solid; what they hold
         // on top is their latent heat (see `latent0`).
         Mat::Lava => (0.2, C_ROCK),
@@ -320,7 +335,7 @@ pub(super) fn cap(m: Mat) -> f32 {
 pub(super) fn latent0(m: Mat) -> f32 {
     match m {
         Mat::Water => LATENT_FUSION,
-        Mat::Lava => LATENT_ROCK,
+        Mat::Lava | Mat::MoltenGlass => LATENT_ROCK,
         Mat::Molten | Mat::MoltenSteel => LATENT_METAL,
         // One cell of water boils into `VAPOUR_PER_WATER` cells of steam at 100 °C, which between
         // them hold the water's heat and the heat that boiled it.
@@ -454,13 +469,16 @@ fn quiet_range(m: Mat) -> (f32, f32) {
     // The reactions of `react` itself.
     match m {
         Mat::Snow => lo = lo.max(-2.0),
-        Mat::Steam | Mat::Glass => return (f32::INFINITY, f32::NEG_INFINITY),
+        // (Molten glass dissolves in the lava it touches, whatever its heat.)
+        Mat::Steam | Mat::Glass | Mat::MoltenGlass => return (f32::INFINITY, f32::NEG_INFINITY),
+        // Earth: its water boils, then its humus burns.
+        Mat::Dirt | Mat::Mud | Mat::Grass => hi = hi.min(BOIL_C),
         // (Frost weathering happens between -8 and 6 °C: rock is taken as quiet only above.)
         Mat::Stone => lo = lo.max(6.0),
         Mat::Rust => hi = hi.min(SMELT_C),
         Mat::Iron => hi = hi.min(STEEL_C),
         Mat::Charcoal => hi = hi.min(CHARCOAL_IGNITE_C),
-        Mat::Grass | Mat::Seed | Mat::Sapling => hi = hi.min(WOOD_IGNITE_C - 40.0),
+        Mat::Seed | Mat::Sapling => hi = hi.min(WOOD_IGNITE_C - 40.0),
         Mat::Oil => hi = hi.min(OIL_IGNITE_C),
         Mat::Gunpowder | Mat::Dynamite => hi = hi.min(POWDER_IGNITE_C),
         _ => {}
@@ -483,6 +501,7 @@ fn tables() -> &'static Tables {
                 Mat::Water | Mat::Ice | Mat::Snow | Mat::Hail | Mat::Steam | Mat::Lava | Mat::Molten | Mat::MoltenSteel | Mat::Stone | Mat::Sand
                     | Mat::Shard | Mat::Glass | Mat::Rust | Mat::Iron | Mat::Steel | Mat::Wood | Mat::Trunk | Mat::Leaf | Mat::Branch | Mat::DeadLeaf
                     | Mat::Grass | Mat::Seed | Mat::Sapling | Mat::Gunpowder | Mat::Dynamite | Mat::Oil | Mat::Clay | Mat::Charcoal
+                    | Mat::Dirt | Mat::Mud | Mat::MoltenGlass
             );
         }
         t
@@ -495,6 +514,7 @@ pub fn paint_temp(m: Mat) -> Option<f32> {
     match m {
         Mat::Lava => Some(LAVA_C),
         Mat::Molten | Mat::MoltenSteel => Some(METAL_MELT_C + 200.0),
+        Mat::MoltenGlass => Some(GLASS_MELT_C + 150.0),
         Mat::Ice | Mat::Snow => Some(-15.0),
         Mat::Steam => Some(95.0),
         _ => None,
@@ -750,6 +770,7 @@ impl World {
                     Mat::Fire => FIRE_C,
                     Mat::Ember => EMBER_C,
                     Mat::Lava => LAVA_C,
+                    Mat::MoltenGlass => GLASS_MELT_C + 150.0,
                     _ => amb,
                 };
             }
@@ -1581,6 +1602,121 @@ impl World {
     ///
     /// (`quiet_range` says at which temperatures a matter cannot react at all: keep it in step
     /// with the thresholds below and with `matter::TRANSITIONS`.)
+    /// Earth heated (sand, humus and water, see `Aspect::Organic`). Its water boils first and
+    /// holds it at 100 °C: the heat beyond goes into `latent` until it has boiled a cell of
+    /// steam's worth, which seeps out into the air (`steam_room`), or, shut in, into cooler earth around,
+    /// where it condenses and warms it (the drying front goes into the ground). Dry, above
+    /// `HUMUS_BURN_C`, its humus burns away, smoking where air reaches it, slowly charring where
+    /// none does; with none left it is only sand. Returns whether its water is still boiling.
+    fn heat_soil(&mut self, i: usize, x: i32, y: i32, m: Mat, t: f32) -> bool {
+        let c = cap(m);
+        if self.moisture[i] > 0 && (t > BOIL_C || self.latent[i] > 0.0) {
+            self.latent[i] += (t - BOIL_C) * c;
+            self.temp[i] = BOIL_C;
+            // The heat a cell of steam takes away (the water in the soil carries none of its own).
+            let steam = heat_of(Mat::Steam, BOIL_C);
+            let units = self.moisture[i].min(SOIL_VAPOUR);
+            let need = steam * units as f32 / SOIL_VAPOUR as f32;
+            if self.latent[i] >= need {
+                if let Some((nx, ny)) = self.steam_room(x, y) {
+                    self.latent[i] -= need;
+                    self.moisture[i] -= units;
+                    // (A last trace of water just dries: it makes no whole cell of steam.)
+                    if units == SOIL_VAPOUR {
+                        let j = Self::idx(nx, ny);
+                        self.latent[i] += heat_of(Mat::Empty, self.temp[j]);
+                        self.set(nx, ny, Mat::Steam);
+                        self.temp[j] = BOIL_C;
+                    }
+                } else if let Some((nx, ny)) = Self::neighbors(x, y).into_iter().find(|&(nx, ny)| {
+                    Self::inb(nx, ny) && matches!(self.raw(nx, ny), Mat::Dirt | Mat::Grass | Mat::Mud) && {
+                        let j = Self::idx(nx, ny);
+                        self.temp[j] < BOIL_C && self.moisture[j] + units <= SOIL_FULL
+                    }
+                }) {
+                    let j = Self::idx(nx, ny);
+                    self.latent[i] -= need;
+                    self.moisture[i] -= units;
+                    self.moisture[j] += units;
+                    self.temp[j] += need / cap(self.raw(nx, ny));
+                    self.zones.wake(j);
+                }
+            }
+            // Shut in with nowhere to go, the vapour's pressure lets the earth heat past 100 °C.
+            if self.latent[i] > 2.0 * steam {
+                self.temp[i] += (self.latent[i] - 2.0 * steam) / c;
+                self.latent[i] = 2.0 * steam;
+            }
+            if self.moisture[i] == 0 {
+                self.temp[i] += self.latent[i] / c;
+                self.latent[i] = 0.0;
+            }
+            return true;
+        }
+        if self.latent[i] != 0.0 {
+            // Its water went (it seeped away): the heat it held for boiling comes back.
+            self.temp[i] += self.latent[i] / c;
+            self.latent[i] = 0.0;
+        }
+        let t = self.temp[i];
+        if m == Mat::Grass || t < HUMUS_BURN_C || self.moisture[i] > 0 {
+            return false;
+        }
+        let air = self.breathes(x, y);
+        if self.chance_t(if air { 3 } else { 12 }) {
+            self.organic[i] = self.organic[i].saturating_sub(1);
+            if air {
+                self.temp[i] += HUMUS_HEAT / c;
+                if self.at(x, y - 1) == Mat::Empty && self.mask_free(x, y - 1) && self.chance(3) {
+                    self.set(x, y - 1, Mat::Smoke);
+                }
+            }
+            if self.organic[i] == 0 {
+                // Nothing but its mineral grains is left: sand (no carbon cycle: the humus is gone).
+                self.retype(x, y, Mat::Sand);
+            }
+        }
+        false
+    }
+
+    /// Where a puff of steam boiled in the earth at (x, y) comes out: the nearest empty cell it
+    /// reaches through the pores of the ground (earth, mud, sand), at most `STEAM_SEEP` cells away
+    /// each way,
+    /// upward first. Wet ground far from the surface steams out of the top like a fumarole.
+    fn steam_room(&self, x: i32, y: i32) -> Option<(i32, i32)> {
+        const R: i32 = STEAM_SEEP;
+        const SIDE: usize = (2 * R + 1) as usize;
+        let mut seen = [[false; SIDE]; SIDE];
+        let mut queue = [(0i32, 0i32); SIDE * SIDE];
+        let (mut head, mut tail) = (0, 1);
+        seen[R as usize][R as usize] = true;
+        while head < tail {
+            let (dx, dy) = queue[head];
+            head += 1;
+            for (ex, ey) in [(0, -1), (-1, 0), (1, 0), (0, 1)] {
+                let (nx, ny) = (dx + ex, dy + ey);
+                if nx.abs() > R || ny.abs() > R || seen[(ny + R) as usize][(nx + R) as usize] {
+                    continue;
+                }
+                seen[(ny + R) as usize][(nx + R) as usize] = true;
+                let (cx, cy) = (x + nx, y + ny);
+                if !Self::inb(cx, cy) || !self.mask_free(cx, cy) {
+                    continue;
+                }
+                match self.raw(cx, cy) {
+                    Mat::Empty => return Some((cx, cy)),
+                    // (And through the steam already out, which it pushes on.)
+                    Mat::Dirt | Mat::Grass | Mat::Mud | Mat::Sand | Mat::Steam | Mat::Smoke => {
+                        queue[tail] = (nx, ny);
+                        tail += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
     fn react(&mut self, i: usize, x: i32, y: i32, m: Mat, t: f32) {
         if super::matter::fusion(m).is_some() && self.latent_heat(i, x, y, m, t) {
             return;
@@ -1608,6 +1744,15 @@ impl World {
                 }
             }
             Mat::Lava => {}
+            Mat::MoltenGlass => {
+                // Molten glass is silica, as lava mostly is: touching lava, it mixes into it.
+                if Self::neighbors(x, y).iter().any(|&(nx, ny)| self.raw(nx, ny) == Mat::Lava) && self.chance_t(6) {
+                    self.change_state(i, Mat::Lava, 0.0);
+                }
+            }
+            Mat::Dirt | Mat::Mud => {
+                self.heat_soil(i, x, y, m, t);
+            }
             Mat::Stone => {
                 if t > -8.0 && t < 6.0 && self.chance_t(20_000) {
                     // Frost weathering: water in the cracks freezes and thaws, rock crumbles to sand.
@@ -1627,7 +1772,7 @@ impl World {
                         worst = worst.max((self.temp[Self::idx(nx, ny)] - t).abs());
                     }
                 }
-                if worst > SHOCK_C && self.chance_t(6) {
+                if worst > SHOCK_C && t < GLASS_SOFT_C && self.chance_t(6) {
                     self.shatter(x, y);
                 }
             }
@@ -1661,8 +1806,12 @@ impl World {
                     self.light_charcoal(x, y, 1);
                 }
             }
-            // Grass burns off its earth: the soil stays, the flame goes up into the air.
+            // Grass burns off its earth once its water has boiled away: the soil stays, the flame
+            // goes up into the air.
             Mat::Grass => {
+                if self.heat_soil(i, x, y, m, t) {
+                    return;
+                }
                 if t >= WOOD_IGNITE_C - 40.0 && self.chance_t(10) {
                     self.retype(x, y, Mat::Dirt);
                     if self.at(x, y - 1) == Mat::Empty {
@@ -2290,5 +2439,169 @@ mod atmosphere_tests {
         assert!((coldest as i32 - CEILING_Y()).abs() <= 1, "coldest row {coldest}");
         assert!(t[0] > t[coldest] + 5.0 && t[GROUND_Y as usize] > t[coldest] + 5.0);
     }
+
 }
 
+/// Earth heated (`heat_soil`) and glass melting into lava.
+#[cfg(test)]
+mod soil_tests {
+    use super::*;
+
+    fn still() -> World {
+        let mut w = World::new();
+        w.structures_fall = false;
+        w.day_cycle = false;
+        w
+    }
+
+    /// Heats cell (x, y) by `dt` °C and lets it react, as the heat pass does.
+    fn heat_and_react(w: &mut World, x: i32, y: i32, dt: f32) {
+        let i = W() * y as usize + x as usize;
+        w.temp[i] += dt;
+        let m = w.cells[i].m;
+        let t = w.temp[i];
+        w.react(i, x, y, m, t);
+    }
+
+    #[test]
+    fn earth_heated_boils_dry_at_100_then_its_humus_burns_and_sand_is_left() {
+        let mut w = World::new_static();
+        let (x, y) = (100, 300);
+        w.set(x, y, Mat::Dirt);
+        let i = W() * y as usize + x as usize;
+        assert_eq!(w.organic[i], SOIL_ORGANIC, "fresh earth holds all its humus");
+        w.moisture[i] = SOIL_FULL;
+        w.temp[i] = 90.0;
+        let steam = |w: &World| w.cells.iter().filter(|c| c.m == Mat::Steam).count();
+        let mut looks = 0;
+        while w.moisture[i] > 0 {
+            heat_and_react(&mut w, x, y, 20.0);
+            assert!(w.moisture[i] == 0 || w.temp[i] <= BOIL_C + 1e-3, "wet earth stays at 100 °C: {}", w.temp[i]);
+            looks += 1;
+            assert!(looks < 10_000);
+        }
+        // Three cells of water make twelve cells of steam (a cell's worth is a quarter of water).
+        assert_eq!(steam(&w), 12, "all its water left as steam");
+        assert!(looks > 30, "boiling it dry takes a lot of heat: {looks} looks");
+        assert_eq!(w.raw(x, y), Mat::Dirt);
+        for c in w.cells.iter_mut().filter(|c| c.m == Mat::Steam) {
+            c.m = Mat::Empty;
+        }
+        // Dry: it heats up again and its humus burns away, smoking.
+        let mut looks = 0;
+        while w.raw(x, y) == Mat::Dirt {
+            if w.temp[i] < 300.0 {
+                heat_and_react(&mut w, x, y, 20.0);
+            } else {
+                heat_and_react(&mut w, x, y, 0.0);
+            }
+            looks += 1;
+            assert!(looks < 10_000, "the humus never burnt: {} left", w.organic[i]);
+        }
+        assert_eq!(w.raw(x, y), Mat::Sand, "with its humus gone, earth is only sand");
+        assert!(w.cells.iter().any(|c| c.m == Mat::Smoke), "burning humus smokes");
+    }
+
+    #[test]
+    fn earth_shut_in_pushes_its_steam_into_cooler_earth() {
+        let mut w = World::new_static();
+        // A ball of earth sealed in rock: the steam has no way out to the air.
+        for y in 293..308 {
+            for x in 93..108 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for y in 295..306 {
+            for x in 95..106 {
+                w.set(x, y, Mat::Dirt);
+                w.temp[W() * y as usize + x as usize] = 20.0;
+            }
+        }
+        let i = W() * 300 + 100;
+        w.moisture[i] = 64;
+        let total = |w: &World| w.moisture.iter().map(|&m| m as u32).sum::<u32>();
+        let before = total(&w);
+        w.temp[i] = 90.0;
+        for _ in 0..200 {
+            heat_and_react(&mut w, 100, 300, 20.0);
+        }
+        assert_eq!(w.moisture[i], 0, "the hot cell dried");
+        assert_eq!(total(&w), before, "no water lost: it went into the earth around");
+        assert!(w.temp[i] > BOIL_C, "dry, it heats past 100 °C");
+    }
+
+    #[test]
+    fn glass_melts_and_molten_glass_mixes_into_lava() {
+        let mut w = World::new_static();
+        w.set(100, 300, Mat::Glass);
+        let i = W() * 300 + 100;
+        w.temp[i] = GLASS_MELT_C + 50.0;
+        let mut looks = 0;
+        while w.raw(100, 300) == Mat::Glass {
+            heat_and_react(&mut w, 100, 300, 30.0);
+            looks += 1;
+            assert!(looks < 1000, "glass never melted");
+        }
+        assert_eq!(w.raw(100, 300), Mat::MoltenGlass);
+        // Cooled, it sets back into glass.
+        w.temp[i] = GLASS_MELT_C - 100.0;
+        let mut looks = 0;
+        while w.raw(100, 300) == Mat::MoltenGlass {
+            heat_and_react(&mut w, 100, 300, -5.0);
+            looks += 1;
+            assert!(looks < 1000, "molten glass never set");
+        }
+        assert_eq!(w.raw(100, 300), Mat::Glass);
+        // Molten again, against lava: it becomes lava, with the heat it held.
+        w.set(100, 300, Mat::MoltenGlass);
+        w.temp[i] = 1000.0;
+        w.set(101, 300, Mat::Lava);
+        w.temp[i + 1] = 1000.0;
+        let before = heat_of(Mat::MoltenGlass, 1000.0);
+        let mut looks = 0;
+        while w.raw(100, 300) == Mat::MoltenGlass {
+            heat_and_react(&mut w, 100, 300, 0.0);
+            looks += 1;
+            assert!(looks < 1000, "molten glass never mixed into the lava");
+        }
+        assert_eq!(w.raw(100, 300), Mat::Lava);
+        assert!((heat_of(Mat::Lava, w.temp[i]) - before).abs() < 1e-2);
+    }
+
+    #[test]
+    fn wet_earth_against_lava_ends_as_sand_glass_or_lava() {
+        let mut w = still();
+        for x in 100..200 {
+            for y in 300..H() as i32 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for x in 120..150 {
+            for y in 270..300 {
+                w.set(x, y, Mat::Dirt);
+                w.moisture[W() * y as usize + x as usize] = 150;
+            }
+        }
+        for x in 170..175 {
+            for y in 260..300 {
+                w.set(x, y, Mat::Stone);
+            }
+        }
+        for x in 150..170 {
+            for y in 270..300 {
+                w.set(x, y, Mat::Lava);
+                w.temp[W() * y as usize + x as usize] = 1150.0;
+            }
+        }
+        let count = |w: &World, m: Mat| w.cells.iter().filter(|c| c.m == m).count();
+        let mut boiled = false;
+        for _ in 0..3_000 {
+            w.step();
+            boiled |= count(&w, Mat::Steam) > 0;
+        }
+        let gone = 30 * 30 - count(&w, Mat::Dirt) - count(&w, Mat::Mud) - count(&w, Mat::Grass);
+        assert!(boiled, "the earth's water boiled off");
+        assert!(gone > 20, "the earth by the lava burnt to sand: {gone} cells");
+        assert!(count(&w, Mat::Dirt) > 30 * 30 / 2, "the earth away from the lava is still earth");
+    }
+}

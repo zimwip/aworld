@@ -266,14 +266,18 @@ pub enum Mat {
     /// A high explosive: it detonates instead of burning, with a shock forty times the pressure
     /// of black powder's.
     Dynamite,
+    /// Glass heated past its melting point: a thick, glowing liquid. It sets back into glass as it
+    /// cools, and mixes into the lava it touches.
+    MoltenGlass,
 }
 
 impl Mat {
-    pub const ALL: [Mat; 41] = [
+    pub const ALL: [Mat; 42] = [
         Mat::Empty, Mat::Sand, Mat::Water, Mat::Fire, Mat::Steam, Mat::Iron, Mat::Wood, Mat::Stone,
         Mat::Brick, Mat::Rust, Mat::Ash, Mat::Ember, Mat::Lava, Mat::Ice, Mat::Gunpowder, Mat::Dirt, Mat::Grass,
         Mat::Leaf, Mat::Steel, Mat::Cloud, Mat::Seed, Mat::Sapling, Mat::Mud, Mat::Glass, Mat::Snow, Mat::Shard, Mat::DeadLeaf, Mat::Branch, Mat::Trunk, Mat::Hail, Mat::Oil, Mat::Smoke, Mat::Molten, Mat::Clay, Mat::Terracotta,
         Mat::Charcoal, Mat::Saltpeter, Mat::MoltenSteel, Mat::Vault, Mat::Diamond, Mat::Dynamite,
+        Mat::MoltenGlass,
     ];
 
     pub fn from_u8(v: u8) -> Mat {
@@ -297,7 +301,7 @@ impl Mat {
         match self {
             Empty => Kind::Empty,
             Sand | Rust | Ash | Charcoal | Gunpowder | Saltpeter | Seed | Mud | Snow | Shard | DeadLeaf | Hail => Kind::Powder,
-            Water | Lava | Oil | Molten | MoltenSteel => Kind::Liquid,
+            Water | Lava | Oil | Molten | MoltenSteel | MoltenGlass => Kind::Liquid,
             Steam | Cloud | Smoke => Kind::Gas,
             Fire => Kind::Flame,
             Iron | Wood | Stone | Brick | Ember | Ice | Dirt | Grass | Leaf | Steel | Sapling | Glass | Branch | Trunk | Clay | Terracotta | Vault | Diamond | Dynamite => Kind::Static,
@@ -331,9 +335,9 @@ impl Mat {
         matches!(self, Mat::Molten | Mat::MoltenSteel)
     }
 
-    /// Molten rock or metal.
+    /// Molten rock, glass or metal.
     pub fn is_melt(self) -> bool {
-        matches!(self, Mat::Lava | Mat::Molten | Mat::MoltenSteel)
+        matches!(self, Mat::Lava | Mat::Molten | Mat::MoltenSteel | Mat::MoltenGlass)
     }
 
     pub fn hot(self) -> bool {
@@ -444,6 +448,10 @@ pub enum Aspect {
     /// `growth`: what a young tree still has to grow; in soil, the seeds sown in it (fertile
     /// earth), each of which can start a tree.
     Growth,
+    /// `organic`: the humus in soil, in `SOIL_ORGANIC`ths of what fresh earth holds. Earth is
+    /// mineral grains (sand), humus and water; heated dry, its humus burns away, and earth with
+    /// none left is only sand.
+    Organic,
     /// `jet`: sideways speed and direction of a drop shot out of a jet (see `pockets::fly`).
     Jet,
 }
@@ -456,6 +464,7 @@ impl Mat {
             Aspect::Water => matches!(self, Mat::Dirt | Mat::Grass | Mat::Mud | Mat::Steam | Mat::Cloud),
             Aspect::Fuel => matches!(self, Mat::Fire | Mat::Ember),
             Aspect::Growth => matches!(self, Mat::Sapling | Mat::Dirt | Mat::Grass | Mat::Mud),
+            Aspect::Organic => matches!(self, Mat::Dirt | Mat::Grass | Mat::Mud),
             Aspect::Jet => self.kind() == Kind::Liquid,
         }
     }
@@ -475,6 +484,7 @@ pub(super) struct States {
     moisture: u16,
     fuel: Fuel,
     growth: u8,
+    organic: u8,
     jet: u8,
 }
 
@@ -507,6 +517,8 @@ const SOIL_VAPOUR: u16 = VAPOUR_UNITS;
 const SOIL_SEEP: u32 = 8;
 /// Saturated soil over a hole lets a drop fall once in this many steps.
 const SOIL_DRIP: u32 = 300;
+/// Humus in a cell of fresh earth (see `Aspect::Organic`).
+pub const SOIL_ORGANIC: u8 = 16;
 /// Most seeds a cell of soil holds.
 pub const SOIL_SEEDS: u8 = 8;
 /// A seed in the top of the soil sprouts once in this many steps, when the soil is at least
@@ -617,6 +629,7 @@ pub struct Matter {
     moisture: Vec<u16>,
     fuel: Vec<Fuel>,
     growth: Vec<u8>,
+    organic: Vec<u8>,
     jet: Vec<u8>,
     log: Vec<u16>,
 }
@@ -701,6 +714,9 @@ pub struct World {
     /// exact physics, 1 = fewer sub-steps and solver iterations (`CHEAP`), 2 = that, and the
     /// liquid that flies or falls freely goes over to drops (`fall_to_drops`).
     pub liq_tier: u8,
+    /// Whether the liquids take the simple solver (see `liquid::SIMPLE_SUB`): cheaper, less exact,
+    /// for every liquid. Off: the detailed one. Set from the Monde tab, to compare them.
+    pub simple_liquids: bool,
     /// The liquids' work in the last step: cells of their spans, summed over the sub-steps (what
     /// their turn costs, the same on every machine: the game reads it to tell whether the liquids
     /// are what makes it slow).
@@ -713,6 +729,12 @@ pub struct World {
     /// Units of water in each cell of water, `field::FULL` for a full one (stored as 0, so that a
     /// cell painted water is full).
     fill: Vec<u32>,
+    /// The liquid held inside each cell of thin matter (`Mat::one_way`: a tree, ash), and how
+    /// much of it (units of fill, `field::FULL` a full cell): the matter lets the liquid through
+    /// sideways, so a flood fills it as it fills the air (`Mat::Empty`: none; see
+    /// `World::open_pores`).
+    pore: Vec<Mat>,
+    pore_fill: Vec<u32>,
     /// Closed pockets of gas (see `pockets.rs`): for each cell its pocket id + 1 (0: not gas).
     pocket_of: Vec<u32>,
     pockets: Vec<pockets::Pocket>,
@@ -728,6 +750,7 @@ pub struct World {
     pub moisture: Vec<u16>,
     pub fuel: Vec<Fuel>,
     pub growth: Vec<u8>,
+    pub organic: Vec<u8>,
     jet: Vec<u8>,
     /// Absolute pressure (atm) inside each liquid cell; 1 elsewhere.
     liq_p: Vec<f32>,
@@ -810,10 +833,13 @@ impl World {
             push: pressure::Push::new(),
             lod: 0,
             liq_tier: 0,
+            simple_liquids: false,
             liq_work: 0,
             parallel_cells: turn::parallel_by_default(),
             liq: liquid::Liquids::default(),
             fill: vec![0; W() * H()],
+            pore: vec![Mat::Empty; W() * H()],
+            pore_fill: vec![0; W() * H()],
             pocket_of: vec![0; W() * H()],
             pockets: Vec::new(),
             liq_p: vec![1.0; W() * H()],
@@ -823,6 +849,7 @@ impl World {
             moisture: vec![0; W() * H()],
             fuel: vec![Fuel::default(); W() * H()],
             growth: vec![0; W() * H()],
+            organic: vec![0; W() * H()],
             jet: vec![0; W() * H()],
             cls: vec![0; W() * H()],
             liq_w: vec![0.0; W() * H()],
@@ -885,8 +912,8 @@ impl World {
             ticks, log, paint_log, temp, clock, dt, tick_time, heat, day_cycle,
             climate_fixed, climate, revision, wind, biome, leaf_rgb, autumn, grass_rgb,
             structures_fall, mask, mask_prev: _, block_mat, mask_pass, touched, blasts, powder_booms, ejecta, thuds, water_flow, flow, push,
-            lod, liq_tier, liq_work, parallel_cells, liq, fill, pocket_of,
-            pockets, latent, vel, fall_at, moisture, fuel, growth, jet, liq_p, cls: _, liq_w: _, zones, bursts, storm,
+            lod, liq_tier, simple_liquids, liq_work, parallel_cells, liq, fill, pore, pore_fill, pocket_of,
+            pockets, latent, vel, fall_at, moisture, fuel, growth, organic, jet, liq_p, cls: _, liq_w: _, zones, bursts, storm,
             pressure_cache: _, prof: _, air_rows, air_sky, later: _, dried, gone,
         } = from;
         self.dried = *dried;
@@ -926,10 +953,13 @@ impl World {
         self.push.copy_picture(push);
         self.lod = *lod;
         self.liq_tier = *liq_tier;
+        self.simple_liquids = *simple_liquids;
         self.liq_work = *liq_work;
         self.parallel_cells = *parallel_cells;
         self.liq.copy_picture(liq);
         self.fill.clone_from(fill);
+        self.pore.clone_from(pore);
+        self.pore_fill.clone_from(pore_fill);
         // The grains' falling speed, for the simulation view.
         self.vel.clone_from(vel);
         self.fall_at.clone_from(fall_at);
@@ -939,6 +969,7 @@ impl World {
         self.moisture.clone_from(moisture);
         self.fuel.clone_from(fuel);
         self.growth.clone_from(growth);
+        self.organic.clone_from(organic);
         self.jet.clone_from(jet);
         self.liq_p.clone_from(liq_p);
         self.zones.clone_from(zones);
@@ -1062,7 +1093,7 @@ impl World {
     }
 
     pub fn snapshot(&self) -> Matter {
-        Matter { cells: self.cells.clone(), moisture: self.moisture.clone(), fuel: self.fuel.clone(), growth: self.growth.clone(), jet: self.jet.clone(), log: self.log.clone() }
+        Matter { cells: self.cells.clone(), moisture: self.moisture.clone(), fuel: self.fuel.clone(), growth: self.growth.clone(), organic: self.organic.clone(), jet: self.jet.clone(), log: self.log.clone() }
     }
 
     pub fn restore(&mut self, snap: &Matter) {
@@ -1073,6 +1104,7 @@ impl World {
         self.moisture.copy_from_slice(&snap.moisture);
         self.fuel.copy_from_slice(&snap.fuel);
         self.growth.copy_from_slice(&snap.growth);
+        self.organic.copy_from_slice(&snap.organic);
         self.jet.copy_from_slice(&snap.jet);
         self.log.copy_from_slice(&snap.log);
         self.latent.fill(0.0);
@@ -1207,6 +1239,14 @@ impl World {
         row >= feet || (row >= feet - climb && !self.at(x, y - 1).one_way() && !self.hard_for_car(x, y - 1))
     }
 
+    /// Whether (x, y) is thin matter (`Mat::one_way`) with room in it for more liquid.
+    pub(super) fn thin_has_room(&self, x: i32, y: i32) -> bool {
+        Self::inb(x, y) && {
+            let i = Self::idx(x, y);
+            self.cells[i].m.one_way() && self.mask[i] == 0 && (self.pore[i] == Mat::Empty || self.pore_fill[i] < field::FULL)
+        }
+    }
+
     /// The column just past the thin matter (`Mat::one_way`) beside (x, y) on side `dir`, if
     /// there is some (at most `THIN_RUN` cells of it): where a liquid that passes through it
     /// comes out.
@@ -1248,11 +1288,21 @@ impl World {
         };
         let frame = self.frame;
         let i = Self::idx(x, y);
+        let held = if self.pore[i] == Mat::Water { self.pore_fill[i] } else { 0 };
         self.cells[i] = Cell { m, stamp: frame };
         self.latent[i] = 0.0;
         self.vel[i] = 0;
         self.clear_states(i);
+        // The water thin matter held soaks the soil it turns into (ash into earth); otherwise
+        // it goes with the matter.
+        if held > 0 && m.carries(Aspect::Water) {
+            self.moisture[i] = (held as u64 * WATER_UNITS as u64 / field::FULL as u64).min(SOIL_FULL as u64) as u16;
+        }
         self.fuel[i].left = left;
+        // Fresh earth holds all its humus.
+        if m.carries(Aspect::Organic) {
+            self.organic[i] = SOIL_ORGANIC;
+        }
         self.zones.wake(i);
         match m {
             Mat::Fire => self.temp[i] = thermal::FIRE_C,
@@ -1311,8 +1361,11 @@ impl World {
         self.fill.swap(i, j);
         self.fuel.swap(i, j);
         self.growth.swap(i, j);
+        self.organic.swap(i, j);
         self.jet.swap(i, j);
         self.log.swap(i, j);
+        self.pore.swap(i, j);
+        self.pore_fill.swap(i, j);
     }
 
     /// Clears the states of cell `i` that only some matters carry (heat stays: every matter has one).
@@ -1321,12 +1374,15 @@ impl World {
         self.fill[i] = 0;
         self.fuel[i] = Fuel::default();
         self.growth[i] = 0;
+        self.organic[i] = 0;
         self.jet[i] = 0;
         self.log[i] = 0;
+        self.pore[i] = Mat::Empty;
+        self.pore_fill[i] = 0;
     }
 
     fn states(&self, i: usize) -> States {
-        States { moisture: self.moisture[i], fuel: self.fuel[i], growth: self.growth[i], jet: self.jet[i] }
+        States { moisture: self.moisture[i], fuel: self.fuel[i], growth: self.growth[i], organic: self.organic[i], jet: self.jet[i] }
     }
 
     /// Cell `i`, which was `from` and has just been set to a new matter, takes back the states of
@@ -1342,6 +1398,9 @@ impl World {
         }
         if both(Aspect::Growth) {
             self.growth[i] = kept.growth;
+        }
+        if both(Aspect::Organic) {
+            self.organic[i] = kept.organic;
         }
         if both(Aspect::Jet) {
             self.jet[i] = kept.jet;
@@ -1537,7 +1596,7 @@ impl World {
         match m.kind() {
             Kind::Empty | Kind::Gas | Kind::Flame => false,
             // Hot liquids would fire the masonry: they are left to the player's care.
-            Kind::Liquid => !m.hot() && !matches!(m, Mat::Molten | Mat::MoltenSteel),
+            Kind::Liquid => !m.hot() && !m.is_melt(),
             Kind::Powder => true,
             Kind::Static => {
                 if m.is_vegetation() || matches!(m, Mat::Iron | Mat::Steel | Mat::Brick | Mat::Terracotta | Mat::Glass | Mat::Vault) || !self.structures_fall {
@@ -1756,7 +1815,10 @@ impl World {
         // cells go to it: a cell it changed after they went would be a cell the card has wrong,
         // and what the card did to it would be lost at the next step.)
         self.take_liquids_from_card();
-        if self.liquids_on_card() {
+        // (Where the liquids run when the step begins: they may go over to the card or back
+        // in it.)
+        let carded = self.liquids_on_card();
+        if carded {
             self.seep_through_thin();
         }
         if audit {
@@ -1776,9 +1838,6 @@ impl World {
                 // `liquid::turns`; a step shorter than a tick leaves them where they are,
                 // as it does the cells.)
                 timed!(self, prof::LIQUIDS, self.step_liquids(ticks as f32 * STEP));
-            }
-            if !self.liquids_on_card() {
-                self.seep_through_thin();
             }
             if audit {
                 marks.push(("liquides", self.water_units_audit()));
@@ -1859,6 +1918,7 @@ impl World {
             Mat::Lava => self.react_hot_liquid(x, y, Mat::Stone),
             Mat::Molten => self.react_hot_liquid(x, y, Mat::Iron),
             Mat::MoltenSteel => self.react_hot_liquid(x, y, Mat::Steel),
+            Mat::MoltenGlass => self.react_hot_liquid(x, y, Mat::Glass),
             Mat::Steam => self.react_steam(x, y),
             Mat::Smoke => self.react_smoke(x, y),
             Mat::Cloud => self.react_cloud(x, y),
@@ -2169,8 +2229,14 @@ impl World {
             }
             Mat::Hail => (0, 70),
             // Earth holds together: its grains only slide where the drop is two cells (a steep
-            // bank of about 60 degrees, as a cut in the ground stands).
-            Mat::Dirt => (100, 0),
+            // bank of about 60 degrees, as a cut in the ground stands). Its humus and its water
+            // bind it: baked dry with its humus burnt, it crumbles almost like sand.
+            Mat::Dirt => {
+                let i = Self::idx(x, y);
+                let humus = self.organic[i] as u32 * 100 / SOIL_ORGANIC as u32;
+                let wet = self.moisture[i] as u32 * 100 / SOIL_FIELD as u32;
+                (60 + 40 * humus.max(wet).min(100) / 100, 0)
+            }
             Mat::Mud => (0, 90),
             Mat::Ash => (30, 0),
             _ => (0, 0),
@@ -4191,7 +4257,7 @@ impl World {
     fn push_liquid(&mut self, i: usize, (vx, vy): (f32, f32)) {
         let (x, y) = xy(i);
         let liq = &mut self.liq;
-        if let Some(Some(card)) = liq.card.as_mut() {
+        if let Some(card) = liq.active_card() {
             for e in [liquid::ui(x, y), liquid::ui(x + 1, y)] {
                 card.patches_up.push(liquid_gpu::Patch { edge: e as u32, mode: 1, value: vx, weight: 1.0 });
             }
@@ -7697,7 +7763,9 @@ fn flowing_water_erodes_bare_soil() {
             w.step();
         }
         assert_eq!(count(&w, Mat::Grass), 0, "the grass burnt");
-        assert!(count(&w, Mat::Dirt) > 90, "the earth stays: {}", count(&w, Mat::Dirt));
+        // (Kept at 400 °C, the earth's humus burns too: some of it is already only sand.)
+        let earth = count(&w, Mat::Dirt) + count(&w, Mat::Sand);
+        assert!(earth > 90, "the earth stays: {earth}");
     }
 
     #[test]

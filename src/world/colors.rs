@@ -3,6 +3,21 @@
 
 use super::*;
 
+/// The colour of a cell holding `fill` units of water at `t` °C, at (x, y).
+fn water_rgba(t: f32, fill: u32, x: usize, y: usize) -> [u8; 4] {
+    let h = (x as u32).wrapping_mul(73856093) ^ (y as u32).wrapping_mul(19349663);
+    let v = ((h >> 7) & 15) as i32 - 8;
+    let flick = (h >> 11 & 31) as i32;
+    // Warm water shifts toward a pale, reddish tone just before it boils.
+    let warm = ((t - 30.0).max(0.0) * 1.3) as i32;
+    let (r, g, b) = (44 + v / 2 + warm, 124 + v + flick / 4 + warm / 3, (224 + v - warm).max(0));
+    // A cell of the field that is not full is water mixed with air: the less water, the clearer
+    // it shows, and the paler (spray and the froth of a splash are whitish, not a deeper blue).
+    let q = fill.min(field::FULL) as i32 * 256 / field::FULL as i32;
+    let pale = |c: i32, to: i32| (c + (to - c) * (256 - q) / 256).clamp(0, 255) as u8;
+    [pale(r, 200), pale(g, 222), pale(b, 240), (205 * q / 256) as u8]
+}
+
 /// A pressure (atmospheres, absolute) as a colour: violet for thin air and suction, blue and green
 /// around one atmosphere, yellow, orange and red under load, white under crushing weight.
 pub fn pressure_rgb(atm: f32) -> (u8, u8, u8) {
@@ -154,8 +169,13 @@ impl World {
 
     /// Everything but the trees, which are drawn as a separate swaying layer.
     pub fn color_without_trees(&self, x: usize, y: usize) -> [u8; 4] {
-        if self.cells[y * W() + x].m.is_vegetation() {
-            return [0, 0, 0, 0];
+        let i = y * W() + x;
+        if self.cells[i].m.is_vegetation() {
+            // The liquid a flood left in the tree shows behind it.
+            return match self.pore[i] {
+                Mat::Water => water_rgba(self.temp[i], self.pore_fill[i], x, y),
+                _ => [0, 0, 0, 0],
+            };
         }
         self.color(x, y)
     }
@@ -175,15 +195,8 @@ impl World {
             Mat::Empty => (0, 0, 0, 0),
             Mat::Sand => (226 + v, 200 + v, 124 + v, 255),
             Mat::Water => {
-                // Warm water shifts toward a pale, reddish tone just before it boils.
-                let warm = ((t - 30.0).max(0.0) * 1.3) as i32;
-                let (r, g, b) = (44 + v / 2 + warm, 124 + v + flick / 4 + warm / 3, (224 + v - warm).max(0));
-                // A cell of the field that is not full is water mixed with air: the less water,
-                // the clearer it shows, and the paler (spray and the froth of a splash are
-                // whitish, not a deeper blue).
-                let q = self.water_fill(y * W() + x).min(field::FULL) as i32 * 256 / field::FULL as i32;
-                let pale = |c: i32, to: i32| c + (to - c) * (256 - q) / 256;
-                (pale(r, 200), pale(g, 222), pale(b, 240), 205 * q / 256)
+                let [r, g, b, a] = water_rgba(t, self.water_fill(y * W() + x), x, y);
+                (r as i32, g as i32, b as i32, a as i32)
             }
             Mat::Fire => (255, (80 + self.fuel[y * W() + x].left as i32 * 3).min(235), 30, 235),
             Mat::Steam | Mat::Cloud => (0, 0, 0, 0),
@@ -227,7 +240,11 @@ impl World {
                 if seeds > 0 && (h >> 3) % 16 < 2 + seeds {
                     (184 + v, 150 + v, 96 + v / 2, 255)
                 } else {
-                    ((112 + v) * k / 256, (78 + v / 2) * k / 256, (52 + v / 2) * k / 256, 255)
+                    // Humus is what makes earth dark: as it burns away, the earth pales towards
+                    // the colour of the sand it is made of.
+                    let o = 256 - 256 * self.organic[y * W() + x].min(SOIL_ORGANIC) as i32 / SOIL_ORGANIC as i32;
+                    let mix = |a: i32, s: i32| a + (s - a) * o / 256;
+                    (mix(112 + v, 214 + v) * k / 256, mix(78 + v / 2, 186 + v) * k / 256, mix(52 + v / 2, 118 + v) * k / 256, 255)
                 }
             }
             Mat::Grass => {
@@ -269,6 +286,8 @@ impl World {
             Mat::Snow => (244 + v / 3, 247 + v / 3, 252, 255),
             Mat::Hail => (210 + v, 236 + v, 252, 255),
             Mat::Molten | Mat::MoltenSteel => (255, 196 + flick * 2 + v, 90 + flick, 255),
+            // Glowing orange, half see-through.
+            Mat::MoltenGlass => (255, 138 + flick * 2 + v, 52 + flick, 225),
             Mat::Oil => {
                 // Almost black with a rainbow sheen where it catches the light.
                 let sheen = if (x / 3 + y / 2) % 7 == 0 { 26 } else { 0 };
