@@ -6,7 +6,7 @@
 //! ```
 //!
 //! `AWORLD_BENCH_STEPS` sets how many steps each scene is measured over (300 by default),
-//! `AWORLD_BENCH_SCENE` runs only the scene of that name, `AWORLD_BENCH_TIER` simplifies the liquids (see `World::liq_tier`), `AWORLD_BENCH_SERIES=1` also prints
+//! `AWORLD_BENCH_SCENE` runs only the scene of that name, `AWORLD_BENCH_TIER` simplifies the liquids (see `World::liq_tier`), `AWORLD_BENCH_SIMPLE=1` gives them the simple solver (`World::simple_liquids`), `AWORLD_BENCH_SERIES=1` also prints
 //! the time of the first 96 measured steps one by one (to see the steps that stick out).
 
 use super::*;
@@ -314,6 +314,8 @@ fn bench_scenes() {
     let only = std::env::var("AWORLD_BENCH_SCENE").ok();
     // The liquids' tier (`World::liq_tier`: AWORLD_BENCH_TIER=1 the cheap one, 2 the drops).
     let tier: u8 = std::env::var("AWORLD_BENCH_TIER").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    // The simple solver of the liquids (`World::simple_liquids`: AWORLD_BENCH_SIMPLE=1).
+    let simple = std::env::var("AWORLD_BENCH_SIMPLE").is_ok_and(|v| v == "1");
     // The length of a step, in ticks of 1/60 s (AWORLD_BENCH_DT=2: steps of 1/30 s).
     let ticks: f32 = std::env::var("AWORLD_BENCH_DT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let dt = ticks * super::STEP;
@@ -324,6 +326,7 @@ fn bench_scenes() {
         }
         let mut w = make();
         w.liq_tier = tier;
+        w.simple_liquids = simple;
         // A short warm-up so that the first explosions and flows get going.
         for i in 0..30 {
             if let Some(f) = each {
@@ -564,6 +567,8 @@ fn a_block_of_sand_falls_by_gravity_at_any_step() {
 #[ignore]
 fn flood_probe() {
     let mut w = deluge();
+    // (AWORLD_BENCH_SIMPLE=1: on the simple solver of the liquids.)
+    w.simple_liquids = std::env::var("AWORLD_BENCH_SIMPLE").is_ok_and(|v| v == "1");
     let ticks: f32 = std::env::var("AWORLD_BENCH_DT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let steps: usize = std::env::var("AWORLD_PROBE_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
     let every = (60.0 / ticks).round() as usize;
@@ -574,8 +579,9 @@ fn flood_probe() {
         if k % every == 0 {
             let water = (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Water).count();
             eprintln!(
-                "{:.1} s : {water} cellules d'eau, {} gouttes, {}/{} zones éveillées, {:.1} ms/pas",
+                "{:.1} s : {water} cellules d'eau ({:.0} pleines), {} gouttes, {}/{} zones éveillées, {:.1} ms/pas",
                 k as f32 * STEP * ticks,
+                w.water_units_audit() as f64 / field::FULL as f64,
                 w.liq.drops.len(),
                 w.zones.awake_count(),
                 CW() * CH(),
