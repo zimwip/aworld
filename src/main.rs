@@ -1618,7 +1618,7 @@ impl Game {
                     self.blow_up_truck();
                 }
             }
-            Tool::Lightning if click => self.world.strike(g.0, g.1),
+            Tool::Lightning if click => self.stroke(Stroke::Strike { at: g }),
             Tool::Sensor if click => self.sensor_click(at),
             Tool::Entry if click => self.entry = Some(g),
             Tool::Exit if click => self.exit = Some(g),
@@ -4337,7 +4337,7 @@ async fn game() {
         }
         // The latest picture of the world, or the world itself for a frame that may change it.
         let lent = sim.as_mut().and_then(|s| {
-            let edit = simthread::input_may_edit(&game, &ui);
+            let edit = simthread::input_may_edit(&game, &ui, game.camera.apply(base).to_world(ui.mouse));
             s.frame(&mut game, edit)
         });
         // A brush held down paints on the picture, and the strokes go to the world's thread

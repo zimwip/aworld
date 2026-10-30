@@ -121,3 +121,17 @@ flickers. The flamethrower and the shovel still borrow (they touch the trucks an
 
 `PAINT=1 cargo test --release frame_cost -- --ignored --nocapture` (cloud machine, 4 cores): 52 ms a frame with the old
 lend at every frame (`PAINT=lend`), 2 ms with the strokes sent.
+
+## Lightning (October 30)
+
+A bolt costs the world next to nothing: `strike_probe` (a calm countryside, a strike, the steps around it) gives 9.7 ms a
+step before and 10.0 after, and the `orage` scene runs as fast with its bolts as without. What slowed the game was the
+click: like the brush once did, the press, every frame the button stayed down and the release each borrowed the real
+world, so each frame waited for a whole step (30–50 ms in a storm) and the next for a picture made after it.
+
+Now a bolt called down goes to the simulation thread as a stroke (`Stroke::Strike`) and shows with the next picture; only
+a click on the little boy still borrows. The release of a stroke no longer borrows either (it changes nothing in the
+world).
+
+`STRIKE=1 cargo test --release frame_cost -- --ignored --nocapture` (a bolt every 10 frames, cloud machine, 4 cores):
+19.6 ms a frame and 113 ms at worst with the old lends (`STRIKE=lend`), 3.5 ms and 12 ms with the strikes sent.

@@ -798,3 +798,39 @@ fn structures_probe() {
         eprintln!("{name}: passe des structures {:.2} ms (médiane), {:.2} ms (la moins chère)", times[times.len() / 2], times[0]);
     }
 }
+
+/// What a bolt costs the steps after it: a calm countryside, 60 steps measured, then a strike
+/// from the sky and 180 steps measured after it.
+///
+/// ```text
+/// cargo test --release --bin aworld strike_probe -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn strike_probe() {
+    let mut w = countryside();
+    for _ in 0..60 {
+        w.step();
+    }
+    let run = |w: &mut World, n: u32, label: &str| {
+        w.prof.on = true;
+        w.prof.reset();
+        let mut series = String::new();
+        let t = Instant::now();
+        for i in 0..n {
+            let s = Instant::now();
+            w.step();
+            if i < 96 {
+                series += &format!("{:5.1}{}", s.elapsed().as_secs_f64() * 1000.0, if i % 16 == 15 { "\n" } else { " " });
+            }
+        }
+        eprintln!("\n=== {label}: {:.2} ms/pas", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+        eprintln!("{series}");
+        eprint!("{}", w.prof.report());
+    };
+    run(&mut w, 60, "avant l'éclair");
+    let x = 480;
+    let g = ground(&w, x);
+    w.strike(x, g);
+    run(&mut w, 180, "après l'éclair");
+}

@@ -62,6 +62,8 @@ use cadence::Pass;
 pub enum Stroke {
     Line { a: (i32, i32), b: (i32, i32), r: i32, m: Mat, rule: PaintRule },
     Tunnel { a: (i32, i32), b: (i32, i32), r: i32 },
+    /// A bolt of lightning called down on this cell (see `World::strike`).
+    Strike { at: (i32, i32) },
 }
 
 /// How the brush treats what is already there.
@@ -1643,15 +1645,17 @@ impl World {
         match *s {
             Stroke::Line { a, b, r, m, rule } => self.line_rule(a, b, r, m, rule),
             Stroke::Tunnel { a, b, r } => self.tunnel_line(a, b, r),
+            Stroke::Strike { at } => self.strike(at.0, at.1),
         }
     }
 
     /// The same stroke on a picture of the world, for the screen to show it at once: a tunnel
-    /// only empties, its roof comes with the next picture.
+    /// only empties, its roof comes with the next picture, and a bolt comes whole with it.
     pub fn stroke_preview(&mut self, s: &Stroke) {
         match *s {
             Stroke::Line { .. } => self.stroke(s),
             Stroke::Tunnel { a, b, r } => self.line_rule(a, b, r, Mat::Empty, PaintRule::Fill),
+            Stroke::Strike { .. } => {}
         }
     }
 

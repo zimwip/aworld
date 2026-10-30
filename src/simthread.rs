@@ -226,13 +226,23 @@ impl SimThread {
 
 /// Could this frame's input change the world? A click or a held button (but on the camera's
 /// Ctrl), a key, the wheel: the frame then borrows the real world. Moving the mouse over the world
-/// or the menus does not.
-pub fn input_may_edit(game: &Game, ui: &Ui) -> bool {
+/// or the menus does not. `at`: the pointer, in the world.
+pub fn input_may_edit(game: &Game, ui: &Ui, at: Vec2) -> bool {
     let buttons = [MouseButton::Left, MouseButton::Right, MouseButton::Middle];
-    // A stroke of the brush that goes on: its strokes are sent to the world (see `Game::stroke`).
-    let changed = buttons.iter().any(|&b| is_mouse_button_pressed(b) || is_mouse_button_released(b));
+    let quiet = mouse_wheel() == (0.0, 0.0) && get_keys_pressed().is_empty();
+    // A stroke of the brush that goes on, or that ends: its strokes are sent to the world (see
+    // `Game::stroke`), and letting go changes nothing in it.
+    let pressed = buttons.iter().any(|&b| is_mouse_button_pressed(b));
     let held = is_mouse_button_down(MouseButton::Left) || is_mouse_button_down(MouseButton::Right);
-    if game.stroking && held && !changed && mouse_wheel() == (0.0, 0.0) && get_keys_pressed().is_empty() {
+    let released = buttons.iter().any(|&b| is_mouse_button_released(b));
+    if game.stroking && (held || released) && !pressed && quiet {
+        return false;
+    }
+    // A bolt of lightning called down: it goes to the world's thread like a stroke, and the bolt
+    // comes with the next picture. (A click on the little boy is for him, in the real world.)
+    let left_only = is_mouse_button_pressed(MouseButton::Left) && !is_mouse_button_down(MouseButton::Right) && !is_mouse_button_down(MouseButton::Middle);
+    let on_kid = game.kids.kid.as_ref().map_or(false, |k| k.contains(at));
+    if game.tool == crate::Tool::Lightning && left_only && quiet && !ui.over_ui() && !ctrl_down() && !game.camera.dragging() && !game.show_science && !game.quit_modal && !on_kid {
         return false;
     }
     let mouse = buttons.iter().any(|&b| is_mouse_button_down(b) || is_mouse_button_pressed(b) || is_mouse_button_released(b));
@@ -448,6 +458,25 @@ mod tests {
         assert!(sim.pending.is_empty());
         sim.give_back(&mut g, lent);
     }
+
+    #[test]
+    fn a_bolt_called_down_goes_to_the_world_without_borrowing_it() {
+        let mut g = Game::new();
+        g.set_running(true);
+        let mut sim = SimThread::start(&mut g);
+        sim.frame(&mut g, false);
+        g.defer_strokes = true;
+        g.stroke(crate::Stroke::Strike { at: (480, 400) });
+        sim.send_strokes(&mut g);
+        // The bolt comes with a later picture, the screen never having had the world.
+        let t = Instant::now();
+        while g.bolts.is_empty() && t.elapsed().as_secs() < 10 {
+            sim.frame(&mut g, false);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!g.bolts.is_empty(), "the bolt reached the world and its picture");
+        assert_eq!(sim.lends, 0);
+    }
 }
 
 #[cfg(test)]
@@ -498,16 +527,30 @@ mod frame_bench {
         let n = 300;
         let mut worst = 0.0f64;
         let paint = std::env::var("PAINT").ok();
-        let lend = paint.as_deref() == Some("lend");
+        // `STRIKE=1`: a bolt called down every 10 frames, sent to the world's thread; with
+        // `STRIKE=lend`, each one borrowing the world for its frame and the next three (the button
+        // held, then let go) as it once did.
+        let strike = std::env::var("STRIKE").ok();
         for k in 0..n {
             let f = Instant::now();
+            let bolt = strike.is_some() && k % 10 == 0;
+            let x = 300 + (k as i32 * 37) % 360;
             // Painting the old way: every frame borrows the world.
+            let lend = paint.as_deref() == Some("lend") || (strike.as_deref() == Some("lend") && k % 10 < 4);
             if let Some(lent) = sim.frame(&mut g, lend) {
-                g.world.paint(480, 100, 4, crate::Mat::Water);
+                if bolt {
+                    g.world.strike(x, 400);
+                } else if paint.is_some() {
+                    g.world.paint(480, 100, 4, crate::Mat::Water);
+                }
                 crate::render::light_map(&g.world, &mut buf);
                 sim.give_back(&mut g, lent);
             } else {
-                if paint.is_some() {
+                if bolt {
+                    g.defer_strokes = true;
+                    g.stroke(crate::Stroke::Strike { at: (x, 400) });
+                    sim.send_strokes(&mut g);
+                } else if paint.is_some() {
                     g.defer_strokes = true;
                     let x = 400 + (k as i32 % 160);
                     g.stroke(crate::Stroke::Line { a: (x, 100), b: (x + 1, 100), r: 4, m: crate::Mat::Water, rule: crate::PaintRule::Fill });
