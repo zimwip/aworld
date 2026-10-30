@@ -138,6 +138,7 @@ fn record(m: Mat) -> MatSpec {
         Water => MatSpec { fall_ms: DROP_TERMINAL_MS, ..liquid(1000.0) },
         Oil => liquid(800.0),
         Lava => liquid(3000.0),
+        MoltenGlass => liquid(2400.0),
         Molten | MoltenSteel => liquid(6500.0),
         Sand | Mud => loose(1600.0, true),
         // Snowflakes catch the air and fall gently.

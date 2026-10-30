@@ -441,6 +441,7 @@ pub fn light_map(world: &World, out: &mut [[u8; 4]]) {
                             fire += 1.0;
                         }
                         Mat::Lava => glow += 1.3,
+                        Mat::MoltenGlass => glow += 0.9,
                         Mat::Ember => glow += 0.5,
                         Mat::Empty | Mat::Steam | Mat::Smoke => heat += ((world.temp[i] - 60.0) / 160.0).clamp(0.0, 1.0),
                         _ => {}

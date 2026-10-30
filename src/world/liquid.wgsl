@@ -73,7 +73,8 @@ struct Throw {
 @group(1) @binding(5) var<storage, read_write> p: array<f32>;
 @group(1) @binding(6) var<storage, read_write> nu: array<f32>;
 @group(1) @binding(7) var<storage, read_write> rhs: array<f32>;
-// The materials: kind, density (kg/m³), viscosity (m²/s) and flags (1: lava) of each, 64 apiece.
+// The materials: kind, density (kg/m³), viscosity (m²/s) and, for a thick liquid (lava, molten
+// glass), the temperature (°C) it thickens from as it cools (0 for the others), 64 apiece.
 @group(1) @binding(8) var<storage, read_write> tables: array<u32>;
 
 @group(2) @binding(0) var<storage, read_write> want: array<u32>;
@@ -164,8 +165,8 @@ fn density(m: u32) -> f32 {
 fn mat_nu(m: u32) -> f32 {
     return bitcast<f32>(tables[128u + m]);
 }
-fn is_lava(m: u32) -> bool {
-    return (tables[192u + m] & 1u) != 0u;
+fn thick_from(m: u32) -> f32 {
+    return bitcast<f32>(tables[192u + m]);
 }
 /// The kind of the cell as the world sees it (a block over it is static; outside, stone over
 /// the top and nothing under or beside).
@@ -587,10 +588,11 @@ fn thickness(@builtin(global_invocation_id) id: vec3<u32>) {
     let r = rho(c);
     var n = mat_nu(m);
     var tau = 0.0;
-    if is_lava(m) {
-        let cool = clamp((1150.0 - t) / 60.0, 0.0, 8.0);
+    let hot = thick_from(m);
+    if hot > 0.0 {
+        let cool = clamp((hot - t) / 60.0, 0.0, 8.0);
         n = min(exp(cool), 50.0);
-        tau = 500.0 * exp(clamp((1150.0 - t) / 150.0, 0.0, 8.0));
+        tau = 500.0 * exp(clamp((hot - t) / 150.0, 0.0, 8.0));
     }
     if n * P.dt / (CELL_M * CELL_M) < 0.01 { return; }
     if tau > 0.0 {

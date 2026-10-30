@@ -1,8 +1,8 @@
 //! The graphics card, for the computations that are the same on every cell (the pressure of the
 //! liquids, see `mgpcg_gpu.rs`): one wgpu device for the whole game, the one the window draws
-//! with (see `gfx`). Off unless asked: on an integrated card the trip costs as much as the CPU's own
-//! solve, so the card is for a dedicated one. `AWORLD_GPU=auto` sends it the big systems;
-//! `AWORLD_GPU=1` sends it even the small ones the CPU would solve faster (for tests).
+//! with (see `gfx`). By default the liquids go to it where it costs less than the CPU, as
+//! measured (`liquid::card_pays`: on an integrated card, a lake pays for the trip and a little
+//! rain does not); `AWORLD_GPU=1` sends it everything (for tests), `AWORLD_GPU=0` nothing.
 //!
 //! In the browser the card draws but does not compute: reading results back means waiting for
 //! the card, which a page cannot do (the liquids stay on the CPU there).
