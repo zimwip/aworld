@@ -1,20 +1,24 @@
 //! Pipes, valves and taps: a network that carries liquid between its open ends.
 //!
-//! The liquid in the world is a cellular automaton, which has no way to push water uphill or to
-//! feel a siphon. Pipes are therefore solved as a small hydraulic network laid over it: every open
-//! end sees the surface of the liquid it dips into (or the air), that gives it a *head* (the height
-//! the liquid would rise to), junction heads follow from conservation of flow, and the flow along a
-//! pipe is proportional to the difference of heads at its ends. Water is then taken from the cells
-//! at the inlets and handed back at the outlets. From that single rule come communicating vessels,
-//! locks (basins joined by valved pipes), siphons that run over a hump, and their limit: a column of
-//! liquid cannot be sucked higher than the atmosphere can hold it, and then the siphon breaks.
+//! A pipe is thinner than a cell: the liquids' solver cannot carry liquid through it. Pipes are
+//! therefore solved as a small hydraulic network laid over the world: every open end sees the
+//! liquid it dips into (or the air), that gives it a *head* (the height the liquid would rise to:
+//! its surface, plus the column the pressure of the gas over it is worth), junction heads follow
+//! from conservation of flow, and the flow along a pipe is proportional to the difference of heads
+//! at its ends. Water is then taken from the cells at the inlets and handed back at the outlets.
+//! From that single rule come communicating vessels, locks (basins joined by valved pipes), siphons
+//! that run over a hump, a boiler or a sealed tank under pressure that drives its water up a pipe
+//! higher than its own surface, and the limit of a siphon: a column of liquid cannot be sucked
+//! higher than the atmosphere can hold it, and then the siphon breaks.
 
-use crate::world::{Kind, Mat, World, H, W};
+use crate::world::{units, Kind, Mat, MatSpec, World, H, W};
 use crate::world::FILL_FULL as FULL;
 
-/// How high (in cells) the atmosphere can hold a column of liquid: the limit of a siphon's hump
-/// above the surface it draws from.
-pub const ATM_HEAD: f32 = 140.0;
+/// How high (in cells) the atmosphere can hold a column of `m`: the limit of a siphon's hump above
+/// the surface it draws from (some 10 m of water).
+pub fn atm_head(m: Mat) -> f32 {
+    1.0 / units::atm_per_cell(MatSpec::of(m).density / units::RHO_WATER)
+}
 /// Ends closer than this are one junction.
 const JOIN: f32 = 3.0;
 /// How far from an open end the liquid is looked for.
@@ -30,7 +34,8 @@ pub fn is_liquid(m: Mat) -> bool {
 
 /// What the network needs from the world around it.
 pub trait Env {
-    /// The liquid a port at `p` dips into, if it does: what it is and the height of its surface.
+    /// The liquid a port at `p` dips into, if it does: what it is and its head there, the height
+    /// it would rise to in an open pipe (that of its surface, in an open basin at rest).
     fn liquid_at(&self, p: (f32, f32)) -> Option<(Mat, f32)>;
     /// Height above the bottom of the world.
     fn elevation(&self, p: (f32, f32)) -> f32 {
@@ -58,11 +63,15 @@ impl Env for World {
             }
         }
         let (_, x, mut y, m) = best?;
-        // The surface is the top of the liquid above that cell.
+        // The surface is the top of the liquid above that cell (read now: the pressure the
+        // pockets count is a few ticks old, and a pipe draining a basin fast overshot on it).
         while y > 0 && is_liquid(self.raw(x, y - 1)) {
             y -= 1;
         }
-        Some((m, H() as f32 - y as f32))
+        // The gas pressing on that surface (a boiler, a sealed tank) adds the column its pressure
+        // over the open air's is worth.
+        let over = self.gas_pressure(x, y - 1) - 1.0;
+        Some((m, H() as f32 - y as f32 + over / units::atm_per_cell(MatSpec::of(m).density / units::RHO_WATER)))
     }
 
     fn take_liquid(&mut self, p: (f32, f32)) -> Option<Mat> {
@@ -415,7 +424,7 @@ impl Plumbing {
             let (up, up_wet) = if drive >= 0.0 { (na, wet[na] || nodes[na].ends.len() > 1) } else { (nb, wet[nb] || nodes[nb].ends.len() > 1) };
             let h_up = head[up];
             // A pump pushes the column, so the pipe may rise higher above its source than a siphon's.
-            let too_high = Self::crest(env, p) - h_up - boost[i].abs() > ATM_HEAD;
+            let too_high = Self::crest(env, p) - h_up - boost[i].abs() > atm_head(p.fluid);
             let was = p.primed;
             let both_dry = !wet[na] && !wet[nb] && nodes[na].ends.len() == 1 && nodes[nb].ends.len() == 1;
             p.primed = g[i] > 0.0 && up_wet && !too_high && !both_dry && drive.abs() > 0.05;
@@ -594,7 +603,7 @@ mod tests {
     fn a_hump_higher_than_the_atmosphere_can_lift_breaks_the_siphon() {
         let mut w = vessels(100, 20);
         let mut p = Plumbing::default();
-        u_tube(&mut p, 40.0 + ATM_HEAD + 20.0); // far above the 100 cells of water
+        u_tube(&mut p, 40.0 + atm_head(Mat::Water) + 20.0); // far above the 100 cells of water
         let ev = run(&mut p, &mut w, 1500);
         let (l, r) = (surface(&w, 130), surface(&w, 330));
         assert!(r < 25.0 && l > 95.0, "nothing flows over: {l} / {r}");
@@ -655,6 +664,48 @@ mod tests {
         // Only a few cells evaporate from the open vessels.
         let after = water_in(&w, 0, W() as i32);
         assert!(after <= before && after + 5 >= before, "{before} -> {after}");
+    }
+
+    /// A sealed stone boiler, its water under a pocket of steam: a pipe from under its water
+    /// carries it out higher than its surface (the steam presses it up), where the same boiler
+    /// without steam gives nothing.
+    #[test]
+    fn steam_pressure_drives_water_up_a_pipe_out_of_a_boiler() {
+        let run = |steam: bool| {
+            let mut w = World::new_static();
+            let fill = |w: &mut World, x0: i32, y0: i32, x1: i32, y1: i32, m: Mat, t: f32| {
+                for x in x0..=x1 {
+                    for y in y0..=y1 {
+                        w.set(x, y, m);
+                        w.temp[y as usize * W() + x as usize] = t;
+                    }
+                }
+            };
+            for x in 100..=140 {
+                for y in 200..=240 {
+                    if x == 100 || x == 140 || y == 200 || y == 240 {
+                        w.set(x, y, Mat::Stone);
+                    }
+                }
+            }
+            fill(&mut w, 101, 225, 139, 239, Mat::Water, 20.0);
+            if steam {
+                fill(&mut w, 101, 201, 139, 205, Mat::Steam, 110.0);
+            }
+            // Out through the wall, up and over to an open end ten cells above the water.
+            let mut p = Plumbing::default();
+            let mut u = uids();
+            p.add_pipe((120.0, 236.0), (160.0, 236.0), 1, &mut u);
+            p.add_pipe((160.0, 236.0), (160.0, 215.0), 2, &mut u);
+            for _ in 0..90 {
+                p.step(&mut w);
+                w.step();
+            }
+            (0..H() as i32).flat_map(|y| (145..W() as i32).map(move |x| (x, y))).filter(|&(x, y)| w.raw(x, y) == Mat::Water).count()
+        };
+        let (with, without) = (run(true), run(false));
+        assert_eq!(without, 0, "no pressure, no flow up");
+        assert!(with > 5, "the steam drove water up and out: {with} cells");
     }
 
     #[test]

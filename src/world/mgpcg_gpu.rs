@@ -24,7 +24,7 @@ pub const GPU_MIN: usize = 40_000;
 pub fn threshold() -> usize {
     match super::gpu::wanted() {
         super::gpu::Use::Always => 0,
-        _ => std::env::var("AWORLD_GPU_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(GPU_MIN),
+        _ => crate::config::config().gpu_min.unwrap_or(GPU_MIN),
     }
 }
 
@@ -151,7 +151,7 @@ mod native {
     /// The level from which the V-cycle runs in one launch (`vcycle_small`): the levels under
     /// it are small enough that the launches cost more than the work. `AWORLD_GPU_FUSE` sets it.
     fn fuse_from() -> usize {
-        std::env::var("AWORLD_GPU_FUSE").ok().and_then(|v| v.parse().ok()).unwrap_or(2).max(1)
+        crate::config::config().gpu_fuse.unwrap_or(2).max(1)
     }
 
     fn bytes<T: Copy>(v: &[T]) -> &[u8] {
@@ -895,7 +895,7 @@ mod tests {
             return;
         };
         eprintln!("carte : {}", g.name);
-        let (w, h) = std::env::var("AWORLD_BENCH_GRID").ok().and_then(|v| v.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))).unwrap_or((960, 540));
+        let (w, h) = crate::config::bench().grid.as_deref().and_then(crate::config::parse_size).unwrap_or((960, 540));
         eprintln!("grille : {w}x{h}");
         let mut gpu = PressureGpu::new(w, h).unwrap();
         gpu.bench();

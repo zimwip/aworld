@@ -2151,7 +2151,7 @@ mod snapshots {
     #[test]
     #[ignore]
     fn snapshot_tumbling() {
-        let Ok(dir) = std::env::var("AWORLD_SNAP") else { return };
+        let Some(dir) = crate::config::bench().snap.clone() else { return };
         let mut w = World::new();
         w.day_cycle = false;
         w.climate_fixed = Some(-5.0);

@@ -514,7 +514,7 @@ impl World {
         self.liq_work = 0;
         let mut liq = std::mem::take(&mut self.liq);
         liq.ready();
-        let audit = std::env::var_os("AWORLD_DEBUG_MASS").is_some();
+        let audit = crate::config::config().debug_mass;
         let units = |w: &World, liq: &Liquids| (0..W() * H()).filter(|&i| w.cells[i].m == Mat::Water).map(|i| w.liquid_fill(i) as u64).sum::<u64>() + liq.drops.iter().filter(|d| d.m == Mat::Water).map(|d| d.q as u64).sum::<u64>();
         let before = if audit { units(self, &liq) } else { 0 };
         // The whole turn on the card, where there is one (and it is wanted): the card works on

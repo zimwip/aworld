@@ -1,6 +1,7 @@
 mod backdrop;
 mod blocks;
 mod camera;
+mod config;
 mod car;
 mod fireworks;
 mod fps;
@@ -4706,7 +4707,7 @@ async fn game() {
     let shot = arg("--demo");
     // `--grid 1440x810` (or `AWORLD_GRID`): the size of the world, in cells, before anything is
     // sized from it.
-    if let Some((w, h)) = arg("--grid").or_else(|| std::env::var("AWORLD_GRID").ok()).as_deref().and_then(parse_grid) {
+    if let Some((w, h)) = arg("--grid").or_else(|| config::config().grid.clone()).as_deref().and_then(config::parse_size) {
         world::set_grid(w, h);
     }
 
@@ -5146,11 +5147,6 @@ async fn game() {
 }
 
 /// `1440x810` as (1440, 810).
-fn parse_grid(v: &str) -> Option<(usize, usize)> {
-    let (w, h) = v.split_once(['x', 'X', '*'])?;
-    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
-}
-
 /// The game again, from the start, with a world of `w` x `h` cells: the world, the renderer and
 /// the card are all sized for the world as the game starts, so a new size takes a new start. The
 /// same arguments, but for `--grid`.
@@ -6163,9 +6159,9 @@ mod tests {
     }
     #[test]
     fn a_grid_is_read_and_snapped_to_sizes_the_world_takes() {
-        assert_eq!(parse_grid("1440x810"), Some((1440, 810)));
-        assert_eq!(parse_grid(" 480 X 270"), Some((480, 270)));
-        assert_eq!(parse_grid("960"), None);
+        assert_eq!(config::parse_size("1440x810"), Some((1440, 810)));
+        assert_eq!(config::parse_size(" 480 X 270"), Some((480, 270)));
+        assert_eq!(config::parse_size("960"), None);
         assert_eq!(world::snap_grid(960, 540), (960, 540), "the size the game was drawn for");
         assert_eq!(world::snap_grid(1000, 560), (960, 558));
         assert_eq!(world::snap_grid(10, 99999), (384, 1080));
