@@ -173,11 +173,13 @@ pub struct Block {
     /// Steps before this block can take another blow (glass breaks in stages).
     pub hurt: u16,
     pub body: Option<RigidBodyHandle>,
+    /// Its velocity while it runs, cells a second (down positive).
+    pub vel: Vec2,
 }
 
 impl Block {
     pub fn new(kind: BlockKind, pos: Vec2, angle: f32) -> Self {
-        Block { uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed), kind, pos, angle, heat: 0, rust: 0.0, hurt: 0, body: None }
+        Block { uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed), kind, pos, angle, heat: 0, rust: 0.0, hurt: 0, body: None, vel: Vec2::ZERO }
     }
 
     pub fn spec(&self) -> Spec {
@@ -255,6 +257,8 @@ pub fn stamp_all(world: &mut World, blocks: &[Block], members: &[Member]) {
     let mut passable = vec![false; blocks.len()];
     passable.extend(members.iter().map(|m| !m.is_deck()));
     world.begin_blocks(mats, passable);
+    let m = crate::world::units::cell_m();
+    world.block_speeds(blocks.iter().map(|b| (b.vel.x * m, b.vel.y * m)).collect());
     for (id, b) in blocks.iter().enumerate() {
         let (x0, y0, x1, y1) = b.bounds();
         for y in y0..=y1 {
@@ -1900,6 +1904,10 @@ impl Physics {
                 let k = -600.0 * (s.w * s.h) / (px_per_m() * px_per_m()) * dt;
                 self.w.bodies[h].apply_impulse(Vector::new(gx * k, gy * k), true);
             }
+            if world.liquid_pressure_known() {
+                self.wade(world, b, h, dt, g);
+                continue;
+            }
             let reach = half.length() + 2.0;
             let (nx, ny) = (((s.w / 4.0) as i32).max(2), ((s.h / 4.0) as i32).max(2));
             let (mut wet, mut total) = (0, 0);
@@ -1932,6 +1940,88 @@ impl Physics {
             rb.set_linear_damping(0.05 + 2.5 * f);
             rb.set_angular_damping(0.3 + 2.0 * f);
         }
+    }
+
+    /// A block in the liquids that run by their physics: the pressure of the liquid on each face
+    /// of it pushes it (the buoyancy is the difference between its underside and its top, and a
+    /// liquid higher on one side than the other, a surge, a dam letting go, pushes it sideways),
+    /// and the liquid drags it towards its own velocity, the harder the thicker it is (oil, lava)
+    /// and the faster the block goes through it: a brick dropped into a pond is braked as it goes
+    /// in, a current carries it along.
+    fn wade(&mut self, world: &World, b: &Block, h: RigidBodyHandle, dt: f32, g: f32) {
+        let s = b.spec();
+        let px = px_per_m();
+        let m = crate::world::units::cell_m();
+        // What one cell of water standing on a face presses, in the blocks' units.
+        let head = 1.0 * g / px / (1000.0 * crate::world::units::G * m);
+        // The faces, a sample every two cells or so: (point, outward normal, length), local.
+        let mut faces: Vec<(Vec2, Vec2, f32)> = vec![];
+        if s.round {
+            let r = s.w / 2.0;
+            let n = ((std::f32::consts::TAU * r / 2.0) as usize).max(8);
+            for k in 0..n {
+                let a = std::f32::consts::TAU * (k as f32 + 0.5) / n as f32;
+                let d = vec2(a.cos(), a.sin());
+                faces.push((d * r, d, std::f32::consts::TAU * r / n as f32));
+            }
+        } else {
+            for (along, across, len, depth) in [(vec2(1.0, 0.0), vec2(0.0, -1.0), s.w, s.h), (vec2(1.0, 0.0), vec2(0.0, 1.0), s.w, s.h), (vec2(0.0, 1.0), vec2(-1.0, 0.0), s.h, s.w), (vec2(0.0, 1.0), vec2(1.0, 0.0), s.h, s.w)] {
+                let n = ((len / 2.0) as usize).max(2);
+                for k in 0..n {
+                    let t = ((k as f32 + 0.5) / n as f32 - 0.5) * len;
+                    faces.push((along * t + across * depth / 2.0, across, len / n as f32));
+                }
+            }
+        }
+        let rb = &mut self.w.bodies[h];
+        let (mut wet, mut thick) = (0.0, 0.0);
+        let mut flow = Vec2::ZERO;
+        let mut push = Vector::new(0.0, 0.0);
+        let mut torque = 0.0;
+        let centre = b.pos;
+        for &(local, normal, len) in &faces {
+            let p = b.pos + rot(b.angle, local);
+            let n = rot(b.angle, normal);
+            // The liquid just outside the face.
+            let q = p + n * 1.5;
+            let (x, y) = (q.x.floor() as i32, q.y.floor() as i32);
+            if x < 0 || y < 0 || x >= W() as i32 || y >= H() as i32 {
+                continue;
+            }
+            let Some(nu) = world.liquid_viscosity(x as usize, y as usize) else { continue };
+            wet += len;
+            thick += len * (1.0 + 0.5 * (nu / 1e-6).max(1.0).ln());
+            if let Some(v) = world.liquid_velocity(x as usize, y as usize) {
+                flow += vec2(v.0, v.1) * len;
+            }
+            let pa = world.liquid_pa(x as usize, y as usize).unwrap_or(0.0).max(0.0);
+            // Pressed in, against the face.
+            let f = -n * (pa * head * len / px);
+            push += Vector::new(f.x, f.y);
+            let r = (p - centre) / px;
+            torque += r.x * f.y - r.y * f.x;
+        }
+        let total: f32 = faces.iter().map(|f| f.2).sum();
+        if wet == 0.0 {
+            rb.set_linear_damping(0.05);
+            rb.set_angular_damping(0.3);
+            return;
+        }
+        let f = wet / total;
+        let thick = thick / wet;
+        rb.apply_impulse(push * dt, true);
+        rb.apply_torque_impulse(torque * dt, true);
+        // The drag: towards the liquid's own velocity (m/s, over the wet faces), damped on the
+        // body (steady however thick the liquid: the push of the current is what the damping
+        // takes off a body moving as fast as the liquid).
+        let current = flow / wet / (m * px);
+        let v = rb.linvel();
+        let rel = ((current.x - v.x).powi(2) + (current.y - v.y).powi(2)).sqrt();
+        let d = f * thick * (2.5 + 1.0 * rel);
+        let mass = rb.mass();
+        rb.apply_impulse(Vector::new(current.x, current.y) * (d * mass * dt), true);
+        rb.set_linear_damping(0.05 + d);
+        rb.set_angular_damping(0.3 + 2.0 * f * thick);
     }
 
     /// Glass blocks that took a hard knock this step (something fast hit them, or
@@ -2028,6 +2118,8 @@ impl Physics {
                 let t = rb.translation();
                 b.pos = vec2(t.x, t.y) * px_per_m();
                 b.angle = rb.rotation().angle();
+                let v = rb.linvel();
+                b.vel = vec2(v.x, v.y) * px_per_m();
             }
         }
     }
@@ -2671,6 +2763,134 @@ mod tests {
         // The water surface is around y = 270: wood bobs there, iron lies on the bottom.
         assert!(plank < 282.0, "the plank should float, mean y = {plank}");
         assert!(blocks[1].pos.y > 300.0, "the iron beam should sink, y = {}", blocks[1].pos.y);
+    }
+
+    /// A pond `deep` cells deep between banks of stone, 200 wide, the stone floor at 320.
+    fn pond(deep: i32) -> World {
+        let mut world = World::new_static();
+        for x in 0..640 {
+            for y in 320..330 {
+                world.set(x, y, Mat::Stone);
+            }
+        }
+        for y in 200..320 {
+            for k in 0..4 {
+                world.set(96 + k, y, Mat::Stone);
+                world.set(300 + k, y, Mat::Stone);
+            }
+        }
+        for x in 100..300 {
+            for y in 320 - deep..320 {
+                world.set(x, y, Mat::Water);
+            }
+        }
+        world
+    }
+
+    /// Units of water in the world, in cells and drops.
+    fn water_of(world: &World) -> u64 {
+        (0..W() * H()).filter(|&i| world.raw((i % W()) as i32, (i / W()) as i32) == Mat::Water).map(|i| world.water_fill(i) as u64).sum::<u64>() + world.liquid_drops().iter().map(|d| d.q as u64).sum::<u64>()
+    }
+
+    #[test]
+    fn a_block_dropped_into_a_pond_drives_the_water_aside() {
+        // A stone cube and an iron rod dropped flat into a pond shallower than they are tall or
+        // wide: they sink to the bottom and the water rises round them, none of it on them.
+        for (kind, deep) in [(BlockKind::Cube, 14), (BlockKind::Beam, 5)] {
+            let mut world = pond(deep);
+            let before = water_of(&world);
+            let mut blocks = vec![Block::new(kind, vec2(200.0, 200.0), 0.0)];
+            let half = blocks[0].half();
+            let mut phys = Physics::build(&mut blocks);
+            stamp_blocks(&mut world, &blocks);
+            let mut on_top = 0;
+            for _ in 0..600 {
+                phys.step(&world, &mut blocks);
+                stamp_blocks(&mut world, &blocks);
+                world.step();
+                let b = &blocks[0];
+                let top = (b.pos.y - half.y).floor() as i32;
+                let x0 = (b.pos.x - half.x).ceil() as i32;
+                let x1 = (b.pos.x + half.x).floor() as i32;
+                // Water lying on its top (within a few cells over it).
+                let wet = (x0..x1).filter(|&x| (top - 3..top).any(|y| world.raw(x, y) == Mat::Water)).count();
+                if b.pos.y + half.y > (320 - deep) as f32 + 2.0 {
+                    on_top = on_top.max(wet);
+                }
+            }
+            let b = &blocks[0];
+            let level = |x: i32| (200..320).find(|&y| world.raw(x, y) == Mat::Water).unwrap_or(320);
+            let (left, right) = (level(110), level(290));
+            let after = water_of(&world);
+            eprintln!("{kind:?}: bottom {}, water on it at worst {on_top}, level {left} / {right} (was {}), water {before} -> {after}", b.pos.y + half.y, 320 - deep);
+            assert!(b.pos.y + half.y > 318.0, "{kind:?} sank to the bottom: {}", b.pos.y + half.y);
+            assert!(on_top <= (2.0 * half.x) as usize / 4, "{kind:?}: the water went over it ({on_top} columns)");
+            // The pond rose round it by its volume under the water, spread over the rest.
+            let rise = deep as f32 * 2.0 * half.x / (200.0 - 2.0 * half.x);
+            for l in [left, right] {
+                assert!(((320 - deep - l) as f32 - rise).abs() <= 2.5, "{kind:?}: the pond rose by {} cells, {rise} expected", 320 - deep - l);
+            }
+            assert!(after.abs_diff(before) * 200 < before, "{kind:?}: water made or lost: {before} -> {after}");
+        }
+    }
+
+    #[test]
+    fn a_block_sinks_slower_in_a_thicker_liquid() {
+        // The same stone cube dropped into a deep pond of water and of oil: the oil, thicker,
+        // brakes it harder as it sinks.
+        let sink = |liquid: Mat| {
+            let mut world = pond(0);
+            for x in 100..300 {
+                for y in 220..320 {
+                    world.set(x, y, liquid);
+                }
+            }
+            let mut blocks = vec![Block::new(BlockKind::Cube, vec2(200.0, 180.0), 0.0)];
+            let mut phys = Physics::build(&mut blocks);
+            let mut steps = 0;
+            while blocks[0].pos.y < 300.0 && steps < 1500 {
+                phys.step(&world, &mut blocks);
+                stamp_blocks(&mut world, &blocks);
+                world.step();
+                steps += 1;
+            }
+            steps
+        };
+        let (water, oil) = (sink(Mat::Water), sink(Mat::Oil));
+        eprintln!("steps to the bottom: water {water}, oil {oil}");
+        assert!(water < 600, "the cube sank in the water");
+        assert!(oil > water + water / 4, "the oil brakes it more: {oil} steps, {water} in water");
+    }
+
+    #[test]
+    fn the_water_pushes_a_block_from_the_side_and_drags_it() {
+        // A stone cube on the floor of a basin with deep water on its left, none on its right
+        // (a little dam): the water's pressure on its side shoves it to the right.
+        let mut world = World::new_static();
+        for x in 0..640 {
+            for y in 320..330 {
+                world.set(x, y, Mat::Stone);
+            }
+        }
+        for y in 200..320 {
+            for k in 0..4 {
+                world.set(96 + k, y, Mat::Stone);
+            }
+        }
+        for x in 100..190 {
+            for y in 250..320 {
+                world.set(x, y, Mat::Water);
+            }
+        }
+        let mut blocks = vec![Block::new(BlockKind::Cube, vec2(200.0, 310.0), 0.0)];
+        let mut phys = Physics::build(&mut blocks);
+        for _ in 0..40 {
+            phys.step(&world, &mut blocks);
+            stamp_blocks(&mut world, &blocks);
+            world.step();
+        }
+        eprintln!("cube at {} (was 200)", blocks[0].pos.x);
+        assert!(blocks[0].pos.x > 204.0, "the water pushed the cube: x = {}", blocks[0].pos.x);
     }
 
     #[test]
