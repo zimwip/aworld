@@ -606,6 +606,9 @@ pub struct Solver {
     /// The best solution so far, to fall back on if the iterations run away.
     /// Iterations the last solve took.
     pub iterations: u32,
+    /// Solves the coarse levels have served since they were last built, when they are kept
+    /// from one solve to the next (`coarsen_kept`); 0 when they are built for each solve.
+    kept: u32,
 }
 
 impl Solver {
@@ -614,6 +617,7 @@ impl Solver {
         if self.levels.first().is_some_and(|l| l.w == w && l.h == h) {
             return;
         }
+        self.kept = 0;
         self.levels.clear();
         let (mut lw, mut lh) = (w, h);
         loop {
@@ -636,8 +640,21 @@ impl Solver {
     /// not write (beside a smaller body, say) must be nothing.
     pub fn clear(&mut self) {
         // (The finest level is always to clear: it is filled in even when the card solves.)
-        for l in &mut self.levels[..self.used.max(1)] {
+        // Kept coarse levels stay as they are, for the next solve.
+        let n = if self.kept > 0 { 1 } else { self.used.max(1) };
+        for l in &mut self.levels[..n] {
             l.clear();
+        }
+    }
+
+    /// Clears the coarse levels kept from an earlier solve, if any: what comes next builds them
+    /// again, or does without.
+    fn drop_kept(&mut self) {
+        if self.kept > 0 {
+            for l in &mut self.levels[1..self.used] {
+                l.clear();
+            }
+            self.kept = 0;
         }
     }
 
@@ -652,6 +669,7 @@ impl Solver {
     /// the `x` it holds, without the coarse levels nor the conjugate gradients: what the simple
     /// solver of the liquids does, from a guess already close.
     pub fn sweep(&mut self, n: usize) {
+        self.drop_kept();
         self.used = 1;
         self.levels[0].prepare();
         self.levels[0].smooth(n, false, false, None, false);
@@ -662,6 +680,7 @@ impl Solver {
     /// columns, then odd ones), then every row the same way. A tall body or a long pipe takes its
     /// pressure in one line, where a sweep of cells moves it a cell. For the simple solver.
     pub fn lines(&mut self, n: usize) {
+        self.drop_kept();
         let f = &mut self.levels[0];
         let (w, h) = (f.w, f.h);
         let Some(y0) = f.rows.iter().position(Option::is_some) else { return };
@@ -766,6 +785,7 @@ impl Solver {
 
     /// Builds the coarse levels from the finest one (after it has been filled in).
     pub fn coarsen(&mut self) {
+        self.drop_kept();
         self.levels[0].prepare();
         let mut n = self.levels[0].nodes[0].len() + self.levels[0].nodes[1].len();
         self.used = 1;
@@ -788,6 +808,38 @@ impl Solver {
             if coarse[0].split {
                 fine[l - 1].unlink(&coarse[0].parts, coarse[0].w);
             }
+        }
+    }
+
+    /// As `coarsen`, but the coarse levels are kept from one solve to the next and built again
+    /// only every `every` solves: the liquid moves a little from one step to the next, and
+    /// the coarse levels only carry the far reach of the pressure, which a grid a few steps old
+    /// carries as well. The finest level is always the one of this solve (its sweeps, its
+    /// residual, the conjugate gradients are exact), and the coarse levels, old or not, are a
+    /// symmetric positive preconditioner: the solve is as sound, only a little less sharp
+    /// where the liquid moved since. A coarse cell over a fine one that is no longer fluid
+    /// takes nothing from it and gives nothing back (the passes down and up read the fine kinds
+    /// of now); a fine fluid cell outside the old coarse rows is left to the sweeps.
+    pub fn coarsen_kept(&mut self, every: u32) {
+        if self.kept == 0 || self.kept >= every || self.used <= 1 {
+            self.coarsen();
+            if self.used > 1 {
+                self.kept = 1;
+            }
+            return;
+        }
+        self.kept += 1;
+        self.levels[0].prepare();
+        let f = &self.levels[0];
+        let (w, rows) = (f.w, &f.rows);
+        self.z.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            if let Some((x0, x1)) = rows[y] {
+                row[x0..=x1].fill(0.0);
+            }
+        });
+        let (fine, coarse) = self.levels.split_at_mut(1);
+        if coarse[0].split {
+            fine[0].unlink(&coarse[0].parts, coarse[0].w);
         }
     }
 
@@ -887,6 +939,9 @@ impl Solver {
                     break;
                 }
                 best = best.min(step);
+                if iterations == max_iter {
+                    break;
+                }
                 let rho2 = self.precondition(&mut r, &mut z);
                 let beta = rho2 / rho;
                 rho = rho2;
@@ -1042,6 +1097,72 @@ pub(in crate::world) mod tests {
             }
             assert!(it <= 8.0, "{w}x{h} took {it} iterations");
         }
+    }
+
+    /// A tank whose liquid starts at row `top` (the gas fixed on the row over it), filled in.
+    fn fill(s: &mut Solver, w: usize, h: usize, top: usize) {
+        let rho = 1000.0f32;
+        let f = s.fine();
+        for y in top - 1..h {
+            for x in 0..w {
+                f.kind[y * w + x] = if y + 1 == top { FIXED } else { FLUID };
+            }
+            f.rows[y] = Some((0, w - 1));
+        }
+        for y in top..h {
+            for x in 1..w {
+                f.ax[y * (w + 1) + x] = 1.0 / rho;
+            }
+            for x in 0..w {
+                f.ay[y * w + x] = 1.0 / rho;
+            }
+        }
+        for y in top..h {
+            for x in 0..w {
+                let c = y * w + x;
+                f.diag[c] = f.ax[y * (w + 1) + x] + f.ax[y * (w + 1) + x + 1] + f.ay[c] + f.ay[c + w];
+                f.b[c] = if y + 1 == h { 9.81 / 6.0 } else { 0.0 };
+            }
+        }
+    }
+
+    #[test]
+    fn coarse_levels_kept_from_a_fuller_tank_still_solve_the_tank_of_now() {
+        let (w, h) = (256, 64);
+        // Built on the full tank, kept while the liquid drops by three rows.
+        let mut s = Solver::default();
+        s.ready(w, h);
+        fill(&mut s, w, h, 1);
+        s.coarsen_kept(4);
+        s.solve(0.01, 0.0, 50);
+        s.clear();
+        fill(&mut s, w, h, 4);
+        s.coarsen_kept(4);
+        assert_eq!(s.kept, 2, "the coarse levels are kept");
+        let kept = s.solve(0.01, 0.0, 50);
+        let step = 1000.0 * 9.81 / 6.0;
+        let f = &s.levels[0];
+        for y in 4..h {
+            let p = f.x[y * w + w / 2];
+            let want = step * (y - 3) as f32;
+            assert!((p - want).abs() < 0.02 * want + 20.0, "row {y}: {p} vs {want}");
+        }
+        // As many iterations, or about, as with the levels built for it.
+        let mut fresh = Solver::default();
+        fresh.ready(w, h);
+        fill(&mut fresh, w, h, 4);
+        fresh.coarsen();
+        let built = fresh.solve(0.01, 0.0, 50);
+        assert!(kept <= built + 3, "kept levels: {kept} iterations, built: {built}");
+        // Every fourth solve builds them again, from clean levels.
+        s.clear();
+        for _ in 0..3 {
+            fill(&mut s, w, h, 4);
+            s.coarsen_kept(4);
+            s.solve(0.01, 0.0, 50);
+            s.clear();
+        }
+        assert_eq!(s.kept, 1, "built again");
     }
 
     /// Two tanks side by side, the wall between them `wall` cells thick and across the cells of

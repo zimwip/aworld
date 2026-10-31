@@ -101,6 +101,11 @@ pub(super) const CHEAP_ITER: u32 = 4;
 pub(super) const SIMPLE_SUB: usize = 2;
 pub(super) const SIMPLE_ITER: u32 = 1;
 pub(super) const SIMPLE_VISCOUS_SWEEPS: usize = 3;
+/// The coarse levels of the multigrid are kept from one solve to the next and built again every
+/// `SIMPLE_KEEP` solves (`Solver::coarsen_kept`): the finest level, its sweeps and the pressure
+/// are still those of each solve, only the far reach of the pressure is carried by a grid a few
+/// steps old.
+pub(super) const SIMPLE_KEEP: u32 = 4;
 /// With `SIMPLE_ITER` at 0, the cheapest: no multigrid at all, `SIMPLE_LINES` rounds of line
 /// solves (`Solver::lines`: each column, then each row, exactly) and `SIMPLE_SWEEPS` sweeps of
 /// Gauss-Seidel. Right for a U-tube or a dam break, but a deep body that lands squeezes by a
@@ -2072,7 +2077,7 @@ impl World {
             solver.sweep(SIMPLE_SWEEPS);
             (SIMPLE_LINES + SIMPLE_SWEEPS) as u32
         } else if simple {
-            solver.coarsen();
+            solver.coarsen_kept(SIMPLE_KEEP);
             solver.solve(SETTLED, RELATIVE, SIMPLE_ITER)
         } else if let Some(gpu) = gpu {
             gpu.solve(solver.fine(), SETTLED, RELATIVE, self.liquid_iterations())
