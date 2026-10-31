@@ -135,3 +135,18 @@ world).
 
 `STRIKE=1 cargo test --release frame_cost -- --ignored --nocapture` (a bolt every 10 frames, cloud machine, 4 cores):
 19.6 ms a frame and 113 ms at worst with the old lends (`STRIKE=lend`), 3.5 ms and 12 ms with the strikes sent.
+
+## The pressure of the simple liquids, kept from step to step (October 31)
+
+The simple solver still solves the pressure at every sub-step (the eddies come from it), but no longer rebuilds all of
+it. Measured on `déluge` (per solve): filling in the fine system 4.4 ms, building the coarse levels 5.8 ms, the one
+iteration 4.5 ms. The fine system is never the same two steps running (0 of 200), so nothing can be skipped exactly:
+
+- The conjugate gradients no longer run the preconditioner after their last iteration (its answer was thrown away):
+  the same pressure, a V-cycle less.
+- The coarse levels of the multigrid are kept and built again every `SIMPLE_KEEP` (4) solves (`Solver::coarsen_kept`).
+  The fine level, its sweeps, its residual and the conjugate gradients are those of each solve; old coarse levels are
+  still a symmetric positive preconditioner, only a little less sharp where the liquid moved since.
+
+Simple solver, 200 steps, cloud machine: `déluge` 63.6 → 49.1 ms a step (pressure 18.3 → 13.2 ms), `liquides`
+43.6 → 33.8. `simple_beside_detailed`: dam front 11.2 m (11.3 before), U-tube 2.80 s and the spreads unchanged.
